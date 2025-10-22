@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv:*)",
+      "Bash(bun:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
