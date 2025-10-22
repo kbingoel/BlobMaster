@@ -155,7 +155,7 @@ Loop until convergence:
     └── Checkpoint: Save model every iteration
 ```
 
-**Expected training time**: 3-7 days on RTX GPU (continuous self-play)
+**Expected training time**: 3-7 days on RTX 4060 GPU (continuous self-play)
 
 #### 6. ELO Tracking
 
@@ -267,7 +267,7 @@ blobmaster/
 
 ## Implementation Roadmap
 
-### Phase 1: Core Game Engine (Weekend 1 - Days 1-2)
+### Phase 1: Core Game Engine
 
 **Goal**: Bulletproof game logic that handles all edge cases
 
@@ -290,7 +290,7 @@ blobmaster/
 
 **Deliverable**: `python ml/game/blob.py` runs a playable game
 
-### Phase 2: MCTS + Neural Network (Midweek - Days 3-5)
+### Phase 2: MCTS + Neural Network
 
 **Goal**: Basic AI that can play legal moves and improve with training
 
@@ -317,7 +317,7 @@ blobmaster/
 
 **Deliverable**: AI plays valid games end-to-end
 
-### Phase 3: Imperfect Information Handling (Weekend 2 - Days 6-7)
+### Phase 3: Imperfect Information Handling
 
 **Goal**: Handle hidden opponent cards via determinization
 
@@ -338,7 +338,7 @@ blobmaster/
 
 **Deliverable**: AI handles imperfect information correctly
 
-### Phase 4: Self-Play Training Pipeline (Week 2 - Days 8-14)
+### Phase 4: Self-Play Training Pipeline
 
 **Goal**: Automated training loop generating strong models
 
@@ -372,7 +372,7 @@ blobmaster/
 
 **Deliverable**: Trained model with ELO progression data
 
-### Phase 5: ONNX Export & Inference (Day 15)
+### Phase 5: ONNX Export & Inference
 
 **Goal**: Fast inference on Intel laptop
 
@@ -388,7 +388,7 @@ blobmaster/
 
 **Deliverable**: `best_model.onnx` runs on laptop
 
-### Phase 6: Backend API (Weekend 3 - Days 16-17)
+### Phase 6: Backend API
 
 **Goal**: Bun server that loads model and serves predictions
 
@@ -418,7 +418,7 @@ blobmaster/
 
 **Deliverable**: `bun run backend/src/index.ts` starts API server
 
-### Phase 7: Frontend UI (Days 18-21)
+### Phase 7: Frontend UI
 
 **Goal**: Playable web interface
 
