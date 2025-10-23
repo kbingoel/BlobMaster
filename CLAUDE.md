@@ -10,6 +10,8 @@ BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bid
 
 ## Development Environment
 
+You are working in a Windows 11 environment, plan your concole commands accordingly!
+
 ### Training Environment (Python)
 
 **Setup virtual environment**:

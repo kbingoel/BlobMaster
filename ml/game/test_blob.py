@@ -7,7 +7,7 @@ of normal operations, edge cases, and anti-cheat functionality.
 
 import pytest
 from ml.game.blob import (
-    Card, Deck, Player, Trick,
+    Card, Deck, Player, Trick, BlobGame,
     BlobGameException, IllegalPlayException, InvalidBidException, GameStateException
 )
 from ml.game.constants import SUITS, RANKS, RANK_VALUES, SCORE_BASE
@@ -585,3 +585,353 @@ class TestExceptions:
         exc = GameStateException("Game not in correct state")
         assert isinstance(exc, BlobGameException)
         assert str(exc) == "Game not in correct state"
+
+
+# ============================================================================
+# Test BlobGame Class
+# ============================================================================
+
+class TestBlobGame:
+    """Test BlobGame class functionality."""
+
+    def test_game_initialization(self):
+        """Game initializes with correct player count and default state."""
+        game = BlobGame(num_players=4)
+
+        assert game.num_players == 4
+        assert len(game.players) == 4
+        assert game.current_round == 0
+        assert game.trump_suit is None
+        assert game.dealer_position == 0
+        assert game.current_trick is None
+        assert game.tricks_history == []
+        assert game.game_phase == 'setup'
+        assert game.cards_played_this_round == []
+        assert game.cards_remaining_by_suit == {}
+
+        # Check default player names
+        assert game.players[0].name == "Player 1"
+        assert game.players[1].name == "Player 2"
+        assert game.players[2].name == "Player 3"
+        assert game.players[3].name == "Player 4"
+
+        # Check player positions
+        assert game.players[0].position == 0
+        assert game.players[1].position == 1
+        assert game.players[2].position == 2
+        assert game.players[3].position == 3
+
+        # Check deck initialization
+        assert isinstance(game.deck, Deck)
+        assert game.deck.remaining_cards() == 52
+
+    def test_game_initialization_invalid_player_count(self):
+        """Game initialization raises ValueError for invalid player counts."""
+        # Too few players
+        with pytest.raises(ValueError, match="must be between"):
+            BlobGame(num_players=2)
+
+        # Too many players
+        with pytest.raises(ValueError, match="must be between"):
+            BlobGame(num_players=9)
+
+        # Zero players
+        with pytest.raises(ValueError, match="must be between"):
+            BlobGame(num_players=0)
+
+        # Negative players
+        with pytest.raises(ValueError, match="must be between"):
+            BlobGame(num_players=-1)
+
+    def test_game_initialization_custom_names(self):
+        """Game initializes with custom player names."""
+        names = ["Alice", "Bob", "Carol"]
+        game = BlobGame(num_players=3, player_names=names)
+
+        assert game.num_players == 3
+        assert len(game.players) == 3
+        assert game.players[0].name == "Alice"
+        assert game.players[1].name == "Bob"
+        assert game.players[2].name == "Carol"
+
+    def test_game_initialization_mismatched_names(self):
+        """Game initialization raises ValueError if player_names length mismatches."""
+        # Too few names
+        with pytest.raises(ValueError, match="must match"):
+            BlobGame(num_players=4, player_names=["Alice", "Bob"])
+
+        # Too many names
+        with pytest.raises(ValueError, match="must match"):
+            BlobGame(num_players=3, player_names=["Alice", "Bob", "Carol", "Dave"])
+
+    def test_trump_rotation(self):
+        """Trump cycles through suits correctly."""
+        game = BlobGame(num_players=4)
+
+        # Round 0: Spades
+        game.current_round = 0
+        assert game.determine_trump() == '♠'
+
+        # Round 1: Hearts
+        game.current_round = 1
+        assert game.determine_trump() == '♥'
+
+        # Round 2: Clubs
+        game.current_round = 2
+        assert game.determine_trump() == '♣'
+
+        # Round 3: Diamonds
+        game.current_round = 3
+        assert game.determine_trump() == '♦'
+
+        # Round 4: No trump
+        game.current_round = 4
+        assert game.determine_trump() is None
+
+        # Round 5: Cycle repeats - Spades
+        game.current_round = 5
+        assert game.determine_trump() == '♠'
+
+        # Round 10: Hearts (10 % 5 = 0 → ♠, wait no... 10 % 5 = 0)
+        game.current_round = 10
+        assert game.determine_trump() == '♠'
+
+        # Round 11: Hearts
+        game.current_round = 11
+        assert game.determine_trump() == '♥'
+
+    def test_setup_round(self):
+        """setup_round() correctly prepares game for a round."""
+        game = BlobGame(num_players=4)
+
+        # Setup a round with 5 cards each
+        game.setup_round(5)
+
+        # Check trump is set
+        assert game.trump_suit == '♠'  # Round 0 → Spades
+
+        # Check game phase
+        assert game.game_phase == 'bidding'
+
+        # Check all players have 5 cards
+        for player in game.players:
+            assert len(player.hand) == 5
+
+        # Check cards are sorted
+        for player in game.players:
+            sorted_hand = sorted(player.hand)
+            assert player.hand == sorted_hand
+
+        # Check card counting initialized
+        total_cards_counted = sum(game.cards_remaining_by_suit.values())
+        assert total_cards_counted == 20  # 4 players × 5 cards
+
+        # Check all suits tracked
+        assert set(game.cards_remaining_by_suit.keys()) == set(SUITS)
+
+        # Check trick state reset
+        assert game.current_trick is None
+        assert game.tricks_history == []
+        assert game.cards_played_this_round == []
+
+    def test_setup_round_resets_state(self):
+        """setup_round() resets previous round state."""
+        game = BlobGame(num_players=3, player_names=["Alice", "Bob", "Carol"])
+
+        # Setup first round
+        game.setup_round(5)
+
+        # Simulate some game state changes
+        game.players[0].make_bid(2)
+        game.players[0].tricks_won = 1
+        game.players[0].known_void_suits.add('♥')
+        game.cards_played_this_round.append(Card('A', '♠'))
+
+        # Setup second round
+        game.current_round = 1
+        game.setup_round(4)
+
+        # Check player state is reset
+        for player in game.players:
+            assert player.bid is None
+            assert player.tricks_won == 0
+            assert player.known_void_suits == set()
+            assert player.cards_played == []
+            assert len(player.hand) == 4  # New cards dealt
+
+        # Check trump rotated
+        assert game.trump_suit == '♥'  # Round 1 → Hearts
+
+        # Check card tracking reset
+        assert game.cards_played_this_round == []
+        total_cards = sum(game.cards_remaining_by_suit.values())
+        assert total_cards == 12  # 3 players × 4 cards
+
+        # Check game phase
+        assert game.game_phase == 'bidding'
+
+    def test_setup_round_different_player_counts(self):
+        """setup_round() works with different player counts."""
+        # 3 players, 7 cards
+        game3 = BlobGame(num_players=3)
+        game3.setup_round(7)
+        assert all(len(p.hand) == 7 for p in game3.players)
+        assert sum(game3.cards_remaining_by_suit.values()) == 21
+
+        # 8 players, 6 cards
+        game8 = BlobGame(num_players=8)
+        game8.setup_round(6)
+        assert all(len(p.hand) == 6 for p in game8.players)
+        assert sum(game8.cards_remaining_by_suit.values()) == 48
+
+    def test_setup_round_max_cards(self):
+        """setup_round() handles maximum card dealing."""
+        # 4 players, 13 cards each = 52 cards (full deck)
+        game = BlobGame(num_players=4)
+        game.setup_round(13)
+
+        assert all(len(p.hand) == 13 for p in game.players)
+        assert sum(game.cards_remaining_by_suit.values()) == 52
+        assert game.deck.remaining_cards() == 0
+
+    def test_setup_round_too_many_cards(self):
+        """setup_round() raises ValueError if too many cards requested."""
+        game = BlobGame(num_players=4)
+
+        # Try to deal 14 cards to 4 players (56 cards needed, only 52 available)
+        with pytest.raises(ValueError, match="Cannot deal"):
+            game.setup_round(14)
+
+    # ============================================================================
+    # Test Bidding Phase
+    # ============================================================================
+
+    def test_get_forbidden_bid_basic(self):
+        """Forbidden bid calculation works correctly."""
+        game = BlobGame(num_players=3)
+
+        # 5 cards dealt, others bid total of 3 → forbidden is 2
+        forbidden = game.get_forbidden_bid(current_total_bids=3, cards_dealt=5)
+        assert forbidden == 2
+
+        # 5 cards dealt, others bid total of 0 → forbidden is 5
+        forbidden = game.get_forbidden_bid(current_total_bids=0, cards_dealt=5)
+        assert forbidden == 5
+
+        # 5 cards dealt, others bid total of 5 → forbidden is 0
+        forbidden = game.get_forbidden_bid(current_total_bids=5, cards_dealt=5)
+        assert forbidden == 0
+
+    def test_get_forbidden_bid_out_of_range_negative(self):
+        """Forbidden bid returns None if negative."""
+        game = BlobGame(num_players=3)
+
+        # Others bid more than cards dealt → forbidden would be negative
+        forbidden = game.get_forbidden_bid(current_total_bids=6, cards_dealt=5)
+        assert forbidden is None
+
+    def test_get_forbidden_bid_out_of_range_too_high(self):
+        """Forbidden bid returns None if greater than cards_dealt."""
+        game = BlobGame(num_players=3)
+
+        # Others bid negative (shouldn't happen, but test boundary)
+        forbidden = game.get_forbidden_bid(current_total_bids=-2, cards_dealt=5)
+        assert forbidden is None  # Would be 7, which is > 5
+
+    def test_get_forbidden_bid_edge_cases(self):
+        """Test forbidden bid edge cases."""
+        game = BlobGame(num_players=4)
+
+        # 1 card dealt, others bid 0 → forbidden is 1
+        assert game.get_forbidden_bid(0, 1) == 1
+
+        # 1 card dealt, others bid 1 → forbidden is 0
+        assert game.get_forbidden_bid(1, 1) == 0
+
+        # 1 card dealt, others bid 2 → forbidden is None (would be -1)
+        assert game.get_forbidden_bid(2, 1) is None
+
+    def test_is_valid_bid_non_dealer(self):
+        """Non-dealer can bid any value in range."""
+        game = BlobGame(num_players=4)
+
+        # All bids in range [0, cards_dealt] are valid for non-dealer
+        for bid in range(6):  # 0 to 5
+            assert game.is_valid_bid(bid, is_dealer=False, current_total_bids=0, cards_dealt=5)
+
+    def test_is_valid_bid_non_dealer_out_of_range(self):
+        """Non-dealer cannot bid out of range."""
+        game = BlobGame(num_players=4)
+
+        # Negative bid invalid
+        assert game.is_valid_bid(-1, is_dealer=False, current_total_bids=0, cards_dealt=5) is False
+
+        # Too high bid invalid
+        assert game.is_valid_bid(6, is_dealer=False, current_total_bids=0, cards_dealt=5) is False
+
+    def test_is_valid_bid_dealer_forbidden(self):
+        """Dealer cannot bid forbidden value."""
+        game = BlobGame(num_players=3)
+
+        # 5 cards dealt, others bid 3 → forbidden is 2
+        # Dealer can bid 0, 1, 3, 4, 5 but NOT 2
+        assert game.is_valid_bid(0, is_dealer=True, current_total_bids=3, cards_dealt=5) is True
+        assert game.is_valid_bid(1, is_dealer=True, current_total_bids=3, cards_dealt=5) is True
+        assert game.is_valid_bid(2, is_dealer=True, current_total_bids=3, cards_dealt=5) is False  # Forbidden!
+        assert game.is_valid_bid(3, is_dealer=True, current_total_bids=3, cards_dealt=5) is True
+        assert game.is_valid_bid(4, is_dealer=True, current_total_bids=3, cards_dealt=5) is True
+        assert game.is_valid_bid(5, is_dealer=True, current_total_bids=3, cards_dealt=5) is True
+
+    def test_is_valid_bid_dealer_forbidden_zero(self):
+        """Dealer cannot bid 0 if that's the forbidden value."""
+        game = BlobGame(num_players=3)
+
+        # 5 cards dealt, others bid 5 → forbidden is 0
+        assert game.is_valid_bid(0, is_dealer=True, current_total_bids=5, cards_dealt=5) is False  # Forbidden!
+        assert game.is_valid_bid(1, is_dealer=True, current_total_bids=5, cards_dealt=5) is True
+
+    def test_is_valid_bid_dealer_forbidden_max(self):
+        """Dealer cannot bid max if that's the forbidden value."""
+        game = BlobGame(num_players=3)
+
+        # 5 cards dealt, others bid 0 → forbidden is 5
+        assert game.is_valid_bid(5, is_dealer=True, current_total_bids=0, cards_dealt=5) is False  # Forbidden!
+        assert game.is_valid_bid(4, is_dealer=True, current_total_bids=0, cards_dealt=5) is True
+
+    def test_is_valid_bid_dealer_no_forbidden(self):
+        """Dealer has no forbidden bid if calculation is out of range."""
+        game = BlobGame(num_players=3)
+
+        # 5 cards dealt, others bid 6 → forbidden would be -1 (invalid), so all bids in range are valid
+        assert game.is_valid_bid(0, is_dealer=True, current_total_bids=6, cards_dealt=5) is True
+        assert game.is_valid_bid(5, is_dealer=True, current_total_bids=6, cards_dealt=5) is True
+
+    def test_is_valid_bid_dealer_out_of_range(self):
+        """Dealer still cannot bid out of range."""
+        game = BlobGame(num_players=3)
+
+        # Even if not forbidden, out of range bids are invalid
+        assert game.is_valid_bid(-1, is_dealer=True, current_total_bids=3, cards_dealt=5) is False
+        assert game.is_valid_bid(6, is_dealer=True, current_total_bids=3, cards_dealt=5) is False
+
+    def test_bidding_phase_wrong_game_state(self):
+        """bidding_phase() raises exception if not in bidding phase."""
+        game = BlobGame(num_players=3)
+
+        # Game starts in 'setup' phase
+        assert game.game_phase == 'setup'
+
+        with pytest.raises(GameStateException, match="Cannot start bidding phase"):
+            game.bidding_phase()
+
+    def test_bidding_phase_structure(self):
+        """bidding_phase() has correct structure and raises NotImplementedError."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Game should be in bidding phase after setup
+        assert game.game_phase == 'bidding'
+
+        # Method should raise NotImplementedError since no bid mechanism provided
+        with pytest.raises(NotImplementedError, match="bid selection mechanism"):
+            game.bidding_phase()

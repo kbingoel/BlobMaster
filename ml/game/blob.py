@@ -420,3 +420,309 @@ class Trick:
     def __repr__(self) -> str:
         """Developer representation."""
         return self.__str__()
+
+
+# ============================================================================
+# BlobGame Class (Main Game Orchestrator)
+# ============================================================================
+
+class BlobGame:
+    """
+    Main game orchestrator for Blob card game.
+
+    Manages complete game flow including setup, bidding, playing, and scoring
+    across multiple rounds with 3-8 players.
+
+    Attributes:
+        num_players: Number of players (3-8)
+        players: List of Player objects
+        deck: Game deck
+        current_round: Round counter (0-indexed)
+        trump_suit: Current trump suit (or None for no-trump)
+        dealer_position: Current dealer position (rotates each round)
+        current_trick: Active trick being played
+        tricks_history: Completed tricks this round
+        game_phase: Current phase ('setup', 'bidding', 'playing', 'scoring', 'complete')
+        cards_played_this_round: All cards played this round (for card counting)
+        cards_remaining_by_suit: Count of unplayed cards per suit
+    """
+
+    def __init__(self, num_players: int, player_names: Optional[List[str]] = None):
+        """
+        Initialize game with N players.
+
+        Args:
+            num_players: Number of players (must be 3-8)
+            player_names: Optional list of player names. If None, generates default names.
+
+        Raises:
+            ValueError: If num_players not in valid range [3, 8]
+            ValueError: If player_names provided but length doesn't match num_players
+        """
+        from ml.game.constants import MIN_PLAYERS, MAX_PLAYERS
+
+        # Validate num_players
+        if num_players < MIN_PLAYERS or num_players > MAX_PLAYERS:
+            raise ValueError(
+                f"num_players must be between {MIN_PLAYERS} and {MAX_PLAYERS}, "
+                f"got {num_players}"
+            )
+
+        self.num_players = num_players
+
+        # Generate player names if not provided
+        if player_names is None:
+            player_names = [f"Player {i+1}" for i in range(num_players)]
+        else:
+            if len(player_names) != num_players:
+                raise ValueError(
+                    f"player_names length ({len(player_names)}) must match "
+                    f"num_players ({num_players})"
+                )
+
+        # Create Player objects
+        self.players: List[Player] = [
+            Player(name, position)
+            for position, name in enumerate(player_names)
+        ]
+
+        # Initialize deck
+        self.deck = Deck()
+
+        # Game state
+        self.current_round: int = 0
+        self.trump_suit: Optional[str] = None
+        self.dealer_position: int = 0
+        self.current_trick: Optional[Trick] = None
+        self.tricks_history: List[Trick] = []
+        self.game_phase: str = 'setup'
+
+        # Anti-cheat and card counting state
+        self.cards_played_this_round: List[Card] = []
+        self.cards_remaining_by_suit: Dict[str, int] = {}
+
+    def determine_trump(self) -> Optional[str]:
+        """
+        Determine trump suit for current round based on round number.
+
+        Trump rotates through: ♠ → ♥ → ♣ → ♦ → None (no-trump) → repeat
+
+        Returns:
+            Trump suit for current round, or None for no-trump rounds
+
+        Examples:
+            Round 0 → ♠ (Spades)
+            Round 1 → ♥ (Hearts)
+            Round 2 → ♣ (Clubs)
+            Round 3 → ♦ (Diamonds)
+            Round 4 → None (no-trump)
+            Round 5 → ♠ (cycle repeats)
+        """
+        trump_index = self.current_round % len(TRUMP_ROTATION)
+        return TRUMP_ROTATION[trump_index]
+
+    def setup_round(self, cards_to_deal: int) -> None:
+        """
+        Prepare for a new round.
+
+        Sets up all necessary state for playing a round:
+        1. Reset deck and shuffle
+        2. Reset all player round state
+        3. Determine trump suit
+        4. Deal cards to players
+        5. Sort player hands
+        6. Initialize card counting state
+        7. Set game phase to 'bidding'
+
+        Args:
+            cards_to_deal: Number of cards to deal to each player
+
+        Raises:
+            ValueError: If cards_to_deal * num_players > 52
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)  # Deal 5 cards to each of 4 players
+            >>> game.trump_suit  # Will be ♠ for round 0
+            >>> game.game_phase  # Will be 'bidding'
+        """
+        # Reset and shuffle deck
+        self.deck.reset()
+        self.deck.shuffle()
+
+        # Reset player round state
+        for player in self.players:
+            player.reset_round()
+
+        # Determine trump for this round
+        self.trump_suit = self.determine_trump()
+
+        # Deal cards to all players
+        hands = self.deck.deal(cards_to_deal, self.num_players)
+        for player, hand in zip(self.players, hands):
+            player.receive_cards(hand)
+            player.sort_hand()
+
+        # Initialize card counting state
+        self.cards_played_this_round = []
+        self.cards_remaining_by_suit = {suit: 0 for suit in SUITS}
+
+        # Count cards dealt by suit
+        for player in self.players:
+            for card in player.hand:
+                self.cards_remaining_by_suit[card.suit] += 1
+
+        # Reset trick state
+        self.current_trick = None
+        self.tricks_history = []
+
+        # Set game phase to bidding
+        self.game_phase = 'bidding'
+
+    def get_forbidden_bid(self, current_total_bids: int, cards_dealt: int) -> Optional[int]:
+        """
+        Calculate dealer's forbidden bid.
+
+        The dealer cannot bid such that the sum of all bids equals the number
+        of cards dealt. This creates strategic tension and ensures someone will
+        either over-bid or under-bid.
+
+        Args:
+            current_total_bids: Sum of all bids made by non-dealer players
+            cards_dealt: Number of cards dealt to each player this round
+
+        Returns:
+            The forbidden bid value, or None if the forbidden value is out of
+            valid range (i.e., < 0 or > cards_dealt)
+
+        Examples:
+            >>> # 3 players, 5 cards dealt, others bid 2 and 1
+            >>> game.get_forbidden_bid(3, 5)
+            2  # Dealer cannot bid 2 (would make total = 5)
+
+            >>> # If current_total_bids already exceeds cards_dealt
+            >>> game.get_forbidden_bid(6, 5)
+            None  # Forbidden bid would be -1, which is invalid
+        """
+        forbidden = cards_dealt - current_total_bids
+
+        # If forbidden bid is out of valid range, return None
+        if forbidden < 0 or forbidden > cards_dealt:
+            return None
+
+        return forbidden
+
+    def is_valid_bid(self, bid: int, is_dealer: bool,
+                     current_total_bids: int, cards_dealt: int) -> bool:
+        """
+        Validate if a bid is legal for a player.
+
+        Validation rules:
+        1. General: 0 <= bid <= cards_dealt
+        2. Dealer only: bid != forbidden_bid (where forbidden_bid = cards_dealt - current_total_bids)
+
+        Args:
+            bid: The bid value to validate
+            is_dealer: Whether the player is the dealer
+            current_total_bids: Sum of all bids made by previous players
+            cards_dealt: Number of cards dealt to each player
+
+        Returns:
+            True if bid is valid, False otherwise
+
+        Examples:
+            >>> # Non-dealer can bid anything in range
+            >>> game.is_valid_bid(3, is_dealer=False, current_total_bids=0, cards_dealt=5)
+            True
+
+            >>> # Dealer cannot bid forbidden value
+            >>> game.is_valid_bid(2, is_dealer=True, current_total_bids=3, cards_dealt=5)
+            False  # 2 is forbidden (3 + 2 = 5)
+
+            >>> # Bid out of range is invalid for everyone
+            >>> game.is_valid_bid(6, is_dealer=False, current_total_bids=0, cards_dealt=5)
+            False
+        """
+        # Check general constraint: 0 <= bid <= cards_dealt
+        if bid < 0 or bid > cards_dealt:
+            return False
+
+        # Check dealer constraint
+        if is_dealer:
+            forbidden_bid = self.get_forbidden_bid(current_total_bids, cards_dealt)
+            if forbidden_bid is not None and bid == forbidden_bid:
+                return False
+
+        return True
+
+    def bidding_phase(self) -> None:
+        """
+        Execute the bidding phase for current round.
+
+        Collects bids from all players sequentially, starting with the player
+        to the left of the dealer. Enforces the dealer constraint that prevents
+        the total bids from equaling the number of cards dealt.
+
+        The method updates each player's bid and transitions the game phase
+        to 'playing' when complete.
+
+        Raises:
+            GameStateException: If game is not in 'bidding' phase
+            InvalidBidException: If a player attempts an invalid bid
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> game.bidding_phase()  # Would normally prompt for bids
+            >>> game.game_phase
+            'playing'
+            >>> all(p.bid is not None for p in game.players)
+            True
+
+        Note:
+            In actual usage, this method would need to be integrated with
+            a bid selection mechanism (human input, bot AI, etc.). For now,
+            it serves as a placeholder for the bidding phase structure.
+        """
+        if self.game_phase != 'bidding':
+            raise GameStateException(
+                f"Cannot start bidding phase: game is in '{self.game_phase}' phase"
+            )
+
+        # Calculate cards dealt (all players should have same number)
+        cards_dealt = len(self.players[0].hand) if self.players else 0
+
+        # Determine bidding order: start with player left of dealer
+        bidding_order = []
+        for i in range(self.num_players):
+            player_idx = (self.dealer_position + 1 + i) % self.num_players
+            bidding_order.append(player_idx)
+
+        # Collect bids from all players
+        current_total_bids = 0
+
+        for i, player_idx in enumerate(bidding_order):
+            player = self.players[player_idx]
+            is_dealer = (player_idx == self.dealer_position)
+
+            # For now, this is a structural placeholder
+            # In actual implementation, this would call a bid selection function
+            # that returns a valid bid from the player (human or AI)
+            #
+            # Example usage:
+            #   bid = get_player_bid(player, cards_dealt, is_dealer, current_total_bids)
+            #   if not self.is_valid_bid(bid, is_dealer, current_total_bids, cards_dealt):
+            #       raise InvalidBidException(f"Invalid bid {bid} for {player.name}")
+            #   player.make_bid(bid)
+            #   current_total_bids += bid
+
+            # For structural completeness, we'll raise an error if called directly
+            # without a bid selection mechanism
+            raise NotImplementedError(
+                "bidding_phase() requires integration with a bid selection mechanism. "
+                "Use this method as a template and provide player bids via a "
+                "callback function or override this method."
+            )
+
+        # Transition to playing phase
+        self.game_phase = 'playing'
