@@ -1568,3 +1568,472 @@ class TestAntiCheat:
         # Player playing clubs when hearts led should not raise exception
         # (already known they have no hearts)
         game.validate_play_with_anti_cheat(Card('3', '♣'), player, led_suit='♥')
+
+
+# ============================================================================
+# Test Game Flow Methods
+# ============================================================================
+
+class TestGameFlow:
+    """Test high-level game flow orchestration methods."""
+
+    def simple_bid_always_zero(self, player, cards_dealt, is_dealer,
+                               current_total_bids, cards_dealt_param):
+        """Bot that always bids 0 (unless dealer and 0 is forbidden)."""
+        if is_dealer:
+            forbidden = cards_dealt - current_total_bids
+            if forbidden == 0:
+                return 1  # Bid 1 if 0 is forbidden
+        return 0
+
+    def simple_play_first_legal(self, player, legal_cards, trick):
+        """Bot that always plays first legal card."""
+        return legal_cards[0]
+
+    def test_play_round_complete_flow(self):
+        """play_round() executes full round flow successfully."""
+        game = BlobGame(num_players=3)
+
+        # Play a round with simple bot functions
+        result = game.play_round(
+            cards_to_deal=5,
+            get_bid_func=self.simple_bid_always_zero,
+            get_card_func=self.simple_play_first_legal
+        )
+
+        # Verify result structure
+        assert 'round' in result
+        assert 'trump_suit' in result
+        assert 'player_scores' in result
+        assert result['round'] == 0
+        assert len(result['player_scores']) == 3
+
+        # Verify game state after round
+        assert game.game_phase == 'complete'
+        assert game.current_round == 1  # Incremented
+        assert len(game.tricks_history) == 5  # 5 tricks played
+
+        # Verify all players have bids
+        for player in game.players:
+            assert player.bid is not None
+            # Players bid 0 in simple strategy (unless forbidden)
+            # Tricks won can vary based on card play
+
+    def test_play_round_scores_calculated(self):
+        """play_round() calculates scores correctly."""
+        def controlled_bid(player, cards_dealt, is_dealer,
+                          current_total_bids, cards_dealt_param):
+            """Controlled bidding: Players bid based on position, avoiding forbidden."""
+            bid = player.position  # Player 0 bids 0, Player 1 bids 1, etc.
+            # Check if dealer and if bid is forbidden
+            if is_dealer:
+                forbidden = cards_dealt - current_total_bids
+                if bid == forbidden:
+                    # Choose different valid bid
+                    bid = (bid + 1) % (cards_dealt + 1)
+                    if bid == forbidden:
+                        bid = (bid + 1) % (cards_dealt + 1)
+            return bid
+
+        def play_winning_cards(player, legal_cards, trick):
+            """Try to play highest card to win tricks."""
+            return max(legal_cards, key=lambda c: c.value)
+
+        game = BlobGame(num_players=3, player_names=['Alice', 'Bob', 'Charlie'])
+
+        result = game.play_round(
+            cards_to_deal=3,
+            get_bid_func=controlled_bid,
+            get_card_func=play_winning_cards
+        )
+
+        # Verify scores calculated
+        for player_result in result['player_scores']:
+            # Score should be either 0 (missed bid) or 10+bid (made bid)
+            score = player_result['round_score']
+            assert score >= 0
+            if score > 0:
+                expected_score = 10 + player_result['bid']
+                assert score == expected_score
+
+    def test_play_round_invalid_bid_raises_exception(self):
+        """play_round() raises InvalidBidException for invalid bid."""
+        def invalid_bid(player, cards_dealt, is_dealer,
+                       current_total_bids, cards_dealt_param):
+            """Always return invalid bid (out of range)."""
+            return 999  # Way out of range
+
+        game = BlobGame(num_players=3)
+
+        with pytest.raises(InvalidBidException, match="bid 999 is invalid"):
+            game.play_round(
+                cards_to_deal=5,
+                get_bid_func=invalid_bid,
+                get_card_func=self.simple_play_first_legal
+            )
+
+    def test_play_round_dealer_constraint_enforced(self):
+        """play_round() enforces dealer constraint on forbidden bid."""
+        call_count = [0]
+
+        def forbidden_bid(player, cards_dealt, is_dealer,
+                         current_total_bids, cards_dealt_param):
+            """Non-dealers bid 2, dealer tries forbidden bid."""
+            call_count[0] += 1
+            if is_dealer:
+                # Dealer should not be able to bid forbidden value
+                # If current_total is 4 and cards_dealt is 5, forbidden is 1
+                forbidden = cards_dealt - current_total_bids
+                return forbidden  # Try to bid forbidden value
+            return 2  # Non-dealers bid 2
+
+        game = BlobGame(num_players=3)
+
+        with pytest.raises(InvalidBidException, match="forbidden"):
+            game.play_round(
+                cards_to_deal=5,
+                get_bid_func=forbidden_bid,
+                get_card_func=self.simple_play_first_legal
+            )
+
+    def test_play_full_game_multiple_rounds(self):
+        """play_full_game() executes multiple rounds correctly."""
+        from ml.game.constants import generate_round_structure
+
+        game = BlobGame(num_players=4, player_names=['P1', 'P2', 'P3', 'P4'])
+
+        # Generate round structure for 4 players, 3 starting cards
+        round_structure = generate_round_structure(3, 4)
+
+        # Play full game
+        results = game.play_full_game(
+            round_structure=round_structure,
+            get_bid_func=self.simple_bid_always_zero,
+            get_card_func=self.simple_play_first_legal
+        )
+
+        # Verify results structure
+        assert 'num_rounds' in results
+        assert 'num_players' in results
+        assert 'round_results' in results
+        assert 'final_scores' in results
+        assert 'winner' in results
+
+        # Verify correct number of rounds
+        expected_rounds = len(round_structure)
+        assert results['num_rounds'] == expected_rounds
+        assert len(results['round_results']) == expected_rounds
+
+        # Verify winner structure
+        assert 'name' in results['winner']
+        assert 'score' in results['winner']
+        assert results['winner']['name'] in ['P1', 'P2', 'P3', 'P4']
+
+        # Verify final scores are sorted
+        scores = [s['total_score'] for s in results['final_scores']]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_play_full_game_dealer_rotation(self):
+        """play_full_game() rotates dealer correctly across rounds."""
+        game = BlobGame(num_players=3)
+
+        # Play 5 rounds (more than number of players)
+        round_structure = [3, 3, 3, 3, 3]
+
+        # Track initial dealer
+        initial_dealer = game.dealer_position
+
+        results = game.play_full_game(
+            round_structure=round_structure,
+            get_bid_func=self.simple_bid_always_zero,
+            get_card_func=self.simple_play_first_legal
+        )
+
+        # After 5 rounds with 3 players, dealer should have rotated
+        # Initial: 0, after round 1: 1, after round 2: 2, after round 3: 0, etc.
+        # After 5 rounds: (0 + 5) % 3 = 2
+        expected_dealer = (initial_dealer + 5) % game.num_players
+        assert game.dealer_position == expected_dealer
+
+    def test_play_full_game_trump_rotation(self):
+        """play_full_game() rotates trump correctly across rounds."""
+        game = BlobGame(num_players=4)
+
+        # Play 6 rounds (to cover full trump rotation: ♠,♥,♣,♦,None,♠)
+        round_structure = [3] * 6
+
+        results = game.play_full_game(
+            round_structure=round_structure,
+            get_bid_func=self.simple_bid_always_zero,
+            get_card_func=self.simple_play_first_legal
+        )
+
+        # Verify trump changed across rounds by checking round results
+        trump_suits = [r['trump_suit'] for r in results['round_results']]
+
+        # Should cycle through: ♠, ♥, ♣, ♦, None, then repeat ♠
+        from ml.game.constants import TRUMP_ROTATION
+        # TRUMP_ROTATION has 5 elements, so for 6 rounds we expect the first one to repeat
+        expected_trumps = [TRUMP_ROTATION[i % len(TRUMP_ROTATION)] for i in range(6)]
+        assert trump_suits == expected_trumps
+
+    def test_get_game_state_structure(self):
+        """get_game_state() returns correct structure."""
+        game = BlobGame(num_players=3, player_names=['Alice', 'Bob', 'Charlie'])
+        game.setup_round(5)
+
+        state = game.get_game_state()
+
+        # Verify all expected keys present
+        assert 'phase' in state
+        assert 'round' in state
+        assert 'trump' in state
+        assert 'dealer_position' in state
+        assert 'num_players' in state
+        assert 'players' in state
+        assert 'current_trick' in state
+        assert 'tricks_history' in state
+        assert 'cards_remaining_by_suit' in state
+
+        # Verify types
+        assert isinstance(state['phase'], str)
+        assert isinstance(state['round'], int)
+        assert state['trump'] in ['♠', '♥', '♣', '♦', None]
+        assert isinstance(state['dealer_position'], int)
+        assert isinstance(state['num_players'], int)
+        assert isinstance(state['players'], list)
+        assert len(state['players']) == 3
+
+        # Verify player structure
+        for player_state in state['players']:
+            assert 'name' in player_state
+            assert 'position' in player_state
+            assert 'hand' in player_state
+            assert 'hand_size' in player_state
+            assert 'bid' in player_state
+            assert 'tricks_won' in player_state
+            assert 'total_score' in player_state
+            assert 'known_void_suits' in player_state
+
+    def test_get_game_state_hidden_hands(self):
+        """get_game_state() hides opponent hands when perspective provided."""
+        game = BlobGame(num_players=3, player_names=['Alice', 'Bob', 'Charlie'])
+        game.setup_round(5)
+
+        # Get state from Alice's perspective (player 0)
+        state = game.get_game_state(player_perspective=game.players[0])
+
+        # Alice's hand should be visible
+        assert state['players'][0]['hand'] is not None
+        assert isinstance(state['players'][0]['hand'], list)
+        assert len(state['players'][0]['hand']) == 5
+
+        # Bob's and Charlie's hands should be hidden
+        assert state['players'][1]['hand'] is None
+        assert state['players'][2]['hand'] is None
+
+        # But hand sizes should be visible
+        assert state['players'][1]['hand_size'] == 5
+        assert state['players'][2]['hand_size'] == 5
+
+    def test_get_game_state_all_visible(self):
+        """get_game_state() shows all hands when no perspective given."""
+        game = BlobGame(num_players=3, player_names=['Alice', 'Bob', 'Charlie'])
+        game.setup_round(5)
+
+        # Get state with no perspective (debug mode)
+        state = game.get_game_state(player_perspective=None)
+
+        # All hands should be visible
+        for player_state in state['players']:
+            assert player_state['hand'] is not None
+            assert isinstance(player_state['hand'], list)
+            assert len(player_state['hand']) == 5
+
+    def test_get_game_state_serializable(self):
+        """get_game_state() returns JSON-serializable data."""
+        import json
+
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        state = game.get_game_state()
+
+        # Should be able to serialize to JSON without errors
+        try:
+            json_str = json.dumps(state)
+            # And deserialize back
+            decoded_state = json.loads(json_str)
+            assert decoded_state['num_players'] == 3
+        except (TypeError, ValueError) as e:
+            pytest.fail(f"State not JSON-serializable: {e}")
+
+    def test_get_game_state_current_trick(self):
+        """get_game_state() includes current trick information."""
+        game = BlobGame(num_players=3)
+
+        # Before any tricks, current_trick should be None
+        state_before = game.get_game_state()
+        assert state_before['current_trick'] is None
+
+        # Start a round and create a trick
+        game.setup_round(3)
+        game.game_phase = 'playing'
+        game.current_trick = Trick(game.trump_suit)
+
+        # Add some cards to the trick
+        player1 = game.players[0]
+        card1 = player1.hand[0]
+        game.current_trick.add_card(player1, card1)
+
+        player2 = game.players[1]
+        card2 = player2.hand[0]
+        game.current_trick.add_card(player2, card2)
+
+        # Get state with trick in progress
+        state_with_trick = game.get_game_state()
+
+        assert state_with_trick['current_trick'] is not None
+        assert 'cards_played' in state_with_trick['current_trick']
+        assert 'led_suit' in state_with_trick['current_trick']
+        assert 'trump_suit' in state_with_trick['current_trick']
+
+        # Should show 2 cards played
+        assert len(state_with_trick['current_trick']['cards_played']) == 2
+
+        # Cards should be serialized as strings
+        for player_name, card_str in state_with_trick['current_trick']['cards_played']:
+            assert isinstance(player_name, str)
+            assert isinstance(card_str, str)
+
+    def test_get_legal_actions_bidding_phase(self):
+        """get_legal_actions() returns valid bids in bidding phase."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Game is in bidding phase
+        assert game.game_phase == 'bidding'
+
+        # Get legal actions for first player (not dealer)
+        player = game.players[1]  # Player 1 bids first (left of dealer)
+        actions = game.get_legal_actions(player)
+
+        # Should return list of integers (valid bids)
+        assert isinstance(actions, list)
+        assert all(isinstance(bid, int) for bid in actions)
+        assert 0 in actions
+        assert 5 in actions  # Max bid for 5 cards
+        assert len(actions) == 6  # [0, 1, 2, 3, 4, 5]
+
+    def test_get_legal_actions_dealer_constraint(self):
+        """get_legal_actions() enforces dealer constraint."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Make non-dealer players bid first
+        game.players[1].bid = 2
+        game.players[2].bid = 1
+
+        # Now get actions for dealer (player 0)
+        dealer = game.players[0]
+        actions = game.get_legal_actions(dealer)
+
+        # Dealer should not be able to bid 2 (2 + 1 + 2 = 5)
+        forbidden = 5 - 3  # forbidden = cards_dealt - current_total_bids
+        assert forbidden == 2
+        assert 2 not in actions
+        assert 0 in actions
+        assert 1 in actions
+        assert 3 in actions
+        assert 4 in actions
+        assert 5 in actions
+
+    def test_get_legal_actions_playing_phase(self):
+        """get_legal_actions() returns legal cards in playing phase."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Transition to playing phase
+        game.game_phase = 'playing'
+        game.current_trick = Trick(game.trump_suit)
+
+        player = game.players[0]
+        actions = game.get_legal_actions(player)
+
+        # Should return list of Card objects
+        assert isinstance(actions, list)
+        assert all(isinstance(card, Card) for card in actions)
+        assert len(actions) == 5  # Player has 5 cards
+
+    def test_get_legal_actions_must_follow_suit(self):
+        """get_legal_actions() enforces follow-suit rule."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Manually set player's hand with specific cards
+        player = game.players[0]
+        player.hand = [
+            Card('5', '♥'),
+            Card('8', '♥'),
+            Card('3', '♣'),
+            Card('K', '♦')
+        ]
+
+        # Transition to playing phase with hearts led
+        game.game_phase = 'playing'
+        game.current_trick = Trick(game.trump_suit)
+        game.current_trick.led_suit = '♥'
+
+        actions = game.get_legal_actions(player)
+
+        # Should only return hearts (player must follow suit)
+        assert len(actions) == 2
+        assert all(card.suit == '♥' for card in actions)
+        assert Card('5', '♥') in actions
+        assert Card('8', '♥') in actions
+
+    def test_get_legal_actions_no_suit_all_cards_legal(self):
+        """get_legal_actions() returns all cards if player can't follow suit."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Manually set player's hand with no hearts
+        player = game.players[0]
+        player.hand = [
+            Card('3', '♣'),
+            Card('K', '♦'),
+            Card('7', '♠')
+        ]
+
+        # Transition to playing phase with hearts led
+        game.game_phase = 'playing'
+        game.current_trick = Trick(game.trump_suit)
+        game.current_trick.led_suit = '♥'
+
+        actions = game.get_legal_actions(player)
+
+        # Player has no hearts, so all cards are legal
+        assert len(actions) == 3
+        assert Card('3', '♣') in actions
+        assert Card('K', '♦') in actions
+        assert Card('7', '♠') in actions
+
+    def test_get_legal_actions_other_phases(self):
+        """get_legal_actions() returns empty list in non-action phases."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        # In setup phase
+        game.game_phase = 'setup'
+        actions = game.get_legal_actions(player)
+        assert actions == []
+
+        # In scoring phase
+        game.game_phase = 'scoring'
+        actions = game.get_legal_actions(player)
+        assert actions == []
+
+        # In complete phase
+        game.game_phase = 'complete'
+        actions = game.get_legal_actions(player)
+        assert actions == []

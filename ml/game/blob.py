@@ -1088,3 +1088,406 @@ class BlobGame:
         self.game_phase = 'complete'
 
         return results
+
+    def play_round(
+        self,
+        cards_to_deal: int,
+        get_bid_func,
+        get_card_func
+    ) -> Dict:
+        """
+        Execute a complete round of play.
+
+        Orchestrates the full round flow: setup → bidding → playing → scoring.
+        Uses provided callback functions to get player decisions.
+
+        Args:
+            cards_to_deal: Number of cards to deal to each player
+            get_bid_func: Callback function with signature:
+                (player: Player, cards_dealt: int, is_dealer: bool,
+                 current_total_bids: int, cards_dealt: int) -> int
+                Returns the bid for a player.
+            get_card_func: Callback function with signature:
+                (player: Player, legal_cards: List[Card], trick: Trick) -> Card
+                Returns the card choice for a player.
+
+        Returns:
+            Dictionary with round results (same format as scoring_phase())
+
+        Raises:
+            ValueError: If cards_to_deal invalid
+            InvalidBidException: If callback returns invalid bid
+            IllegalPlayException: If callback returns illegal card
+
+        Example:
+            >>> def simple_bid(player, cards, is_dealer, total, cards_dealt):
+            ...     return 0  # Always bid 0
+            >>> def simple_play(player, legal_cards, trick):
+            ...     return legal_cards[0]  # Play first legal card
+            >>> game = BlobGame(num_players=4)
+            >>> result = game.play_round(5, simple_bid, simple_play)
+            >>> result['round']
+            0
+        """
+        # Phase 1: Setup
+        self.setup_round(cards_to_deal)
+
+        # Phase 2: Bidding
+        # Collect bids from all players sequentially
+        bidding_order = []
+        for i in range(self.num_players):
+            player_idx = (self.dealer_position + 1 + i) % self.num_players
+            bidding_order.append(player_idx)
+
+        current_total_bids = 0
+
+        for player_idx in bidding_order:
+            player = self.players[player_idx]
+            is_dealer = (player_idx == self.dealer_position)
+
+            # Get bid from callback
+            bid = get_bid_func(player, cards_to_deal, is_dealer,
+                             current_total_bids, cards_to_deal)
+
+            # Validate bid
+            if not self.is_valid_bid(bid, is_dealer, current_total_bids, cards_to_deal):
+                forbidden = self.get_forbidden_bid(current_total_bids, cards_to_deal)
+                raise InvalidBidException(
+                    f"{player.name} bid {bid} is invalid. "
+                    f"Valid range: 0-{cards_to_deal}"
+                    f"{f', forbidden: {forbidden}' if is_dealer and forbidden is not None else ''}"
+                )
+
+            # Accept bid
+            player.make_bid(bid)
+            current_total_bids += bid
+
+        # Transition to playing phase
+        self.game_phase = 'playing'
+
+        # Phase 3: Playing
+        # Play all tricks for the round
+        for trick_num in range(cards_to_deal):
+            # Create new trick
+            self.current_trick = Trick(self.trump_suit)
+
+            # Determine lead player
+            if not self.tricks_history:
+                # First trick: player left of dealer leads
+                lead_player_idx = (self.dealer_position + 1) % self.num_players
+            else:
+                # Subsequent tricks: winner of last trick leads
+                last_winner = self.tricks_history[-1].winner
+                lead_player_idx = last_winner.position
+
+            # Play order: start with lead player, go clockwise
+            play_order = []
+            for i in range(self.num_players):
+                player_idx = (lead_player_idx + i) % self.num_players
+                play_order.append(player_idx)
+
+            # Each player plays a card
+            for player_idx in play_order:
+                player = self.players[player_idx]
+
+                # Get legal plays for this player
+                legal_cards = self.get_legal_plays(player, self.current_trick.led_suit)
+
+                # Get card choice from callback
+                card = get_card_func(player, legal_cards, self.current_trick)
+
+                # Validate play with anti-cheat
+                self.validate_play_with_anti_cheat(card, player, self.current_trick.led_suit)
+
+                # Play the card
+                played_card = player.play_card(card)
+                self.current_trick.add_card(player, played_card)
+
+                # Update card counting
+                self.update_card_counting(played_card, player, self.current_trick.led_suit)
+
+            # Determine winner
+            winner = self.current_trick.determine_winner()
+            winner.win_trick()
+
+            # Add to history
+            self.tricks_history.append(self.current_trick)
+
+        # Transition to scoring phase
+        self.game_phase = 'scoring'
+
+        # Phase 4: Scoring
+        results = self.scoring_phase()
+
+        return results
+
+    def play_full_game(
+        self,
+        round_structure: List[int],
+        get_bid_func,
+        get_card_func
+    ) -> Dict:
+        """
+        Play a complete multi-round game.
+
+        Executes multiple rounds with varying card counts, tracking all results
+        and final scores.
+
+        Args:
+            round_structure: List of cards to deal per round
+                Example: [5, 4, 3, 2, 1, 1, 1, 1, 1, 2, 3, 4, 5]
+            get_bid_func: Callback for getting player bids (see play_round())
+            get_card_func: Callback for getting card choices (see play_round())
+
+        Returns:
+            Dictionary containing complete game results:
+            {
+                'num_rounds': int,
+                'num_players': int,
+                'round_results': [result_dict_per_round],
+                'final_scores': [
+                    {'name': str, 'total_score': int, 'position': int},
+                    ...
+                ],
+                'winner': {'name': str, 'score': int}
+            }
+
+        Example:
+            >>> from ml.game.constants import generate_round_structure
+            >>> game = BlobGame(num_players=4)
+            >>> rounds = generate_round_structure(5, 4)
+            >>> results = game.play_full_game(rounds, simple_bid, simple_play)
+            >>> results['num_rounds']
+            13
+            >>> results['winner']['name']
+            'Player 1'
+        """
+        # Initialize game history
+        round_results = []
+
+        # Play each round
+        for round_idx, cards_to_deal in enumerate(round_structure):
+            result = self.play_round(cards_to_deal, get_bid_func, get_card_func)
+            round_results.append(result)
+
+        # Compile final results
+        final_scores = []
+        for player in self.players:
+            final_scores.append({
+                'name': player.name,
+                'position': player.position,
+                'total_score': player.total_score
+            })
+
+        # Sort by score descending to find winner
+        final_scores_sorted = sorted(final_scores, key=lambda x: x['total_score'], reverse=True)
+
+        # Determine winner
+        winner = final_scores_sorted[0]
+
+        return {
+            'num_rounds': len(round_structure),
+            'num_players': self.num_players,
+            'round_results': round_results,
+            'final_scores': final_scores_sorted,
+            'winner': {
+                'name': winner['name'],
+                'score': winner['total_score']
+            }
+        }
+
+    def get_game_state(self, player_perspective: Optional[Player] = None) -> Dict:
+        """
+        Get complete observable game state.
+
+        Returns all game information needed for AI decision-making and UI display.
+        Supports imperfect information by hiding opponent hands when a player
+        perspective is specified.
+
+        Args:
+            player_perspective: If provided, only show this player's hand (imperfect info).
+                               If None, show all hands (debug/UI mode).
+
+        Returns:
+            Dictionary containing complete game state:
+            {
+                'phase': str,  # 'setup', 'bidding', 'playing', 'scoring', 'complete'
+                'round': int,
+                'trump': Optional[str],
+                'dealer_position': int,
+                'num_players': int,
+                'players': [
+                    {
+                        'name': str,
+                        'position': int,
+                        'hand': List[str] or None,  # Card strings like 'A♠'
+                        'hand_size': int,
+                        'bid': Optional[int],
+                        'tricks_won': int,
+                        'total_score': int,
+                        'known_void_suits': List[str]
+                    }, ...
+                ],
+                'current_trick': {
+                    'cards_played': [(player_name, card_str), ...],
+                    'led_suit': Optional[str],
+                    'trump_suit': Optional[str]
+                } or None,
+                'tricks_history': [
+                    {
+                        'winner': str,  # player name
+                        'cards': [(player_name, card_str), ...]
+                    }, ...
+                ],
+                'cards_remaining_by_suit': Dict[str, int]
+            }
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> state = game.get_game_state()
+            >>> state['phase']
+            'bidding'
+            >>> state['trump']
+            '♠'
+            >>> len(state['players'])
+            4
+
+            >>> # Get state from player 0's perspective (hide other hands)
+            >>> state = game.get_game_state(game.players[0])
+            >>> state['players'][0]['hand']  # Player 0's hand visible
+            ['2♠', '5♥', ...]
+            >>> state['players'][1]['hand']  # Other players' hands hidden
+            None
+        """
+        # Build players state
+        players_state = []
+        for player in self.players:
+            # Determine if this player's hand should be visible
+            show_hand = (player_perspective is None or player == player_perspective)
+
+            player_state = {
+                'name': player.name,
+                'position': player.position,
+                'hand': [str(card) for card in sorted(player.hand)] if show_hand else None,
+                'hand_size': len(player.hand),
+                'bid': player.bid,
+                'tricks_won': player.tricks_won,
+                'total_score': player.total_score,
+                'known_void_suits': sorted(list(player.known_void_suits))
+            }
+            players_state.append(player_state)
+
+        # Build current trick state
+        current_trick_state = None
+        if self.current_trick is not None:
+            current_trick_state = {
+                'cards_played': [
+                    (player.name, str(card))
+                    for player, card in self.current_trick.cards_played
+                ],
+                'led_suit': self.current_trick.led_suit,
+                'trump_suit': self.current_trick.trump_suit
+            }
+
+        # Build tricks history state
+        tricks_history_state = []
+        for trick in self.tricks_history:
+            trick_state = {
+                'winner': trick.winner.name if trick.winner else None,
+                'cards': [
+                    (player.name, str(card))
+                    for player, card in trick.cards_played
+                ]
+            }
+            tricks_history_state.append(trick_state)
+
+        # Assemble complete state
+        state = {
+            'phase': self.game_phase,
+            'round': self.current_round,
+            'trump': self.trump_suit,
+            'dealer_position': self.dealer_position,
+            'num_players': self.num_players,
+            'players': players_state,
+            'current_trick': current_trick_state,
+            'tricks_history': tricks_history_state,
+            'cards_remaining_by_suit': dict(self.cards_remaining_by_suit)
+        }
+
+        return state
+
+    def get_legal_actions(self, player: Player) -> Union[List[int], List[Card]]:
+        """
+        Get valid actions for a player based on current game phase.
+
+        Used by AI agents to determine what actions are available.
+
+        Args:
+            player: Player whose legal actions to check
+
+        Returns:
+            - If 'bidding' phase: List of valid bid integers
+            - If 'playing' phase: List of legal Card objects
+            - Otherwise: Empty list
+
+        Raises:
+            GameStateException: If player not found or invalid state
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> # In bidding phase
+            >>> actions = game.get_legal_actions(game.players[0])
+            >>> actions
+            [0, 1, 2, 3, 4, 5]
+
+            >>> # After dealing, in playing phase with hearts led
+            >>> game.game_phase = 'playing'
+            >>> game.current_trick = Trick('♠')
+            >>> game.current_trick.led_suit = '♥'
+            >>> actions = game.get_legal_actions(game.players[0])
+            >>> # Returns only hearts if player has hearts, else all cards
+        """
+        if player not in self.players:
+            raise GameStateException(f"Player {player.name} not in game")
+
+        if self.game_phase == 'bidding':
+            # Return valid bids
+            cards_dealt = len(player.hand) if player.hand else 0
+            is_dealer = (player.position == self.dealer_position)
+
+            # Calculate current total bids (all players who have bid before this one)
+            current_total_bids = 0
+            bidding_order_start = (self.dealer_position + 1) % self.num_players
+
+            # Count bids up to this player in bidding order
+            for i in range(self.num_players):
+                check_idx = (bidding_order_start + i) % self.num_players
+                check_player = self.players[check_idx]
+
+                if check_player == player:
+                    break  # Stop when we reach the player in question
+
+                if check_player.bid is not None:
+                    current_total_bids += check_player.bid
+
+            # Generate list of valid bids
+            valid_bids = []
+            for bid in range(cards_dealt + 1):
+                if self.is_valid_bid(bid, is_dealer, current_total_bids, cards_dealt):
+                    valid_bids.append(bid)
+
+            return valid_bids
+
+        elif self.game_phase == 'playing':
+            # Return legal cards
+            if self.current_trick is None:
+                # No trick in progress, shouldn't happen but return all cards
+                return list(player.hand)
+
+            return self.get_legal_plays(player, self.current_trick.led_suit)
+
+        else:
+            # No actions available in other phases
+            return []
