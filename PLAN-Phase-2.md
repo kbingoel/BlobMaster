@@ -43,10 +43,11 @@ ml/
 ## Prerequisites
 
 Before starting Phase 2, ensure Phase 1 is complete:
-- ✅ `ml/game/blob.py` fully implemented and tested
-- ✅ All unit tests passing (`pytest ml/game/test_blob.py`)
-- ✅ CLI version playable
-- ✅ Game state queries working (`get_game_state()`, `get_legal_actions()`)
+- ✅ `ml/game/blob.py` fully implemented and tested (COMPLETE - Phase 1a.10)
+- ✅ All unit tests passing - 135 tests, 97% coverage (COMPLETE - Phase 1a.9)
+- ⚠️ CLI version playable (SKIPPED - not needed, use `play_round()` with callbacks)
+- ✅ Game state queries working: `get_game_state()`, `get_legal_actions()` (COMPLETE)
+- ✅ **BONUS**: `copy()` and `apply_action()` methods ready for MCTS (Phase 1a.10)
 
 ---
 
@@ -1185,14 +1186,15 @@ class MCTSNode:
         """
         Simulate taking an action and return new game state.
 
-        NOTE: This requires game state to be copyable.
-        Implement copy() method in BlobGame if not exists.
+        NOTE: ✅ BlobGame.copy() and apply_action() were implemented in Phase 1a.10
         """
-        # TODO: Implement game state cloning
-        # new_game = self.game_state.copy()
-        # new_game.apply_action(action, self.player)
-        # return new_game
-        raise NotImplementedError("Game state cloning needed")
+        # Create copy of game state
+        new_game = self.game_state.copy()
+
+        # Apply action to the copy
+        new_game.apply_action(action, self.player)
+
+        return new_game
 
     def backpropagate(self, value: float) -> None:
         """
@@ -1294,41 +1296,29 @@ class TestMCTSNode:
 
 #### 7.1 Game State Cloning (30 min)
 
-Add copy functionality to BlobGame:
-```python
-# ml/game/blob.py (add to existing class)
+**✅ ALREADY IMPLEMENTED in Phase 1a.10**
 
-import copy
+The `BlobGame.copy()` and `BlobGame.apply_action()` methods have been implemented in Phase 1 to prepare for MCTS integration.
 
-class BlobGame:
-    # ... existing code ...
+**What was implemented:**
+- `copy()`: Uses `copy.deepcopy()` to create independent game state copies
+- `apply_action()`: Handles both bidding (action = bid value) and playing (action = card index 0-51)
+- Full validation with anti-cheat detection
+- Card index mapping: 0-12 (♠), 13-25 (♥), 26-38 (♣), 39-51 (♦)
 
-    def copy(self) -> 'BlobGame':
-        """
-        Create deep copy of game state.
+**Tasks for this session:**
+- [ ] Read and understand the existing implementation in `ml/game/blob.py` (lines ~1535-1685)
+- [ ] Write unit tests for `copy()` method:
+  - Test that copy is independent (modify copy doesn't affect original)
+  - Test all game state is copied (players, deck, tricks, history)
+  - Test with different game phases
+- [ ] Write unit tests for `apply_action()` method:
+  - Test bidding actions (valid bids, dealer constraints)
+  - Test playing actions (card index mapping, follow-suit rules)
+  - Test error cases (invalid indices, illegal plays)
+- [ ] Verify integration with existing game logic
 
-        Used by MCTS for simulation without modifying original state.
-        """
-        return copy.deepcopy(self)
-
-    def apply_action(self, action: int, player: Player) -> None:
-        """
-        Apply an action to the game state.
-
-        Args:
-            action: Action index (bid value or card index)
-            player: Player taking the action
-        """
-        if self.game_phase == 'bidding':
-            # Action is a bid value
-            player.make_bid(action)
-            # Progress bidding phase...
-        elif self.game_phase == 'playing':
-            # Action is a card index - need to map to Card object
-            # Find card in player's hand matching index
-            # Play the card...
-            pass
-```
+**Time estimate:** 30 min (now focused on testing, not implementation)
 
 #### 7.2 Implement MCTS Class (60 min)
 

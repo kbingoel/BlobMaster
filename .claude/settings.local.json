@@ -4,7 +4,14 @@
       "Bash(python -m venv:*)",
       "Bash(bun:*)",
       "Bash(dir:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(where:*)",
+      "Bash(venvScriptsactivate)",
+      "Bash(pip install:*)",
+      "Bash(venv/Scripts/flake8.exe:*)",
+      "Bash(venv/Scripts/mypy.exe:*)",
+      "Bash(venv/Scripts/python.exe -m pytest:*)",
+      "Bash(venv/Scripts/black.exe:*)"
     ],
     "deny": [],
     "ask": []

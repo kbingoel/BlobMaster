@@ -9,19 +9,14 @@ scoring rules.
 from typing import List
 
 # Card definitions
-SUITS = ['♠', '♥', '♣', '♦']
-SUIT_NAMES = {
-    '♠': 'Spades',
-    '♥': 'Hearts',
-    '♣': 'Clubs',
-    '♦': 'Diamonds'
-}
+SUITS = ["♠", "♥", "♣", "♦"]
+SUIT_NAMES = {"♠": "Spades", "♥": "Hearts", "♣": "Clubs", "♦": "Diamonds"}
 
-RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 RANK_VALUES = {rank: idx for idx, rank in enumerate(RANKS, start=2)}
 
 # Trump rotation cycle
-TRUMP_ROTATION = ['♠', '♥', '♣', '♦', None]  # None = no-trump rounds
+TRUMP_ROTATION = ["♠", "♥", "♣", "♦", None]  # None = no-trump rounds
 
 # Game constraints
 MIN_PLAYERS = 3
@@ -69,9 +64,7 @@ def generate_round_structure(starting_cards: int, num_players: int) -> List[int]
         )
 
     if starting_cards < 1:
-        raise ValueError(
-            f"starting_cards must be at least 1, got {starting_cards}"
-        )
+        raise ValueError(f"starting_cards must be at least 1, got {starting_cards}")
 
     # Validate we don't exceed deck size
     if starting_cards * num_players > DECK_SIZE:

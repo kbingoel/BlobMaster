@@ -21,7 +21,8 @@ from ml.game.constants import (
 
 # Import game classes (will be available after blob.py is created)
 try:
-    from ml.game.blob import Card, Deck, Player, Trick, BlobGame
+    from ml.game.blob import Card, Deck, Player, Trick, BlobGame  # noqa: F401
+
     _blob_available = True
 except ImportError:
     _blob_available = False
