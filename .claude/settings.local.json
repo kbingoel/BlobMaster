@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -m venv:*)",
       "Bash(bun:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []
