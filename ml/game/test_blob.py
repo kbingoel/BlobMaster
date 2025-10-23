@@ -935,3 +935,636 @@ class TestBlobGame:
         # Method should raise NotImplementedError since no bid mechanism provided
         with pytest.raises(NotImplementedError, match="bid selection mechanism"):
             game.bidding_phase()
+
+    # ============================================================================
+    # Test Playing Phase
+    # ============================================================================
+
+    def test_get_legal_plays_first_card(self):
+        """First card of trick can be any card in hand."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+        player = game.players[0]
+
+        # Led suit is None (first card)
+        legal_plays = game.get_legal_plays(player, led_suit=None)
+
+        # Should be able to play any card
+        assert len(legal_plays) == 5
+        assert set(legal_plays) == set(player.hand)
+
+    def test_get_legal_plays_must_follow_suit(self):
+        """Player must follow suit if they have cards in that suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        # Give player specific cards
+        player.receive_cards([
+            Card('5', '♥'),
+            Card('8', '♥'),
+            Card('3', '♣'),
+            Card('K', '♦')
+        ])
+
+        # Led suit is hearts
+        legal_plays = game.get_legal_plays(player, led_suit='♥')
+
+        # Should only be able to play hearts
+        assert len(legal_plays) == 2
+        assert Card('5', '♥') in legal_plays
+        assert Card('8', '♥') in legal_plays
+
+    def test_get_legal_plays_no_led_suit(self):
+        """Player can play any card if they don't have led suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        # Give player cards with no hearts
+        player.receive_cards([
+            Card('3', '♣'),
+            Card('K', '♦'),
+            Card('7', '♠')
+        ])
+
+        # Led suit is hearts (player has none)
+        legal_plays = game.get_legal_plays(player, led_suit='♥')
+
+        # Should be able to play any card
+        assert len(legal_plays) == 3
+        assert set(legal_plays) == set(player.hand)
+
+    def test_is_valid_play_card_in_hand(self):
+        """is_valid_play() returns True for valid play."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        card = Card('5', '♥')
+        player.receive_cards([card, Card('3', '♣')])
+
+        # First card (no led suit)
+        assert game.is_valid_play(card, player, led_suit=None) is True
+
+    def test_is_valid_play_card_not_in_hand(self):
+        """is_valid_play() returns False for card not in hand."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([Card('3', '♣')])
+
+        # Try to play card not in hand
+        assert game.is_valid_play(Card('5', '♥'), player, led_suit=None) is False
+
+    def test_is_valid_play_must_follow_suit(self):
+        """is_valid_play() enforces follow-suit rule."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([
+            Card('5', '♥'),
+            Card('3', '♣')
+        ])
+
+        # Led suit is hearts, trying to play clubs
+        assert game.is_valid_play(Card('3', '♣'), player, led_suit='♥') is False
+
+        # Led suit is hearts, playing hearts
+        assert game.is_valid_play(Card('5', '♥'), player, led_suit='♥') is True
+
+    def test_is_valid_play_no_led_suit_can_play_any(self):
+        """is_valid_play() allows any card if player has no led suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([
+            Card('3', '♣'),
+            Card('K', '♦')
+        ])
+
+        # Led suit is hearts (player has none), can play clubs
+        assert game.is_valid_play(Card('3', '♣'), player, led_suit='♥') is True
+
+    def test_validate_play_with_anti_cheat_valid_play(self):
+        """validate_play_with_anti_cheat() allows valid plays."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        card = Card('5', '♥')
+        player.receive_cards([card, Card('3', '♣')])
+
+        # Should not raise exception for valid play
+        game.validate_play_with_anti_cheat(card, player, led_suit=None)
+
+    def test_validate_play_with_anti_cheat_card_not_in_hand(self):
+        """validate_play_with_anti_cheat() raises exception for card not in hand."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([Card('3', '♣')])
+
+        # Should raise IllegalPlayException
+        with pytest.raises(IllegalPlayException, match="card not in hand"):
+            game.validate_play_with_anti_cheat(Card('5', '♥'), player, led_suit=None)
+
+    def test_validate_play_with_anti_cheat_illegal_suit_violation(self):
+        """validate_play_with_anti_cheat() detects illegal suit violations."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([
+            Card('5', '♥'),
+            Card('3', '♣')
+        ])
+
+        # Player has hearts but tries to play clubs when hearts led
+        with pytest.raises(IllegalPlayException, match="must follow suit"):
+            game.validate_play_with_anti_cheat(Card('3', '♣'), player, led_suit='♥')
+
+    def test_validate_play_with_anti_cheat_valid_different_suit(self):
+        """validate_play_with_anti_cheat() allows different suit if player has none of led suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([
+            Card('3', '♣'),
+            Card('K', '♦')
+        ])
+
+        # Player has no hearts, can play clubs
+        # Should not raise exception
+        game.validate_play_with_anti_cheat(Card('3', '♣'), player, led_suit='♥')
+
+    def test_update_card_counting_adds_to_history(self):
+        """update_card_counting() adds card to round history."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+        player = game.players[0]
+
+        card = player.hand[0]
+
+        assert len(game.cards_played_this_round) == 0
+
+        game.update_card_counting(card, player, led_suit=None)
+
+        assert len(game.cards_played_this_round) == 1
+        assert card in game.cards_played_this_round
+
+    def test_update_card_counting_decrements_suit_count(self):
+        """update_card_counting() decrements cards_remaining_by_suit."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+        player = game.players[0]
+
+        # Find a heart in player's hand
+        heart_card = None
+        for card in player.hand:
+            if card.suit == '♥':
+                heart_card = card
+                break
+
+        if heart_card:
+            initial_hearts = game.cards_remaining_by_suit['♥']
+            game.update_card_counting(heart_card, player, led_suit=None)
+            assert game.cards_remaining_by_suit['♥'] == initial_hearts - 1
+
+    def test_update_card_counting_marks_void_suit(self):
+        """update_card_counting() marks player void when they don't follow suit."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)  # Initialize card counting state
+        player = game.players[0]
+
+        # Replace player's hand with specific card
+        player.hand = [Card('3', '♣')]
+
+        assert '♥' not in player.known_void_suits
+
+        # Player plays clubs when hearts led (they have no hearts)
+        game.update_card_counting(Card('3', '♣'), player, led_suit='♥')
+
+        # Player should be marked void in hearts
+        assert '♥' in player.known_void_suits
+
+    def test_update_card_counting_no_void_when_following_suit(self):
+        """update_card_counting() doesn't mark void when following suit."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+        player = game.players[0]
+
+        card = Card('5', '♥')
+        player.receive_cards([card])
+
+        assert len(player.known_void_suits) == 0
+
+        # Player plays hearts when hearts led
+        game.update_card_counting(card, player, led_suit='♥')
+
+        # Player should NOT be marked void in hearts
+        assert '♥' not in player.known_void_suits
+
+    def test_play_trick_wrong_phase(self):
+        """play_trick() raises exception if not in playing phase."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Game is in 'bidding' phase
+        assert game.game_phase == 'bidding'
+
+        with pytest.raises(GameStateException, match="Cannot play trick"):
+            game.play_trick()
+
+    def test_play_trick_structure(self):
+        """play_trick() has correct structure and raises NotImplementedError."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Transition to playing phase
+        game.game_phase = 'playing'
+
+        # Method should raise NotImplementedError since no card selection mechanism
+        with pytest.raises(NotImplementedError, match="card selection mechanism"):
+            game.play_trick()
+
+    def test_playing_phase_wrong_phase(self):
+        """playing_phase() raises exception if not in playing phase."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Game is in 'bidding' phase
+        assert game.game_phase == 'bidding'
+
+        with pytest.raises(GameStateException, match="Cannot start playing phase"):
+            game.playing_phase()
+
+    def test_playing_phase_structure(self):
+        """playing_phase() has correct structure."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Transition to playing phase
+        game.game_phase = 'playing'
+
+        # Should try to play tricks (will fail due to NotImplementedError in play_trick)
+        with pytest.raises(NotImplementedError):
+            game.playing_phase()
+
+    def test_scoring_phase_basic(self):
+        """scoring_phase() calculates and updates scores correctly."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Manually set up player states for scoring
+        game.players[0].bid = 2
+        game.players[0].tricks_won = 2  # Made bid
+
+        game.players[1].bid = 1
+        game.players[1].tricks_won = 0  # Missed bid
+
+        game.players[2].bid = 3
+        game.players[2].tricks_won = 3  # Made bid
+
+        # Transition to scoring phase
+        game.game_phase = 'scoring'
+
+        # Execute scoring
+        results = game.scoring_phase()
+
+        # Verify results structure
+        assert 'round' in results
+        assert 'trump_suit' in results
+        assert 'player_scores' in results
+        assert results['round'] == 0
+
+        # Verify player scores
+        assert len(results['player_scores']) == 3
+
+        # Player 0: bid 2, won 2 → 10 + 2 = 12 points
+        assert results['player_scores'][0]['name'] == 'Player 1'
+        assert results['player_scores'][0]['bid'] == 2
+        assert results['player_scores'][0]['tricks_won'] == 2
+        assert results['player_scores'][0]['round_score'] == 12
+        assert results['player_scores'][0]['total_score'] == 12
+        assert game.players[0].total_score == 12
+
+        # Player 1: bid 1, won 0 → 0 points
+        assert results['player_scores'][1]['name'] == 'Player 2'
+        assert results['player_scores'][1]['bid'] == 1
+        assert results['player_scores'][1]['tricks_won'] == 0
+        assert results['player_scores'][1]['round_score'] == 0
+        assert results['player_scores'][1]['total_score'] == 0
+        assert game.players[1].total_score == 0
+
+        # Player 2: bid 3, won 3 → 10 + 3 = 13 points
+        assert results['player_scores'][2]['name'] == 'Player 3'
+        assert results['player_scores'][2]['bid'] == 3
+        assert results['player_scores'][2]['tricks_won'] == 3
+        assert results['player_scores'][2]['round_score'] == 13
+        assert results['player_scores'][2]['total_score'] == 13
+        assert game.players[2].total_score == 13
+
+        # Verify game state transitions
+        assert game.game_phase == 'complete'
+        assert game.current_round == 1  # Incremented
+        assert game.dealer_position == 1  # Rotated
+
+    def test_scoring_phase_all_players_make_bid(self):
+        """scoring_phase() handles all players making their bids."""
+        game = BlobGame(num_players=4)
+        game.setup_round(3)
+
+        # All players make their bids
+        for i, player in enumerate(game.players):
+            player.bid = i  # 0, 1, 2, 3
+            player.tricks_won = i
+
+        game.game_phase = 'scoring'
+        results = game.scoring_phase()
+
+        # Verify all players scored
+        expected_scores = [10, 11, 12, 13]  # 10+0, 10+1, 10+2, 10+3
+        for i, player_result in enumerate(results['player_scores']):
+            assert player_result['round_score'] == expected_scores[i]
+            assert player_result['total_score'] == expected_scores[i]
+
+    def test_scoring_phase_no_players_make_bid(self):
+        """scoring_phase() handles no players making their bids."""
+        game = BlobGame(num_players=4)
+        game.setup_round(3)
+
+        # All players miss their bids
+        game.players[0].bid = 2
+        game.players[0].tricks_won = 1  # Missed
+
+        game.players[1].bid = 1
+        game.players[1].tricks_won = 2  # Missed
+
+        game.players[2].bid = 0
+        game.players[2].tricks_won = 1  # Missed
+
+        game.players[3].bid = 3
+        game.players[3].tricks_won = 2  # Missed
+
+        game.game_phase = 'scoring'
+        results = game.scoring_phase()
+
+        # Verify all players scored 0
+        for player_result in results['player_scores']:
+            assert player_result['round_score'] == 0
+            assert player_result['total_score'] == 0
+
+    def test_scoring_phase_zero_bid_success(self):
+        """scoring_phase() correctly scores player who bid 0 and won 0."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Player bids 0 and wins 0 tricks
+        game.players[0].bid = 0
+        game.players[0].tricks_won = 0  # Made bid!
+
+        game.players[1].bid = 2
+        game.players[1].tricks_won = 2
+
+        game.players[2].bid = 3
+        game.players[2].tricks_won = 3
+
+        game.game_phase = 'scoring'
+        results = game.scoring_phase()
+
+        # Player 0: bid 0, won 0 → 10 + 0 = 10 points
+        assert results['player_scores'][0]['round_score'] == 10
+        assert game.players[0].total_score == 10
+
+    def test_scoring_phase_wrong_phase(self):
+        """scoring_phase() raises exception if not in scoring phase."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Game is in 'bidding' phase
+        assert game.game_phase == 'bidding'
+
+        with pytest.raises(GameStateException, match="Cannot start scoring phase"):
+            game.scoring_phase()
+
+    def test_scoring_phase_dealer_rotation(self):
+        """scoring_phase() rotates dealer position correctly."""
+        game = BlobGame(num_players=4)
+        game.setup_round(3)
+
+        # Set initial dealer
+        game.dealer_position = 0
+
+        # Set up minimal scoring state
+        for player in game.players:
+            player.bid = 0
+            player.tricks_won = 0
+
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+
+        # Dealer should have rotated to position 1
+        assert game.dealer_position == 1
+
+        # After another round, should rotate to 2
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+        assert game.dealer_position == 2
+
+        # After another round, should rotate to 3
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+        assert game.dealer_position == 3
+
+        # After another round, should wrap to 0
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+        assert game.dealer_position == 0
+
+    def test_scoring_phase_round_counter_increment(self):
+        """scoring_phase() increments round counter correctly."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Set up minimal scoring state
+        for player in game.players:
+            player.bid = 1
+            player.tricks_won = 1
+
+        assert game.current_round == 0
+
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+
+        assert game.current_round == 1
+
+        # Another round
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+
+        assert game.current_round == 2
+
+    def test_scoring_phase_cumulative_scores(self):
+        """scoring_phase() accumulates scores across multiple rounds."""
+        game = BlobGame(num_players=3)
+
+        # Round 1
+        game.setup_round(3)
+        game.players[0].bid = 2
+        game.players[0].tricks_won = 2
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+
+        # Player 0 should have 12 points
+        assert game.players[0].total_score == 12
+
+        # Round 2
+        game.setup_round(3)
+        game.players[0].bid = 1
+        game.players[0].tricks_won = 1
+        game.game_phase = 'scoring'
+        game.scoring_phase()
+
+        # Player 0 should now have 12 + 11 = 23 points
+        assert game.players[0].total_score == 23
+
+
+# ============================================================================
+# Test Anti-Cheat System
+# ============================================================================
+
+class TestAntiCheat:
+    """Test anti-cheat detection and card counting."""
+
+    def test_detect_illegal_card_not_in_hand(self):
+        """Raise exception if player plays card they don't have."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([Card('3', '♣')])
+
+        # Try to play a card not in hand
+        with pytest.raises(IllegalPlayException) as exc_info:
+            game.validate_play_with_anti_cheat(Card('A', '♠'), player, led_suit=None)
+
+        assert exc_info.value.player_name == player.name
+        assert exc_info.value.card == Card('A', '♠')
+        assert "card not in hand" in exc_info.value.reason
+
+    def test_detect_illegal_suit_violation(self):
+        """Raise exception if player has led suit but plays different suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([
+            Card('5', '♥'),
+            Card('8', '♥'),
+            Card('3', '♣')
+        ])
+
+        # Player has hearts but tries to play clubs when hearts led
+        with pytest.raises(IllegalPlayException) as exc_info:
+            game.validate_play_with_anti_cheat(Card('3', '♣'), player, led_suit='♥')
+
+        assert exc_info.value.player_name == player.name
+        assert exc_info.value.card == Card('3', '♣')
+        assert "must follow suit" in exc_info.value.reason
+        assert "♥" in exc_info.value.reason
+
+    def test_suit_elimination_tracking(self):
+        """Mark player void in suit when they don't follow suit."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+        player = game.players[0]
+
+        # Replace player's hand with specific cards (no hearts)
+        player.hand = [Card('3', '♣'), Card('K', '♦')]
+
+        assert '♥' not in player.known_void_suits
+
+        # Player plays clubs when hearts led
+        game.update_card_counting(Card('3', '♣'), player, led_suit='♥')
+
+        # Player should now be marked void in hearts
+        assert '♥' in player.known_void_suits
+
+    def test_suit_elimination_multiple_suits(self):
+        """Track multiple void suits."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)  # Initialize card counting state
+        player = game.players[0]
+
+        # Replace hand with specific cards
+        player.hand = [Card('A', '♠'), Card('K', '♣')]
+
+        # Player plays spades when hearts led
+        game.update_card_counting(Card('A', '♠'), player, led_suit='♥')
+        assert '♥' in player.known_void_suits
+
+        # Player plays clubs when diamonds led
+        game.update_card_counting(Card('K', '♣'), player, led_suit='♦')
+        assert '♦' in player.known_void_suits
+
+        # Should have both hearts and diamonds marked as void
+        assert len(player.known_void_suits) == 2
+        assert '♥' in player.known_void_suits
+        assert '♦' in player.known_void_suits
+
+    def test_card_counting_updates(self):
+        """cards_remaining_by_suit updates correctly after plays."""
+        game = BlobGame(num_players=3)
+        game.setup_round(5)
+
+        # Get initial suit counts
+        initial_hearts = game.cards_remaining_by_suit['♥']
+        initial_clubs = game.cards_remaining_by_suit['♣']
+
+        # Find a heart and a club in players' hands
+        heart_card = None
+        club_card = None
+
+        for player in game.players:
+            for card in player.hand:
+                if card.suit == '♥' and heart_card is None:
+                    heart_card = (player, card)
+                if card.suit == '♣' and club_card is None:
+                    club_card = (player, card)
+
+        # Play a heart
+        if heart_card:
+            player, card = heart_card
+            game.update_card_counting(card, player, led_suit=None)
+            assert game.cards_remaining_by_suit['♥'] == initial_hearts - 1
+
+        # Play a club
+        if club_card:
+            player, card = club_card
+            game.update_card_counting(card, player, led_suit='♥')
+            assert game.cards_remaining_by_suit['♣'] == initial_clubs - 1
+
+    def test_valid_play_different_suit_when_void(self):
+        """Allow different suit if player has none of led suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        # Player has no hearts
+        player.receive_cards([
+            Card('3', '♣'),
+            Card('K', '♦'),
+            Card('7', '♠')
+        ])
+
+        # All cards should be valid when hearts led (player has no hearts)
+        for card in player.hand:
+            # Should not raise exception
+            game.validate_play_with_anti_cheat(card, player, led_suit='♥')
+
+    def test_known_void_suits_prevent_false_positives(self):
+        """Don't raise exception if player is known to be void in suit."""
+        game = BlobGame(num_players=3)
+        player = game.players[0]
+
+        player.receive_cards([Card('3', '♣')])
+
+        # Mark player as void in hearts (from previous play)
+        player.mark_void_suit('♥')
+
+        # Player playing clubs when hearts led should not raise exception
+        # (already known they have no hearts)
+        game.validate_play_with_anti_cheat(Card('3', '♣'), player, led_suit='♥')

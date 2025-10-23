@@ -726,3 +726,365 @@ class BlobGame:
 
         # Transition to playing phase
         self.game_phase = 'playing'
+
+    def get_legal_plays(self, player: Player, led_suit: Optional[str]) -> List[Card]:
+        """
+        Get legal cards that a player can play.
+
+        Rules:
+        - If no suit has been led (first card of trick): can play any card
+        - If player has cards in led suit: must play one of those cards
+        - If player has no cards in led suit: can play any card
+
+        Args:
+            player: Player whose legal plays to check
+            led_suit: Suit of the first card played in trick (None if first card)
+
+        Returns:
+            List of cards the player can legally play
+
+        Examples:
+            >>> # Player has [5♥, 8♥, 3♣, K♦]
+            >>> # Led suit is ♥
+            >>> game.get_legal_plays(player, '♥')
+            [5♥, 8♥]  # Must follow suit
+
+            >>> # Player has [3♣, K♦, 7♠]
+            >>> # Led suit is ♥ (player has no hearts)
+            >>> game.get_legal_plays(player, '♥')
+            [3♣, K♦, 7♠]  # Can play any card
+        """
+        # If no suit led yet (first card of trick), can play any card
+        if led_suit is None:
+            return list(player.hand)
+
+        # Get cards in led suit
+        cards_in_led_suit = [card for card in player.hand if card.suit == led_suit]
+
+        # If player has cards in led suit, must play one of them
+        if cards_in_led_suit:
+            return cards_in_led_suit
+
+        # Player has no cards in led suit, can play any card
+        return list(player.hand)
+
+    def is_valid_play(self, card: Card, player: Player, led_suit: Optional[str]) -> bool:
+        """
+        Check if a card play is legal.
+
+        Validation rules:
+        1. Card must be in player's hand
+        2. If led_suit exists and player has cards in that suit, card must match led_suit
+
+        Args:
+            card: Card to validate
+            player: Player attempting to play the card
+            led_suit: Suit of first card in trick (None if first card)
+
+        Returns:
+            True if play is legal, False otherwise
+
+        Examples:
+            >>> # Player has [5♥, 3♣, K♦], led suit is ♥
+            >>> game.is_valid_play(Card('5', '♥'), player, '♥')
+            True
+
+            >>> # Player has [5♥, 3♣], led suit is ♥, trying to play ♣
+            >>> game.is_valid_play(Card('3', '♣'), player, '♥')
+            False  # Must follow suit
+        """
+        # Check if card is in player's hand
+        if card not in player.hand:
+            return False
+
+        # Get legal plays
+        legal_cards = self.get_legal_plays(player, led_suit)
+
+        # Check if card is in legal plays
+        return card in legal_cards
+
+    def validate_play_with_anti_cheat(self, card: Card, player: Player,
+                                      led_suit: Optional[str]) -> None:
+        """
+        Strictly validate card play with anti-cheat detection.
+
+        This method performs thorough validation and raises exceptions for
+        illegal plays. It's designed to catch both honest mistakes and
+        deliberate cheating attempts.
+
+        Validation steps:
+        1. Verify card is in player's hand
+        2. If led_suit exists and player has cards in that suit:
+           - If card doesn't match led_suit: RAISE IllegalPlayException
+        3. If player doesn't have led_suit, mark them as void in that suit
+
+        Args:
+            card: Card being played
+            player: Player attempting to play the card
+            led_suit: Suit of first card in trick (None if first card)
+
+        Raises:
+            IllegalPlayException: If player attempts an illegal move
+
+        Examples:
+            >>> # Player has [5♥, 3♣], tries to play ♣ when ♥ is led
+            >>> game.validate_play_with_anti_cheat(Card('3', '♣'), player, '♥')
+            IllegalPlayException: Player played 3♣ illegally: must follow suit ♥
+
+            >>> # Player has [3♣, K♦] (no hearts), plays ♣ when ♥ is led
+            >>> game.validate_play_with_anti_cheat(Card('3', '♣'), player, '♥')
+            # No exception, and player.known_void_suits now contains ♥
+        """
+        # Verify card is in player's hand
+        if card not in player.hand:
+            raise IllegalPlayException(
+                player.name, card,
+                f"card not in hand (hand: {sorted(player.hand)})"
+            )
+
+        # If a suit has been led, check follow-suit rules
+        if led_suit is not None:
+            # Check if player has cards in led suit
+            has_led_suit = player.has_suit(led_suit)
+
+            if has_led_suit and card.suit != led_suit:
+                # Player has led suit but played different suit - CHEATING!
+                raise IllegalPlayException(
+                    player.name, card,
+                    f"must follow suit {led_suit} (player has cards in that suit)"
+                )
+
+    def update_card_counting(self, card: Card, player: Player,
+                            led_suit: Optional[str]) -> None:
+        """
+        Update card counting state after a valid play.
+
+        Tracks:
+        1. Cards played this round (global history)
+        2. Cards remaining by suit (for card counting)
+        3. Void suits (when player doesn't follow suit)
+
+        Args:
+            card: Card that was played
+            player: Player who played the card
+            led_suit: Suit that was led (None if first card)
+
+        Examples:
+            >>> # Before: cards_remaining_by_suit = {'♥': 5, '♣': 8, ...}
+            >>> game.update_card_counting(Card('5', '♥'), player, None)
+            >>> # After: cards_remaining_by_suit = {'♥': 4, '♣': 8, ...}
+            >>> # And cards_played_this_round contains Card('5', '♥')
+        """
+        # Add card to round history
+        self.cards_played_this_round.append(card)
+
+        # Decrement cards remaining in that suit
+        self.cards_remaining_by_suit[card.suit] -= 1
+
+        # If player didn't follow suit and a suit was led, mark them as void
+        if led_suit is not None and card.suit != led_suit:
+            player.mark_void_suit(led_suit)
+
+    def play_trick(self) -> Player:
+        """
+        Execute one complete trick.
+
+        Flow:
+        1. Create new Trick with current trump
+        2. Loop through players (starting with lead player)
+        3. For each player:
+           - Get legal plays
+           - Get player's card selection (must be provided externally)
+           - Validate play with anti-cheat
+           - Add card to trick
+           - Update card counting
+        4. Determine winner after all cards played
+        5. Award trick to winner
+        6. Add trick to history
+        7. Return winner for next trick's lead
+
+        Returns:
+            Player who won the trick (will lead next trick)
+
+        Raises:
+            GameStateException: If game is not in 'playing' phase
+            NotImplementedError: If called without card selection mechanism
+
+        Note:
+            This method requires integration with a card selection mechanism
+            (human input, AI decision, etc.). It serves as a structural template.
+        """
+        if self.game_phase != 'playing':
+            raise GameStateException(
+                f"Cannot play trick: game is in '{self.game_phase}' phase"
+            )
+
+        # Create new trick
+        self.current_trick = Trick(self.trump_suit)
+
+        # Determine lead player
+        # First trick: player left of dealer leads
+        # Subsequent tricks: winner of last trick leads
+        if not self.tricks_history:
+            lead_player_idx = (self.dealer_position + 1) % self.num_players
+        else:
+            # Last trick's winner leads
+            last_winner = self.tricks_history[-1].winner
+            lead_player_idx = last_winner.position
+
+        # Play order: start with lead player, go clockwise
+        play_order = []
+        for i in range(self.num_players):
+            player_idx = (lead_player_idx + i) % self.num_players
+            play_order.append(player_idx)
+
+        # Each player plays a card
+        for player_idx in play_order:
+            player = self.players[player_idx]
+
+            # Get legal plays for this player
+            legal_cards = self.get_legal_plays(player, self.current_trick.led_suit)
+
+            # This is where we'd integrate with card selection mechanism
+            # Example:
+            #   card = get_player_card_choice(player, legal_cards, self.current_trick)
+            #   self.validate_play_with_anti_cheat(card, player, self.current_trick.led_suit)
+            #   played_card = player.play_card(card)
+            #   self.current_trick.add_card(player, played_card)
+            #   self.update_card_counting(played_card, player, self.current_trick.led_suit)
+
+            raise NotImplementedError(
+                "play_trick() requires integration with a card selection mechanism. "
+                "Use this method as a template and provide card choices via a "
+                "callback function or override this method."
+            )
+
+        # Determine winner
+        winner = self.current_trick.determine_winner()
+        winner.win_trick()
+
+        # Add to history
+        self.tricks_history.append(self.current_trick)
+
+        return winner
+
+    def playing_phase(self) -> None:
+        """
+        Execute the playing phase for current round.
+
+        Plays all tricks for the round. Each trick is played in sequence,
+        with the winner of each trick leading the next trick.
+
+        The method continues until all cards have been played (number of
+        tricks equals the number of cards dealt to each player).
+
+        Raises:
+            GameStateException: If game is not in 'playing' phase
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> # ... bidding happens ...
+            >>> game.playing_phase()  # Plays all 5 tricks
+            >>> game.game_phase
+            'scoring'
+            >>> len(game.tricks_history)
+            5
+
+        Note:
+            This method requires integration with play_trick() which needs
+            a card selection mechanism to be fully functional.
+        """
+        if self.game_phase != 'playing':
+            raise GameStateException(
+                f"Cannot start playing phase: game is in '{self.game_phase}' phase"
+            )
+
+        # Calculate number of tricks to play (equals cards dealt)
+        cards_dealt = len(self.players[0].hand) if self.players else 0
+
+        # Play all tricks
+        for trick_num in range(cards_dealt):
+            self.play_trick()
+
+        # Transition to scoring phase
+        self.game_phase = 'scoring'
+
+    def scoring_phase(self) -> Dict[str, Union[int, List[Dict]]]:
+        """
+        Execute the scoring phase for current round.
+
+        Calculates scores for all players based on whether they met their bids,
+        updates total scores, and prepares for the next round.
+
+        Scoring rule: If tricks_won == bid, score = 10 + bid. Otherwise, score = 0.
+
+        Returns:
+            Dictionary containing round results:
+            {
+                'round': int,
+                'trump_suit': Optional[str],
+                'player_scores': [
+                    {
+                        'name': str,
+                        'bid': int,
+                        'tricks_won': int,
+                        'round_score': int,
+                        'total_score': int
+                    }, ...
+                ]
+            }
+
+        Raises:
+            GameStateException: If game is not in 'scoring' phase
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> # ... bidding and playing happens ...
+            >>> results = game.scoring_phase()
+            >>> results['round']
+            0
+            >>> results['player_scores'][0]['total_score']
+            12  # Example: if player bid 2 and won 2 tricks
+        """
+        if self.game_phase != 'scoring':
+            raise GameStateException(
+                f"Cannot start scoring phase: game is in '{self.game_phase}' phase"
+            )
+
+        # Prepare results dictionary
+        results = {
+            'round': self.current_round,
+            'trump_suit': self.trump_suit,
+            'player_scores': []
+        }
+
+        # Calculate and update scores for all players
+        for player in self.players:
+            # Calculate round score
+            round_score = player.calculate_round_score()
+
+            # Update total score
+            player.total_score += round_score
+
+            # Record results for this player
+            player_result = {
+                'name': player.name,
+                'bid': player.bid if player.bid is not None else 0,
+                'tricks_won': player.tricks_won,
+                'round_score': round_score,
+                'total_score': player.total_score
+            }
+            results['player_scores'].append(player_result)
+
+        # Increment round counter
+        self.current_round += 1
+
+        # Rotate dealer position for next round
+        self.dealer_position = (self.dealer_position + 1) % self.num_players
+
+        # Transition to complete phase (can setup next round or end game)
+        self.game_phase = 'complete'
+
+        return results

@@ -283,7 +283,7 @@ blobmaster/
   - Edge cases: 0-bid, last player constraint, suit elimination
   - Multi-player scenarios (3, 4, 5, 8 players)
 
-- [ ] Build CLI version:
+- [ ] Build CLI version (optional? I don't need it):
   - Play manually against random bots
   - Validate rules feel correct
   - Debug any logic issues
