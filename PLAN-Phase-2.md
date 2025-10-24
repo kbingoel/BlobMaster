@@ -71,10 +71,10 @@ pytest>=7.3.0
 
 #### 1.2 Design State Vector (15 min)
 
-Document the encoding scheme (~512 dimensions):
+Document the encoding scheme (**256 dimensions - optimized for CPU inference**):
 ```python
 """
-State Encoding Dimensions (512 total):
+State Encoding Dimensions (256 total):
 
 1. My Hand (52-dim binary):
    - One-hot encoding: 1 if I have this card, 0 otherwise
@@ -106,7 +106,7 @@ State Encoding Dimensions (512 total):
    - Current trick number (normalized)
    - My position relative to dealer (normalized)
    - Number of active players (normalized)
-   - Trump suit (one-hot: 5-dim for ♠♥♣♦ + None)
+   - Trump suit (one-hot: 4-dim for ♠♥♣♦, all zeros for None)
    - Am I the dealer? (binary)
 
 9. Bidding Constraint (1-dim):
@@ -123,7 +123,17 @@ State Encoding Dimensions (512 total):
     - etc.
 
 Total: 52 + 52 + 52 + 8 + 8 + 1 + 1 + 8 + 1 + 3 + 16 = 202 base dimensions
-Padded to 512 with zeros for future extensibility
+Padded to 256 with zeros for future extensibility (54 dimensions spare)
+
+Architecture Decision: Why 256 vs 512?
+---------------------------------------
+- 202 required dimensions + 54 spare = 26% overhead (vs 60% with 512)
+- 2x less memory per state vector (1KB vs 2KB)
+- 4x fewer parameters in embedding layer (65K vs 262K)
+- Faster CPU inference on Intel laptop (deployment target)
+- Better cache utilization (fits in L1/L2 cache)
+- Still power-of-2 for hardware memory alignment benefits
+- Results in ~60% smaller model overall (2-3M vs 5-8M parameters)
 """
 ```
 
@@ -151,7 +161,7 @@ class StateEncoder:
     """
 
     def __init__(self):
-        self.state_dim = 512
+        self.state_dim = 256  # Optimized for CPU inference
         self.card_dim = 52
         self.max_players = MAX_PLAYERS
 
@@ -164,7 +174,7 @@ class StateEncoder:
             player: Player whose perspective to encode
 
         Returns:
-            torch.Tensor of shape (512,) with normalized state features
+            torch.Tensor of shape (256,) with normalized state features
         """
         # Initialize full state vector
         state = torch.zeros(self.state_dim, dtype=torch.float32)
@@ -224,7 +234,7 @@ class StateEncoder:
         offset += 16
 
         # Remaining dimensions padded with zeros (for future features)
-        # offset should be around 202, rest is zero-padded to 512
+        # offset should be 202, rest is zero-padded to 256 (54 dims spare)
 
         return state
 
@@ -260,10 +270,10 @@ class StateEncoder:
 - [ ] Create `ml/network/test_network.py`
 - [ ] Test `_card_to_index()` mapping
 - [ ] Test hand encoding (verify correct cards marked)
-- [ ] Test state shape (should be 512-dim)
+- [ ] Test state shape (should be 256-dim)
 - [ ] Test with simple game state
 
-**Deliverable**: Basic StateEncoder that produces 512-dim tensors
+**Deliverable**: Basic StateEncoder that produces 256-dim tensors
 
 ---
 
@@ -374,8 +384,8 @@ class TestStateEncoder:
     def test_state_determinism(self):
         """Same game state should produce identical tensor."""
 
-    def test_state_shape_always_512(self):
-        """State tensor always 512-dim regardless of game config."""
+    def test_state_shape_always_256(self):
+        """State tensor always 256-dim regardless of game config."""
 ```
 
 **Deliverable**: Fully functional StateEncoder with >95% test coverage
@@ -394,7 +404,7 @@ Design document:
 BlobNet: Lightweight Transformer for Blob Card Game
 
 Architecture:
-    Input (512) → Embedding (512) → Transformer Layers (4-6) → Dual Heads
+    Input (256) → Embedding (256) → Transformer Layers (4-6) → Dual Heads
 
     Dual Heads:
     1. Policy Head:
@@ -406,14 +416,22 @@ Architecture:
        - Single scalar: Expected final score (normalized [-1, 1])
        - Predicts how well current player will do
 
-Hyperparameters:
-    - Embedding dim: 512
+Hyperparameters (Optimized for CPU Inference):
+    - State dim: 256 (reduced from 512)
+    - Embedding dim: 256 (reduced from 512)
     - Transformer layers: 6
     - Attention heads: 8
-    - Feedforward dim: 2048
+    - Feedforward dim: 1024 (reduced from 2048)
     - Dropout: 0.1
 
-Total Parameters: ~5-8M (small enough for laptop CPU inference)
+Total Parameters: ~2-3M (optimized for laptop CPU inference)
+
+Performance Benefits:
+    - 4x fewer parameters in embedding layer (65K vs 262K)
+    - 2x smaller feedforward layers (1024 vs 2048)
+    - ~60% smaller model overall (2-3M vs 5-8M parameters)
+    - Faster inference on Intel i5-1135G7 iGPU
+    - Better memory efficiency for 8GB RTX 4060 training
 """
 ```
 
@@ -439,11 +457,11 @@ class BlobNet(nn.Module):
 
     def __init__(
         self,
-        state_dim: int = 512,
-        embedding_dim: int = 512,
+        state_dim: int = 256,  # Optimized for CPU inference
+        embedding_dim: int = 256,  # Optimized for CPU inference
         num_layers: int = 6,
         num_heads: int = 8,
-        feedforward_dim: int = 2048,
+        feedforward_dim: int = 1024,  # Reduced from 2048
         dropout: float = 0.1,
         max_bid: int = 13,  # Max cards per player
         max_cards: int = 52,  # Full deck
