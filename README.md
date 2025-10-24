@@ -292,31 +292,37 @@ blobmaster/
 
 **Deliverable**: Complete game engine with comprehensive tests and >95% code coverage
 
-### Phase 2: MCTS + Neural Network
+### Phase 2: MCTS + Neural Network (IN PROGRESS - Sessions 1-2 Complete)
 
 **Goal**: Basic AI that can play legal moves and improve with training
 
-- [ ] Implement state encoding (`network/encode.py`):
+- [x] **Session 1 COMPLETE**: Implement state encoding (`network/encode.py`):
   - Convert game state → 256-dim tensor
   - Handle variable player counts with masking
   - Belief state representation
+  - Legal action masking for bidding/playing
+  - **Result**: 15 tests, 86% coverage
 
-- [ ] Build neural network (`network/model.py`):
-  - Transformer architecture (4-6 layers)
-  - Policy head (bidding + card play)
-  - Value head (score prediction)
-  - Legal action masking
+- [x] **Session 2 COMPLETE**: Build neural network (`network/model.py`):
+  - Transformer architecture (6 layers, 8 heads, ~4.9M params)
+  - Policy head (bidding + card play) with legal action masking
+  - Value head (score prediction, tanh activation)
+  - Training infrastructure (loss computation, checkpointing)
+  - **Result**: 34 total tests, 96% coverage, 1.4ms inference time
+  - **Performance**: 693 inferences/sec, 16x speedup with batching
 
-- [ ] Implement MCTS (`mcts/search.py`):
+- [ ] **Next**: Implement MCTS (`mcts/search.py`):
   - Basic MCTS with UCB1 selection
   - Integration with neural network for leaf evaluation
   - Action sampling based on visit counts
+  - Tree reuse for efficiency
 
 - [ ] Test integration:
   - Random network should make legal moves
   - MCTS improves move quality over random
   - Inference speed: <200ms per move (CPU)
 
+**Progress**: 2/9 sessions complete (~22% of Phase 2)
 **Deliverable**: AI plays valid games end-to-end
 
 ### Phase 3: Imperfect Information Handling

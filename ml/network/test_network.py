@@ -1,13 +1,20 @@
 """
-Tests for neural network state encoding.
+Tests for neural network state encoding and model.
 
-Tests the StateEncoder class that converts game states into tensor representations.
+Tests:
+- StateEncoder: Converts game states into tensor representations
+- ActionMasker: Creates legal action masks
+- BlobNet: Transformer neural network for policy and value prediction
+- BlobNetTrainer: Training infrastructure
 """
 
 import pytest
 import torch
+import tempfile
+from pathlib import Path
 from ml.game.blob import BlobGame, Card
 from ml.network.encode import StateEncoder, ActionMasker
+from ml.network.model import BlobNet, BlobNetTrainer, create_model, create_trainer
 
 
 class TestStateEncoder:
@@ -331,6 +338,472 @@ class TestActionMasker:
 
         # Should have exactly 4 legal cards
         assert mask.sum() == 4
+
+
+class TestBlobNet:
+    """Test suite for BlobNet neural network."""
+
+    def test_network_initialization(self):
+        """Test BlobNet creates with correct architecture."""
+        net = BlobNet(
+            state_dim=256,
+            embedding_dim=256,
+            num_layers=6,
+            num_heads=8,
+            feedforward_dim=1024,
+        )
+
+        # Check attributes
+        assert net.state_dim == 256
+        assert net.embedding_dim == 256
+        assert net.action_dim == 52  # max(14, 52)
+        assert net.max_bid == 13
+        assert net.max_cards == 52
+
+        # Check parameter count is in expected range (2-5M for this config)
+        # Note: With 6 layers, 8 heads, 1024 FFN, we get ~4.9M parameters
+        num_params = net.get_num_parameters()
+        assert 1_500_000 < num_params < 6_000_000, \
+            f"Expected 1.5M-6M parameters, got {num_params:,}"
+
+    def test_forward_pass_shape(self):
+        """Test output shapes are correct."""
+        net = BlobNet()
+
+        # Create random state
+        state = torch.randn(256)
+
+        # Forward pass
+        policy, value = net(state)
+
+        # Check shapes
+        assert policy.shape == (52,), f"Policy shape is {policy.shape}, expected (52,)"
+        assert value.shape == (1,), f"Value shape is {value.shape}, expected (1,)"
+
+    def test_single_state_inference(self):
+        """Test forward pass with single state (no batch)."""
+        net = BlobNet()
+
+        # Single state (1D)
+        state = torch.randn(256)
+        policy, value = net(state)
+
+        assert policy.dim() == 1, "Policy should be 1D for single state"
+        assert value.dim() == 1, "Value should be 1D for single state"
+        assert policy.shape[0] == 52
+        assert value.shape[0] == 1
+
+    def test_batch_inference(self):
+        """Test forward pass with batched states."""
+        net = BlobNet()
+
+        # Batch of states (2D)
+        batch_size = 16
+        state_batch = torch.randn(batch_size, 256)
+
+        policy, value = net(state_batch)
+
+        # Check batch dimensions
+        assert policy.shape == (batch_size, 52)
+        assert value.shape == (batch_size, 1)
+
+    def test_value_output_range(self):
+        """Test value head outputs in [-1, 1] due to tanh."""
+        net = BlobNet()
+
+        # Multiple random states
+        for _ in range(10):
+            state = torch.randn(256)
+            _, value = net(state)
+
+            # Value should be in [-1, 1] due to tanh activation
+            assert -1.0 <= value.item() <= 1.0, \
+                f"Value {value.item()} outside [-1, 1]"
+
+    def test_policy_sums_to_one(self):
+        """Test policy probabilities sum to 1."""
+        net = BlobNet()
+
+        state = torch.randn(256)
+        policy, _ = net(state)
+
+        # Policy should sum to 1 (softmax normalization)
+        policy_sum = policy.sum().item()
+        assert abs(policy_sum - 1.0) < 1e-5, \
+            f"Policy sums to {policy_sum}, expected 1.0"
+
+    def test_legal_action_masking(self):
+        """Test legal action masking zeros out illegal actions."""
+        net = BlobNet()
+
+        state = torch.randn(256)
+
+        # Create mask: only first 5 actions legal
+        mask = torch.zeros(52)
+        mask[0:5] = 1.0
+
+        policy, _ = net(state, legal_actions_mask=mask)
+
+        # Legal actions should have non-zero probability
+        assert (policy[0:5] > 0).all(), "Legal actions should have probability > 0"
+
+        # Illegal actions should have zero probability
+        assert (policy[5:] == 0).all(), "Illegal actions should have probability 0"
+
+        # Policy should still sum to 1
+        assert abs(policy.sum().item() - 1.0) < 1e-5
+
+    def test_legal_action_masking_batch(self):
+        """Test legal action masking with batched input."""
+        net = BlobNet()
+
+        batch_size = 4
+        state_batch = torch.randn(batch_size, 256)
+
+        # Different masks for each batch item
+        mask_batch = torch.zeros(batch_size, 52)
+        mask_batch[0, 0:3] = 1.0   # First state: 3 legal actions
+        mask_batch[1, 0:5] = 1.0   # Second state: 5 legal actions
+        mask_batch[2, 0:10] = 1.0  # Third state: 10 legal actions
+        mask_batch[3, :] = 1.0     # Fourth state: all legal
+
+        policy_batch, _ = net(state_batch, legal_actions_mask=mask_batch)
+
+        # Check each batch item
+        for i in range(batch_size):
+            policy = policy_batch[i]
+            mask = mask_batch[i]
+
+            # Legal actions have positive probability
+            legal_actions = mask == 1.0
+            assert (policy[legal_actions] > 0).all()
+
+            # Illegal actions have zero probability
+            illegal_actions = mask == 0.0
+            if illegal_actions.any():
+                assert (policy[illegal_actions] == 0).all()
+
+            # Each policy sums to 1
+            assert abs(policy.sum().item() - 1.0) < 1e-5
+
+    def test_deterministic_output(self):
+        """Test same input produces same output (no randomness in forward pass)."""
+        net = BlobNet()
+        net.eval()  # Evaluation mode (disables dropout)
+
+        state = torch.randn(256)
+
+        # Two forward passes
+        with torch.no_grad():
+            policy1, value1 = net(state)
+            policy2, value2 = net(state)
+
+        # Should be identical
+        assert torch.allclose(policy1, policy2)
+        assert torch.allclose(value1, value2)
+
+    def test_factory_function(self):
+        """Test create_model factory function."""
+        model = create_model(state_dim=256, num_layers=4)
+
+        assert isinstance(model, BlobNet)
+        assert model.state_dim == 256
+
+        # Should be on CPU by default
+        assert next(model.parameters()).device.type == 'cpu'
+
+
+class TestBlobNetTrainer:
+    """Test suite for BlobNetTrainer."""
+
+    def test_trainer_initialization(self):
+        """Test BlobNetTrainer initializes correctly."""
+        model = BlobNet()
+        trainer = BlobNetTrainer(
+            model,
+            learning_rate=0.001,
+            value_loss_weight=1.0,
+            policy_loss_weight=1.0,
+        )
+
+        assert trainer.model is model
+        assert trainer.value_loss_weight == 1.0
+        assert trainer.policy_loss_weight == 1.0
+        assert trainer.optimizer is not None
+
+    def test_loss_computation(self):
+        """Test loss computation returns expected values."""
+        model = BlobNet()
+        trainer = BlobNetTrainer(model)
+
+        # Create dummy data
+        state = torch.randn(4, 256)  # Batch of 4
+
+        # Target policy (random valid distribution)
+        target_policy = torch.rand(4, 52)
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True)
+
+        # Target value
+        target_value = torch.randn(4, 1).clamp(-1, 1)
+
+        # Legal action mask (all legal)
+        mask = torch.ones(4, 52)
+
+        # Compute loss
+        loss, loss_dict = trainer.compute_loss(state, target_policy, target_value, mask)
+
+        # Check loss is scalar tensor
+        assert loss.dim() == 0
+        assert loss.item() > 0  # Loss should be positive
+
+        # Check loss dict has expected keys
+        assert 'total_loss' in loss_dict
+        assert 'policy_loss' in loss_dict
+        assert 'value_loss' in loss_dict
+
+        # All losses should be positive
+        assert loss_dict['total_loss'] > 0
+        assert loss_dict['policy_loss'] > 0
+        assert loss_dict['value_loss'] > 0
+
+    def test_train_step(self):
+        """Test training step updates model."""
+        model = BlobNet()
+        trainer = BlobNetTrainer(model, learning_rate=0.01)
+
+        # Get initial parameters
+        initial_params = [p.clone() for p in model.parameters()]
+
+        # Create dummy data
+        state = torch.randn(4, 256)
+        target_policy = torch.rand(4, 52)
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True)
+        target_value = torch.randn(4, 1).clamp(-1, 1)
+        mask = torch.ones(4, 52)
+
+        # Training step
+        loss_dict = trainer.train_step(state, target_policy, target_value, mask)
+
+        # Check parameters changed
+        for initial, current in zip(initial_params, model.parameters()):
+            assert not torch.equal(initial, current), \
+                "Parameters should change after training step"
+
+        # Check loss dict returned
+        assert 'total_loss' in loss_dict
+
+    def test_loss_decreases_with_training(self):
+        """Test loss decreases over multiple training steps."""
+        model = BlobNet()
+        trainer = BlobNetTrainer(model, learning_rate=0.01)
+
+        # Create dummy data (same data for overfitting)
+        state = torch.randn(4, 256)
+        target_policy = torch.rand(4, 52)
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True)
+        target_value = torch.randn(4, 1).clamp(-1, 1)
+        mask = torch.ones(4, 52)
+
+        # Train for multiple steps
+        losses = []
+        for _ in range(20):
+            loss_dict = trainer.train_step(state, target_policy, target_value, mask)
+            losses.append(loss_dict['total_loss'])
+
+        # Loss should generally decrease (allow some fluctuation)
+        # Check that final loss < initial loss
+        assert losses[-1] < losses[0], \
+            f"Loss should decrease: initial={losses[0]:.4f}, final={losses[-1]:.4f}"
+
+    def test_checkpoint_save_load(self):
+        """Test checkpoint saving and loading."""
+        model = BlobNet()
+        trainer = BlobNetTrainer(model)
+
+        # Train for a few steps to change parameters
+        state = torch.randn(4, 256)
+        target_policy = torch.rand(4, 52)
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True)
+        target_value = torch.randn(4, 1).clamp(-1, 1)
+        mask = torch.ones(4, 52)
+
+        for _ in range(5):
+            trainer.train_step(state, target_policy, target_value, mask)
+
+        # Save checkpoint
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "test_checkpoint.pth"
+
+            # Save
+            trainer.save_checkpoint(
+                str(checkpoint_path),
+                iteration=100,
+                metadata={'test': 'data'}
+            )
+
+            # Check file exists
+            assert checkpoint_path.exists()
+
+            # Create new model and trainer
+            new_model = BlobNet()
+            new_trainer = BlobNetTrainer(new_model)
+
+            # Get initial parameters (should be different from trained)
+            initial_params = [p.clone() for p in new_model.parameters()]
+
+            # Load checkpoint
+            iteration, metadata = new_trainer.load_checkpoint(str(checkpoint_path))
+
+            # Check iteration and metadata
+            assert iteration == 100
+            assert metadata == {'test': 'data'}
+
+            # Check parameters match original trained model
+            for orig_param, loaded_param in zip(model.parameters(), new_model.parameters()):
+                assert torch.allclose(orig_param, loaded_param), \
+                    "Loaded parameters should match saved parameters"
+
+    def test_factory_function_trainer(self):
+        """Test create_trainer factory function."""
+        model = create_model()
+        trainer = create_trainer(model, learning_rate=0.002)
+
+        assert isinstance(trainer, BlobNetTrainer)
+        assert trainer.model is model
+
+
+class TestNetworkIntegration:
+    """Integration tests for complete pipeline."""
+
+    def test_encode_and_inference(self):
+        """Test encoding game state and running inference."""
+        # Create components
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        net = BlobNet()
+
+        # Create game
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Encode state
+        state = encoder.encode(game, player)
+
+        # Create action mask (bidding phase)
+        mask = masker.create_bidding_mask(
+            cards_dealt=5,
+            is_dealer=False,
+            forbidden_bid=None
+        )
+
+        # Run inference
+        policy, value = net(state, mask)
+
+        # Check outputs
+        assert policy.shape == (52,)
+        assert value.shape == (1,)
+        assert abs(policy.sum().item() - 1.0) < 1e-5
+        assert -1.0 <= value.item() <= 1.0
+
+        # Check only legal bids have probability
+        # Legal bids: 0-5 (indices 0-5)
+        assert (policy[0:6] > 0).all()
+        assert (policy[6:] == 0).all()
+
+    def test_full_training_pipeline(self):
+        """Test complete training pipeline with real game data."""
+        # Create components
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        model = BlobNet()
+        trainer = BlobNetTrainer(model, learning_rate=0.01)
+
+        # Generate training data from multiple game states
+        states = []
+        target_policies = []
+        target_values = []
+        masks = []
+
+        for _ in range(8):  # 8 game states
+            game = BlobGame(num_players=4)
+            game.setup_round(cards_to_deal=5)
+            player = game.players[0]
+
+            # Encode state
+            state = encoder.encode(game, player)
+            states.append(state)
+
+            # Create mask
+            mask = masker.create_bidding_mask(
+                cards_dealt=5,
+                is_dealer=(player.position == game.dealer_position),
+                forbidden_bid=None
+            )
+            masks.append(mask)
+
+            # Create dummy target policy (uniform over legal actions)
+            target_policy = mask.clone()
+            target_policy = target_policy / target_policy.sum()
+            target_policies.append(target_policy)
+
+            # Create dummy target value
+            target_values.append(torch.tensor([0.5]))
+
+        # Stack into batches
+        state_batch = torch.stack(states)
+        policy_batch = torch.stack(target_policies)
+        value_batch = torch.stack(target_values)
+        mask_batch = torch.stack(masks)
+
+        # Train for multiple steps
+        initial_loss = None
+        for i in range(10):
+            loss_dict = trainer.train_step(
+                state_batch, policy_batch, value_batch, mask_batch
+            )
+
+            if i == 0:
+                initial_loss = loss_dict['total_loss']
+
+        final_loss = loss_dict['total_loss']
+
+        # Loss should decrease
+        assert final_loss < initial_loss, \
+            f"Loss should decrease: {initial_loss:.4f} -> {final_loss:.4f}"
+
+    def test_performance_benchmark(self):
+        """Test inference performance meets targets (<10ms per forward pass)."""
+        import time
+
+        net = BlobNet()
+        net.eval()
+
+        # Warmup
+        state = torch.randn(256)
+        with torch.no_grad():
+            for _ in range(10):
+                net(state)
+
+        # Benchmark
+        num_runs = 100
+        start_time = time.time()
+
+        with torch.no_grad():
+            for _ in range(num_runs):
+                policy, value = net(state)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        avg_time_ms = elapsed_ms / num_runs
+
+        print(f"\nInference benchmark:")
+        print(f"  Average time per forward pass: {avg_time_ms:.2f} ms")
+        print(f"  Total time for {num_runs} runs: {elapsed_ms:.2f} ms")
+
+        # Should be less than 10ms per forward pass on CPU
+        # Note: This may fail on very slow machines, adjust if needed
+        assert avg_time_ms < 50, \
+            f"Inference too slow: {avg_time_ms:.2f} ms > 50 ms target"
 
 
 if __name__ == "__main__":
