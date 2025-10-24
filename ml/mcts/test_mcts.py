@@ -1065,3 +1065,487 @@ class TestMCTSIntegrationWithNetwork:
         total_bids = sum(p.bid for p in game.players)
         cards_dealt = 3
         assert total_bids != cards_dealt, "Dealer constraint violated"
+
+
+class TestMCTSTreeReuse:
+    """Test tree reuse functionality for performance optimization."""
+
+    def test_search_with_tree_reuse_first_call(self):
+        """Test first call to search_with_tree_reuse creates new root."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        # First call: no previous root
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        assert mcts.root is None, "Root should be None initially"
+
+        action_probs = mcts.search_with_tree_reuse(game, player)
+
+        # Root should now exist
+        assert mcts.root is not None, "Root should be created"
+        assert mcts.root.visit_count > 0, "Root should have visits"
+        assert len(action_probs) > 0, "Should return action probabilities"
+
+    def test_search_with_tree_reuse_navigates_to_child(self):
+        """Test tree reuse navigates to child node after action."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=30)
+
+        # First search
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        action_probs = mcts.search_with_tree_reuse(game, player)
+        best_action = max(action_probs, key=action_probs.get)
+
+        # Store old root info
+        old_root = mcts.root
+        assert best_action in old_root.children, "Best action should have child node"
+        old_child = old_root.children[best_action]
+        old_child_visits = old_child.visit_count
+
+        # Apply action to game
+        game.apply_action(best_action, player)
+        next_player = game.get_current_player()
+
+        # Second search with tree reuse
+        action_probs2 = mcts.search_with_tree_reuse(
+            game, next_player, previous_action=best_action
+        )
+
+        # Root should now be the old child
+        assert mcts.root is old_child, "Root should be the previous child"
+        assert mcts.root.parent is None, "New root should have no parent"
+        assert mcts.root.visit_count >= old_child_visits, "Visit count should increase"
+
+    def test_reset_tree_clears_root(self):
+        """Test reset_tree clears the stored root."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        # Build a tree
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        action_probs = mcts.search_with_tree_reuse(game, player)
+        assert mcts.root is not None, "Root should exist after search"
+
+        # Reset tree
+        mcts.reset_tree()
+        assert mcts.root is None, "Root should be None after reset"
+
+    def test_tree_reuse_with_unexpected_action(self):
+        """Test tree reuse handles action not in tree gracefully."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        # First search
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        action_probs = mcts.search_with_tree_reuse(game, player)
+
+        # Pick an action that might not be in tree (e.g., lowest probability)
+        unexpected_action = min(action_probs, key=action_probs.get)
+
+        # Apply action
+        game.apply_action(unexpected_action, player)
+        next_player = game.get_current_player()
+
+        # Search with unexpected action (might not be in tree)
+        # Should create new root instead of reusing
+        old_root = mcts.root
+        action_probs2 = mcts.search_with_tree_reuse(
+            game, next_player, previous_action=99  # Invalid action
+        )
+
+        # Should create new root since action not found
+        assert mcts.root is not None, "Should create new root"
+        assert mcts.root is not old_root, "Should be a different root"
+
+
+class TestMCTSBatchedInference:
+    """Test batched neural network inference for performance optimization."""
+
+    def test_search_batched_returns_valid_probabilities(self):
+        """Test batched search returns valid action probabilities."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=32)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Run batched search
+        action_probs = mcts.search_batched(game, player, batch_size=8)
+
+        # Check results
+        assert len(action_probs) > 0, "Should return action probabilities"
+        assert abs(sum(action_probs.values()) - 1.0) < 1e-5, "Probabilities should sum to 1"
+
+        # All actions should be legal
+        for action in action_probs.keys():
+            assert 0 <= action <= 3, f"Action {action} out of range for 3 cards"
+
+    def test_batched_vs_sequential_produces_similar_results(self):
+        """Test batched and sequential search produce similar results."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+        import torch
+
+        # Use fixed seed for reproducibility
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Sequential search
+        mcts_seq = MCTS(network, encoder, masker, num_simulations=40)
+        probs_seq = mcts_seq.search(game, player)
+
+        # Batched search
+        game2 = BlobGame(num_players=4)
+        game2.setup_round(cards_to_deal=3)
+        player2 = game2.players[0]
+
+        mcts_batch = MCTS(network, encoder, masker, num_simulations=40)
+        probs_batch = mcts_batch.search_batched(game2, player2, batch_size=8)
+
+        # Results should have same actions
+        assert set(probs_seq.keys()) == set(probs_batch.keys()), \
+            "Both should explore same actions"
+
+        # Note: Results won't be identical due to different traversal order,
+        # but distribution should be similar
+        # Check that top action is in top 2 of other method
+        best_seq = max(probs_seq, key=probs_seq.get)
+        best_batch = max(probs_batch, key=probs_batch.get)
+
+        top2_seq = sorted(probs_seq, key=probs_seq.get, reverse=True)[:2]
+        top2_batch = sorted(probs_batch, key=probs_batch.get, reverse=True)[:2]
+
+        assert best_seq in top2_batch or best_batch in top2_seq, \
+            "Best actions should be similar between methods"
+
+    def test_traverse_to_leaf_finds_unexpanded_node(self):
+        """Test _traverse_to_leaf finds unexpanded nodes."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        # Use player 1 (not dealer) to avoid forbidden bid issues
+        player = game.players[1]
+
+        # Create root node
+        from ml.mcts.node import MCTSNode
+        root = MCTSNode(game, player)
+
+        # Expand root with legal actions
+        legal_actions = [0, 1, 2, 3]
+        action_probs = {a: 0.25 for a in legal_actions}
+        root.expand(action_probs, legal_actions)
+
+        # Traverse should find a child (leaf)
+        leaf = mcts._traverse_to_leaf(root)
+
+        assert leaf is not None, "Should find a leaf node"
+        assert leaf.is_leaf(), "Found node should be a leaf"
+        assert leaf in root.children.values(), "Leaf should be a child of root"
+
+    def test_batch_expand_and_evaluate_handles_multiple_nodes(self):
+        """Test _batch_expand_and_evaluate expands multiple nodes."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+        from ml.mcts.node import MCTSNode
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        # Create multiple leaf nodes
+        nodes = []
+        for i in range(3):
+            game = BlobGame(num_players=4)
+            game.setup_round(cards_to_deal=3)
+            player = game.players[0]
+            node = MCTSNode(game, player)
+            nodes.append(node)
+
+        # All should be leaves initially
+        assert all(node.is_leaf() for node in nodes)
+
+        # Batch expand and evaluate
+        mcts._batch_expand_and_evaluate(nodes)
+
+        # All should now be expanded
+        assert all(not node.is_leaf() for node in nodes)
+        assert all(len(node.children) > 0 for node in nodes)
+        assert all(node.visit_count > 0 for node in nodes)
+
+    def test_batched_inference_with_different_batch_sizes(self):
+        """Test batched inference works with various batch sizes."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Test different batch sizes
+        for batch_size in [1, 4, 8, 16]:
+            game_copy = BlobGame(num_players=4)
+            game_copy.setup_round(cards_to_deal=3)
+            player_copy = game_copy.players[0]
+
+            mcts = MCTS(network, encoder, masker, num_simulations=32)
+            action_probs = mcts.search_batched(game_copy, player_copy, batch_size=batch_size)
+
+            assert len(action_probs) > 0, f"Should work with batch_size={batch_size}"
+            assert abs(sum(action_probs.values()) - 1.0) < 1e-5
+
+
+class TestMCTSPerformance:
+    """Performance benchmarks for MCTS search."""
+
+    def test_mcts_inference_speed_cpu(self):
+        """Benchmark MCTS inference speed on CPU."""
+        import time
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=50)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Warm-up run
+        _ = mcts.search(game, player)
+
+        # Benchmark
+        start_time = time.time()
+        action_probs = mcts.search(game, player)
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        print(f"\nMCTS inference (50 sims): {elapsed_ms:.2f} ms")
+        print(f"Time per simulation: {elapsed_ms/50:.2f} ms")
+
+        # Should complete in reasonable time (relaxed for CI)
+        assert elapsed_ms < 5000, f"Too slow: {elapsed_ms:.2f} ms > 5000 ms"
+        assert len(action_probs) > 0
+
+    def test_batched_inference_performance(self):
+        """Compare batched vs sequential inference performance."""
+        import time
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Sequential
+        mcts_seq = MCTS(network, encoder, masker, num_simulations=40)
+        start = time.time()
+        _ = mcts_seq.search(game, player)
+        time_seq = time.time() - start
+
+        # Batched
+        game2 = BlobGame(num_players=4)
+        game2.setup_round(cards_to_deal=5)
+        player2 = game2.players[0]
+
+        mcts_batch = MCTS(network, encoder, masker, num_simulations=40)
+        start = time.time()
+        _ = mcts_batch.search_batched(game2, player2, batch_size=8)
+        time_batch = time.time() - start
+
+        print(f"\nSequential: {time_seq*1000:.2f} ms")
+        print(f"Batched: {time_batch*1000:.2f} ms")
+        print(f"Speedup: {time_seq/time_batch:.2f}x")
+
+        # Both should complete successfully
+        assert time_seq > 0 and time_batch > 0
+
+    def test_tree_reuse_effectiveness(self):
+        """Measure effectiveness of tree reuse."""
+        import time
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=50)
+
+        # First search (cold start)
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        start = time.time()
+        action_probs = mcts.search_with_tree_reuse(game, player)
+        time_first = time.time() - start
+
+        best_action = max(action_probs, key=action_probs.get)
+
+        # Get stats before reuse
+        old_root_visits = mcts.root.visit_count
+
+        # Apply action
+        game.apply_action(best_action, player)
+        next_player = game.get_current_player()
+
+        # Second search (with tree reuse)
+        start = time.time()
+        action_probs2 = mcts.search_with_tree_reuse(
+            game, next_player, previous_action=best_action
+        )
+        time_reuse = time.time() - start
+
+        print(f"\nFirst search: {time_first*1000:.2f} ms")
+        print(f"Reused search: {time_reuse*1000:.2f} ms")
+        print(f"Speedup: {time_first/time_reuse:.2f}x")
+
+        # Root should have accumulated visits
+        assert mcts.root.visit_count >= 50, "Root should have at least 50 visits"
+
+        # Both should produce valid results
+        assert len(action_probs2) > 0
+
+
+class TestMCTSIntegrationComplete:
+    """Complete integration tests for optimized MCTS."""
+
+    def test_complete_game_with_tree_reuse(self):
+        """Test playing a complete game using tree reuse."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=30)
+
+        # Create game
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=2)
+
+        # Bidding phase with tree reuse
+        previous_action = None
+        for i, player in enumerate(game.players):
+            action_probs = mcts.search_with_tree_reuse(
+                game, player, previous_action=previous_action
+            )
+            bid = max(action_probs, key=action_probs.get)
+            game.apply_action(bid, player)
+            previous_action = bid
+
+            # After first player, tree should exist
+            if i == 0:
+                assert mcts.root is not None
+
+        # All players should have bids
+        assert all(p.bid is not None for p in game.players)
+
+        # Reset tree for playing phase
+        mcts.reset_tree()
+
+        print("\nBidding complete, all players have valid bids")
+
+    def test_batched_inference_complete_bidding(self):
+        """Test complete bidding round using batched inference."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=32)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+
+        # All players use batched search
+        for player in game.players:
+            action_probs = mcts.search_batched(game, player, batch_size=8)
+            bid = max(action_probs, key=action_probs.get)
+            player.make_bid(bid)
+
+        # All players should have bids
+        assert all(p.bid is not None for p in game.players)
+
+        # Dealer constraint respected
+        total_bids = sum(p.bid for p in game.players)
+        assert total_bids != 3, "Dealer constraint should be respected"
+
+        print("\nBatched inference: all players made valid bids")

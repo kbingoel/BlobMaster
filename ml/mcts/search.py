@@ -107,6 +107,9 @@ class MCTS:
         self.c_puct = c_puct
         self.temperature = temperature
 
+        # Tree reuse: Store root node for next search
+        self.root: Optional[MCTSNode] = None
+
         # Set network to evaluation mode (disable dropout, etc.)
         self.network.eval()
 
@@ -346,6 +349,227 @@ class MCTS:
         normalized_score = score / max_score
 
         return normalized_score
+
+    def search_with_tree_reuse(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        previous_action: Optional[int] = None,
+    ) -> Dict[int, float]:
+        """
+        Run MCTS with tree reuse.
+
+        If previous_action is provided, navigate to that child node
+        and make it the new root (keeping its subtree). This allows
+        reusing explored nodes from previous searches, significantly
+        improving performance.
+
+        Args:
+            game_state: Current game state
+            player: Current player
+            previous_action: Action taken to reach this state (from previous search)
+
+        Returns:
+            Action probabilities from visit counts
+
+        Example:
+            >>> # First move: build tree from scratch
+            >>> action_probs = mcts.search_with_tree_reuse(game, player)
+            >>> best_action = max(action_probs, key=action_probs.get)
+            >>>
+            >>> # Apply action to game
+            >>> game.apply_action(best_action, player)
+            >>>
+            >>> # Second move: reuse subtree
+            >>> action_probs = mcts.search_with_tree_reuse(
+            ...     game, next_player, previous_action=best_action
+            ... )
+        """
+        # Tree reuse: Navigate to child node from previous search
+        if self.root is not None and previous_action is not None:
+            if previous_action in self.root.children:
+                # Reuse subtree: make child the new root
+                self.root = self.root.children[previous_action]
+                self.root.parent = None  # Detach from old parent
+            else:
+                # Action not in tree (unexpected), create new root
+                self.root = None
+
+        # Create new root if needed (first search or reuse failed)
+        if self.root is None:
+            self.root = MCTSNode(
+                game_state=game_state,
+                player=player,
+                parent=None,
+                action_taken=None,
+                prior_prob=0.0,
+            )
+
+        # Run simulations from root
+        for _ in range(self.num_simulations):
+            self._simulate(self.root)
+
+        # Get action probabilities
+        action_probs = self.root.get_action_probabilities(self.temperature)
+
+        return action_probs
+
+    def reset_tree(self) -> None:
+        """
+        Clear tree (for new game or round).
+
+        Call this when starting a new game or when tree reuse is not possible
+        (e.g., after opponent's move that we didn't predict).
+
+        Example:
+            >>> # Start new game
+            >>> mcts.reset_tree()
+            >>> action_probs = mcts.search_with_tree_reuse(game, player)
+        """
+        self.root = None
+
+    def search_batched(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        batch_size: int = 8,
+    ) -> Dict[int, float]:
+        """
+        Run MCTS with batched neural network inference.
+
+        Accumulates leaf nodes and evaluates them in batches, improving
+        GPU utilization and overall performance. Particularly effective
+        when running on GPU with larger batch sizes.
+
+        Args:
+            game_state: Current game state
+            player: Current player
+            batch_size: Number of leaf nodes to evaluate per batch (default: 8)
+                       Larger = better GPU utilization but more memory
+                       Recommended: 8-16 for training, 4-8 for inference
+
+        Returns:
+            Action probabilities from visit counts
+
+        Example:
+            >>> # Use batched inference for better GPU utilization
+            >>> action_probs = mcts.search_batched(game, player, batch_size=16)
+        """
+        # Create root node
+        root = MCTSNode(
+            game_state=game_state,
+            player=player,
+            parent=None,
+            action_taken=None,
+            prior_prob=0.0,
+        )
+
+        # Calculate number of batches needed
+        num_batches = (self.num_simulations + batch_size - 1) // batch_size
+
+        for _ in range(num_batches):
+            # Collect leaf nodes for batch evaluation
+            leaf_nodes = []
+            current_batch_size = min(batch_size, self.num_simulations - len(leaf_nodes))
+
+            for _ in range(current_batch_size):
+                # Traverse to leaf
+                leaf = self._traverse_to_leaf(root)
+                if leaf is not None:
+                    leaf_nodes.append(leaf)
+
+            # Batch evaluate all collected leaves
+            if leaf_nodes:
+                self._batch_expand_and_evaluate(leaf_nodes)
+
+        # Get action probabilities from visit counts
+        return root.get_action_probabilities(self.temperature)
+
+    def _traverse_to_leaf(self, root: MCTSNode) -> Optional[MCTSNode]:
+        """
+        Traverse from root to leaf using UCB1.
+
+        Helper method for batched inference. Traverses tree until
+        reaching a leaf node (unexpanded node).
+
+        Args:
+            root: Node to start traversal from
+
+        Returns:
+            Leaf node reached, or None if root is terminal
+        """
+        node = root
+
+        # Selection: traverse until leaf
+        while not node.is_leaf():
+            node = node.select_child(self.c_puct)
+
+        # Check if terminal (don't return terminal nodes for batch evaluation)
+        if self._is_terminal(node.game_state):
+            # Handle terminal immediately
+            value = self._get_terminal_value(node.game_state, node.player)
+            node.backpropagate(value)
+            return None
+
+        return node
+
+    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode]) -> None:
+        """
+        Expand and evaluate multiple nodes in batch.
+
+        Performs batch neural network inference on multiple leaf nodes,
+        then expands each node with action priors and backpropagates values.
+
+        Args:
+            nodes: List of leaf nodes to evaluate
+
+        Example:
+            >>> leaves = [node1, node2, node3]
+            >>> mcts._batch_expand_and_evaluate(leaves)
+            >>> # All leaves now expanded with children
+        """
+        if not nodes:
+            return
+
+        # Encode all states
+        states = []
+        masks = []
+        legal_actions_list = []
+
+        for node in nodes:
+            state = self.encoder.encode(node.game_state, node.player)
+            legal_actions, mask = self._get_legal_actions_and_mask(
+                node.game_state, node.player
+            )
+
+            states.append(state)
+            masks.append(mask)
+            legal_actions_list.append(legal_actions)
+
+        # Stack into batch tensors
+        state_batch = torch.stack(states)
+        mask_batch = torch.stack(masks)
+
+        # Batch inference
+        with torch.no_grad():
+            policy_batch, value_batch = self.network(state_batch, mask_batch)
+
+        # Expand and backpropagate each node
+        for i, node in enumerate(nodes):
+            policy = policy_batch[i].cpu().numpy()
+            value = value_batch[i].item()
+
+            # Create action probs dictionary
+            action_probs = {
+                action: float(policy[action])
+                for action in legal_actions_list[i]
+            }
+
+            # Expand node
+            node.expand(action_probs, legal_actions_list[i])
+
+            # Backpropagate value
+            node.backpropagate(value)
 
 
 # Export main class
