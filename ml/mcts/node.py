@@ -3,6 +3,13 @@ MCTS Node implementation with UCB1 selection.
 
 This module implements the tree node structure for Monte Carlo Tree Search,
 including UCB1-based child selection, tree expansion, and backpropagation.
+
+Architecture Note (Session 7.5 - 2025-10-25):
+    Turn tracking delegates to BlobGame.get_current_player() as the canonical
+    source of truth. This ensures game logic stays centralized in the game
+    engine rather than being duplicated in MCTS, which is critical for Phase 3
+    imperfect information handling where we'll need to create multiple possible
+    game world copies with consistent turn tracking.
 """
 
 from typing import Dict, Optional, List
@@ -290,6 +297,11 @@ class MCTSNode:
         """
         Determine which player's turn it is in the given game state.
 
+        Delegates to BlobGame.get_current_player() as the canonical
+        source of truth for turn tracking. This ensures turn logic
+        is centralized in the game engine rather than duplicated
+        in MCTS.
+
         Args:
             game_state: Game state to check
 
@@ -297,23 +309,18 @@ class MCTSNode:
             Player whose turn it is
 
         Note:
-            This is a simplified version. In full MCTS search (Session 7),
-            we'll use more sophisticated turn tracking.
+            Falls back to self.player if no current player found
+            (e.g., at end of round/trick). This ensures MCTS node
+            always has a valid player reference.
         """
-        # For bidding phase, find next player who hasn't bid
-        if game_state.game_phase == "bidding":
-            bidding_order_start = (game_state.dealer_position + 1) % game_state.num_players
-            for i in range(game_state.num_players):
-                player_idx = (bidding_order_start + i) % game_state.num_players
-                player = game_state.players[player_idx]
-                if player.bid is None:
-                    return player
-            # All players have bid, return first player for playing phase
-            return game_state.players[bidding_order_start]
+        # Use canonical turn tracking from BlobGame
+        current_player = game_state.get_current_player()
 
-        # For playing phase, return current player
-        # (this will be refined in Session 7 with trick tracking)
-        return self.player
+        # Fallback: if no current player (end of round/trick), use self.player
+        if current_player is None:
+            return self.player
+
+        return current_player
 
     def backpropagate(self, value: float) -> None:
         """

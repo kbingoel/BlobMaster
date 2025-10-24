@@ -2244,3 +2244,199 @@ class TestGameFlow:
         game.game_phase = "complete"
         actions = game.get_legal_actions(player)
         assert actions == []
+
+
+# ============================================================================
+# TestGetCurrentPlayer: Test canonical turn tracking
+# ============================================================================
+
+
+class TestGetCurrentPlayer:
+    """
+    Test canonical turn tracking via get_current_player().
+
+    This is the single source of truth for turn order throughout the game.
+    Used by MCTS and AI components to determine whose turn it is.
+    """
+
+    def test_bidding_phase_first_player(self):
+        """First bidder is player left of dealer."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        current = game.get_current_player()
+        expected_idx = (game.dealer_position + 1) % 4
+
+        assert current is not None
+        assert current == game.players[expected_idx]
+        assert current.bid is None
+
+    def test_bidding_phase_sequence(self):
+        """Turn advances through all players in bidding order."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        bidders = []
+        for i in range(4):
+            current = game.get_current_player()
+            assert current is not None, f"No current player at step {i}"
+
+            bidders.append(current.position)
+            current.make_bid(0 if i < 3 else 1)  # Dealer can't bid 0 (forbidden)
+
+        # Should cycle through all 4 players exactly once
+        assert len(bidders) == 4
+        assert len(set(bidders)) == 4, "Should have 4 unique players"
+
+        # Verify bidding order starts left of dealer
+        expected_first = (game.dealer_position + 1) % 4
+        assert bidders[0] == expected_first
+
+    def test_bidding_complete_returns_none(self):
+        """Returns None when all players have bid."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Make all players bid
+        for i, player in enumerate(game.players):
+            if player.position == game.dealer_position:
+                player.make_bid(1)  # Dealer can't bid 0 in this scenario
+            else:
+                player.make_bid(0)
+
+        # No current player (all have bid)
+        assert game.get_current_player() is None
+
+    def test_playing_phase_first_trick_lead(self):
+        """First trick led by player left of dealer."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Complete bidding phase
+        for i, player in enumerate(game.players):
+            player.make_bid(0)
+
+        # Transition to playing phase
+        game.game_phase = "playing"
+        from ml.game.blob import Trick
+
+        game.current_trick = Trick(game.trump_suit)
+
+        current = game.get_current_player()
+        expected_idx = (game.dealer_position + 1) % 4
+
+        assert current is not None
+        assert current == game.players[expected_idx]
+
+    def test_playing_phase_turn_rotation(self):
+        """Turn rotates through players during trick."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Complete bidding
+        for player in game.players:
+            player.make_bid(0)
+
+        # Setup playing phase
+        game.game_phase = "playing"
+        from ml.game.blob import Trick
+
+        game.current_trick = Trick(game.trump_suit)
+
+        play_order = []
+        for i in range(4):
+            current = game.get_current_player()
+            assert current is not None, f"No current player at position {i}"
+
+            play_order.append(current.position)
+
+            # Simulate card play
+            card = current.hand[0]
+            game.current_trick.add_card(current, card)
+
+        # Should have 4 different players in order
+        assert len(play_order) == 4
+        assert len(set(play_order)) == 4
+
+        # Verify rotation is correct (sequential from lead player)
+        lead_idx = (game.dealer_position + 1) % 4
+        for i, pos in enumerate(play_order):
+            expected = (lead_idx + i) % 4
+            assert pos == expected, f"Position {i}: expected {expected}, got {pos}"
+
+    def test_playing_phase_subsequent_trick_winner_leads(self):
+        """Winner of previous trick leads next trick."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Complete bidding
+        for player in game.players:
+            player.make_bid(0)
+
+        game.game_phase = "playing"
+        from ml.game.blob import Trick
+
+        # Play first trick completely
+        first_trick = Trick(game.trump_suit)
+        game.current_trick = first_trick
+        lead_idx = (game.dealer_position + 1) % 4
+
+        for i in range(4):
+            player_idx = (lead_idx + i) % 4
+            player = game.players[player_idx]
+            card = player.hand[0]
+            first_trick.add_card(player, card)
+            player.hand.remove(card)
+
+        # Determine winner of first trick
+        winner = first_trick.determine_winner()
+        winner.win_trick()
+        game.tricks_history.append(first_trick)
+
+        # Start second trick
+        game.current_trick = Trick(game.trump_suit)
+        current = game.get_current_player()
+
+        # Winner of first trick should lead second trick
+        assert current == winner
+
+    def test_no_current_player_in_other_phases(self):
+        """Returns None in setup/scoring/complete phases."""
+        game = BlobGame(num_players=4)
+
+        # Setup phase (initial state)
+        assert game.game_phase == "setup"
+        assert game.get_current_player() is None
+
+        # Scoring phase
+        game.game_phase = "scoring"
+        assert game.get_current_player() is None
+
+        # Complete phase
+        game.game_phase = "complete"
+        assert game.get_current_player() is None
+
+    def test_playing_phase_trick_complete_returns_none(self):
+        """Returns None when trick is complete (all players played)."""
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Complete bidding
+        for player in game.players:
+            player.make_bid(0)
+
+        game.game_phase = "playing"
+        from ml.game.blob import Trick
+
+        game.current_trick = Trick(game.trump_suit)
+        lead_idx = (game.dealer_position + 1) % 4
+
+        # All 4 players play
+        for i in range(4):
+            player_idx = (lead_idx + i) % 4
+            player = game.players[player_idx]
+            card = player.hand[0]
+            game.current_trick.add_card(player, card)
+
+        # Trick complete, no current player
+        assert game.get_current_player() is None

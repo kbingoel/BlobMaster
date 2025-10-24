@@ -600,3 +600,468 @@ class TestMCTSNodeIntegration:
         selected_action = selected_child.action_taken
         other_action = 1 - selected_action
         assert probs[selected_action] > probs.get(other_action, 0)
+
+
+# ============================================================================
+# MCTS SEARCH TESTS
+# ============================================================================
+
+
+class TestMCTSSearch:
+    """Test MCTS search algorithm and integration with neural network."""
+
+    def test_mcts_initialization(self):
+        """Test MCTS initializes correctly with all components."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = MCTS(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_simulations=100,
+            c_puct=1.5,
+            temperature=1.0,
+        )
+
+        assert mcts.network is network
+        assert mcts.encoder is encoder
+        assert mcts.masker is masker
+        assert mcts.num_simulations == 100
+        assert mcts.c_puct == 1.5
+        assert mcts.temperature == 1.0
+
+    def test_search_returns_action_probabilities(self):
+        """Test MCTS search returns valid action probability dictionary."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        # Setup
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # Create game in bidding phase
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Run search
+        action_probs = mcts.search(game, player)
+
+        # Verify output format
+        assert isinstance(action_probs, dict)
+        assert len(action_probs) > 0
+        assert all(isinstance(k, (int, np.integer)) for k in action_probs.keys())
+        assert all(isinstance(v, float) for v in action_probs.values())
+
+    def test_search_probabilities_sum_to_one(self):
+        """Test action probabilities sum to approximately 1.0."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        action_probs = mcts.search(game, player)
+
+        # Probabilities should sum to ~1.0
+        prob_sum = sum(action_probs.values())
+        assert abs(prob_sum - 1.0) < 0.01, f"Probabilities sum to {prob_sum}, expected 1.0"
+
+    def test_search_only_returns_legal_actions(self):
+        """Test MCTS only returns probabilities for legal actions."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # BIDDING PHASE TEST
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        action_probs = mcts.search(game, player)
+
+        # All actions should be valid bids (0-5)
+        for action in action_probs.keys():
+            assert 0 <= action <= 5, f"Invalid bid action: {action}"
+
+    def test_search_respects_dealer_constraint(self):
+        """Test MCTS respects dealer's forbidden bid constraint."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=20)
+
+        # Setup game where dealer is last to bid
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+
+        # Simulate all players except dealer bidding
+        game.players[1].make_bid(1)  # Player 1 bids 1
+        game.players[2].make_bid(1)  # Player 2 bids 1
+        game.players[3].make_bid(0)  # Player 3 bids 0
+        # Total bids: 2, cards dealt: 3
+        # Dealer (player 0) cannot bid 1 (forbidden: 3 - 2 = 1)
+
+        dealer = game.players[0]
+        action_probs = mcts.search(game, dealer)
+
+        # Dealer should NOT have forbidden bid (1) in action probabilities
+        forbidden_bid = 3 - 2  # 1
+        assert forbidden_bid not in action_probs, \
+            f"Dealer should not be able to bid {forbidden_bid}"
+
+    def test_search_in_playing_phase(self):
+        """Test MCTS search works in card playing phase."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+        from ml.game.blob import Trick
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        # Use fewer simulations to reduce chance of deep tree issues
+        mcts = MCTS(network, encoder, masker, num_simulations=5)
+
+        # Setup game in playing phase
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+
+        # Complete bidding
+        for player in game.players:
+            player.make_bid(1)
+
+        # Start playing phase
+        game.game_phase = "playing"
+        game.current_trick = Trick(game.trump_suit)
+        player = game.players[0]
+
+        # Run search - this tests the integration works
+        action_probs = mcts.search(game, player)
+
+        # Should return card indices
+        assert len(action_probs) > 0, "MCTS should return action probabilities"
+
+        # All actions should be valid card indices (0-51)
+        for action in action_probs.keys():
+            assert 0 <= action <= 51, f"Invalid card index: {action}"
+
+        # Actions should correspond to cards in player's hand at root
+        hand_indices = [encoder._card_to_index(card) for card in player.hand]
+        for action in action_probs.keys():
+            assert action in hand_indices, \
+                f"Action {action} not in player's hand: {hand_indices}"
+
+    def test_terminal_state_detection(self):
+        """Test MCTS correctly detects terminal game states."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # Create terminal game state
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        game.game_phase = "complete"
+
+        # Check terminal detection
+        assert mcts._is_terminal(game) is True
+
+        # Non-terminal state
+        game.game_phase = "bidding"
+        assert mcts._is_terminal(game) is False
+
+    def test_terminal_value_calculation(self):
+        """Test terminal value is correctly calculated and normalized."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # Setup player with completed round
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Player makes bid and achieves it
+        player.make_bid(2)
+        player.tricks_won = 2
+
+        # Calculate terminal value
+        value = mcts._get_terminal_value(game, player)
+
+        # Expected: score = 10 + 2 = 12, normalized: 12 / 23 ≈ 0.52
+        expected_score = 12
+        expected_value = expected_score / 23.0
+        assert abs(value - expected_value) < 0.01, \
+            f"Terminal value {value} != expected {expected_value}"
+
+        # Player fails to make bid
+        player.tricks_won = 1  # Bid was 2, won 1
+        value = mcts._get_terminal_value(game, player)
+        assert value == 0.0, "Failed bid should give value 0.0"
+
+    def test_legal_actions_and_mask_bidding(self):
+        """Test legal action extraction in bidding phase."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        legal_actions, mask = mcts._get_legal_actions_and_mask(game, player)
+
+        # Should have bids 0-5 for non-dealer, or 0-5 minus forbidden for dealer
+        assert len(legal_actions) >= 5  # At least 5 legal actions
+        assert len(legal_actions) <= 6  # At most 6 legal actions
+        assert all(0 <= action <= 5 for action in legal_actions)
+
+        # Mask should match
+        assert mask.sum() >= 5  # At least 5 legal actions
+
+    def test_legal_actions_and_mask_playing(self):
+        """Test legal action extraction in playing phase."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+        from ml.game.blob import Trick
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Move to playing phase
+        for p in game.players:
+            p.make_bid(1)
+        game.game_phase = "playing"
+        game.current_trick = Trick(game.trump_suit)
+
+        legal_actions, mask = mcts._get_legal_actions_and_mask(game, player)
+
+        # Should have 5 legal actions (5 cards in hand)
+        assert len(legal_actions) == 5
+
+        # All actions should correspond to cards in hand
+        hand_indices = [encoder._card_to_index(card) for card in player.hand]
+        assert set(legal_actions) == set(hand_indices)
+
+    def test_expand_and_evaluate(self):
+        """Test node expansion and neural network evaluation."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # Create root node
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        root = MCTSNode(game, player)
+
+        # Expand and evaluate
+        value = mcts._expand_and_evaluate(root)
+
+        # Node should now be expanded
+        assert root.is_expanded is True
+        assert len(root.children) > 0
+
+        # Value should be in reasonable range [-1, 1]
+        assert -1.0 <= value <= 1.0, f"Value {value} out of range [-1, 1]"
+
+    def test_simulate_updates_tree(self):
+        """Test single simulation updates tree statistics."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=10)
+
+        # Create root
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        root = MCTSNode(game, player)
+
+        # Initial state
+        assert root.visit_count == 0
+        assert root.is_leaf()
+
+        # Run one simulation
+        value = mcts._simulate(root)
+
+        # Root should be expanded and visited
+        assert root.is_expanded is True
+        assert root.visit_count == 1
+        assert root.mean_value == value
+
+    def test_multiple_simulations_converge(self):
+        """Test multiple simulations build tree and converge."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=50)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Run search
+        action_probs = mcts.search(game, player)
+
+        # Should have explored multiple actions
+        assert len(action_probs) > 0
+
+        # At least one action should have significant probability
+        max_prob = max(action_probs.values())
+        assert max_prob > 0.1, "Should have at least one action with >10% probability"
+
+    def test_temperature_affects_action_selection(self):
+        """Test temperature parameter affects action probability distribution."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+        player = game.players[0]
+
+        # Low temperature (greedy)
+        mcts_greedy = MCTS(network, encoder, masker, num_simulations=30, temperature=0.0)
+        probs_greedy = mcts_greedy.search(game, player)
+
+        # One action should dominate (greedy selection)
+        max_prob_greedy = max(probs_greedy.values())
+        assert max_prob_greedy > 0.8, "Greedy should strongly prefer one action"
+
+        # High temperature (more uniform)
+        mcts_explore = MCTS(network, encoder, masker, num_simulations=30, temperature=2.0)
+        probs_explore = mcts_explore.search(game, player)
+
+        # Distribution should be more uniform
+        max_prob_explore = max(probs_explore.values())
+        assert max_prob_explore < max_prob_greedy, \
+            "High temperature should produce more uniform distribution"
+
+
+class TestMCTSIntegrationWithNetwork:
+    """Test MCTS integration with neural network components."""
+
+    def test_full_mcts_search_pipeline(self):
+        """Test complete MCTS pipeline from game state to action."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        # Initialize all components
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=50)
+
+        # Create game
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Run search
+        action_probs = mcts.search(game, player)
+
+        # Select action
+        best_action = max(action_probs, key=action_probs.get)
+
+        # Verify action is legal
+        assert 0 <= best_action <= 5, f"Selected action {best_action} out of range"
+
+        # Apply action should work
+        player.make_bid(best_action)
+        assert player.bid == best_action
+
+    def test_mcts_plays_complete_bidding_round(self):
+        """Test MCTS can play complete bidding round for all players."""
+        from ml.mcts.search import MCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+        mcts = MCTS(network, encoder, masker, num_simulations=30)
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=3)
+
+        # All players make bids using MCTS
+        for player in game.players:
+            action_probs = mcts.search(game, player)
+            bid = max(action_probs, key=action_probs.get)
+            player.make_bid(bid)
+
+        # All players should have bids
+        assert all(p.bid is not None for p in game.players)
+
+        # Dealer constraint should be respected
+        total_bids = sum(p.bid for p in game.players)
+        cards_dealt = 3
+        assert total_bids != cards_dealt, "Dealer constraint violated"

@@ -1537,6 +1537,99 @@ class BlobGame:
             # No actions available in other phases
             return []
 
+    def get_current_player(self) -> Optional[Player]:
+        """
+        Get the player whose turn it is in the current game state.
+
+        This is the canonical source of truth for turn tracking throughout
+        the game. Used by MCTS and other AI components to determine whose
+        turn it is without duplicating game logic.
+
+        Returns:
+            Player whose turn it is, or None if no active turn
+            (e.g., between phases, all players have acted, etc.)
+
+        Raises:
+            GameStateException: If playing phase has no current trick
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> current = game.get_current_player()
+            >>> current == game.players[(game.dealer_position + 1) % 4]
+            True
+
+            >>> # After all players bid
+            >>> for p in game.players:
+            ...     p.make_bid(1)
+            >>> game.get_current_player() is None
+            True
+        """
+        if self.game_phase == "bidding":
+            # BIDDING PHASE: Find next player who hasn't bid yet
+            # Bidding order starts with player left of dealer
+            bidding_order_start = (self.dealer_position + 1) % self.num_players
+
+            for i in range(self.num_players):
+                player_idx = (bidding_order_start + i) % self.num_players
+                player = self.players[player_idx]
+                if player.bid is None:
+                    return player
+
+            # All players have bid
+            return None
+
+        elif self.game_phase == "playing":
+            # PLAYING PHASE: Determine next player based on current trick state
+
+            # Validate we have a current trick
+            if self.current_trick is None:
+                raise GameStateException(
+                    "No current trick in playing phase - game state inconsistent"
+                )
+
+            num_cards_in_trick = len(self.current_trick.cards_played)
+
+            # Check if trick is complete
+            if num_cards_in_trick >= self.num_players:
+                return None
+
+            # Determine who plays next based on trick state
+            if num_cards_in_trick == 0:
+                # First card of trick: determine lead player
+                if not self.tricks_history:
+                    # First trick of round: player left of dealer leads
+                    lead_idx = (self.dealer_position + 1) % self.num_players
+                else:
+                    # Subsequent tricks: winner of last trick leads
+                    last_winner = self.tricks_history[-1].winner
+                    if last_winner is None:
+                        raise GameStateException(
+                            "Last trick has no winner - game state inconsistent"
+                        )
+                    lead_idx = last_winner.position
+
+                return self.players[lead_idx]
+
+            else:
+                # Mid-trick: find next player in rotation
+                # Last player to play is at end of cards_played list
+                last_player = self.current_trick.cards_played[-1][0]
+
+                # Find next player in rotation who still has cards
+                for offset in range(1, self.num_players + 1):
+                    next_idx = (last_player.position + offset) % self.num_players
+                    next_player = self.players[next_idx]
+                    if len(next_player.hand) > 0:
+                        return next_player
+
+                # No players with cards left (shouldn't happen mid-trick)
+                return None
+
+        else:
+            # No active player in other phases (setup, scoring, complete)
+            return None
+
     def copy(self) -> "BlobGame":
         """
         Create deep copy of game state for MCTS simulation.
@@ -1636,6 +1729,13 @@ class BlobGame:
             # Apply bid
             player.make_bid(action)
 
+            # Check if all players have now bid -> transition to playing phase
+            all_players_bid = all(p.bid is not None for p in self.players)
+            if all_players_bid:
+                self.game_phase = "playing"
+                # Initialize first trick for playing phase
+                self.current_trick = Trick(self.trump_suit)
+
         elif self.game_phase == "playing":
             # PLAYING PHASE: action is card index (0-51)
             # Convert card index to Card object using the standard mapping
@@ -1684,6 +1784,21 @@ class BlobGame:
             played_card = player.play_card(target_card)
             self.current_trick.add_card(player, played_card)
             self.update_card_counting(played_card, player, led_suit)
+
+            # Check if trick is complete -> determine winner and start new trick
+            if self.current_trick.is_complete(self.num_players):
+                winner = self.current_trick.determine_winner()
+                winner.win_trick()
+                self.tricks_history.append(self.current_trick)
+
+                # Check if round is complete (all cards played)
+                all_hands_empty = all(len(p.hand) == 0 for p in self.players)
+                if all_hands_empty:
+                    self.game_phase = "scoring"
+                    self.current_trick = None
+                else:
+                    # Start new trick
+                    self.current_trick = Trick(self.trump_suit)
 
         else:
             raise GameStateException(
