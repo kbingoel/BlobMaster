@@ -62,7 +62,7 @@ For this project, we're using an **AlphaZero-inspired approach** rather than pur
 The AI needs to encode a **belief state** since opponent hands are hidden:
 
 ```
-State Vector (~256-512 dimensions):
+State Vector (256 dimensions):
 ├── My Hand (52-dim binary: which cards I hold)
 ├── Cards Played This Trick (52-dim sequential)
 ├── All Cards Played This Round (52-dim binary)
@@ -86,7 +86,7 @@ State Vector (~256-512 dimensions):
 **Lightweight Transformer** (~5-8M parameters for laptop inference):
 
 ```
-Input Encoder (512-dim)
+Input Encoder (256-dim)
     ↓
 Positional Encoding (handle variable game state)
     ↓
@@ -297,7 +297,7 @@ blobmaster/
 **Goal**: Basic AI that can play legal moves and improve with training
 
 - [ ] Implement state encoding (`network/encode.py`):
-  - Convert game state → 512-dim tensor
+  - Convert game state → 256-dim tensor
   - Handle variable player counts with masking
   - Belief state representation
 
@@ -456,7 +456,7 @@ blobmaster/
 
 ```python
 # Network
-EMBEDDING_DIM = 512
+EMBEDDING_DIM = 256
 NUM_TRANSFORMER_LAYERS = 6
 NUM_HEADS = 8
 DROPOUT = 0.1

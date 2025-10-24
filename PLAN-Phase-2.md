@@ -125,15 +125,15 @@ State Encoding Dimensions (256 total):
 Total: 52 + 52 + 52 + 8 + 8 + 1 + 1 + 8 + 1 + 3 + 16 = 202 base dimensions
 Padded to 256 with zeros for future extensibility (54 dimensions spare)
 
-Architecture Decision: Why 256 vs 512?
----------------------------------------
-- 202 required dimensions + 54 spare = 26% overhead (vs 60% with 512)
-- 2x less memory per state vector (1KB vs 2KB)
-- 4x fewer parameters in embedding layer (65K vs 262K)
-- Faster CPU inference on Intel laptop (deployment target)
+Architecture Decision: State Vector Dimensions
+----------------------------------------------
+- 202 required dimensions + 54 spare = 26% padding overhead (optimal efficiency)
+- 2x less memory per state vector (1KB)
+- 4x fewer parameters in embedding layer vs larger alternatives (65K)
+- Optimized for CPU inference on Intel laptop (deployment target)
 - Better cache utilization (fits in L1/L2 cache)
-- Still power-of-2 for hardware memory alignment benefits
-- Results in ~60% smaller model overall (2-3M vs 5-8M parameters)
+- Power-of-2 size for optimal hardware memory alignment
+- Compact model footprint (~2-3M parameters)
 """
 ```
 
@@ -153,7 +153,7 @@ class StateEncoder:
     """
     Encodes game state into tensor representation for neural network.
 
-    Output: torch.Tensor of shape (512,) containing:
+    Output: torch.Tensor of shape (256,) containing:
         - Card representations (one-hot, sequential)
         - Player state (bids, tricks, positions)
         - Game metadata (trump, phase, constraints)
@@ -417,21 +417,21 @@ Architecture:
        - Predicts how well current player will do
 
 Hyperparameters (Optimized for CPU Inference):
-    - State dim: 256 (reduced from 512)
-    - Embedding dim: 256 (reduced from 512)
+    - State dim: 256
+    - Embedding dim: 256
     - Transformer layers: 6
     - Attention heads: 8
-    - Feedforward dim: 1024 (reduced from 2048)
+    - Feedforward dim: 1024
     - Dropout: 0.1
 
-Total Parameters: ~2-3M (optimized for laptop CPU inference)
+Total Parameters: ~2-3M (compact, optimized for laptop CPU inference)
 
 Performance Benefits:
-    - 4x fewer parameters in embedding layer (65K vs 262K)
-    - 2x smaller feedforward layers (1024 vs 2048)
-    - ~60% smaller model overall (2-3M vs 5-8M parameters)
-    - Faster inference on Intel i5-1135G7 iGPU
-    - Better memory efficiency for 8GB RTX 4060 training
+    - Efficient parameter count (65K in embedding layer)
+    - Lean feedforward layers (1024 hidden units)
+    - Compact model size (2-3M parameters)
+    - Fast inference on Intel i5-1135G7 iGPU
+    - Excellent memory efficiency for 8GB RTX 4060 training
 """
 ```
 
@@ -2065,7 +2065,7 @@ def test_mcts_beats_random():
 ## Success Criteria
 
 ### Functional Requirements
-✅ State encoder converts game state → 512-dim tensor
+✅ State encoder converts game state → 256-dim tensor
 ✅ Neural network produces policy and value outputs
 ✅ Legal action masking prevents illegal moves
 ✅ MCTS integrates with neural network

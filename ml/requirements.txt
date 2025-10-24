@@ -1,5 +1,8 @@
-# Core ML Framework (install separately with CUDA support)
-# torch>=2.0
+# Core ML Framework
+# For CUDA support (RTX 4060 training PC):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CPU-only (Intel laptop inference): see requirements-cpu.txt
+torch>=2.0.0
 # torchvision
 # torchaudio
 

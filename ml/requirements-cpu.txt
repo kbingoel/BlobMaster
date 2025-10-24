@@ -1,0 +1,32 @@
+# CPU-only requirements for inference on Intel laptop
+# Use this file for deployment on machines without NVIDIA GPU
+
+# Core ML Framework (CPU version)
+torch>=2.0.0
+# torchvision  # Uncomment if needed
+# torchaudio   # Uncomment if needed
+
+# To install CPU version explicitly:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# ONNX Export and Runtime (CPU optimized)
+onnx>=1.15.0
+onnxruntime>=1.16.0
+# onnxruntime-openvino>=1.16.0  # For Intel iGPU optimization
+
+# Array/Matrix Operations
+numpy>=1.24.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Code Quality
+black>=23.12.0
+flake8>=7.0.0
+mypy>=1.7.0

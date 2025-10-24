@@ -112,7 +112,7 @@ Self-Play → Replay Buffer → Network Training → Evaluation → Checkpoint
 
 **Key Components**:
 
-- **Game State Encoder**: Converts imperfect information game state → 512-dim tensor
+- **Game State Encoder**: Converts imperfect information game state → 256-dim tensor
   - Player's hand, cards played, bids, tricks won, belief state about opponent cards
   - Handles variable player counts (3-8 players) with masking
 
