@@ -58,14 +58,18 @@ class Determinizer:
         max_attempts: Maximum sampling attempts before giving up
     """
 
-    def __init__(self, max_attempts: int = 100):
+    def __init__(self, max_attempts: int = 100, use_caching: bool = True):
         """
         Initialize determinizer.
 
         Args:
             max_attempts: Maximum sampling attempts before giving up
+            use_caching: Whether to cache recent samples for diversity
         """
         self.max_attempts = max_attempts
+        self.use_caching = use_caching
+        self.sample_cache: List[Dict[int, List[Card]]] = []
+        self.cache_size = 20
 
     def sample_determinization(
         self,
@@ -295,3 +299,178 @@ class Determinizer:
         det_game.players[observer_pos].hand = list(belief.known_cards)
 
         return det_game
+
+    def _propagate_constraints(
+        self, belief: BeliefState, sampled_hands: Dict[int, List[Card]]
+    ) -> bool:
+        """
+        Propagate constraints forward to check for conflicts.
+
+        Detects early if a partial sample will lead to inconsistency by
+        checking if remaining players can still be satisfied with the
+        available card pool.
+
+        Args:
+            belief: Belief state
+            sampled_hands: Partially sampled hands
+
+        Returns:
+            True if constraints are satisfiable, False if conflict detected
+        """
+        # Count cards remaining per suit
+        unseen_pool = set(belief.unseen_cards)
+        for hand in sampled_hands.values():
+            for card in hand:
+                unseen_pool.discard(card)
+
+        # Check remaining players can be satisfied
+        remaining_players = [
+            pos for pos in belief.player_constraints if pos not in sampled_hands
+        ]
+
+        for player_pos in remaining_players:
+            constraints = belief.player_constraints[player_pos]
+            cards_needed = constraints.cards_in_hand
+
+            # Count available cards for this player
+            available = [
+                card for card in unseen_pool if constraints.can_have_card(card)
+            ]
+
+            if len(available) < cards_needed:
+                return False  # Not enough cards available
+
+        return True
+
+    def sample_determinization_with_diversity(
+        self,
+        game: BlobGame,
+        belief: BeliefState,
+        avoid_samples: Optional[List[Dict[int, List[Card]]]] = None,
+    ) -> Optional[Dict[int, List[Card]]]:
+        """
+        Sample a determinization that's diverse from previous samples.
+
+        Attempts to generate samples that are sufficiently different from
+        existing samples to provide better coverage of the belief space.
+
+        Args:
+            game: Current game state
+            belief: Belief state
+            avoid_samples: List of samples to avoid (for diversity)
+
+        Returns:
+            Sampled hands that are different from avoid_samples
+        """
+        for attempt in range(self.max_attempts):
+            sample = self.sample_determinization(game, belief, use_probabilities=True)
+
+            if sample is None:
+                continue
+
+            # Check diversity
+            if avoid_samples is None or self._is_diverse(sample, avoid_samples):
+                return sample
+
+        # Fall back to any valid sample
+        return self.sample_determinization(game, belief, use_probabilities=True)
+
+    def _is_diverse(
+        self,
+        sample: Dict[int, List[Card]],
+        existing_samples: List[Dict[int, List[Card]]],
+        threshold: float = 0.3,
+    ) -> bool:
+        """
+        Check if sample is sufficiently different from existing samples.
+
+        Uses Jaccard similarity to measure how similar two hand assignments are.
+        A sample is considered diverse if it differs from all existing samples
+        by at least the threshold percentage.
+
+        Args:
+            sample: New sample to check
+            existing_samples: Existing samples
+            threshold: Minimum difference ratio (0.3 = 30% different cards)
+
+        Returns:
+            True if sample is diverse enough
+        """
+        for existing in existing_samples:
+            similarity = self._compute_similarity(sample, existing)
+            if similarity > (1.0 - threshold):
+                return False  # Too similar
+
+        return True
+
+    def _compute_similarity(
+        self, sample1: Dict[int, List[Card]], sample2: Dict[int, List[Card]]
+    ) -> float:
+        """
+        Compute Jaccard similarity between two samples.
+
+        Jaccard similarity is |intersection| / |union| of the card sets.
+        Returns 1.0 if samples are identical, 0.0 if completely different.
+
+        Args:
+            sample1: First hand assignment
+            sample2: Second hand assignment
+
+        Returns:
+            Similarity in [0, 1] where 1 = identical
+        """
+        all_cards1 = set()
+        all_cards2 = set()
+
+        for hand in sample1.values():
+            all_cards1.update(hand)
+
+        for hand in sample2.values():
+            all_cards2.update(hand)
+
+        intersection = len(all_cards1 & all_cards2)
+        union = len(all_cards1 | all_cards2)
+
+        return intersection / union if union > 0 else 0.0
+
+    def sample_adaptive(
+        self,
+        game: BlobGame,
+        belief: BeliefState,
+        num_samples: int,
+        diversity_weight: float = 0.5,
+    ) -> List[Dict[int, List[Card]]]:
+        """
+        Sample determinizations with adaptive diversity control.
+
+        Balances between probability-weighted sampling (which respects
+        belief distributions) and diversity (which ensures good coverage
+        of the belief space).
+
+        Args:
+            game: Current game state
+            belief: Belief state
+            num_samples: Number of samples to generate
+            diversity_weight: Weight for diversity vs probability (0-1)
+                            0 = pure probability sampling
+                            1 = pure diversity sampling
+
+        Returns:
+            List of diverse determinizations
+        """
+        samples = []
+
+        for i in range(num_samples):
+            if i == 0 or random.random() > diversity_weight:
+                # First sample or probability-weighted sampling
+                sample = self.sample_determinization(game, belief, use_probabilities=True)
+            else:
+                # Diversity-focused sampling
+                sample = self.sample_determinization_with_diversity(
+                    game, belief, avoid_samples=samples
+                )
+
+            if sample is not None:
+                samples.append(sample)
+
+        return samples

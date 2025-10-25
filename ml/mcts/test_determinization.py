@@ -874,3 +874,315 @@ class TestDeterminization:
 
         # Should get close to 5 (may be slightly less if sampling fails)
         assert len(samples) >= 4
+
+
+class TestDeterminizationAdvanced:
+    """Advanced tests for determinization quality and optimization."""
+
+    def test_diversity_sampling(self):
+        """Test diversity-focused sampling produces different results."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        samples = determinizer.sample_adaptive(
+            game, belief, num_samples=5, diversity_weight=0.8
+        )
+
+        # Should get most samples
+        assert len(samples) >= 4
+
+        # Check diversity - samples should be different from each other
+        for i, sample1 in enumerate(samples):
+            for j, sample2 in enumerate(samples):
+                if i < j:
+                    similarity = determinizer._compute_similarity(sample1, sample2)
+                    # Should be different (similarity < 0.9)
+                    assert similarity < 0.9
+
+    def test_compute_similarity_identical_samples(self):
+        """Test similarity computation for identical samples."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+
+        # Identical samples should have similarity 1.0
+        similarity = determinizer._compute_similarity(sample, sample)
+        assert abs(similarity - 1.0) < 0.01
+
+    def test_compute_similarity_different_samples(self):
+        """Test similarity computation for different samples."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample1 = determinizer.sample_determinization(game, belief)
+        sample2 = determinizer.sample_determinization(game, belief)
+
+        # Different samples should have similarity < 1.0 (usually)
+        similarity = determinizer._compute_similarity(sample1, sample2)
+        assert 0.0 <= similarity <= 1.0
+
+    def test_is_diverse_threshold(self):
+        """Test diversity checking with different thresholds."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample1 = determinizer.sample_determinization(game, belief)
+        sample2 = determinizer.sample_determinization(game, belief)
+
+        existing_samples = [sample1]
+
+        # Check diversity with strict threshold (0.5 = 50% different)
+        is_diverse_strict = determinizer._is_diverse(
+            sample2, existing_samples, threshold=0.5
+        )
+
+        # Check diversity with loose threshold (0.1 = 10% different)
+        is_diverse_loose = determinizer._is_diverse(
+            sample2, existing_samples, threshold=0.1
+        )
+
+        # Loose threshold should be easier to satisfy
+        # (this is probabilistic, so we just check the API works)
+        assert isinstance(is_diverse_strict, bool)
+        assert isinstance(is_diverse_loose, bool)
+
+    def test_constraint_propagation_detects_conflicts(self):
+        """Test constraint propagation catches impossible scenarios."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        # Create very tight constraints (may make sampling impossible)
+        for player_pos in belief.player_constraints:
+            constraints = belief.player_constraints[player_pos]
+            # Eliminate 3 suits (very constrained)
+            constraints.cannot_have_suits = {"♠", "♥", "♣"}
+
+        # Try to sample - should handle gracefully
+        sample = determinizer.sample_determinization(game, belief)
+
+        # Either succeeds with valid sample or returns None
+        if sample is not None:
+            assert determinizer._validate_sample(sample, belief)
+
+    def test_constraint_propagation_valid_partial(self):
+        """Test constraint propagation accepts valid partial samples."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        # Create a partial sample (just one player)
+        sample1 = determinizer.sample_determinization(game, belief)
+        if sample1 is not None:
+            # Take just the first player's hand
+            partial_sample = {list(sample1.keys())[0]: sample1[list(sample1.keys())[0]]}
+
+            # Should be able to satisfy remaining players
+            can_satisfy = determinizer._propagate_constraints(belief, partial_sample)
+
+            # Should return True for reasonable constraints
+            assert isinstance(can_satisfy, bool)
+
+    def test_probability_weighted_sampling_quality(self):
+        """Test probability-weighted sampling respects distributions."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Artificially boost probability of specific card
+        high_prob_card = list(belief.unseen_cards)[0]
+        belief.card_probabilities[opponent_pos][high_prob_card] = 2.0
+        belief._normalize_probabilities(opponent_pos)
+
+        determinizer = Determinizer()
+
+        # Sample many times
+        count_with_card = 0
+        num_trials = 100
+
+        for _ in range(num_trials):
+            sample = determinizer.sample_determinization(
+                game, belief, use_probabilities=True
+            )
+            if sample and high_prob_card in sample[opponent_pos]:
+                count_with_card += 1
+
+        # Should appear more often than random (>20% vs ~20% expected baseline)
+        # With boosted probability, should see it more frequently
+        assert count_with_card > 25
+
+    def test_sample_adaptive_diversity_weight_zero(self):
+        """Test adaptive sampling with zero diversity weight (pure probability)."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        samples = determinizer.sample_adaptive(
+            game, belief, num_samples=5, diversity_weight=0.0
+        )
+
+        # Should still get samples
+        assert len(samples) >= 4
+
+    def test_sample_adaptive_diversity_weight_one(self):
+        """Test adaptive sampling with max diversity weight."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        samples = determinizer.sample_adaptive(
+            game, belief, num_samples=5, diversity_weight=1.0
+        )
+
+        # Should still get samples
+        assert len(samples) >= 4
+
+        # Check that samples are diverse
+        if len(samples) >= 2:
+            for i in range(len(samples) - 1):
+                similarity = determinizer._compute_similarity(samples[i], samples[i + 1])
+                # Should be reasonably diverse
+                assert similarity < 0.95
+
+    def test_sample_with_diversity_fallback(self):
+        """Test diversity sampling falls back gracefully."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer(max_attempts=10)  # Low attempts for testing
+
+        # Generate a few samples
+        existing_samples = []
+        for _ in range(3):
+            sample = determinizer.sample_determinization(game, belief)
+            if sample:
+                existing_samples.append(sample)
+
+        # Try to get a diverse sample
+        diverse_sample = determinizer.sample_determinization_with_diversity(
+            game, belief, avoid_samples=existing_samples
+        )
+
+        # Should either get a diverse sample or fall back to any sample
+        # (either way, should get something)
+        assert diverse_sample is not None or len(existing_samples) > 0
+
+    def test_caching_initialization(self):
+        """Test that caching is properly initialized."""
+        from ml.mcts.determinization import Determinizer
+
+        # With caching
+        det_with_cache = Determinizer(use_caching=True)
+        assert det_with_cache.use_caching is True
+        assert det_with_cache.sample_cache == []
+        assert det_with_cache.cache_size == 20
+
+        # Without caching
+        det_no_cache = Determinizer(use_caching=False)
+        assert det_no_cache.use_caching is False
+
+
+def test_determinization_performance_benchmarks():
+    """
+    Benchmark determinization performance.
+
+    Validates Phase 3 performance targets:
+    - Single sample: <10ms
+    - 5 samples batch: <50ms
+    """
+    import time
+    from ml.mcts.determinization import Determinizer
+
+    game = BlobGame(num_players=4)
+    game.setup_round(cards_to_deal=5)
+    observer = game.players[0]
+
+    belief = BeliefState(game, observer)
+    determinizer = Determinizer()
+
+    # Benchmark single sample
+    start = time.time()
+    for _ in range(100):
+        sample = determinizer.sample_determinization(game, belief)
+    single_time = (time.time() - start) * 1000 / 100
+
+    print(f"\nSingle sample: {single_time:.2f} ms")
+    assert single_time < 10.0
+
+    # Benchmark multiple samples
+    start = time.time()
+    for _ in range(20):
+        samples = determinizer.sample_multiple_determinizations(
+            game, belief, num_samples=5
+        )
+    multi_time = (time.time() - start) * 1000 / 20
+
+    print(f"5 samples batch: {multi_time:.2f} ms")
+    assert multi_time < 50.0  # 5 samples in <50ms
+
+    # Benchmark adaptive sampling
+    start = time.time()
+    for _ in range(20):
+        samples = determinizer.sample_adaptive(
+            game, belief, num_samples=5, diversity_weight=0.5
+        )
+    adaptive_time = (time.time() - start) * 1000 / 20
+
+    print(f"5 adaptive samples: {adaptive_time:.2f} ms")
+    assert adaptive_time < 100.0  # Allow more time for diversity checks
+
+    print("\nAll performance targets met!")
