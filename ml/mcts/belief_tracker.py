@@ -115,17 +115,19 @@ class BeliefState:
         player_constraints: Constraints on each opponent's possible hand
     """
 
-    def __init__(self, game: BlobGame, observer: Player):
+    def __init__(self, game: BlobGame, observer: Player, enable_caching: bool = True):
         """
         Initialize belief state from observer's perspective.
 
         Args:
             game: Current game state
             observer: Player whose perspective we're tracking
+            enable_caching: Enable caching of computed results (default: True)
         """
         self.game = game
         self.observer = observer
         self.num_players = len(game.players)
+        self.enable_caching = enable_caching
 
         # Track which cards are known
         self.known_cards: Set[Card] = set(observer.hand)  # We know our own hand
@@ -162,6 +164,9 @@ class BeliefState:
         # Shape: Dict[player_position, Dict[Card, float]]
         self.card_probabilities: Dict[int, Dict[Card, float]] = {}
         self._initialize_probabilities()
+
+        # Cache for expensive computations
+        self._cached_possible_cards: Dict[int, Set[Card]] = {}
 
     def _initialize_constraints_from_history(self):
         """
@@ -224,9 +229,41 @@ class BeliefState:
         self.played_cards.add(card)
         self.unseen_cards.discard(card)
 
+        # Invalidate cache since state has changed
+        self.invalidate_cache()
+
     def get_possible_cards(self, player_position: int) -> Set[Card]:
         """
-        Get set of cards that a player could possibly have.
+        Get set of cards that a player could possibly have (with caching).
+
+        Uses memoization to avoid recomputing the same result multiple times.
+        Cache is invalidated when belief state is updated.
+
+        Args:
+            player_position: Position of player to query
+
+        Returns:
+            Set of cards consistent with all constraints
+        """
+        if player_position == self.observer.position:
+            return self.known_cards
+
+        # Check cache first
+        if self.enable_caching and player_position in self._cached_possible_cards:
+            return self._cached_possible_cards[player_position]
+
+        # Compute possible cards
+        possible = self._compute_possible_cards(player_position)
+
+        # Cache result
+        if self.enable_caching:
+            self._cached_possible_cards[player_position] = possible
+
+        return possible
+
+    def _compute_possible_cards(self, player_position: int) -> Set[Card]:
+        """
+        Compute possible cards (original implementation without caching).
 
         Args:
             player_position: Position of player to query
@@ -457,6 +494,23 @@ class BeliefState:
             lines.append(f"  Belief entropy: {entropy:.2f} bits")
 
         return "\n".join(lines)
+
+    def invalidate_cache(self):
+        """
+        Invalidate cached data after state updates.
+
+        Call this method after updating constraints or belief state to ensure
+        cached results are recomputed with the new information.
+
+        This is automatically called by update methods, but can be called
+        manually if needed.
+
+        Example:
+            >>> belief.player_constraints[1].cannot_have_suits.add('♠')
+            >>> belief.invalidate_cache()  # Force recomputation
+            >>> possible = belief.get_possible_cards(1)
+        """
+        self._cached_possible_cards.clear()
 
     def copy(self) -> "BeliefState":
         """

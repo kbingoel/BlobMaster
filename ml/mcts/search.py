@@ -620,6 +620,7 @@ class ImperfectInfoMCTS:
         simulations_per_determinization: int = 50,
         c_puct: float = 1.5,
         temperature: float = 1.0,
+        use_parallel: bool = False,
     ):
         """
         Initialize imperfect information MCTS.
@@ -634,6 +635,7 @@ class ImperfectInfoMCTS:
                                             More = better per-world evaluation
             c_puct: Exploration constant (default: 1.5)
             temperature: Temperature for action selection (default: 1.0)
+            use_parallel: Use parallel evaluation of determinizations (default: False)
 
         Note:
             Total budget = num_determinizations × simulations_per_determinization
@@ -646,6 +648,7 @@ class ImperfectInfoMCTS:
         self.simulations_per_determinization = simulations_per_determinization
         self.c_puct = c_puct
         self.temperature = temperature
+        self.use_parallel = use_parallel
 
         # Import determinization components
         from ml.mcts.belief_tracker import BeliefState
@@ -835,6 +838,130 @@ class ImperfectInfoMCTS:
         }
 
         return action_probs, details
+
+    def search_parallel(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        belief: Optional["BeliefState"] = None,
+    ) -> Dict[int, float]:
+        """
+        Run imperfect information MCTS with parallel determinizations.
+
+        Evaluates multiple determinizations in parallel for improved performance.
+        Uses ThreadPoolExecutor to run MCTS on different worlds concurrently.
+
+        Args:
+            game_state: Current game state (with hidden hands)
+            player: Player whose turn it is
+            belief: Belief state (will be created if None)
+
+        Returns:
+            Dictionary mapping action → probability
+
+        Note:
+            Parallel evaluation is most beneficial when:
+            - CPU has multiple cores available
+            - Network inference is fast (GPU)
+            - num_determinizations >= 4
+
+        Example:
+            >>> mcts = ImperfectInfoMCTS(
+            ...     network, encoder, masker,
+            ...     use_parallel=True
+            ... )
+            >>> action_probs = mcts.search_parallel(game, player)
+        """
+        from ml.mcts.belief_tracker import BeliefState
+
+        # Create belief state if not provided
+        if belief is None:
+            belief = BeliefState(game_state, player)
+
+        # Sample determinizations
+        determinizations = self.determinizer.sample_adaptive(
+            game_state, belief, num_samples=self.num_determinizations
+        )
+
+        if not determinizations:
+            # Fall back to single MCTS if sampling fails
+            return self.perfect_info_mcts.search(game_state, player)
+
+        # Create determinized games
+        det_games = [
+            self.determinizer.create_determinized_game(game_state, belief, det_hands)
+            for det_hands in determinizations
+        ]
+
+        if self.use_parallel:
+            # Parallel evaluation using ThreadPoolExecutor
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.num_determinizations
+            ) as executor:
+                futures = [
+                    executor.submit(self.perfect_info_mcts.search, det_game, player)
+                    for det_game in det_games
+                ]
+
+                action_probs_list = [f.result() for f in futures]
+        else:
+            # Sequential evaluation (fallback)
+            action_probs_list = [
+                self.perfect_info_mcts.search(det_game, player)
+                for det_game in det_games
+            ]
+
+        # Aggregate results
+        return self._aggregate_action_probs(action_probs_list)
+
+    def _aggregate_action_probs(
+        self, action_probs_list: List[Dict[int, float]]
+    ) -> Dict[int, float]:
+        """
+        Aggregate action probabilities from multiple determinizations.
+
+        Takes action probabilities from each determinization and averages them
+        to produce a final probability distribution that is robust across
+        multiple possible worlds.
+
+        Args:
+            action_probs_list: List of action probability dicts from each determinization
+
+        Returns:
+            Aggregated action probabilities (averaged and normalized)
+
+        Example:
+            >>> # Three determinizations with different action preferences
+            >>> probs1 = {0: 0.6, 1: 0.4}
+            >>> probs2 = {0: 0.3, 1: 0.7}
+            >>> probs3 = {0: 0.5, 1: 0.5}
+            >>> aggregated = mcts._aggregate_action_probs([probs1, probs2, probs3])
+            >>> # Result: {0: 0.47, 1: 0.53} (averaged)
+        """
+        if not action_probs_list:
+            return {}
+
+        aggregated = {}
+
+        # Sum probabilities across all determinizations
+        for action_probs in action_probs_list:
+            for action, prob in action_probs.items():
+                aggregated[action] = aggregated.get(action, 0.0) + prob
+
+        # Average across determinizations
+        num_dets = len(action_probs_list)
+        for action in aggregated:
+            aggregated[action] /= num_dets
+
+        # Normalize to ensure sum = 1.0
+        total = sum(aggregated.values())
+        if total > 0:
+            for action in aggregated:
+                aggregated[action] /= total
+
+        return aggregated
 
 
 # Export main classes

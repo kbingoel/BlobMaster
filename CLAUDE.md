@@ -13,6 +13,8 @@ BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bid
 VERY IMPORTANT:
 You are working in a Windows 11 environment, plan your console commands accordingly!
 When checking for tools, use the correct Windows command syntax! For example, use venv/Scripts/python.exe with forward slash!
+Use Grep!
+Avoid Unicode encoding errors (checkmarks and card symbols)
 
 ### Training Environment (Python)
 

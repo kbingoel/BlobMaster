@@ -1417,3 +1417,321 @@ class TestImperfectInfoMCTS:
         # Should still return valid action probs (fall back to perfect info MCTS)
         action_probs = mcts.search(game, player, belief)
         assert len(action_probs) > 0
+
+
+# ============================================================================
+# SESSION 6: PARALLEL SEARCH AND CACHING TESTS
+# ============================================================================
+
+
+class TestParallelSearchOptimization:
+    """Tests for parallel search optimization."""
+
+    def test_parallel_search_initialization(self):
+        """Test parallel search flag is set correctly."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        # With parallel enabled
+        mcts_parallel = ImperfectInfoMCTS(
+            network, encoder, masker, use_parallel=True
+        )
+        assert mcts_parallel.use_parallel is True
+
+        # Without parallel (default)
+        mcts_sequential = ImperfectInfoMCTS(network, encoder, masker)
+        assert mcts_sequential.use_parallel is False
+
+    def test_parallel_search_returns_valid_probs(self):
+        """Test parallel search returns valid action probabilities."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network,
+            encoder,
+            masker,
+            num_determinizations=3,
+            simulations_per_determinization=20,
+            use_parallel=True,
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        action_probs = mcts.search_parallel(game, player)
+
+        # Should return valid probabilities
+        assert len(action_probs) > 0
+        assert abs(sum(action_probs.values()) - 1.0) < 0.01
+        assert all(0 <= p <= 1 for p in action_probs.values())
+
+    def test_aggregate_action_probs(self):
+        """Test action probability aggregation."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(network, encoder, masker)
+
+        # Test aggregation
+        probs1 = {0: 0.6, 1: 0.4}
+        probs2 = {0: 0.3, 1: 0.7}
+        probs3 = {0: 0.5, 1: 0.5}
+
+        aggregated = mcts._aggregate_action_probs([probs1, probs2, probs3])
+
+        # Should average probabilities
+        assert len(aggregated) == 2
+        assert abs(sum(aggregated.values()) - 1.0) < 0.01
+
+        # Check approximate averages
+        assert 0.4 < aggregated[0] < 0.5  # Average of 0.6, 0.3, 0.5 ≈ 0.47
+        assert 0.5 < aggregated[1] < 0.6  # Average of 0.4, 0.7, 0.5 ≈ 0.53
+
+    def test_aggregate_empty_list(self):
+        """Test aggregation with empty list."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(network, encoder, masker)
+
+        aggregated = mcts._aggregate_action_probs([])
+        assert aggregated == {}
+
+    def test_aggregate_single_prob(self):
+        """Test aggregation with single probability dict."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(network, encoder, masker)
+
+        probs = {0: 0.7, 1: 0.3}
+        aggregated = mcts._aggregate_action_probs([probs])
+
+        # Should return normalized version of single prob
+        assert len(aggregated) == 2
+        assert abs(sum(aggregated.values()) - 1.0) < 0.01
+
+    def test_parallel_search_fallback_on_no_determinizations(self):
+        """Test parallel search falls back when no determinizations available."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker, use_parallel=True
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        belief = BeliefState(game, player)
+
+        # Create impossible constraints
+        for pos in belief.player_constraints:
+            constraints = belief.player_constraints[pos]
+            constraints.cannot_have_suits = {'♠', '♥', '♣', '♦'}
+
+        # Should fall back to perfect info MCTS
+        action_probs = mcts.search_parallel(game, player, belief)
+        assert len(action_probs) > 0
+
+
+class TestBeliefStateCaching:
+    """Tests for belief state caching optimization."""
+
+    def test_caching_enabled_by_default(self):
+        """Test caching is enabled by default."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        assert belief.enable_caching is True
+
+    def test_caching_can_be_disabled(self):
+        """Test caching can be disabled."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=False)
+        assert belief.enable_caching is False
+
+    def test_cache_stores_results(self):
+        """Test cache stores computed results."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Cache should be empty initially
+        assert len(belief._cached_possible_cards) == 0
+
+        # Get possible cards (should populate cache)
+        possible1 = belief.get_possible_cards(1)
+
+        # Cache should now have entry
+        assert 1 in belief._cached_possible_cards
+
+        # Second call should use cache
+        possible2 = belief.get_possible_cards(1)
+        assert possible1 == possible2
+
+    def test_cache_returns_same_results(self):
+        """Test cached results match non-cached results."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Get result (will be cached)
+        cached_result = belief.get_possible_cards(1)
+
+        # Manually compute without cache
+        uncached_result = belief._compute_possible_cards(1)
+
+        # Should match
+        assert cached_result == uncached_result
+
+    def test_invalidate_cache_clears_data(self):
+        """Test invalidate_cache clears cached data."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Populate cache
+        _ = belief.get_possible_cards(1)
+        assert len(belief._cached_possible_cards) > 0
+
+        # Invalidate
+        belief.invalidate_cache()
+        assert len(belief._cached_possible_cards) == 0
+
+    def test_cache_invalidated_on_update(self):
+        """Test cache is invalidated when belief state updates."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent = game.players[1]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Populate cache
+        _ = belief.get_possible_cards(1)
+        assert len(belief._cached_possible_cards) > 0
+
+        # Update belief state
+        card = Card("K", "♥")
+        belief.update_on_card_played(opponent, card, None)
+
+        # Cache should be cleared
+        assert len(belief._cached_possible_cards) == 0
+
+    def test_caching_performance_benefit(self):
+        """Test that caching provides performance benefit."""
+        import time
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        # Measure with caching
+        belief_cached = BeliefState(game, observer, enable_caching=True)
+        start = time.time()
+        for _ in range(100):
+            _ = belief_cached.get_possible_cards(1)
+        cached_time = time.time() - start
+
+        # Measure without caching (using _compute_possible_cards directly)
+        belief_uncached = BeliefState(game, observer, enable_caching=False)
+        start = time.time()
+        for _ in range(100):
+            _ = belief_uncached._compute_possible_cards(1)
+        uncached_time = time.time() - start
+
+        # Cached should be faster (at least for many calls)
+        # Allow some tolerance since first call populates cache
+        assert cached_time <= uncached_time * 1.1
+
+    def test_cache_per_player(self):
+        """Test cache stores separate results per player."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Get possible cards for different players
+        possible1 = belief.get_possible_cards(1)
+        possible2 = belief.get_possible_cards(2)
+
+        # Cache should have entries for both
+        assert 1 in belief._cached_possible_cards
+        assert 2 in belief._cached_possible_cards
+
+        # Results should be different (different players, different constraints)
+        # (may be same if constraints allow, but cache should store separately)
+        assert belief._cached_possible_cards[1] is not belief._cached_possible_cards[2]
+
+    def test_cache_respects_constraints(self):
+        """Test cache respects constraint updates."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer, enable_caching=True)
+
+        # Get initial possible cards
+        initial = belief.get_possible_cards(1)
+        initial_count = len(initial)
+
+        # Add constraint
+        belief.player_constraints[1].cannot_have_suits.add('♠')
+        belief.invalidate_cache()
+
+        # Get updated possible cards
+        updated = belief.get_possible_cards(1)
+        updated_count = len(updated)
+
+        # Should have fewer possible cards after constraint
+        assert updated_count < initial_count
+
+        # No spades should be in updated set
+        spades_in_updated = [c for c in updated if c.suit == '♠']
+        assert len(spades_in_updated) == 0
