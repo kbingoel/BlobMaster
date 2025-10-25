@@ -572,5 +572,270 @@ class MCTS:
             node.backpropagate(value)
 
 
-# Export main class
-__all__ = ["MCTS"]
+class ImperfectInfoMCTS:
+    """
+    Monte Carlo Tree Search for imperfect information games.
+
+    Uses determinization to handle hidden opponent hands by sampling multiple
+    possible worlds consistent with observations, running MCTS on each, and
+    aggregating results.
+
+    Multi-World MCTS Algorithm:
+        1. Generate N determinizations (sampled opponent hands)
+        2. For each determinization:
+            - Run MCTS with K simulations
+            - Get action visit counts
+        3. Aggregate visit counts across all determinizations
+        4. Select action based on aggregated counts
+
+    Key Insight:
+        - Running MCTS on multiple possible worlds averages out uncertainty
+        - Actions that are good across many scenarios are more robust
+        - Equivalent to doing expectation over belief distribution
+
+    Attributes:
+        network: Neural network for evaluation
+        encoder: StateEncoder for converting game state to tensor
+        masker: ActionMasker for creating legal action masks
+        num_determinizations: Number of worlds to sample (default: 5)
+        simulations_per_determinization: MCTS simulations per world (default: 50)
+        c_puct: Exploration constant for UCB1
+        temperature: Temperature for action selection
+
+    Example:
+        >>> imperfect_mcts = ImperfectInfoMCTS(
+        ...     network, encoder, masker,
+        ...     num_determinizations=5,
+        ...     simulations_per_determinization=50
+        ... )
+        >>> action_probs = imperfect_mcts.search(game_state, player)
+    """
+
+    def __init__(
+        self,
+        network: BlobNet,
+        encoder: StateEncoder,
+        masker: ActionMasker,
+        num_determinizations: int = 5,
+        simulations_per_determinization: int = 50,
+        c_puct: float = 1.5,
+        temperature: float = 1.0,
+    ):
+        """
+        Initialize imperfect information MCTS.
+
+        Args:
+            network: Neural network for evaluation
+            encoder: State encoder
+            masker: Action masker
+            num_determinizations: Number of worlds to sample (default: 5)
+                                 More = better coverage but slower
+            simulations_per_determinization: MCTS simulations per world (default: 50)
+                                            More = better per-world evaluation
+            c_puct: Exploration constant (default: 1.5)
+            temperature: Temperature for action selection (default: 1.0)
+
+        Note:
+            Total budget = num_determinizations × simulations_per_determinization
+            Example: 5 determinizations × 50 simulations = 250 total simulations
+        """
+        self.network = network
+        self.encoder = encoder
+        self.masker = masker
+        self.num_determinizations = num_determinizations
+        self.simulations_per_determinization = simulations_per_determinization
+        self.c_puct = c_puct
+        self.temperature = temperature
+
+        # Import determinization components
+        from ml.mcts.belief_tracker import BeliefState
+        from ml.mcts.determinization import Determinizer
+
+        # Create determinizer
+        self.determinizer = Determinizer()
+
+        # Perfect info MCTS for each determinization
+        self.perfect_info_mcts = MCTS(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_simulations=simulations_per_determinization,
+            c_puct=c_puct,
+            temperature=temperature,
+        )
+
+    def search(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        belief: Optional["BeliefState"] = None,
+    ) -> Dict[int, float]:
+        """
+        Run imperfect information MCTS search.
+
+        Samples multiple determinizations of hidden opponent hands, runs
+        MCTS on each determinized world, and aggregates results to get
+        robust action probabilities.
+
+        Args:
+            game_state: Current game state (with hidden hands)
+            player: Player whose turn it is
+            belief: Belief state (will be created if None)
+
+        Returns:
+            Dictionary mapping action → probability
+            Example: {0: 0.1, 1: 0.3, 2: 0.6}
+
+        Example:
+            >>> game = BlobGame(num_players=4)
+            >>> game.setup_round(5)
+            >>> player = game.players[0]
+            >>> action_probs = imperfect_mcts.search(game, player)
+        """
+        from ml.mcts.belief_tracker import BeliefState
+
+        # Create belief state if not provided
+        if belief is None:
+            belief = BeliefState(game_state, player)
+
+        # Sample determinizations
+        determinizations = self.determinizer.sample_adaptive(
+            game_state,
+            belief,
+            num_samples=self.num_determinizations,
+            diversity_weight=0.5,
+        )
+
+        if not determinizations:
+            # Fall back to single MCTS on original state if sampling fails
+            return self.perfect_info_mcts.search(game_state, player)
+
+        # Aggregate action counts across determinizations
+        aggregated_counts: Dict[int, int] = {}
+
+        for det_hands in determinizations:
+            # Create determinized game
+            det_game = self.determinizer.create_determinized_game(
+                game_state, belief, det_hands
+            )
+
+            # Run MCTS on this determinization
+            action_probs = self.perfect_info_mcts.search(det_game, player)
+
+            # Accumulate visit counts (approximate from probabilities)
+            for action, prob in action_probs.items():
+                # Convert prob back to visit count estimate
+                visit_count = int(prob * self.simulations_per_determinization)
+                aggregated_counts[action] = aggregated_counts.get(action, 0) + visit_count
+
+        # Convert aggregated counts to probabilities
+        total_counts = sum(aggregated_counts.values())
+
+        if total_counts == 0:
+            # No valid actions found, fall back
+            return self.perfect_info_mcts.search(game_state, player)
+
+        action_probs = {
+            action: count / total_counts
+            for action, count in aggregated_counts.items()
+        }
+
+        # Apply temperature
+        if self.temperature != 1.0:
+            action_probs = self._apply_temperature(action_probs, self.temperature)
+
+        return action_probs
+
+    def _apply_temperature(
+        self,
+        action_probs: Dict[int, float],
+        temperature: float
+    ) -> Dict[int, float]:
+        """
+        Apply temperature scaling to action probabilities.
+
+        Temperature controls exploration vs exploitation:
+        - temperature = 0: Greedy (select best action with prob 1.0)
+        - temperature = 1: No change (proportional to visit counts)
+        - temperature > 1: More uniform (more exploration)
+        - temperature < 1: More peaked (more exploitation)
+
+        Args:
+            action_probs: Action probabilities
+            temperature: Temperature (1.0 = no change, <1 = more greedy, >1 = more random)
+
+        Returns:
+            Temperature-scaled probabilities
+        """
+        if temperature == 0:
+            # Greedy: select max
+            best_action = max(action_probs, key=action_probs.get)
+            return {best_action: 1.0}
+
+        # Convert to logits, apply temperature, convert back
+        actions = list(action_probs.keys())
+        probs = np.array([action_probs[a] for a in actions])
+
+        logits = np.log(probs + 1e-10)
+        logits = logits / temperature
+
+        # Softmax
+        exp_logits = np.exp(logits - np.max(logits))
+        new_probs = exp_logits / exp_logits.sum()
+
+        return {action: prob for action, prob in zip(actions, new_probs)}
+
+    def search_with_action_details(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        belief: Optional["BeliefState"] = None,
+    ) -> Tuple[Dict[int, float], Dict[str, any]]:
+        """
+        Run search and return detailed information.
+
+        Useful for debugging, analysis, and explainability. Returns action
+        probabilities along with metadata about the search process.
+
+        Args:
+            game_state: Current game state
+            player: Player whose turn it is
+            belief: Belief state (will be created if None)
+
+        Returns:
+            Tuple of (action_probs, details_dict) where details contains:
+            - num_determinizations: Number of worlds sampled
+            - action_entropy: Entropy of action distribution (uncertainty measure)
+            - belief_entropy: Uncertainty in beliefs about opponent hands
+            - num_actions: Number of legal actions available
+
+        Example:
+            >>> action_probs, details = imperfect_mcts.search_with_action_details(
+            ...     game, player
+            ... )
+            >>> print(f"Action entropy: {details['action_entropy']:.2f}")
+            >>> print(f"Belief entropy: {details['belief_entropy']:.2f}")
+        """
+        from ml.mcts.belief_tracker import BeliefState
+
+        if belief is None:
+            belief = BeliefState(game_state, player)
+
+        action_probs = self.search(game_state, player, belief)
+
+        # Compute agreement metric
+        # (How consistent are action preferences across determinizations?)
+        entropy = -sum(p * np.log(p + 1e-10) for p in action_probs.values())
+
+        details = {
+            'num_determinizations': self.num_determinizations,
+            'action_entropy': entropy,
+            'belief_entropy': belief.get_entropy(player.position),
+            'num_actions': len(action_probs),
+        }
+
+        return action_probs, details
+
+
+# Export main classes
+__all__ = ["MCTS", "ImperfectInfoMCTS"]

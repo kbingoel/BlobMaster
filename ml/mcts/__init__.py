@@ -3,7 +3,8 @@ Monte Carlo Tree Search (MCTS) implementation for BlobMaster.
 
 This module provides MCTS infrastructure for decision-making in the Blob card game:
 - MCTSNode: Tree node with UCB1 selection and backpropagation
-- MCTS: Search algorithm integrated with neural network
+- MCTS: Search algorithm integrated with neural network (perfect information)
+- ImperfectInfoMCTS: Multi-world MCTS for imperfect information (Phase 3 Session 5)
 - BeliefState: Belief tracking for imperfect information (Phase 3)
 - Determinizer: Determinization sampling for hidden opponent hands (Phase 3)
 
@@ -31,7 +32,28 @@ Example (Perfect Information):
     >>> action_probs = mcts.search(game, game.players[0])
     >>> best_action = max(action_probs, key=action_probs.get)
 
-Example (Imperfect Information with Determinization):
+Example (Imperfect Information with Multi-World MCTS):
+    >>> from ml.mcts import ImperfectInfoMCTS
+    >>> from ml.network import BlobNet, StateEncoder, ActionMasker
+    >>> from ml.game.blob import BlobGame
+    >>>
+    >>> # Initialize components
+    >>> network = BlobNet()
+    >>> encoder = StateEncoder()
+    >>> masker = ActionMasker()
+    >>> imperfect_mcts = ImperfectInfoMCTS(
+    ...     network, encoder, masker,
+    ...     num_determinizations=5,
+    ...     simulations_per_determinization=50
+    ... )
+    >>>
+    >>> # Run search (automatically handles belief tracking and determinization)
+    >>> game = BlobGame(num_players=4)
+    >>> game.setup_round(cards_to_deal=5)
+    >>> action_probs = imperfect_mcts.search(game, game.players[0])
+    >>> best_action = max(action_probs, key=action_probs.get)
+
+Example (Manual Determinization):
     >>> from ml.mcts import BeliefState, Determinizer
     >>> from ml.game.blob import BlobGame
     >>>
@@ -55,13 +77,14 @@ Example (Imperfect Information with Determinization):
 """
 
 from ml.mcts.node import MCTSNode
-from ml.mcts.search import MCTS
+from ml.mcts.search import MCTS, ImperfectInfoMCTS
 from ml.mcts.belief_tracker import BeliefState, PlayerConstraints
 from ml.mcts.determinization import Determinizer
 
 __all__ = [
     "MCTSNode",
     "MCTS",
+    "ImperfectInfoMCTS",
     "BeliefState",
     "PlayerConstraints",
     "Determinizer",

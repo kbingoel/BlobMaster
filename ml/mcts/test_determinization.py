@@ -1186,3 +1186,234 @@ def test_determinization_performance_benchmarks():
     assert adaptive_time < 100.0  # Allow more time for diversity checks
 
     print("\nAll performance targets met!")
+
+
+# ============================================================================
+# SESSION 5: IMPERFECT INFO MCTS INTEGRATION TESTS
+# ============================================================================
+
+
+class TestImperfectInfoMCTS:
+    """Integration tests for ImperfectInfoMCTS class."""
+
+    def test_imperfect_mcts_initialization(self):
+        """Test imperfect info MCTS initializes correctly."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20
+        )
+
+        assert mcts.num_determinizations == 3
+        assert mcts.simulations_per_determinization == 20
+        assert mcts.determinizer is not None
+        assert mcts.perfect_info_mcts is not None
+
+    def test_imperfect_mcts_search_returns_probabilities(self):
+        """Test search returns valid action probabilities."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        action_probs = mcts.search(game, player)
+
+        # Should return valid probabilities
+        assert len(action_probs) > 0
+        assert abs(sum(action_probs.values()) - 1.0) < 0.01  # Should sum to ~1
+        assert all(0 <= p <= 1 for p in action_probs.values())
+
+    def test_imperfect_mcts_handles_constraints(self):
+        """Test MCTS respects belief state constraints."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        belief = BeliefState(game, player)
+
+        # Add constraint: opponent doesn't have Spades
+        constraints = belief.player_constraints[1]
+        constraints.cannot_have_suits.add('♠')
+
+        # Should still work with constraints
+        action_probs = mcts.search(game, player, belief)
+        assert len(action_probs) > 0
+
+    def test_imperfect_vs_perfect_info_comparison(self):
+        """Compare imperfect info MCTS to perfect info baseline."""
+        from ml.mcts.search import MCTS, ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        # Perfect info MCTS
+        perfect_mcts = MCTS(
+            network, encoder, masker,
+            num_simulations=100
+        )
+
+        # Imperfect info MCTS (same total budget: 5×20 = 100)
+        imperfect_mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=5,
+            simulations_per_determinization=20
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Both should return valid probabilities
+        perfect_probs = perfect_mcts.search(game, player)
+        imperfect_probs = imperfect_mcts.search(game, player)
+
+        assert len(perfect_probs) > 0
+        assert len(imperfect_probs) > 0
+        assert abs(sum(perfect_probs.values()) - 1.0) < 0.01
+        assert abs(sum(imperfect_probs.values()) - 1.0) < 0.01
+
+    def test_search_with_action_details(self):
+        """Test search_with_action_details returns metadata."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        action_probs, details = mcts.search_with_action_details(game, player)
+
+        # Check action probs
+        assert len(action_probs) > 0
+        assert abs(sum(action_probs.values()) - 1.0) < 0.01
+
+        # Check details
+        assert 'num_determinizations' in details
+        assert 'action_entropy' in details
+        assert 'belief_entropy' in details
+        assert 'num_actions' in details
+
+        assert details['num_determinizations'] == 3
+        assert details['num_actions'] == len(action_probs)
+        assert details['action_entropy'] >= 0
+        assert details['belief_entropy'] >= 0
+
+    def test_temperature_scaling(self):
+        """Test temperature parameter affects action distribution."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        # Greedy (temperature=0)
+        mcts_greedy = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20,
+            temperature=0.0
+        )
+        greedy_probs = mcts_greedy.search(game, player)
+
+        # Should select single best action
+        assert len(greedy_probs) == 1
+        assert list(greedy_probs.values())[0] == 1.0
+
+        # Normal temperature
+        mcts_normal = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20,
+            temperature=1.0
+        )
+        normal_probs = mcts_normal.search(game, player)
+
+        # Should have multiple actions with varying probabilities
+        assert len(normal_probs) >= 1
+
+    def test_imperfect_mcts_fallback_on_no_determinizations(self):
+        """Test MCTS falls back gracefully when determinization fails."""
+        from ml.mcts.search import ImperfectInfoMCTS
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+
+        network = BlobNet()
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        mcts = ImperfectInfoMCTS(
+            network, encoder, masker,
+            num_determinizations=3,
+            simulations_per_determinization=20
+        )
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        player = game.players[0]
+
+        belief = BeliefState(game, player)
+
+        # Create impossible constraints (no cards available)
+        for pos in belief.player_constraints:
+            constraints = belief.player_constraints[pos]
+            # Eliminate all suits - should make sampling very difficult
+            constraints.cannot_have_suits = {'♠', '♥', '♣', '♦'}
+
+        # Should still return valid action probs (fall back to perfect info MCTS)
+        action_probs = mcts.search(game, player, belief)
+        assert len(action_probs) > 0
