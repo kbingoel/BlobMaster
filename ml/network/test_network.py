@@ -594,8 +594,11 @@ class TestBlobNetTrainer:
 
     def test_loss_decreases_with_training(self):
         """Test loss decreases over multiple training steps."""
+        # Use fixed seed for reproducible tests
+        torch.manual_seed(42)
+
         model = BlobNet()
-        trainer = BlobNetTrainer(model, learning_rate=0.01)
+        trainer = BlobNetTrainer(model)  # Use default learning_rate=0.001
 
         # Create dummy data (same data for overfitting)
         state = torch.randn(4, 256)
@@ -713,11 +716,14 @@ class TestNetworkIntegration:
 
     def test_full_training_pipeline(self):
         """Test complete training pipeline with real game data."""
+        # Use fixed seed for reproducible tests
+        torch.manual_seed(42)
+
         # Create components
         encoder = StateEncoder()
         masker = ActionMasker()
         model = BlobNet()
-        trainer = BlobNetTrainer(model, learning_rate=0.01)
+        trainer = BlobNetTrainer(model)  # Use default learning_rate=0.001
 
         # Generate training data from multiple game states
         states = []
@@ -771,6 +777,54 @@ class TestNetworkIntegration:
         # Loss should decrease
         assert final_loss < initial_loss, \
             f"Loss should decrease: {initial_loss:.4f} -> {final_loss:.4f}"
+
+    def test_training_robustness_across_seeds(self):
+        """
+        Test training converges reliably across different random initializations.
+
+        This test verifies that the learning rate and training procedure are robust
+        to different weight initializations. With a properly tuned learning rate,
+        at least 90% of random seeds should result in loss decrease.
+
+        This catches potential issues with:
+        - Learning rate too high (causes divergence on some seeds)
+        - Gradient explosion/vanishing
+        - Optimizer instability
+        """
+        success_count = 0
+        num_trials = 10
+        failed_seeds = []
+
+        for seed in range(num_trials):
+            torch.manual_seed(seed)
+            model = BlobNet()
+            trainer = BlobNetTrainer(model)  # Use default lr=0.001
+
+            # Create dummy training data (unique per seed)
+            torch.manual_seed(seed + 1000)
+            state = torch.randn(4, 256)
+            target_policy = torch.rand(4, 52)
+            target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True)
+            target_value = torch.randn(4, 1).clamp(-1, 1)
+            mask = torch.ones(4, 52)
+
+            # Train for 50 steps (more than basic test to ensure convergence)
+            losses = []
+            for _ in range(50):
+                loss_dict = trainer.train_step(state, target_policy, target_value, mask)
+                losses.append(loss_dict['total_loss'])
+
+            # Check if this seed converged
+            if losses[-1] < losses[0]:
+                success_count += 1
+            else:
+                failed_seeds.append(seed)
+
+        # Require 90% success rate (allows 1 unlucky initialization out of 10)
+        success_rate = success_count / num_trials
+        assert success_count >= 9, \
+            f"Training unreliable: only {success_count}/{num_trials} seeds converged " \
+            f"({success_rate:.0%} success rate). Failed seeds: {failed_seeds}"
 
     def test_performance_benchmark(self):
         """Test inference performance meets targets (<10ms per forward pass)."""
