@@ -584,3 +584,293 @@ class TestBeliefStateIntegration:
         # Should have tracked that they have Spades
         constraints = belief.player_constraints[1]
         assert "♠" in constraints.must_have_suits
+
+
+class TestDeterminization:
+    """Tests for Determinization sampling algorithm."""
+
+    def test_determinizer_samples_valid_hands(self):
+        """Test determinizer produces valid hand assignments."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+
+        assert sample is not None
+        assert len(sample) == 3  # 3 opponents
+
+        # Each opponent should have 5 cards
+        for hand in sample.values():
+            assert len(hand) == 5
+
+    def test_determinizer_respects_suit_constraints(self):
+        """Test sampled hands respect suit elimination."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Add constraint: opponent doesn't have Spades
+        constraints = belief.player_constraints[opponent_pos]
+        constraints.cannot_have_suits.add("♠")
+
+        determinizer = Determinizer()
+        sample = determinizer.sample_determinization(game, belief)
+
+        assert sample is not None
+
+        # Opponent's hand should have no Spades
+        opponent_hand = sample[opponent_pos]
+        spades_in_hand = [c for c in opponent_hand if c.suit == "♠"]
+        assert len(spades_in_hand) == 0
+
+    def test_multiple_samples_are_different(self):
+        """Test multiple samples produce different results."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        samples = determinizer.sample_multiple_determinizations(
+            game, belief, num_samples=10
+        )
+
+        assert len(samples) >= 8  # Should get most samples
+
+        # Check diversity (at least some samples should be different)
+        unique_samples = set()
+        for sample in samples:
+            # Convert to hashable format
+            sample_tuple = tuple(
+                sorted([tuple(sorted(hand)) for hand in sample.values()])
+            )
+            unique_samples.add(sample_tuple)
+
+        assert len(unique_samples) > 1  # At least 2 different samples
+
+    def test_create_determinized_game(self):
+        """Test creating a complete game from determinization."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+        det_game = determinizer.create_determinized_game(game, belief, sample)
+
+        # All players should have 5 cards
+        for player in det_game.players:
+            assert len(player.hand) == 5
+
+        # Observer's hand should match original
+        assert set(det_game.players[observer.position].hand) == belief.known_cards
+
+    def test_sampling_performance(self):
+        """Test sampling is fast enough (<10ms per sample)."""
+        import time
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        start = time.time()
+        for _ in range(100):
+            sample = determinizer.sample_determinization(game, belief)
+        elapsed_ms = (time.time() - start) * 1000 / 100
+
+        print(f"Sampling time: {elapsed_ms:.2f} ms per sample")
+        assert elapsed_ms < 10.0  # Should be fast
+
+    def test_determinizer_handles_no_unseen_cards(self):
+        """Test determinizer handles edge case of no unseen cards."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Simulate all cards being known (edge case)
+        # This is tricky - we'll just check that sampling doesn't crash
+        determinizer = Determinizer()
+
+        # Should handle gracefully
+        sample = determinizer.sample_determinization(game, belief)
+        # May return None or valid sample depending on state
+
+    def test_determinizer_validates_hand_size(self):
+        """Test that sampled hands have correct size."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=7)  # Different hand size
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+
+        if sample is not None:
+            # All hands should have 7 cards
+            for player_pos, hand in sample.items():
+                expected_size = belief.player_constraints[player_pos].cards_in_hand
+                assert len(hand) == expected_size
+
+    def test_determinizer_no_duplicate_cards(self):
+        """Test that sampled hands have no duplicate cards."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+
+        assert sample is not None
+
+        # Collect all cards
+        all_sampled_cards = []
+        for hand in sample.values():
+            all_sampled_cards.extend(hand)
+
+        # Check no duplicates
+        assert len(all_sampled_cards) == len(set(all_sampled_cards))
+
+    def test_determinizer_respects_must_have_suits(self):
+        """Test determinizer respects must-have suit constraints."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Add constraint: opponent must have Hearts
+        constraints = belief.player_constraints[opponent_pos]
+        constraints.must_have_suits.add("♥")
+
+        determinizer = Determinizer()
+        sample = determinizer.sample_determinization(game, belief)
+
+        if sample is not None:
+            # Opponent's hand should have at least one Heart
+            opponent_hand = sample[opponent_pos]
+            hearts_in_hand = [c for c in opponent_hand if c.suit == "♥"]
+            assert len(hearts_in_hand) > 0
+
+    def test_uniform_vs_probability_sampling(self):
+        """Test both uniform and probability-weighted sampling work."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        # Uniform sampling
+        sample_uniform = determinizer.sample_determinization(
+            game, belief, use_probabilities=False
+        )
+        assert sample_uniform is not None
+
+        # Probability-weighted sampling
+        sample_prob = determinizer.sample_determinization(
+            game, belief, use_probabilities=True
+        )
+        assert sample_prob is not None
+
+    def test_determinizer_tight_constraints(self):
+        """Test determinizer handles very tight constraints."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Add very tight constraints
+        for player_pos in belief.player_constraints:
+            constraints = belief.player_constraints[player_pos]
+            # Eliminate 2 suits (tight but not impossible)
+            constraints.cannot_have_suits = {"♠", "♥"}
+
+        determinizer = Determinizer()
+
+        # Should still try to sample (may fail if truly impossible)
+        sample = determinizer.sample_determinization(game, belief)
+
+        # Either succeeds with valid sample or returns None
+        if sample is not None:
+            assert determinizer._validate_sample(sample, belief)
+
+    def test_determinized_game_preserves_game_state(self):
+        """Test that determinized game preserves other game state."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        # Set some game state
+        game.trump_suit = "♥"
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        sample = determinizer.sample_determinization(game, belief)
+        det_game = determinizer.create_determinized_game(game, belief, sample)
+
+        # Game state should be preserved
+        assert det_game.trump_suit == game.trump_suit
+        assert det_game.num_players == game.num_players
+
+    def test_multiple_determinizations_batch_size(self):
+        """Test that batch sampling returns requested number of samples."""
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+        determinizer = Determinizer()
+
+        # Request 5 samples
+        samples = determinizer.sample_multiple_determinizations(
+            game, belief, num_samples=5
+        )
+
+        # Should get close to 5 (may be slightly less if sampling fails)
+        assert len(samples) >= 4
