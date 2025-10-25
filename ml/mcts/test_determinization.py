@@ -288,6 +288,243 @@ class TestPlayerConstraints:
         assert constraints.can_have_card(card)
 
 
+class TestProbabilisticBeliefTracking:
+    """Tests for probabilistic belief tracking and Bayesian updates."""
+
+    def test_initial_probabilities_uniform(self):
+        """Test initial probabilities are uniform over unseen cards."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Check probabilities sum to cards_in_hand for each player
+        for player_pos, probs in belief.card_probabilities.items():
+            total = sum(probs.values())
+            expected = belief.player_constraints[player_pos].cards_in_hand
+            assert abs(total - expected) < 0.01  # Allow small floating point error
+
+    def test_probability_update_on_card_played(self):
+        """Test probabilities update correctly when card is played."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        card = list(belief.unseen_cards)[0]
+        initial_prob = belief.get_card_probability(opponent_pos, card)
+
+        # Simulate card being played by opponent
+        belief.update_probabilities_on_card_played(opponent_pos, card, None)
+
+        # Probability should now be 0
+        assert belief.get_card_probability(opponent_pos, card) == 0.0
+
+    def test_suit_elimination_zeros_probabilities(self):
+        """Test suit elimination zeros probabilities correctly."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Play off-suit card
+        led_suit = "♠"
+        card_played = Card("K", "♥")
+        belief.update_probabilities_on_card_played(opponent_pos, card_played, led_suit)
+
+        # All Spades should have 0 probability
+        for card in belief.unseen_cards:
+            if card.suit == "♠":
+                prob = belief.get_card_probability(opponent_pos, card)
+                assert prob == 0.0
+
+    def test_entropy_decreases_with_information(self):
+        """Test entropy decreases as we gain information."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        initial_entropy = belief.get_entropy(opponent_pos)
+
+        # Eliminate a suit
+        constraints = belief.player_constraints[opponent_pos]
+        constraints.cannot_have_suits.add("♠")
+        belief._initialize_probabilities()
+
+        final_entropy = belief.get_entropy(opponent_pos)
+
+        # Entropy should decrease
+        assert final_entropy < initial_entropy
+
+    def test_probability_normalization(self):
+        """Test probabilities normalize correctly after updates."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Play a few cards
+        cards_to_play = list(belief.unseen_cards)[:3]
+        for card in cards_to_play:
+            belief.update_probabilities_on_card_played(opponent_pos, card, None)
+
+        # Probabilities should still sum to cards_in_hand
+        total_prob = sum(belief.card_probabilities[opponent_pos].values())
+        expected = belief.player_constraints[opponent_pos].cards_in_hand
+        assert abs(total_prob - expected) < 0.01
+
+    def test_get_most_likely_holder(self):
+        """Test finding most likely card holder."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Test for a card in observer's hand
+        if len(observer.hand) > 0:
+            observer_card = list(observer.hand)[0]
+            holder, prob = belief.get_most_likely_holder(observer_card)
+            assert holder == observer.position
+            assert prob == 1.0
+
+        # Test for unseen card
+        unseen_card = list(belief.unseen_cards)[0]
+        holder, prob = belief.get_most_likely_holder(unseen_card)
+        # Should return one of the opponents
+        assert holder in belief.player_constraints
+        assert 0.0 <= prob <= 1.0
+
+    def test_get_card_probability_for_observer(self):
+        """Test getting probability for observer's cards."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Cards in observer's hand should have probability 1.0
+        for card in observer.hand:
+            prob = belief.get_card_probability(observer.position, card)
+            assert prob == 1.0
+
+        # Cards not in observer's hand should have probability 0.0
+        other_card = list(belief.unseen_cards)[0]
+        prob = belief.get_card_probability(observer.position, other_card)
+        assert prob == 0.0
+
+    def test_entropy_zero_for_observer(self):
+        """Test entropy is zero for observer (perfect information)."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        entropy = belief.get_entropy(observer.position)
+        assert entropy == 0.0
+
+    def test_update_from_trick_updates_probabilities(self):
+        """Test update_from_trick updates both constraints and probabilities."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        # Create a trick manually
+        from ml.game.blob import Trick
+
+        trick = Trick(trump_suit=None)
+        trick.led_suit = "♠"
+
+        # Player 1 plays off-suit
+        player1 = game.players[1]
+        card_played = Card("K", "♥")
+        trick.cards_played.append((player1, card_played))
+
+        initial_entropy = belief.get_entropy(1)
+
+        # Update from trick
+        belief.update_from_trick(trick)
+
+        # Should have updated constraints
+        assert "♠" in belief.player_constraints[1].cannot_have_suits
+
+        # Probabilities for Spades should be zero
+        for card in belief.unseen_cards:
+            if card.suit == "♠":
+                assert belief.get_card_probability(1, card) == 0.0
+
+        # Entropy should decrease
+        final_entropy = belief.get_entropy(1)
+        assert final_entropy < initial_entropy
+
+    def test_get_belief_summary_format(self):
+        """Test belief summary produces readable output."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief = BeliefState(game, observer)
+
+        summary = belief.get_belief_summary()
+
+        # Check it's a non-empty string
+        assert len(summary) > 0
+        assert "Belief State Summary" in summary
+        assert f"Observer: Player {observer.position}" in summary
+        assert "Unseen cards:" in summary
+
+        # Should contain info about each opponent
+        for player_pos in belief.player_constraints:
+            assert f"Player {player_pos}:" in summary
+            assert "Cards in hand:" in summary
+            assert "Belief entropy:" in summary
+
+    def test_copy_preserves_probabilities(self):
+        """Test that copy preserves probability distributions."""
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+
+        belief1 = BeliefState(game, observer)
+
+        # Modify some probabilities
+        first_card = list(belief1.unseen_cards)[0]
+        belief1.update_probabilities_on_card_played(1, first_card, None)
+
+        # Create copy
+        belief2 = belief1.copy()
+
+        # Check probabilities match
+        for player_pos in belief1.player_constraints:
+            for card in belief1.unseen_cards:
+                prob1 = belief1.get_card_probability(player_pos, card)
+                prob2 = belief2.get_card_probability(player_pos, card)
+                assert abs(prob1 - prob2) < 0.01
+
+        # Modify copy
+        second_card = list(belief2.unseen_cards)[1]
+        belief2.update_probabilities_on_card_played(1, second_card, None)
+
+        # Original should not be affected
+        prob1_original = belief1.get_card_probability(1, second_card)
+        prob2_modified = belief2.get_card_probability(1, second_card)
+        assert prob1_original > 0.0  # Original still has probability
+        assert prob2_modified == 0.0  # Copy has zero probability
+
+
 class TestBeliefStateIntegration:
     """Integration tests for belief state with game history."""
 

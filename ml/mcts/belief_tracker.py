@@ -158,6 +158,11 @@ class BeliefState:
         # Initialize constraint tracking from game history
         self._initialize_constraints_from_history()
 
+        # Probability distributions: P(player has card | observations)
+        # Shape: Dict[player_position, Dict[Card, float]]
+        self.card_probabilities: Dict[int, Dict[Card, float]] = {}
+        self._initialize_probabilities()
+
     def _initialize_constraints_from_history(self):
         """
         Initialize constraints by analyzing past tricks.
@@ -273,6 +278,186 @@ class BeliefState:
 
         return True
 
+    def _initialize_probabilities(self):
+        """
+        Initialize uniform probability distributions for opponent hands.
+
+        Each opponent has equal probability of having any unseen card that
+        satisfies their constraints.
+        """
+        num_unseen = len(self.unseen_cards)
+
+        if num_unseen == 0:
+            # No unseen cards, nothing to initialize
+            return
+
+        for player_pos, constraints in self.player_constraints.items():
+            self.card_probabilities[player_pos] = {}
+
+            # Uniform distribution over unseen cards
+            for card in self.unseen_cards:
+                if constraints.can_have_card(card):
+                    # P(card | player) = cards_in_hand / total_unseen
+                    self.card_probabilities[player_pos][card] = (
+                        constraints.cards_in_hand / num_unseen
+                    )
+                else:
+                    self.card_probabilities[player_pos][card] = 0.0
+
+    def update_probabilities_on_card_played(
+        self, player_position: int, card: Card, led_suit: Optional[str]
+    ):
+        """
+        Update probabilities using Bayesian inference.
+
+        When a player plays a card, update beliefs about their remaining hand.
+
+        Args:
+            player_position: Position of player who played the card
+            card: Card that was played
+            led_suit: Suit that was led (None if first card of trick)
+        """
+        if player_position == self.observer.position:
+            return  # We know our own hand
+
+        # Zero out probability for the played card (now known)
+        if card in self.card_probabilities[player_position]:
+            self.card_probabilities[player_position][card] = 0.0
+
+        # If player didn't follow suit, zero out all cards in that suit
+        if led_suit and card.suit != led_suit:
+            for unseen_card in self.unseen_cards:
+                if unseen_card.suit == led_suit:
+                    self.card_probabilities[player_position][unseen_card] = 0.0
+
+        # Re-normalize probabilities
+        self._normalize_probabilities(player_position)
+
+    def _normalize_probabilities(self, player_position: int):
+        """
+        Normalize probabilities to sum to cards_in_hand.
+
+        Args:
+            player_position: Player whose probabilities to normalize
+        """
+        if player_position not in self.player_constraints:
+            return
+
+        constraints = self.player_constraints[player_position]
+        total_prob = sum(self.card_probabilities[player_position].values())
+
+        if total_prob > 0:
+            scale = constraints.cards_in_hand / total_prob
+            for card in self.card_probabilities[player_position]:
+                self.card_probabilities[player_position][card] *= scale
+
+    def get_card_probability(self, player_position: int, card: Card) -> float:
+        """
+        Get probability that a specific player has a specific card.
+
+        Args:
+            player_position: Player to query
+            card: Card to query
+
+        Returns:
+            Probability [0.0, 1.0]
+        """
+        if player_position == self.observer.position:
+            return 1.0 if card in self.known_cards else 0.0
+
+        return self.card_probabilities[player_position].get(card, 0.0)
+
+    def get_most_likely_holder(self, card: Card) -> tuple[int, float]:
+        """
+        Get the player most likely to hold a specific card.
+
+        Args:
+            card: Card to query
+
+        Returns:
+            Tuple of (player_position, probability)
+        """
+        if card in self.known_cards:
+            return (self.observer.position, 1.0)
+
+        best_player = None
+        best_prob = 0.0
+
+        for player_pos in self.player_constraints:
+            prob = self.get_card_probability(player_pos, card)
+            if prob > best_prob:
+                best_prob = prob
+                best_player = player_pos
+
+        if best_player is None:
+            # Return observer with 0 probability if no one else can have it
+            return (self.observer.position, 0.0)
+
+        return (best_player, best_prob)
+
+    def get_entropy(self, player_position: int) -> float:
+        """
+        Calculate information entropy of belief about a player's hand.
+
+        High entropy = uncertain, Low entropy = confident
+
+        Args:
+            player_position: Player to query
+
+        Returns:
+            Shannon entropy in bits
+        """
+        if player_position == self.observer.position:
+            return 0.0  # Perfect information about own hand
+
+        probs = self.card_probabilities[player_position].values()
+        entropy = 0.0
+
+        for p in probs:
+            if p > 0:
+                entropy -= p * np.log2(p)
+
+        return entropy
+
+    def update_from_trick(self, trick):
+        """
+        Update belief state from a completed trick.
+
+        Args:
+            trick: Trick object with all cards played
+        """
+        led_suit = trick.led_suit
+
+        for player, card in trick.cards_played:
+            self.update_on_card_played(player, card, led_suit)
+            self.update_probabilities_on_card_played(player.position, card, led_suit)
+
+    def get_belief_summary(self) -> str:
+        """
+        Get human-readable summary of current beliefs.
+
+        Useful for debugging and explainability.
+
+        Returns:
+            Multi-line string describing belief state
+        """
+        lines = ["Belief State Summary:"]
+        lines.append(f"Observer: Player {self.observer.position}")
+        lines.append(f"Unseen cards: {len(self.unseen_cards)}")
+
+        for player_pos, constraints in self.player_constraints.items():
+            lines.append(f"\nPlayer {player_pos}:")
+            lines.append(f"  Cards in hand: {constraints.cards_in_hand}")
+            lines.append(f"  Cannot have suits: {constraints.cannot_have_suits}")
+            lines.append(f"  Must have suits: {constraints.must_have_suits}")
+            lines.append(f"  Cards played: {len(constraints.cards_played)}")
+
+            # Entropy
+            entropy = self.get_entropy(player_pos)
+            lines.append(f"  Belief entropy: {entropy:.2f} bits")
+
+        return "\n".join(lines)
+
     def copy(self) -> "BeliefState":
         """
         Create a copy of this belief state.
@@ -295,5 +480,10 @@ class BeliefState:
                 cannot_have_suits=constraints.cannot_have_suits.copy(),
                 must_have_suits=constraints.must_have_suits.copy(),
             )
+
+        # Deep copy card probabilities
+        new_belief.card_probabilities = {}
+        for pos, card_probs in self.card_probabilities.items():
+            new_belief.card_probabilities[pos] = card_probs.copy()
 
         return new_belief
