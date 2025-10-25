@@ -11,7 +11,9 @@
       "Bash(venv/Scripts/flake8.exe:*)",
       "Bash(venv/Scripts/mypy.exe:*)",
       "Bash(venv/Scripts/python.exe -m pytest:*)",
-      "Bash(venv/Scripts/black.exe:*)"
+      "Bash(venv/Scripts/black.exe:*)",
+      "Bash(venv/Scripts/python.exe -m black:*)",
+      "Bash(findstr:*)"
     ],
     "deny": [],
     "ask": []
