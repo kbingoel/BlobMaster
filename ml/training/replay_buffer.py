@@ -22,7 +22,7 @@ Design:
 Training Example Structure:
     {
         'state': np.array,      # Encoded state (256-dim)
-        'policy': np.array,     # MCTS policy (65-dim)
+        'policy': np.array,     # MCTS policy (52-dim, matches network)
         'value': float,         # Outcome (-1 to 1 normalized)
         'player_position': int,
         'game_id': str,
@@ -122,7 +122,7 @@ class ReplayBuffer:
         Returns:
             (states, policies, values) tuple of tensors
             - states: (batch_size, 256) tensor
-            - policies: (batch_size, 65) tensor
+            - policies: (batch_size, 52) tensor (matches network action_dim)
             - values: (batch_size,) tensor
 
         Raises:

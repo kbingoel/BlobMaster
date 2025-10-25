@@ -19,7 +19,7 @@ from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.selfplay import SelfPlayWorker, SelfPlayEngine
 from ml.training.replay_buffer import ReplayBuffer, augment_example
-from ml.training.trainer import NetworkTrainer
+from ml.training.trainer import NetworkTrainer, TrainingPipeline
 
 
 class TestSelfPlayWorker:
@@ -127,7 +127,7 @@ class TestSelfPlayWorker:
 
             # Check shapes
             assert example["state"].shape == (256,)
-            assert example["policy"].shape == (65,)
+            assert example["policy"].shape == (52,)
 
             # Check ranges
             assert 0 <= example["player_position"] < 4
@@ -238,7 +238,7 @@ class TestSelfPlayWorker:
         action_probs = {0: 0.2, 1: 0.5, 2: 0.3}
         policy_vector = worker._action_probs_to_vector(action_probs, is_bidding=True)
 
-        assert policy_vector.shape == (65,)
+        assert policy_vector.shape == (52,)
         assert policy_vector[0] == 0.2
         assert policy_vector[1] == 0.5
         assert policy_vector[2] == 0.3
@@ -250,7 +250,7 @@ class TestSelfPlayWorker:
         action_probs = {0: 0.1, 10: 0.3, 20: 0.6}
         policy_vector = worker._action_probs_to_vector(action_probs, is_bidding=False)
 
-        assert policy_vector.shape == (65,)
+        assert policy_vector.shape == (52,)
         assert policy_vector[0] == 0.1
         assert policy_vector[10] == 0.3
         assert policy_vector[20] == 0.6
@@ -415,7 +415,7 @@ def validate_training_example(example: Dict[str, Any]) -> bool:
     # Check shapes
     if example["state"].shape != (256,):
         return False
-    if example["policy"].shape != (65,):
+    if example["policy"].shape != (52,):
         return False
 
     # Check ranges
@@ -774,7 +774,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": float(np.random.rand() * 2 - 1),  # Range [-1, 1]
                     "player_position": i % 4,
                     "game_id": f"game_{i // 4}",
@@ -818,7 +818,7 @@ class TestReplayBuffer:
         for i in range(5):
             example = {
                 "state": np.random.randn(256).astype(np.float32),
-                "policy": np.random.rand(65).astype(np.float32),
+                "policy": np.random.rand(52).astype(np.float32),
                 "value": 0.5,
                 "player_position": i,
                 "game_id": "test_game",
@@ -839,7 +839,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": float(i),  # Use i as value to track which examples remain
                     "player_position": 0,
                     "game_id": f"game_{i}",
@@ -877,7 +877,7 @@ class TestReplayBuffer:
 
         # Check shapes
         assert states.shape == (batch_size, 256)
-        assert policies.shape == (batch_size, 65)
+        assert policies.shape == (batch_size, 52)
         assert values.shape == (batch_size,)
 
         # Check types
@@ -1015,7 +1015,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": float(i) / 10.0,  # 0.0, 0.1, 0.2, 0.3, 0.4
                     "player_position": 0,
                     "game_id": "test_game",
@@ -1039,7 +1039,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": 0.0,
                     "player_position": i % 4,  # Players 0, 1, 2, 3 (3 of each)
                     "game_id": "test_game",
@@ -1065,7 +1065,7 @@ class TestReplayBuffer:
             states, policies, values = buffer.sample_batch(batch_size, device="cpu")
 
             assert states.shape == (batch_size, 256)
-            assert policies.shape == (batch_size, 65)
+            assert policies.shape == (batch_size, 52)
             assert values.shape == (batch_size,)
 
     def test_batch_tensor_dtypes(self, buffer, sample_examples):
@@ -1089,7 +1089,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": 0.0,
                     "player_position": 0,
                     "game_id": "test_game",
@@ -1124,7 +1124,7 @@ class TestReplayBuffer:
             examples.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": 0.0,
                     "player_position": i % 4,
                     "game_id": f"game_{i // 16}",
@@ -1148,7 +1148,7 @@ class TestReplayBuffer:
         assert sample_time < 0.1
 
         assert states.shape == (512, 256)
-        assert policies.shape == (512, 65)
+        assert policies.shape == (512, 52)
         assert values.shape == (512,)
 
     def test_circular_buffer_position_wrapping(self):
@@ -1161,7 +1161,7 @@ class TestReplayBuffer:
             examples1.append(
                 {
                     "state": np.random.randn(256).astype(np.float32),
-                    "policy": np.random.rand(65).astype(np.float32),
+                    "policy": np.random.rand(52).astype(np.float32),
                     "value": float(i),
                     "player_position": 0,
                     "game_id": f"game1_{i}",
@@ -1177,7 +1177,7 @@ class TestReplayBuffer:
         # Add one more to trigger overflow
         example_overflow = {
             "state": np.random.randn(256).astype(np.float32),
-            "policy": np.random.rand(65).astype(np.float32),
+            "policy": np.random.rand(52).astype(np.float32),
             "value": 99.0,
             "player_position": 0,
             "game_id": "overflow",
@@ -1201,7 +1201,7 @@ class TestAugmentation:
         """Test augmentation currently returns unchanged example."""
         example = {
             "state": np.random.randn(256).astype(np.float32),
-            "policy": np.random.rand(65).astype(np.float32),
+            "policy": np.random.rand(52).astype(np.float32),
             "value": 0.5,
             "player_position": 0,
             "game_id": "test_game",
@@ -1610,3 +1610,287 @@ class TestNetworkTrainer:
 
         # Network should be in train mode now
         assert trainer.network.training
+
+
+class TestTrainingPipeline:
+    """Tests for TrainingPipeline class."""
+
+    @pytest.fixture
+    def network(self):
+        """Create a small neural network for testing."""
+        return BlobNet(
+            state_dim=256,
+            embedding_dim=128,  # Smaller for faster tests
+            num_layers=2,  # Fewer layers for faster tests
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+    @pytest.fixture
+    def encoder(self):
+        """Create state encoder."""
+        return StateEncoder()
+
+    @pytest.fixture
+    def masker(self):
+        """Create action masker."""
+        return ActionMasker()
+
+    @pytest.fixture
+    def test_config(self, tmp_path):
+        """Create test configuration."""
+        return {
+            "num_workers": 2,  # Small for faster tests
+            "games_per_iteration": 10,  # Small for faster tests
+            "num_determinizations": 1,  # Minimal for speed
+            "simulations_per_determinization": 5,  # Minimal for speed
+            "replay_buffer_capacity": 1000,
+            "min_buffer_size": 20,
+            "batch_size": 16,
+            "epochs_per_iteration": 2,  # Small for faster tests
+            "learning_rate": 0.001,
+            "weight_decay": 1e-4,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "save_every_n_iterations": 1,  # Save every iteration for testing
+            "device": "cpu",
+        }
+
+    @pytest.fixture
+    def pipeline(self, network, encoder, masker, test_config):
+        """Create training pipeline."""
+        return TrainingPipeline(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            config=test_config,
+        )
+
+    def test_pipeline_initialization(self, network, encoder, masker, test_config):
+        """Test training pipeline initializes correctly."""
+        pipeline = TrainingPipeline(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            config=test_config,
+        )
+
+        # Check components initialized
+        assert pipeline.network is network
+        assert pipeline.encoder is encoder
+        assert pipeline.masker is masker
+        assert pipeline.config == test_config
+
+        # Check internal components created
+        assert pipeline.selfplay_engine is not None
+        assert pipeline.replay_buffer is not None
+        assert pipeline.trainer is not None
+
+        # Check initial state
+        assert pipeline.current_iteration == 0
+        assert pipeline.best_model_path is None
+        assert len(pipeline.metrics_history) == 0
+
+        # Check checkpoint dir created
+        assert pipeline.checkpoint_dir.exists()
+
+        # Clean up workers
+        pipeline.selfplay_engine.shutdown()
+
+    def test_single_iteration(self, pipeline):
+        """Test running a single training iteration."""
+        # Run one iteration
+        metrics = pipeline.run_iteration(iteration=0)
+
+        # Check metrics returned
+        assert "num_selfplay_examples" in metrics
+        assert "replay_buffer_size" in metrics
+        assert "avg_total_loss" in metrics
+        assert "avg_policy_loss" in metrics
+        assert "avg_value_loss" in metrics
+        assert "avg_policy_accuracy" in metrics
+
+        # Check self-play worked
+        assert metrics["num_selfplay_examples"] > 0
+        assert metrics["replay_buffer_size"] > 0
+
+        # Check training metrics are reasonable
+        assert metrics["avg_total_loss"] >= 0
+        assert 0 <= metrics["avg_policy_accuracy"] <= 100
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()
+
+    def test_selfplay_training_integration(self, pipeline):
+        """Test self-play examples feed into training."""
+        # Initially buffer is empty
+        assert len(pipeline.replay_buffer) == 0
+
+        # Run self-play phase
+        examples = pipeline._selfplay_phase(iteration=0)
+
+        # Check examples generated
+        assert len(examples) > 0
+
+        # Check examples added to replay buffer
+        assert len(pipeline.replay_buffer) == len(examples)
+
+        # Now run training phase
+        training_metrics = pipeline._training_phase(iteration=0, num_epochs=2)
+
+        # Check training happened (if buffer has enough examples)
+        if len(pipeline.replay_buffer) >= pipeline.config["min_buffer_size"]:
+            assert training_metrics["avg_total_loss"] > 0
+        else:
+            # If buffer too small, training skipped
+            assert training_metrics["avg_total_loss"] == 0.0
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()
+
+    def test_checkpoint_resume(self, pipeline, tmp_path):
+        """Test resuming training from checkpoint."""
+        # Run one iteration
+        metrics1 = pipeline.run_iteration(iteration=0)
+
+        # Check checkpoint was saved (save_every_n_iterations=1)
+        checkpoint_path = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
+        assert checkpoint_path.exists()
+
+        # Save current state
+        replay_buffer_size_before = len(pipeline.replay_buffer)
+
+        # Create new pipeline and resume
+        new_network = BlobNet(
+            state_dim=256,
+            embedding_dim=128,
+            num_layers=2,
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+        new_pipeline = TrainingPipeline(
+            network=new_network,
+            encoder=pipeline.encoder,
+            masker=pipeline.masker,
+            config=pipeline.config,
+        )
+
+        # Resume from checkpoint
+        new_pipeline._resume_from_checkpoint(str(checkpoint_path))
+
+        # Check state restored
+        assert new_pipeline.current_iteration == 1  # Should start from next iteration
+
+        # Check replay buffer restored (if saved)
+        buffer_path = pipeline.checkpoint_dir / "replay_buffer_iter_1.pkl"
+        if buffer_path.exists():
+            assert len(new_pipeline.replay_buffer) == replay_buffer_size_before
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()
+        new_pipeline.selfplay_engine.shutdown()
+
+    def test_metrics_logging(self, pipeline, capsys):
+        """Test metrics are logged correctly."""
+        # Create mock metrics
+        metrics = {
+            "num_selfplay_examples": 100,
+            "replay_buffer_size": 200,
+            "avg_total_loss": 1.234,
+            "avg_policy_loss": 0.567,
+            "avg_value_loss": 0.890,
+            "avg_policy_accuracy": 45.6,
+            "iteration_time_minutes": 5.5,
+        }
+
+        # Log metrics
+        pipeline._log_metrics(iteration=0, metrics=metrics)
+
+        # Check output contains key information
+        captured = capsys.readouterr()
+        assert "ITERATION 1 SUMMARY" in captured.out
+        assert "Self-Play:" in captured.out
+        assert "Training:" in captured.out
+        assert "100" in captured.out  # num_selfplay_examples
+        assert "1.234" in captured.out  # avg_total_loss
+        assert "45.6" in captured.out  # avg_policy_accuracy
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()
+
+    def test_full_training_run(self, pipeline):
+        """Test running multiple training iterations end-to-end."""
+        # Run 2 iterations (minimal test)
+        pipeline.run_training(num_iterations=2)
+
+        # Check iterations completed
+        assert pipeline.current_iteration == 1  # Last completed iteration (0-indexed)
+
+        # Check metrics history recorded
+        assert len(pipeline.metrics_history) == 2
+
+        # Check checkpoints saved
+        checkpoint_iter1 = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
+        checkpoint_iter2 = pipeline.checkpoint_dir / "checkpoint_iter_2.pth"
+        assert checkpoint_iter1.exists()
+        assert checkpoint_iter2.exists()
+
+        # Check best model saved
+        assert pipeline.best_model_path is not None
+        assert pipeline.best_model_path.exists()
+
+        # Check metrics history file saved
+        metrics_file = pipeline.checkpoint_dir / "metrics_history.json"
+        assert metrics_file.exists()
+
+        # Clean up is handled by run_training
+        # (selfplay_engine.shutdown() is called at the end)
+
+    def test_checkpoint_phase(self, pipeline):
+        """Test checkpoint phase saves files correctly."""
+        # Generate some examples first
+        examples = pipeline._selfplay_phase(iteration=0)
+
+        # Create mock metrics
+        metrics = {
+            "avg_total_loss": 1.5,
+            "avg_policy_accuracy": 40.0,
+        }
+
+        # Run checkpoint phase
+        pipeline._checkpoint_phase(iteration=0, metrics=metrics)
+
+        # Check checkpoint saved (save_every_n_iterations=1, so iteration 0 saves at iter 1)
+        checkpoint_path = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
+        assert checkpoint_path.exists()
+
+        # Check replay buffer saved
+        buffer_path = pipeline.checkpoint_dir / "replay_buffer_iter_1.pkl"
+        assert buffer_path.exists()
+
+        # Check best model saved
+        best_model_path = pipeline.checkpoint_dir / "best_model.pth"
+        assert best_model_path.exists()
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()
+
+    def test_evaluation_phase_stub(self, pipeline):
+        """Test evaluation phase returns stub metrics."""
+        # Evaluation not yet implemented (Session 6)
+        eval_metrics = pipeline._evaluation_phase(iteration=0)
+
+        # Check stub metrics returned
+        assert "eval_win_rate" in eval_metrics
+        assert "eval_games_played" in eval_metrics
+        assert "model_promoted" in eval_metrics
+
+        # Check values are defaults
+        assert eval_metrics["eval_win_rate"] == 0.0
+        assert eval_metrics["eval_games_played"] == 0
+        assert eval_metrics["model_promoted"] is False
+
+        # Clean up
+        pipeline.selfplay_engine.shutdown()

@@ -31,7 +31,7 @@ Key Design Decisions:
 Training Example Format:
     {
         'state': encoded_state,          # 256-dim numpy array
-        'policy': action_probabilities,  # MCTS visit counts (65-dim)
+        'policy': action_probabilities,  # MCTS visit counts (52-dim, matches network)
         'value': final_score,            # Outcome from this player's perspective
         'player_position': int,          # Which player made this decision
         'game_id': str,                  # For tracking game history
@@ -295,7 +295,7 @@ class SelfPlayWorker:
         """
         Convert action probabilities dict to fixed-size vector.
 
-        Creates a 65-dimensional vector (max of 14 bids + 52 cards - 1 extra for safety).
+        Creates a 52-dimensional vector to match network output dimension.
         For bidding: indices 0-13 are bids
         For playing: indices 0-51 are card indices
 
@@ -304,12 +304,13 @@ class SelfPlayWorker:
             is_bidding: True if this is a bidding action
 
         Returns:
-            65-dim numpy array with probabilities (zeros for illegal actions)
+            52-dim numpy array with probabilities (zeros for illegal actions)
         """
-        policy_vector = np.zeros(65, dtype=np.float32)
+        # Use 52 dimensions to match network action_dim = max(14, 52) = 52
+        policy_vector = np.zeros(52, dtype=np.float32)
 
         for action_idx, prob in action_probs.items():
-            if action_idx < 65:  # Safety check
+            if action_idx < 52:  # Safety check
                 policy_vector[action_idx] = prob
 
         return policy_vector
