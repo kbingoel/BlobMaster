@@ -1344,8 +1344,9 @@ class TestImperfectInfoMCTS:
 
         assert details['num_determinizations'] == 3
         assert details['num_actions'] == len(action_probs)
-        assert details['action_entropy'] >= 0
-        assert details['belief_entropy'] >= 0
+        # Allow small floating-point precision errors (within 1e-9)
+        assert details['action_entropy'] >= -1e-9, f"action_entropy should be >= -1e-9, got {details['action_entropy']}"
+        assert details['belief_entropy'] >= -1e-9, f"belief_entropy should be >= -1e-9, got {details['belief_entropy']}"
 
     def test_temperature_scaling(self):
         """Test temperature parameter affects action distribution."""

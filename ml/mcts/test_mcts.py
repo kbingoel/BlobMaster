@@ -1053,7 +1053,13 @@ class TestMCTSIntegrationWithNetwork:
         game.setup_round(cards_to_deal=3)
 
         # All players make bids using MCTS
-        for player in game.players:
+        # IMPORTANT: Iterate in actual bidding order (left of dealer goes first, dealer goes last)
+        # This ensures dealer has knowledge of all other bids when deciding
+        bidding_order_start = (game.dealer_position + 1) % game.num_players
+        for i in range(game.num_players):
+            player_idx = (bidding_order_start + i) % game.num_players
+            player = game.players[player_idx]
+
             action_probs = mcts.search(game, player)
             bid = max(action_probs, key=action_probs.get)
             player.make_bid(bid)
