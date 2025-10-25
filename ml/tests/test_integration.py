@@ -56,8 +56,12 @@ class TestPhase2Integration:
         game.setup_round(cards_to_deal=3)
 
         print("\n=== BIDDING PHASE ===")
-        # Bidding phase
-        for i, player in enumerate(game.players):
+        # Bidding phase - iterate in actual bidding order (left of dealer goes first)
+        bidding_order_start = (game.dealer_position + 1) % game.num_players
+        for i in range(game.num_players):
+            player_idx = (bidding_order_start + i) % game.num_players
+            player = game.players[player_idx]
+
             print(f"\n{player.name}'s turn to bid:")
             print(f"  Hand: {[str(c) for c in sorted(player.hand)]}")
 
@@ -71,7 +75,9 @@ class TestPhase2Integration:
 
             # Validate bid is legal
             legal_bids = list(range(4))  # 0-3 for 3 cards
-            if i == 3:  # Last bidder (dealer)
+            # Dealer is the last bidder in bidding order
+            is_last_bidder = (i == game.num_players - 1)
+            if is_last_bidder:
                 total_bids = sum(p.bid for p in game.players if p.bid is not None)
                 forbidden_bid = 3 - total_bids
                 if 0 <= forbidden_bid <= 3:
@@ -352,17 +358,23 @@ class TestQualityValidation:
             game = BlobGame(num_players=4)
             game.setup_round(cards_to_deal=3)
 
-            # Player 0 uses MCTS, others use random
-            # Bidding
-            for i, player in enumerate(game.players):
-                if i == 0:
+            # Bidding in proper bidding order (left of dealer goes first)
+            bidding_order_start = (game.dealer_position + 1) % game.num_players
+            for i in range(game.num_players):
+                player_idx = (bidding_order_start + i) % game.num_players
+                player = game.players[player_idx]
+
+                # Player 0 uses MCTS, others use random
+                if player.position == 0:
                     # MCTS bid
                     action_probs = mcts.search(game, player)
                     bid = max(action_probs, key=action_probs.get)
                 else:
                     # Random bid
                     legal_bids = list(range(4))  # 0-3 for 3 cards
-                    if i == 3:  # Dealer
+                    # Dealer is the last bidder in bidding order
+                    is_last_bidder = (i == game.num_players - 1)
+                    if is_last_bidder:
                         total_bids = sum(p.bid for p in game.players if p.bid is not None)
                         forbidden_bid = 3 - total_bids
                         if 0 <= forbidden_bid <= 3:
@@ -424,14 +436,20 @@ class TestQualityValidation:
             game = BlobGame(num_players=4)
             game.setup_round(cards_to_deal=3)
 
-            # Bidding
-            for i, player in enumerate(game.players):
+            # Bidding in proper bidding order (left of dealer goes first)
+            bidding_order_start = (game.dealer_position + 1) % game.num_players
+            for i in range(game.num_players):
+                player_idx = (bidding_order_start + i) % game.num_players
+                player = game.players[player_idx]
+
                 action_probs = mcts.search(game, player)
                 bid = max(action_probs, key=action_probs.get)
 
                 # Check if legal
                 legal_bids = list(range(4))
-                if i == 3:  # Dealer
+                # Dealer is the last bidder in bidding order
+                is_last_bidder = (i == game.num_players - 1)
+                if is_last_bidder:
                     total_bids = sum(p.bid for p in game.players if p.bid is not None)
                     forbidden_bid = 3 - total_bids
                     if 0 <= forbidden_bid <= 3:

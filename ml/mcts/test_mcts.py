@@ -1535,8 +1535,12 @@ class TestMCTSIntegrationComplete:
         game = BlobGame(num_players=4)
         game.setup_round(cards_to_deal=3)
 
-        # All players use batched search
-        for player in game.players:
+        # All players use batched search in proper bidding order (left of dealer goes first)
+        bidding_order_start = (game.dealer_position + 1) % game.num_players
+        for i in range(game.num_players):
+            player_idx = (bidding_order_start + i) % game.num_players
+            player = game.players[player_idx]
+
             action_probs = mcts.search_batched(game, player, batch_size=8)
             bid = max(action_probs, key=action_probs.get)
             player.make_bid(bid)
@@ -1544,7 +1548,7 @@ class TestMCTSIntegrationComplete:
         # All players should have bids
         assert all(p.bid is not None for p in game.players)
 
-        # Dealer constraint respected
+        # Dealer constraint respected (sum should never equal cards dealt = 3)
         total_bids = sum(p.bid for p in game.players)
         assert total_bids != 3, "Dealer constraint should be respected"
 
