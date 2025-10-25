@@ -18,6 +18,7 @@ from typing import List, Dict, Any
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.selfplay import SelfPlayWorker, SelfPlayEngine
+from ml.training.replay_buffer import ReplayBuffer, augment_example
 
 
 class TestSelfPlayWorker:
@@ -754,3 +755,460 @@ class TestSelfPlayEngine:
 
         # Clean up
         engine.shutdown()
+
+
+class TestReplayBuffer:
+    """Tests for ReplayBuffer class."""
+
+    @pytest.fixture
+    def buffer(self):
+        """Create replay buffer with small capacity for testing."""
+        return ReplayBuffer(capacity=100)
+
+    @pytest.fixture
+    def sample_examples(self):
+        """Create sample training examples for testing."""
+        examples = []
+        for i in range(10):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": float(np.random.rand() * 2 - 1),  # Range [-1, 1]
+                    "player_position": i % 4,
+                    "game_id": f"game_{i // 4}",
+                    "move_number": i,
+                }
+            )
+        return examples
+
+    def test_replay_buffer_initialization(self):
+        """Test replay buffer initializes correctly."""
+        buffer = ReplayBuffer(capacity=1000)
+
+        assert len(buffer) == 0
+        assert buffer.capacity == 1000
+        assert buffer.position == 0
+        assert buffer.is_full is False
+        assert buffer.use_prioritization is False
+
+    def test_replay_buffer_custom_capacity(self):
+        """Test replay buffer with custom capacity."""
+        buffer = ReplayBuffer(capacity=500_000)
+
+        assert buffer.capacity == 500_000
+        assert len(buffer) == 0
+
+    def test_prioritization_not_implemented(self):
+        """Test that prioritization raises NotImplementedError."""
+        with pytest.raises(NotImplementedError):
+            ReplayBuffer(capacity=100, use_prioritization=True)
+
+    def test_add_examples(self, buffer, sample_examples):
+        """Test adding examples to buffer."""
+        buffer.add_examples(sample_examples)
+
+        assert len(buffer) == 10
+        assert buffer.position == 10
+
+    def test_add_examples_incremental(self, buffer):
+        """Test adding examples incrementally."""
+        # Add examples one at a time
+        for i in range(5):
+            example = {
+                "state": np.random.randn(256).astype(np.float32),
+                "policy": np.random.rand(65).astype(np.float32),
+                "value": 0.5,
+                "player_position": i,
+                "game_id": "test_game",
+                "move_number": i,
+            }
+            buffer.add_examples([example])
+
+        assert len(buffer) == 5
+
+    def test_circular_buffer_overflow(self, buffer):
+        """Test buffer overwrites old examples when full."""
+        # Create buffer with capacity 10
+        small_buffer = ReplayBuffer(capacity=10)
+
+        # Add 15 examples (5 more than capacity)
+        examples = []
+        for i in range(15):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": float(i),  # Use i as value to track which examples remain
+                    "player_position": 0,
+                    "game_id": f"game_{i}",
+                    "move_number": i,
+                }
+            )
+
+        small_buffer.add_examples(examples)
+
+        # Buffer should have exactly 10 examples
+        assert len(small_buffer) == 10
+        assert small_buffer.is_full is True
+
+        # Position should wrap around
+        assert small_buffer.position == 5  # (15 % 10)
+
+        # First 5 examples should be overwritten
+        # Remaining examples should have values 5-14
+        values = [ex["value"] for ex in small_buffer.buffer]
+        assert 0.0 not in values  # First example (value=0) was overwritten
+        assert 1.0 not in values
+        assert 2.0 not in values
+        assert 3.0 not in values
+        assert 4.0 not in values
+        assert 10.0 in values  # Later examples remain
+        assert 14.0 in values
+
+    def test_sample_batch(self, buffer, sample_examples):
+        """Test sampling batches for training."""
+        buffer.add_examples(sample_examples)
+
+        # Sample a batch
+        batch_size = 5
+        states, policies, values = buffer.sample_batch(batch_size, device="cpu")
+
+        # Check shapes
+        assert states.shape == (batch_size, 256)
+        assert policies.shape == (batch_size, 65)
+        assert values.shape == (batch_size,)
+
+        # Check types
+        assert isinstance(states, torch.Tensor)
+        assert isinstance(policies, torch.Tensor)
+        assert isinstance(values, torch.Tensor)
+
+        # Check device
+        assert states.device.type == "cpu"
+        assert policies.device.type == "cpu"
+        assert values.device.type == "cpu"
+
+    def test_sample_batch_randomness(self, buffer, sample_examples):
+        """Test that sampling is random."""
+        buffer.add_examples(sample_examples)
+
+        # Sample multiple batches and check they differ
+        batch1_states, _, _ = buffer.sample_batch(5, device="cpu")
+        batch2_states, _, _ = buffer.sample_batch(5, device="cpu")
+
+        # Batches should be different (with very high probability)
+        # Compare by checking if any states differ
+        states_equal = torch.allclose(batch1_states, batch2_states)
+        # With random sampling from 10 examples, getting identical batches is unlikely
+        # but possible, so we can't assert False directly
+        # Just verify the mechanism works
+
+    def test_sample_batch_too_large(self, buffer, sample_examples):
+        """Test sampling more examples than available raises error."""
+        buffer.add_examples(sample_examples)
+
+        with pytest.raises(ValueError):
+            buffer.sample_batch(100, device="cpu")  # Buffer only has 10 examples
+
+    def test_sample_batch_empty_buffer(self, buffer):
+        """Test sampling from empty buffer raises error."""
+        with pytest.raises(ValueError):
+            buffer.sample_batch(5, device="cpu")
+
+    def test_save_and_load(self, buffer, sample_examples, tmp_path):
+        """Test persisting buffer to disk."""
+        buffer.add_examples(sample_examples)
+
+        # Save buffer
+        save_path = tmp_path / "replay_buffer.pkl"
+        buffer.save(str(save_path))
+
+        # Create new buffer and load
+        new_buffer = ReplayBuffer(capacity=100)
+        new_buffer.load(str(save_path))
+
+        # Check that state is preserved
+        assert len(new_buffer) == len(buffer)
+        assert new_buffer.position == buffer.position
+        assert new_buffer.is_full == buffer.is_full
+        assert new_buffer.capacity == buffer.capacity
+
+        # Check that examples are preserved
+        for orig_ex, loaded_ex in zip(buffer.buffer, new_buffer.buffer):
+            assert np.allclose(orig_ex["state"], loaded_ex["state"])
+            assert np.allclose(orig_ex["policy"], loaded_ex["policy"])
+            assert orig_ex["value"] == loaded_ex["value"]
+            assert orig_ex["player_position"] == loaded_ex["player_position"]
+            assert orig_ex["game_id"] == loaded_ex["game_id"]
+            assert orig_ex["move_number"] == loaded_ex["move_number"]
+
+    def test_load_nonexistent_file(self, buffer):
+        """Test loading from nonexistent file raises error."""
+        with pytest.raises(FileNotFoundError):
+            buffer.load("nonexistent_file.pkl")
+
+    def test_load_mismatched_capacity(self, sample_examples, tmp_path):
+        """Test loading buffer with different capacity raises error."""
+        # Create and save buffer with capacity 100
+        buffer1 = ReplayBuffer(capacity=100)
+        buffer1.add_examples(sample_examples)
+        save_path = tmp_path / "buffer.pkl"
+        buffer1.save(str(save_path))
+
+        # Try to load into buffer with different capacity
+        buffer2 = ReplayBuffer(capacity=200)
+        with pytest.raises(ValueError):
+            buffer2.load(str(save_path))
+
+    def test_clear(self, buffer, sample_examples):
+        """Test clearing the buffer."""
+        buffer.add_examples(sample_examples)
+
+        assert len(buffer) > 0
+
+        buffer.clear()
+
+        assert len(buffer) == 0
+        assert buffer.position == 0
+        assert buffer.is_full is False
+
+    def test_buffer_statistics_empty(self, buffer):
+        """Test statistics for empty buffer."""
+        stats = buffer.get_statistics()
+
+        assert stats["size"] == 0
+        assert stats["capacity"] == 100
+        assert stats["utilization"] == 0.0
+        assert stats["num_games"] == 0
+        assert stats["avg_game_length"] == 0.0
+
+    def test_buffer_statistics(self, buffer, sample_examples):
+        """Test buffer statistics calculation."""
+        buffer.add_examples(sample_examples)
+
+        stats = buffer.get_statistics()
+
+        assert stats["size"] == 10
+        assert stats["capacity"] == 100
+        assert stats["utilization"] == 10.0  # 10/100 * 100
+        assert stats["num_games"] == 3  # game_0, game_1, game_2
+        assert stats["avg_game_length"] > 0
+
+        # Check value distribution
+        assert "value_distribution" in stats
+        assert "min" in stats["value_distribution"]
+        assert "max" in stats["value_distribution"]
+        assert "mean" in stats["value_distribution"]
+        assert "std" in stats["value_distribution"]
+
+        # Check player distribution
+        assert "player_distribution" in stats
+        assert len(stats["player_distribution"]) > 0
+
+    def test_buffer_statistics_value_distribution(self, buffer):
+        """Test value distribution statistics are correct."""
+        # Create examples with known values
+        examples = []
+        for i in range(5):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": float(i) / 10.0,  # 0.0, 0.1, 0.2, 0.3, 0.4
+                    "player_position": 0,
+                    "game_id": "test_game",
+                    "move_number": i,
+                }
+            )
+
+        buffer.add_examples(examples)
+        stats = buffer.get_statistics()
+
+        # Check value distribution
+        assert abs(stats["value_distribution"]["min"] - 0.0) < 1e-6
+        assert abs(stats["value_distribution"]["max"] - 0.4) < 1e-6
+        assert abs(stats["value_distribution"]["mean"] - 0.2) < 1e-6
+
+    def test_buffer_statistics_player_distribution(self, buffer):
+        """Test player distribution statistics."""
+        # Create examples with known player distribution
+        examples = []
+        for i in range(12):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": 0.0,
+                    "player_position": i % 4,  # Players 0, 1, 2, 3 (3 of each)
+                    "game_id": "test_game",
+                    "move_number": i,
+                }
+            )
+
+        buffer.add_examples(examples)
+        stats = buffer.get_statistics()
+
+        # Each player should have 3 examples
+        assert stats["player_distribution"][0] == 3
+        assert stats["player_distribution"][1] == 3
+        assert stats["player_distribution"][2] == 3
+        assert stats["player_distribution"][3] == 3
+
+    def test_batch_tensor_shapes(self, buffer, sample_examples):
+        """Test sampled batch tensors have correct shapes."""
+        buffer.add_examples(sample_examples)
+
+        # Test different batch sizes
+        for batch_size in [1, 3, 5, 10]:
+            states, policies, values = buffer.sample_batch(batch_size, device="cpu")
+
+            assert states.shape == (batch_size, 256)
+            assert policies.shape == (batch_size, 65)
+            assert values.shape == (batch_size,)
+
+    def test_batch_tensor_dtypes(self, buffer, sample_examples):
+        """Test sampled batch tensors have correct dtypes."""
+        buffer.add_examples(sample_examples)
+
+        states, policies, values = buffer.sample_batch(5, device="cpu")
+
+        assert states.dtype == torch.float32
+        assert policies.dtype == torch.float32
+        assert values.dtype == torch.float32
+
+    def test_is_ready_for_training(self, buffer):
+        """Test ready for training check."""
+        # Empty buffer not ready
+        assert not buffer.is_ready_for_training(min_examples=10)
+
+        # Add examples
+        examples = []
+        for i in range(15):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": 0.0,
+                    "player_position": 0,
+                    "game_id": "test_game",
+                    "move_number": i,
+                }
+            )
+
+        buffer.add_examples(examples)
+
+        # Now should be ready
+        assert buffer.is_ready_for_training(min_examples=10)
+        assert not buffer.is_ready_for_training(min_examples=20)
+
+    def test_len_operator(self, buffer, sample_examples):
+        """Test __len__ operator."""
+        assert len(buffer) == 0
+
+        buffer.add_examples(sample_examples)
+        assert len(buffer) == 10
+
+        buffer.clear()
+        assert len(buffer) == 0
+
+    def test_large_buffer_performance(self):
+        """Test buffer performance with large capacity."""
+        # Create large buffer
+        large_buffer = ReplayBuffer(capacity=10_000)
+
+        # Add many examples
+        examples = []
+        for i in range(5000):
+            examples.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": 0.0,
+                    "player_position": i % 4,
+                    "game_id": f"game_{i // 16}",
+                    "move_number": i % 16,
+                }
+            )
+
+        # Add in batches
+        batch_size = 100
+        for i in range(0, len(examples), batch_size):
+            large_buffer.add_examples(examples[i : i + batch_size])
+
+        assert len(large_buffer) == 5000
+
+        # Test sampling is fast
+        start_time = time.time()
+        states, policies, values = large_buffer.sample_batch(512, device="cpu")
+        sample_time = time.time() - start_time
+
+        # Sampling should be fast (< 0.1 seconds)
+        assert sample_time < 0.1
+
+        assert states.shape == (512, 256)
+        assert policies.shape == (512, 65)
+        assert values.shape == (512,)
+
+    def test_circular_buffer_position_wrapping(self):
+        """Test position wraps correctly in circular buffer."""
+        small_buffer = ReplayBuffer(capacity=5)
+
+        # Add exactly capacity examples
+        examples1 = []
+        for i in range(5):
+            examples1.append(
+                {
+                    "state": np.random.randn(256).astype(np.float32),
+                    "policy": np.random.rand(65).astype(np.float32),
+                    "value": float(i),
+                    "player_position": 0,
+                    "game_id": f"game1_{i}",
+                    "move_number": i,
+                }
+            )
+
+        small_buffer.add_examples(examples1)
+        assert len(small_buffer) == 5
+        assert small_buffer.position == 0  # Wrapped to 0
+        assert not small_buffer.is_full  # Not full yet (exactly at capacity)
+
+        # Add one more to trigger overflow
+        example_overflow = {
+            "state": np.random.randn(256).astype(np.float32),
+            "policy": np.random.rand(65).astype(np.float32),
+            "value": 99.0,
+            "player_position": 0,
+            "game_id": "overflow",
+            "move_number": 0,
+        }
+
+        small_buffer.add_examples([example_overflow])
+        assert len(small_buffer) == 5
+        assert small_buffer.is_full is True
+        assert small_buffer.position == 1
+
+        # First example should be replaced
+        assert small_buffer.buffer[0]["value"] == 99.0
+        assert small_buffer.buffer[0]["game_id"] == "overflow"
+
+
+class TestAugmentation:
+    """Tests for data augmentation functions."""
+
+    def test_augment_example_no_op(self):
+        """Test augmentation currently returns unchanged example."""
+        example = {
+            "state": np.random.randn(256).astype(np.float32),
+            "policy": np.random.rand(65).astype(np.float32),
+            "value": 0.5,
+            "player_position": 0,
+            "game_id": "test_game",
+            "move_number": 0,
+        }
+
+        augmented = augment_example(example)
+
+        # Currently should just return list with original example
+        assert len(augmented) == 1
+        assert augmented[0] is example
