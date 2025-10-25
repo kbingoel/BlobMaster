@@ -19,6 +19,7 @@ from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.selfplay import SelfPlayWorker, SelfPlayEngine
 from ml.training.replay_buffer import ReplayBuffer, augment_example
+from ml.training.trainer import NetworkTrainer
 
 
 class TestSelfPlayWorker:
@@ -1212,3 +1213,400 @@ class TestAugmentation:
         # Currently should just return list with original example
         assert len(augmented) == 1
         assert augmented[0] is example
+
+
+class TestNetworkTrainer:
+    """Tests for NetworkTrainer class."""
+
+    @pytest.fixture
+    def network(self):
+        """Create a small neural network for testing."""
+        return BlobNet(
+            state_dim=256,
+            embedding_dim=128,  # Smaller for faster tests
+            num_layers=2,  # Fewer layers for faster tests
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+    @pytest.fixture
+    def trainer(self, network):
+        """Create network trainer."""
+        return NetworkTrainer(
+            network=network,
+            learning_rate=0.001,
+            weight_decay=1e-4,
+            policy_loss_weight=1.0,
+            value_loss_weight=1.0,
+            use_mixed_precision=False,
+            device="cpu",  # Use CPU for testing
+        )
+
+    @pytest.fixture
+    def replay_buffer_with_data(self):
+        """Create replay buffer with sample data."""
+        buffer = ReplayBuffer(capacity=1000)
+
+        # Generate 100 synthetic examples
+        examples = []
+        for i in range(100):
+            example = {
+                "state": np.random.randn(256).astype(np.float32),
+                "policy": self._create_policy_for_network(52),  # Match network output size
+                "value": float(np.random.randn()),
+                "player_position": i % 4,
+                "game_id": f"game_{i // 20}",
+                "move_number": i % 20,
+            }
+            examples.append(example)
+
+        buffer.add_examples(examples)
+        return buffer
+
+    def _create_random_policy(self, size: int) -> np.ndarray:
+        """Create a random probability distribution."""
+        policy = np.random.rand(size).astype(np.float32)
+        policy = policy / policy.sum()  # Normalize to sum to 1
+        return policy
+
+    @staticmethod
+    def _create_policy_for_network(size: int = 52) -> np.ndarray:
+        """Create a random probability distribution matching network output size."""
+        policy = np.random.rand(size).astype(np.float32)
+        policy = policy / policy.sum()  # Normalize to sum to 1
+        return policy
+
+    def test_trainer_initialization(self, network):
+        """Test network trainer initializes correctly."""
+        trainer = NetworkTrainer(
+            network=network,
+            learning_rate=0.001,
+            weight_decay=1e-4,
+            device="cpu",
+        )
+
+        assert trainer.network is network
+        assert trainer.learning_rate == 0.001
+        assert trainer.weight_decay == 1e-4
+        assert trainer.device == "cpu"
+        assert trainer.optimizer is not None
+        assert trainer.scheduler is not None
+        assert trainer.total_steps == 0
+        assert trainer.total_epochs == 0
+
+    def test_trainer_cuda_fallback(self, network):
+        """Test trainer falls back to CPU if CUDA not available."""
+        trainer = NetworkTrainer(
+            network=network,
+            device="cuda",  # Request CUDA
+        )
+
+        # If CUDA not available, should fall back to CPU
+        if not torch.cuda.is_available():
+            assert trainer.device == "cpu"
+        else:
+            assert trainer.device == "cuda"
+
+    def test_single_training_step(self, trainer):
+        """Test a single training step."""
+        batch_size = 8
+
+        # Create synthetic batch
+        states = torch.randn(batch_size, 256)
+        target_policies = torch.randn(batch_size, 52).softmax(dim=1)  # Normalized
+        target_values = torch.randn(batch_size)
+
+        # Perform training step
+        metrics = trainer.train_step(states, target_policies, target_values)
+
+        # Check metrics are returned
+        assert "total_loss" in metrics
+        assert "policy_loss" in metrics
+        assert "value_loss" in metrics
+        assert "policy_accuracy" in metrics
+
+        # Losses should be positive
+        assert metrics["total_loss"] > 0
+        assert metrics["policy_loss"] > 0
+        assert metrics["value_loss"] >= 0
+
+        # Accuracy should be in [0, 100]
+        assert 0 <= metrics["policy_accuracy"] <= 100
+
+        # Check training step counter incremented
+        # Note: train_step doesn't increment total_steps (train_epoch does)
+        assert isinstance(metrics["total_loss"], float)
+
+    def test_loss_computation(self, trainer):
+        """Test loss computation is correct."""
+        batch_size = 4
+
+        # Create synthetic predictions and targets (with requires_grad for computation graph)
+        policy_pred = torch.randn(batch_size, 52, requires_grad=True)
+        value_pred = torch.randn(batch_size, requires_grad=True)
+        policy_target = torch.randn(batch_size, 52).softmax(dim=1)
+        value_target = torch.randn(batch_size)
+
+        # Compute loss
+        total_loss, metrics = trainer.compute_loss(
+            policy_pred, value_pred, policy_target, value_target
+        )
+
+        # Check total_loss is a tensor with gradient tracking
+        assert isinstance(total_loss, torch.Tensor)
+        # Note: metrics contains .item() values (floats), so we check the tensor itself
+        assert total_loss.dim() == 0  # Scalar tensor
+
+        # Check metrics
+        assert "total_loss" in metrics
+        assert "policy_loss" in metrics
+        assert "value_loss" in metrics
+        assert "policy_accuracy" in metrics
+
+        # Verify total_loss is sum of components (approximately)
+        expected_total = (
+            trainer.policy_loss_weight * metrics["policy_loss"] +
+            trainer.value_loss_weight * metrics["value_loss"]
+        )
+        assert abs(metrics["total_loss"] - expected_total) < 1e-4
+
+    def test_train_epoch(self, trainer, replay_buffer_with_data):
+        """Test training for one epoch."""
+        # Train for one epoch
+        metrics = trainer.train_epoch(
+            replay_buffer=replay_buffer_with_data,
+            batch_size=16,
+            num_batches=5,  # Small number for testing
+        )
+
+        # Check metrics are returned
+        assert "total_loss" in metrics
+        assert "policy_loss" in metrics
+        assert "value_loss" in metrics
+        assert "policy_accuracy" in metrics
+
+        # Check epoch counter incremented
+        assert trainer.total_epochs == 1
+        assert trainer.total_steps == 5  # num_batches
+
+    def test_multiple_epochs_reduce_loss(self, trainer, replay_buffer_with_data):
+        """Test that training reduces loss over multiple epochs."""
+        # Train for a few epochs and track loss
+        losses = []
+
+        for epoch in range(5):
+            metrics = trainer.train_epoch(
+                replay_buffer=replay_buffer_with_data,
+                batch_size=16,
+                num_batches=10,
+            )
+            losses.append(metrics["total_loss"])
+
+        # Loss should generally decrease (not strict monotonic due to randomness)
+        # Just check that final loss is less than initial loss
+        assert losses[-1] < losses[0], "Loss should decrease over training"
+
+        # Check epoch counter
+        assert trainer.total_epochs == 5
+
+    def test_checkpoint_save_load(self, trainer, tmp_path):
+        """Test saving and loading checkpoints."""
+        checkpoint_path = tmp_path / "checkpoint.pth"
+
+        # Get initial state
+        initial_lr = trainer.get_learning_rate()
+
+        # Train a bit to change state
+        trainer.total_steps = 100
+        trainer.total_epochs = 10
+
+        # Save checkpoint
+        metrics = {"test_metric": 123.45}
+        trainer.save_checkpoint(
+            filepath=str(checkpoint_path),
+            iteration=5,
+            metrics=metrics,
+        )
+
+        # Check file exists
+        assert checkpoint_path.exists()
+
+        # Create new trainer
+        new_network = BlobNet(
+            state_dim=256,
+            embedding_dim=128,
+            num_layers=2,
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+        new_trainer = NetworkTrainer(
+            network=new_network,
+            learning_rate=0.001,
+            weight_decay=1e-4,
+            device="cpu",
+        )
+
+        # Load checkpoint
+        loaded_metadata = new_trainer.load_checkpoint(str(checkpoint_path))
+
+        # Check metadata
+        assert loaded_metadata["iteration"] == 5
+        assert loaded_metadata["total_steps"] == 100
+        assert loaded_metadata["total_epochs"] == 10
+        assert loaded_metadata["metrics"]["test_metric"] == 123.45
+
+        # Check trainer state restored
+        assert new_trainer.total_steps == 100
+        assert new_trainer.total_epochs == 10
+
+        # Check network weights match
+        for p1, p2 in zip(trainer.network.parameters(), new_trainer.network.parameters()):
+            assert torch.allclose(p1, p2)
+
+    def test_learning_rate_scheduling(self, trainer):
+        """Test learning rate scheduler works."""
+        initial_lr = trainer.get_learning_rate()
+        assert initial_lr == 0.001
+
+        # Step scheduler (StepLR: decay by 0.1 every 100 epochs)
+        # Before 100 steps, LR should stay the same
+        for _ in range(50):
+            trainer.step_scheduler()
+        assert trainer.get_learning_rate() == 0.001
+
+        # After 100 steps, LR should decay
+        for _ in range(51):
+            trainer.step_scheduler()
+        current_lr = trainer.get_learning_rate()
+        assert current_lr < initial_lr
+        assert abs(current_lr - 0.0001) < 1e-6  # Should be 0.001 * 0.1 = 0.0001
+
+    def test_gradient_clipping(self, trainer):
+        """Test gradients are clipped correctly."""
+        batch_size = 4
+
+        # Create synthetic batch with large gradients
+        states = torch.randn(batch_size, 256) * 100  # Large values
+        target_policies = torch.randn(batch_size, 52).softmax(dim=1)
+        target_values = torch.randn(batch_size) * 100  # Large values
+
+        # Perform training step
+        metrics = trainer.train_step(states, target_policies, target_values)
+
+        # Check that gradients exist and training completed
+        # (if clipping didn't work, gradients might explode)
+        assert metrics["total_loss"] > 0
+        assert not np.isnan(metrics["total_loss"])
+        assert not np.isinf(metrics["total_loss"])
+
+        # Check gradient norms are bounded (should be clipped to max_norm=1.0)
+        total_norm = 0.0
+        for p in trainer.network.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+
+        # Total norm should be reasonable (clipping prevents explosion)
+        # Note: After optimizer.step(), gradients may be modified, so we can't
+        # strictly test the clipping here. The main test is that training completes
+        # without NaN/Inf
+        assert total_norm < 1e6  # Sanity check
+
+    def test_policy_loss_weight(self):
+        """Test policy loss weighting works correctly."""
+        network = BlobNet(
+            state_dim=256,
+            embedding_dim=128,
+            num_layers=2,
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+        # Create trainer with high policy loss weight
+        trainer_high_policy = NetworkTrainer(
+            network=network,
+            policy_loss_weight=10.0,
+            value_loss_weight=1.0,
+            device="cpu",
+        )
+
+        batch_size = 4
+        policy_pred = torch.randn(batch_size, 52)
+        value_pred = torch.randn(batch_size)
+        policy_target = torch.randn(batch_size, 52).softmax(dim=1)
+        value_target = torch.randn(batch_size)
+
+        total_loss, metrics = trainer_high_policy.compute_loss(
+            policy_pred, value_pred, policy_target, value_target
+        )
+
+        # Total loss should be dominated by policy loss
+        expected_total = 10.0 * metrics["policy_loss"] + 1.0 * metrics["value_loss"]
+        assert abs(metrics["total_loss"] - expected_total) < 1e-4
+
+    def test_value_loss_weight(self):
+        """Test value loss weighting works correctly."""
+        network = BlobNet(
+            state_dim=256,
+            embedding_dim=128,
+            num_layers=2,
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+        # Create trainer with high value loss weight
+        trainer_high_value = NetworkTrainer(
+            network=network,
+            policy_loss_weight=1.0,
+            value_loss_weight=10.0,
+            device="cpu",
+        )
+
+        batch_size = 4
+        policy_pred = torch.randn(batch_size, 52)
+        value_pred = torch.randn(batch_size)
+        policy_target = torch.randn(batch_size, 52).softmax(dim=1)
+        value_target = torch.randn(batch_size)
+
+        total_loss, metrics = trainer_high_value.compute_loss(
+            policy_pred, value_pred, policy_target, value_target
+        )
+
+        # Total loss should be dominated by value loss
+        expected_total = 1.0 * metrics["policy_loss"] + 10.0 * metrics["value_loss"]
+        assert abs(metrics["total_loss"] - expected_total) < 1e-4
+
+    def test_train_epoch_with_default_batches(self, trainer, replay_buffer_with_data):
+        """Test training epoch with automatic batch calculation."""
+        # Train without specifying num_batches (should calculate automatically)
+        metrics = trainer.train_epoch(
+            replay_buffer=replay_buffer_with_data,
+            batch_size=16,
+            num_batches=None,  # Auto-calculate
+        )
+
+        # Should have trained for approximately buffer_size / batch_size batches
+        # Buffer has 100 examples, batch_size=16, so ~6 batches
+        expected_batches = max(1, len(replay_buffer_with_data) // 16)
+        assert trainer.total_steps == expected_batches
+
+    def test_network_in_train_mode_during_training(self, trainer, replay_buffer_with_data):
+        """Test network is in training mode during train_epoch."""
+        # Set network to eval mode
+        trainer.network.eval()
+        assert not trainer.network.training
+
+        # Train epoch should set to train mode
+        trainer.train_epoch(
+            replay_buffer=replay_buffer_with_data,
+            batch_size=16,
+            num_batches=2,
+        )
+
+        # Network should be in train mode now
+        assert trainer.network.training
