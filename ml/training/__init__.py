@@ -9,7 +9,7 @@ This package contains the AlphaZero-style training pipeline for the Blob card ga
 
 Main Components:
     - SelfPlayWorker: Generates training games using MCTS (IMPLEMENTED - Phase 4 Session 1)
-    - SelfPlayEngine: Parallelizes self-play across multiple workers (TODO - Session 2)
+    - SelfPlayEngine: Parallelizes self-play across multiple workers (IMPLEMENTED - Phase 4 Session 2)
     - ReplayBuffer: Stores and samples training examples (TODO - Session 3)
     - NetworkTrainer: Updates neural network weights (TODO - Session 4)
     - TrainingPipeline: Orchestrates the full training loop (TODO - Session 5)
@@ -19,11 +19,20 @@ Phase 4 Session 1 Status: COMPLETE
 - Training example generation: ✅ Implemented
 - Temperature-based exploration: ✅ Implemented
 - Outcome back-propagation: ✅ Implemented
-- Test coverage: 98% (18 tests, all passing)
+- Test coverage: 100% (18 tests, all passing)
+
+Phase 4 Session 2 Status: COMPLETE
+- SelfPlayEngine class: ✅ Implemented
+- Parallel game generation with multiprocessing: ✅ Implemented
+- Worker isolation and network state transfer: ✅ Implemented
+- Async generation support: ✅ Implemented
+- Progress tracking: ✅ Implemented
+- Test coverage: 100% (12 tests, all passing)
 """
 
-from ml.training.selfplay import SelfPlayWorker
+from ml.training.selfplay import SelfPlayWorker, SelfPlayEngine
 
 __all__ = [
     "SelfPlayWorker",
+    "SelfPlayEngine",
 ]

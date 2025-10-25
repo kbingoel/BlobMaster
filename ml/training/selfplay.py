@@ -42,6 +42,8 @@ Training Example Format:
 import torch
 import numpy as np
 import uuid
+import multiprocessing as mp
+import concurrent.futures
 from typing import Dict, List, Any, Optional, Callable
 
 from ml.network.model import BlobNet
@@ -371,3 +373,263 @@ class SelfPlayWorker:
                 return 0.1  # Near-greedy
 
         return schedule
+
+
+class SelfPlayEngine:
+    """
+    Manages parallel self-play game generation.
+
+    Orchestrates multiple workers to generate games efficiently using
+    multiprocessing. This avoids the Python GIL and enables true parallel
+    execution across multiple CPU cores.
+
+    Architecture:
+        - Main process distributes game generation tasks to worker pool
+        - Each worker creates its own SelfPlayWorker with network copy
+        - Workers run independently with different random seeds
+        - Training examples are collected and aggregated in main process
+
+    Performance:
+        - Target: 300+ games/minute with 16 workers
+        - Each worker generates ~20 games/minute
+        - Linear scaling with number of CPU cores available
+    """
+
+    def __init__(
+        self,
+        network: BlobNet,
+        encoder: StateEncoder,
+        masker: ActionMasker,
+        num_workers: int = 16,
+        num_determinizations: int = 3,
+        simulations_per_determinization: int = 30,
+        temperature_schedule: Optional[Callable[[int], float]] = None,
+    ):
+        """
+        Initialize self-play engine.
+
+        Args:
+            network: Neural network for MCTS
+            encoder: State encoder
+            masker: Action masker
+            num_workers: Number of parallel workers (default: 16)
+            num_determinizations: Determinizations per MCTS search
+            simulations_per_determinization: MCTS simulations per world
+            temperature_schedule: Temperature schedule function
+        """
+        self.network = network
+        self.encoder = encoder
+        self.masker = masker
+        self.num_workers = num_workers
+        self.num_determinizations = num_determinizations
+        self.simulations_per_determinization = simulations_per_determinization
+        self.temperature_schedule = temperature_schedule
+
+        # Get network state dict for passing to workers
+        # Workers will create their own network instances from this
+        self.network_state = network.state_dict()
+
+        # Process pool for parallel execution
+        self.pool = None
+        self.executor = None
+
+    def generate_games(
+        self,
+        num_games: int,
+        num_players: int = 4,
+        cards_to_deal: int = 5,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate multiple games in parallel.
+
+        Distributes game generation across worker processes and aggregates
+        all training examples into a single flat list.
+
+        Args:
+            num_games: Total number of games to generate
+            num_players: Players per game
+            cards_to_deal: Cards to deal per player
+            progress_callback: Optional callback(games_completed) for progress updates
+
+        Returns:
+            Flat list of all training examples from all games
+        """
+        if num_games <= 0:
+            return []
+
+        # Create process pool if not already created
+        if self.pool is None:
+            self.pool = mp.Pool(processes=self.num_workers)
+
+        # Distribute games evenly across workers
+        games_per_worker = num_games // self.num_workers
+        remaining_games = num_games % self.num_workers
+
+        # Create tasks for each worker
+        tasks = []
+        for worker_id in range(self.num_workers):
+            # Give extra games to first few workers to handle remainder
+            worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
+            if worker_games > 0:
+                tasks.append(
+                    (
+                        worker_id,
+                        worker_games,
+                        num_players,
+                        cards_to_deal,
+                        self.network_state,
+                        self.num_determinizations,
+                        self.simulations_per_determinization,
+                        self.temperature_schedule,
+                    )
+                )
+
+        # Execute tasks in parallel
+        results = self.pool.starmap(_worker_generate_games_static, tasks)
+
+        # Flatten results from all workers
+        all_examples = []
+        for worker_examples in results:
+            all_examples.extend(worker_examples)
+
+        # Call progress callback if provided
+        if progress_callback is not None:
+            progress_callback(num_games)
+
+        return all_examples
+
+    def generate_games_async(
+        self,
+        num_games: int,
+        num_players: int = 4,
+        cards_to_deal: int = 5,
+    ) -> concurrent.futures.Future:
+        """
+        Generate games asynchronously (non-blocking).
+
+        Returns immediately with a Future that will contain training examples
+        when generation completes. Useful for running self-play in background
+        while doing other work (e.g., training).
+
+        Args:
+            num_games: Total number of games to generate
+            num_players: Players per game
+            cards_to_deal: Cards to deal
+
+        Returns:
+            Future that will contain training examples when complete
+        """
+        if self.executor is None:
+            self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        # Submit generation task to executor
+        future = self.executor.submit(
+            self.generate_games, num_games, num_players, cards_to_deal
+        )
+
+        return future
+
+    def shutdown(self):
+        """Shutdown the parallel workers gracefully."""
+        if self.pool is not None:
+            self.pool.close()
+            self.pool.join()
+            self.pool = None
+
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+
+
+def _worker_generate_games_static(
+    worker_id: int,
+    num_games: int,
+    num_players: int,
+    cards_to_deal: int,
+    network_state: Dict[str, torch.Tensor],
+    num_determinizations: int,
+    simulations_per_determinization: int,
+    temperature_schedule: Optional[Callable[[int], float]],
+) -> List[Dict[str, Any]]:
+    """
+    Static worker function for parallel game generation.
+
+    This function is defined at module level (not as a method) so it can
+    be pickled by multiprocessing. Each worker creates its own isolated
+    SelfPlayWorker instance and generates games independently.
+
+    Args:
+        worker_id: Unique worker identifier
+        num_games: Number of games this worker should generate
+        num_players: Players per game
+        cards_to_deal: Cards to deal
+        network_state: Network weights (state dict)
+        num_determinizations: Determinizations per MCTS search
+        simulations_per_determinization: MCTS simulations per world
+        temperature_schedule: Temperature schedule function
+
+    Returns:
+        List of training examples from all games
+    """
+    # Set random seed for this worker (ensures different games across workers)
+    np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
+    torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
+
+    # Create network instance for this worker
+    # Infer network architecture from state dict
+    state_dim = network_state["input_embedding.weight"].shape[1]
+    embedding_dim = network_state["input_embedding.weight"].shape[0]
+
+    # Count transformer layers
+    num_layers = 0
+    while f"transformer.layers.{num_layers}.self_attn.in_proj_weight" in network_state:
+        num_layers += 1
+
+    # Infer feedforward dimension from actual linear1 layer
+    feedforward_dim = network_state["transformer.layers.0.linear1.weight"].shape[0]
+
+    # Get other hyperparameters from state dict shapes
+    num_heads = 8  # Default, could infer from attention weights if needed
+    dropout = 0.1  # Default
+
+    network = BlobNet(
+        state_dim=state_dim,
+        embedding_dim=embedding_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        feedforward_dim=feedforward_dim,
+        dropout=dropout,
+    )
+    network.load_state_dict(network_state)
+    network.eval()  # Set to evaluation mode
+
+    # Create encoder and masker for this worker
+    encoder = StateEncoder()
+    masker = ActionMasker()
+
+    # Create SelfPlayWorker
+    worker = SelfPlayWorker(
+        network=network,
+        encoder=encoder,
+        masker=masker,
+        num_determinizations=num_determinizations,
+        simulations_per_determinization=simulations_per_determinization,
+        temperature_schedule=temperature_schedule,
+        use_imperfect_info=True,
+    )
+
+    # Generate games
+    all_examples = []
+    for game_idx in range(num_games):
+        # Include UUID to ensure uniqueness across runs
+        unique_id = str(uuid.uuid4())[:8]
+        game_id = f"worker{worker_id}_game{game_idx}_{unique_id}"
+        examples = worker.generate_game(
+            num_players=num_players,
+            cards_to_deal=cards_to_deal,
+            game_id=game_id,
+        )
+        all_examples.extend(examples)
+
+    return all_examples
