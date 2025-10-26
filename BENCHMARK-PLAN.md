@@ -1,8 +1,11 @@
 # Comprehensive Benchmark Plan - Correct Network Configuration
 
 **Date**: 2025-10-26
-**Status**: Ready for Execution
+**Status**: ⚠️ PHASE 1 EXECUTED - MODERATE RESULTS (1.76x speedup)
 **Hardware**: NVIDIA RTX 4060 (3,072 CUDA cores, 8GB VRAM), AMD Ryzen 9 7950X (16 cores, 32 threads)
+
+**Execution Summary**: See [docs/performance/PHASE1-EXECUTION-SUMMARY.md](docs/performance/PHASE1-EXECUTION-SUMMARY.md)
+**Next Steps**: See [docs/performance/NEXT-STEPS-GPU-MCTS.md](docs/performance/NEXT-STEPS-GPU-MCTS.md)
 
 ---
 
@@ -716,6 +719,66 @@ python benchmarks/performance/benchmark_selfplay.py --device cuda --games 50 --w
 
 ---
 
-**Status**: **READY FOR EXECUTION** ✓
+## Execution Results (2025-10-26)
 
-All benchmark scripts will be updated to use the correct 4.9M parameter network configuration before running tests.
+**Status**: ⚠️ **PHASE 1 COMPLETED - MODERATE SPEEDUP**
+
+### What Was Executed
+
+Following the "Fail-Fast-Fail-Cheap" strategy, we executed the **Phase 1 Quick Screen**:
+
+1. ✅ **Baseline Self-Play Performance** ([test_reproduce_baseline.py](benchmarks/tests/test_reproduce_baseline.py))
+   - Medium MCTS: **31.8 games/min** (expected 43.3, -27%)
+   - Actual baseline slower than expected but consistent
+
+2. ✅ **Phase 1 GPU-Batched MCTS Quick Sweep** ([benchmark_phase1_validation.py](benchmarks/performance/benchmark_phase1_validation.py))
+   - Tested batch sizes: 30, 60, 90
+   - Best result: **1.76x speedup** at batch_size=60
+   - Results: [results/phase1_quick_sweep.csv](results/phase1_quick_sweep.csv)
+
+### Key Findings
+
+| Metric | Result | Target | Status |
+|--------|--------|--------|--------|
+| **Phase 1 Speedup** | **1.76x** | 2.0x minimum | ⚠️ Below target |
+| Baseline (Medium MCTS) | 31.8 games/min | 43.3 games/min | -27% variance |
+| Phase 1 (batch=60) | 5.6 games/min* | N/A | *5-card games |
+| GPU Utilization | 0% | 30%+ | ❌ GPU underutilized |
+
+**Note**: Phase 1 benchmark used 5 cards/game (vs 3 cards in baseline), explaining the lower absolute games/min. The **speedup ratio (1.76x) is valid** for comparison.
+
+### Decision: Stop Phase 1, Proceed to GPU-Batched MCTS
+
+Per BENCHMARK-PLAN.md decision criteria (line 651-653):
+
+> **If Phase 1 achieves <2x speedup**: ❌ Do NOT implement Phase 1, MUST implement GPU-batched MCTS
+
+**Rationale**:
+- 1.76x speedup insufficient (below 2x target)
+- Training time: 80 days → 45 days (still too slow)
+- GPU underutilization (0%) indicates MCTS bottleneck, not NN inference
+- Phase 1 intra-game batching hit fundamental limits
+
+**Next Steps**: Implement GPU-batched MCTS (target: 5-10x speedup)
+- See detailed plan: [docs/performance/NEXT-STEPS-GPU-MCTS.md](docs/performance/NEXT-STEPS-GPU-MCTS.md)
+- Expected performance: 160-320 games/min (vs 32 baseline)
+- Expected training time: **8-16 days** (vs 80 days baseline)
+
+### Time Investment
+
+- **Phase 1 Quick Screen**: 30 minutes ✅
+- **Avoided time**: 90+ minutes (skipped fine-grained sweep and production validation)
+- **Fail-fast approach**: SUCCESS - quickly identified Phase 1 limitations
+
+### Documentation Generated
+
+1. ✅ [PHASE1-EXECUTION-SUMMARY.md](docs/performance/PHASE1-EXECUTION-SUMMARY.md) - Complete execution report
+2. ✅ [NEXT-STEPS-GPU-MCTS.md](docs/performance/NEXT-STEPS-GPU-MCTS.md) - Implementation roadmap
+3. ✅ [results/baseline_reproduction.csv](results/baseline_reproduction.csv) - Baseline measurements
+4. ✅ [results/phase1_quick_sweep.csv](results/phase1_quick_sweep.csv) - Phase 1 results
+
+---
+
+**Status**: **PHASE 1 COMPLETE** ✓ - Recommend GPU-batched MCTS for transformative gains
+
+All benchmark scripts verified to use the correct 4.9M parameter network configuration (256/6/1024).

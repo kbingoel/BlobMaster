@@ -75,6 +75,8 @@ class SelfPlayWorker:
         batch_evaluator: Optional["BatchedEvaluator"] = None,
         gpu_server_client: Optional["GPUServerClient"] = None,
         batch_size: Optional[int] = None,
+        use_parallel_expansion: bool = False,
+        parallel_batch_size: int = 10,
     ):
         """
         Initialize self-play worker.
@@ -95,6 +97,12 @@ class SelfPlayWorker:
             batch_size: Optional batch size for Phase 1 intra-game batching
                        If None, uses sequential search() for baseline
                        If set, uses search_batched() with virtual loss mechanism
+            use_parallel_expansion: Use GPU-batched parallel expansion (default: False)
+                                   If True, uses search_parallel() for cross-worker batching
+                                   Requires batch_evaluator or gpu_server_client
+            parallel_batch_size: Batch size for parallel expansion (default: 10)
+                                Number of leaves to expand per iteration
+                                Recommended: 10 for 32 workers (32×10=320 batch size)
         """
         self.network = network
         self.encoder = encoder
@@ -105,6 +113,8 @@ class SelfPlayWorker:
         self.batch_evaluator = batch_evaluator
         self.gpu_server_client = gpu_server_client
         self.batch_size = batch_size
+        self.use_parallel_expansion = use_parallel_expansion
+        self.parallel_batch_size = parallel_batch_size
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -176,9 +186,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
+            # GPU-Batched: Use search_parallel() if use_parallel_expansion is True
             # Phase 1: Use search_batched() if batch_size is set
             # Baseline: Use search() if batch_size is None
-            if self.batch_size is not None:
+            if self.use_parallel_expansion:
+                action_probs = self.mcts.search_parallel(
+                    game, player, parallel_batch_size=self.parallel_batch_size
+                )
+            elif self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
                     game, player, batch_size=self.batch_size
                 )
@@ -214,9 +229,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
+            # GPU-Batched: Use search_parallel() if use_parallel_expansion is True
             # Phase 1: Use search_batched() if batch_size is set
             # Baseline: Use search() if batch_size is None
-            if self.batch_size is not None:
+            if self.use_parallel_expansion:
+                action_probs = self.mcts.search_parallel(
+                    game, player, parallel_batch_size=self.parallel_batch_size
+                )
+            elif self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
                     game, player, batch_size=self.batch_size
                 )
