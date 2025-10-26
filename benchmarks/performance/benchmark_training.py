@@ -58,12 +58,13 @@ class TrainingBenchmark:
         Returns:
             Initialized network
         """
+        # BASELINE: 4.9M parameters
         network = BlobNet(
             state_dim=256,
-            embedding_dim=256,
-            num_layers=4,
-            num_heads=8,
-            feedforward_dim=512,
+            embedding_dim=256,      # Baseline: 256
+            num_layers=6,           # Baseline: 6 (not 4!)
+            num_heads=8,            # Baseline: 8
+            feedforward_dim=1024,   # Baseline: 1024 (not 512!)
             dropout=0.1,
         )
         network.to(device)
@@ -458,14 +459,14 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
-        help="Epochs per configuration (default: 5)",
+        default=3,
+        help="Epochs per configuration (default: 3 for quick screening)",
     )
     parser.add_argument(
         "--examples",
         type=int,
-        default=100000,
-        help="Synthetic training examples (default: 100000)",
+        default=50000,
+        help="Synthetic training examples (default: 50000 for quick screening)",
     )
     parser.add_argument(
         "--quick",
@@ -489,8 +490,8 @@ def main():
         num_examples = min(args.examples, 50000)
         print("\nQUICK TEST MODE: Limited configurations")
     else:
-        batch_sizes = args.batch_sizes if args.batch_sizes else DEFAULT_BATCH_SIZES
-        precisions = DEFAULT_PRECISIONS
+        batch_sizes = args.batch_sizes if args.batch_sizes else [2048]  # Default: single batch size
+        precisions = DEFAULT_PRECISIONS  # FP32 + FP16
         num_epochs = args.epochs
         num_examples = args.examples
 

@@ -188,14 +188,14 @@ def run_benchmark():
     print("Phase 2: Multi-Game Batched MCTS Benchmark")
     print("=" * 70)
 
-    # Create network (small for fast benchmarking)
+    # Create network (BASELINE: 4.9M parameters)
     print("\nCreating neural network...")
     network = BlobNet(
         state_dim=256,
-        embedding_dim=128,
-        num_layers=2,
-        num_heads=4,
-        feedforward_dim=256,
+        embedding_dim=256,      # Baseline: 256 (not 128!)
+        num_layers=6,           # Baseline: 6 (not 2!)
+        num_heads=8,            # Baseline: 8 (not 4!)
+        feedforward_dim=1024,   # Baseline: 1024 (not 256!)
         dropout=0.0,
     )
     network.eval()
@@ -204,7 +204,7 @@ def run_benchmark():
     masker = ActionMasker()
 
     # Benchmark parameters
-    num_games = 16  # Total games to generate
+    num_games = 5  # Total games to generate (quick screening)
     num_threads = 4  # Parallel threads
 
     print(f"\nBenchmark Configuration:")

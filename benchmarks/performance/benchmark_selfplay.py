@@ -60,13 +60,13 @@ class SelfPlayBenchmark:
 
         print("Initializing benchmark components...")
 
-        # Create network (small version for faster inference)
+        # Create network (BASELINE: 4.9M parameters)
         self.network = BlobNet(
             state_dim=256,
-            embedding_dim=128,
-            num_layers=2,
-            num_heads=4,
-            feedforward_dim=256,
+            embedding_dim=256,      # Baseline: 256 (not 128!)
+            num_layers=6,           # Baseline: 6 (not 2!)
+            num_heads=8,            # Baseline: 8 (not 4!)
+            feedforward_dim=1024,   # Baseline: 1024 (not 256!)
             dropout=0.0,  # No dropout for inference
         )
         self.network.to(device)
@@ -396,8 +396,8 @@ def main():
     parser.add_argument(
         "--games",
         type=int,
-        default=50,
-        help="Games per configuration (default: 50)",
+        default=5,
+        help="Games per configuration (default: 5 for quick screening)",
     )
     parser.add_argument(
         "--quick",
@@ -453,11 +453,11 @@ def main():
     if args.quick:
         worker_counts = QUICK_WORKER_COUNTS
         mcts_configs = QUICK_MCTS_CONFIGS
-        games_per_config = min(args.games, 20)  # Limit games for quick test
+        games_per_config = min(args.games, 5)  # Limit games for quick test
         print("\nQUICK TEST MODE: Limited configurations")
     else:
-        worker_counts = args.workers if args.workers else DEFAULT_WORKER_COUNTS
-        mcts_configs = DEFAULT_MCTS_CONFIGS
+        worker_counts = args.workers if args.workers else [32]  # Default: single worker count
+        mcts_configs = QUICK_MCTS_CONFIGS  # Default: medium MCTS only
         games_per_config = args.games
 
     # Print benchmark plan

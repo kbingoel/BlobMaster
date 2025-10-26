@@ -118,13 +118,13 @@ class Phase1Benchmark:
         print(f"Device: {device}")
         print("Initializing components...")
 
-        # Create network (small version for faster inference)
+        # Create network (BASELINE: 4.9M parameters)
         self.network = BlobNet(
             state_dim=256,
-            embedding_dim=128,
-            num_layers=2,
-            num_heads=4,
-            feedforward_dim=256,
+            embedding_dim=256,      # Baseline: 256 (not 128!)
+            num_layers=6,           # Baseline: 6 (not 2!)
+            num_heads=8,            # Baseline: 8 (not 4!)
+            feedforward_dim=1024,   # Baseline: 1024 (not 256!)
             dropout=0.0,
         )
         self.network.to(device)
@@ -423,20 +423,20 @@ def main():
     parser.add_argument(
         "--batch-start",
         type=int,
-        default=1,
-        help="Starting batch size (default: 1)"
+        default=30,
+        help="Starting batch size (default: 30 for quick sweep)"
     )
     parser.add_argument(
         "--batch-end",
         type=int,
-        default=30,
-        help="Ending batch size (default: 30)"
+        default=90,
+        help="Ending batch size (default: 90 for quick sweep)"
     )
     parser.add_argument(
         "--batch-step",
         type=int,
-        default=10,
-        help="Batch size step (default: 10)"
+        default=30,
+        help="Batch size step (default: 30 for quick sweep)"
     )
     parser.add_argument(
         "--batch-size",

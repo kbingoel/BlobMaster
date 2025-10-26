@@ -68,7 +68,15 @@ def test_batched_vs_sequential_mcts():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    network = BlobNet().to(device)
+    # Use BASELINE network (4.9M parameters)
+    network = BlobNet(
+        state_dim=256,
+        embedding_dim=256,      # Baseline: 256
+        num_layers=6,           # Baseline: 6
+        num_heads=8,            # Baseline: 8
+        feedforward_dim=1024,   # Baseline: 1024
+        dropout=0.0,
+    ).to(device)
     encoder = StateEncoder()
     masker = ActionMasker()
 
@@ -141,7 +149,15 @@ def test_batch_size_variations():
     print("\n=== Testing Different Batch Sizes ===")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    network = BlobNet().to(device)
+    # Use BASELINE network (4.9M parameters)
+    network = BlobNet(
+        state_dim=256,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.0,
+    ).to(device)
     encoder = StateEncoder()
     masker = ActionMasker()
 
@@ -182,7 +198,15 @@ def test_network_call_batching():
     print("\n=== Testing Network Call Batching ===")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    network = BlobNet().to(device)
+    # Use BASELINE network (4.9M parameters)
+    network = BlobNet(
+        state_dim=256,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.0,
+    ).to(device)
     encoder = StateEncoder()
     masker = ActionMasker()
 

@@ -31,13 +31,13 @@ from ml.training.selfplay import SelfPlayEngine
 
 
 def create_test_network(device="cuda"):
-    """Create a small test network for benchmarking."""
+    """Create BASELINE network (4.9M parameters) for benchmarking."""
     network = BlobNet(
         state_dim=256,
-        embedding_dim=128,
-        num_layers=2,
-        num_heads=4,
-        feedforward_dim=256,
+        embedding_dim=256,      # Baseline: 256 (not 128!)
+        num_layers=6,           # Baseline: 6 (not 2!)
+        num_heads=8,            # Baseline: 8 (not 4!)
+        feedforward_dim=1024,   # Baseline: 1024 (not 256!)
         dropout=0.0,  # No dropout for consistent timing
     )
     network.to(device)
@@ -207,7 +207,7 @@ def benchmark_phase3_threaded(network, encoder, masker, num_games=20, num_worker
     }
 
 
-def run_comparison(num_games=20, num_workers=4, device="cuda"):
+def run_comparison(num_games=5, num_workers=4, device="cuda"):
     """Run comprehensive comparison of Phase 2 vs Phase 3."""
     print("\n" + "=" * 70)
     print("PHASE 3 BENCHMARK: Multiprocessing vs Threading")

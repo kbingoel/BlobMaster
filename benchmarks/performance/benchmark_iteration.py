@@ -54,13 +54,13 @@ class IterationBenchmark:
         self.simulations_per_det = simulations_per_det
         self.device = device
 
-        # Create network
+        # Create network (BASELINE: 4.9M parameters)
         self.network = BlobNet(
             state_dim=256,
-            embedding_dim=256,
-            num_layers=4,
-            num_heads=8,
-            feedforward_dim=512,
+            embedding_dim=256,      # Baseline: 256
+            num_layers=6,           # Baseline: 6 (not 4!)
+            num_heads=8,            # Baseline: 8
+            feedforward_dim=1024,   # Baseline: 1024 (not 512!)
             dropout=0.1,
         )
         self.network.to(device)
@@ -423,14 +423,14 @@ def main():
     parser.add_argument(
         "--games",
         type=int,
-        default=1000,
-        help="Games for self-play (default: 1000 = 1/10th scale)",
+        default=500,
+        help="Games for self-play (default: 500 = 1/20th scale for quick screening)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
-        help="Training epochs (default: 10)",
+        default=5,
+        help="Training epochs (default: 5 for quick screening)",
     )
     parser.add_argument(
         "--batch-size",
