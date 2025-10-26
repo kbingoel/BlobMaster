@@ -405,6 +405,7 @@ class SelfPlayEngine:
         num_determinizations: int = 3,
         simulations_per_determinization: int = 30,
         temperature_schedule: Optional[Callable[[int], float]] = None,
+        device: str = "cpu",
     ):
         """
         Initialize self-play engine.
@@ -417,6 +418,7 @@ class SelfPlayEngine:
             num_determinizations: Determinizations per MCTS search
             simulations_per_determinization: MCTS simulations per world
             temperature_schedule: Temperature schedule function
+            device: Device for neural network ('cpu' or 'cuda')
         """
         self.network = network
         self.encoder = encoder
@@ -425,6 +427,7 @@ class SelfPlayEngine:
         self.num_determinizations = num_determinizations
         self.simulations_per_determinization = simulations_per_determinization
         self.temperature_schedule = temperature_schedule
+        self.device = device
 
         # Get network state dict for passing to workers
         # Workers will create their own network instances from this
@@ -483,6 +486,7 @@ class SelfPlayEngine:
                         self.num_determinizations,
                         self.simulations_per_determinization,
                         self.temperature_schedule,
+                        self.device,
                     )
                 )
 
@@ -552,6 +556,7 @@ def _worker_generate_games_static(
     num_determinizations: int,
     simulations_per_determinization: int,
     temperature_schedule: Optional[Callable[[int], float]],
+    device: str = "cpu",
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -569,6 +574,7 @@ def _worker_generate_games_static(
         num_determinizations: Determinizations per MCTS search
         simulations_per_determinization: MCTS simulations per world
         temperature_schedule: Temperature schedule function
+        device: Device to run network on ('cpu' or 'cuda')
 
     Returns:
         List of training examples from all games
@@ -603,6 +609,7 @@ def _worker_generate_games_static(
         dropout=dropout,
     )
     network.load_state_dict(network_state)
+    network.to(device)  # Move to specified device (CPU or GPU)
     network.eval()  # Set to evaluation mode
 
     # Create encoder and masker for this worker

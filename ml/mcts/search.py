@@ -107,6 +107,9 @@ class MCTS:
         self.c_puct = c_puct
         self.temperature = temperature
 
+        # Detect device from network parameters
+        self.device = next(network.parameters()).device
+
         # Tree reuse: Store root node for next search
         self.root: Optional[MCTSNode] = None
 
@@ -213,11 +216,13 @@ class MCTS:
         """
         # Encode current state to tensor
         state_tensor = self.encoder.encode(node.game_state, node.player)
+        state_tensor = state_tensor.to(self.device)
 
         # Get legal actions and mask for current game phase
         legal_actions, legal_mask = self._get_legal_actions_and_mask(
             node.game_state, node.player
         )
+        legal_mask = legal_mask.to(self.device)
 
         # Neural network evaluation
         with torch.no_grad():

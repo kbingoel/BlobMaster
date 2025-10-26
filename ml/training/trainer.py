@@ -452,6 +452,7 @@ class TrainingPipeline:
             simulations_per_determinization=config.get(
                 "simulations_per_determinization", 30
             ),
+            device=self.device,
         )
 
         # Replay buffer
