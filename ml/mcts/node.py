@@ -83,6 +83,12 @@ class MCTSNode:
         self.total_value = 0.0
         self.mean_value = 0.0
 
+        # Virtual losses for concurrent tree search
+        # Used in batched MCTS to prevent multiple simulations from
+        # selecting the same path. Incremented during selection,
+        # decremented after backpropagation.
+        self.virtual_losses = 0
+
         # Children: action_index → MCTSNode
         self.children: Dict[int, MCTSNode] = {}
 
@@ -167,15 +173,18 @@ class MCTSNode:
         """
         Compute UCB1 score for child node.
 
-        Implements the UCB1 formula from AlphaZero:
+        Implements the UCB1 formula from AlphaZero with virtual loss adjustment:
         UCB(child) = Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
 
         Where:
-        - Q: Average value of child (exploitation term)
+        - Q: Average value of child (exploitation term), adjusted for virtual losses
         - P: Prior probability from neural network
         - N_parent: Visit count of parent
-        - N_child: Visit count of child
+        - N_child: Visit count of child (including virtual losses)
         - c_puct: Exploration constant
+
+        Virtual losses discourage multiple concurrent simulations from selecting
+        the same path, improving diversity in batched MCTS.
 
         Args:
             child: Child node to compute score for
@@ -189,12 +198,17 @@ class MCTSNode:
             >>> isinstance(score, float)
             True
         """
-        # Q: Average value (exploitation)
-        q_value = child.mean_value
+        # Q: Average value (exploitation) adjusted for virtual losses
+        # Virtual losses temporarily reduce the value to discourage re-selection
+        effective_visits = child.visit_count + child.virtual_losses
+        if effective_visits > 0:
+            q_value = child.total_value / effective_visits
+        else:
+            q_value = 0.0
 
         # U: Exploration bonus
         u_value = c_puct * child.prior_prob * (
-            np.sqrt(self.visit_count) / (1 + child.visit_count)
+            np.sqrt(self.visit_count) / (1 + effective_visits)
         )
 
         return q_value + u_value
@@ -349,6 +363,78 @@ class MCTSNode:
         # Recursively backpropagate to parent
         if self.parent is not None:
             self.parent.backpropagate(value)
+
+    def add_virtual_loss(self) -> None:
+        """
+        Add a virtual loss to this node.
+
+        Virtual losses are used in batched MCTS to discourage multiple concurrent
+        simulations from selecting the same path. When a node is selected for
+        evaluation, we add a virtual loss to make it temporarily less attractive
+        to other simulations.
+
+        The virtual loss is removed after the simulation completes and the real
+        value is backpropagated.
+
+        Example:
+            >>> node.virtual_losses
+            0
+            >>> node.add_virtual_loss()
+            >>> node.virtual_losses
+            1
+        """
+        self.virtual_losses += 1
+
+    def remove_virtual_loss(self) -> None:
+        """
+        Remove a virtual loss from this node.
+
+        Called after a simulation completes to restore the node's true value.
+        Should always be paired with a prior add_virtual_loss() call.
+
+        Example:
+            >>> node.add_virtual_loss()
+            >>> node.virtual_losses
+            1
+            >>> node.remove_virtual_loss()
+            >>> node.virtual_losses
+            0
+        """
+        self.virtual_losses = max(0, self.virtual_losses - 1)
+
+    def add_virtual_loss_to_path(self) -> None:
+        """
+        Add virtual loss to this node and all ancestors.
+
+        Used when selecting a path through the tree in batched MCTS.
+        Marks the entire path as "in progress" to encourage diversity.
+
+        Example:
+            >>> # Traverse to a leaf
+            >>> path = [root, child1, child2, leaf]
+            >>> leaf.add_virtual_loss_to_path()
+            >>> # Now all nodes on the path have virtual_losses == 1
+        """
+        self.add_virtual_loss()
+        if self.parent is not None:
+            self.parent.add_virtual_loss_to_path()
+
+    def remove_virtual_loss_from_path(self) -> None:
+        """
+        Remove virtual loss from this node and all ancestors.
+
+        Called after a simulation completes and values are backpropagated.
+        Restores the path to its true state.
+
+        Example:
+            >>> leaf.add_virtual_loss_to_path()
+            >>> # ... evaluate and backpropagate ...
+            >>> leaf.remove_virtual_loss_from_path()
+            >>> # All nodes on the path have virtual_losses decremented
+        """
+        self.remove_virtual_loss()
+        if self.parent is not None:
+            self.parent.remove_virtual_loss_from_path()
 
     def get_action_probabilities(self, temperature: float = 1.0) -> Dict[int, float]:
         """

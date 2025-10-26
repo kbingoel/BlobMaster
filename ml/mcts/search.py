@@ -83,6 +83,7 @@ class MCTS:
         num_simulations: int = 100,
         c_puct: float = 1.5,
         temperature: float = 1.0,
+        batch_evaluator: Optional["BatchedEvaluator"] = None,
     ):
         """
         Initialize MCTS search.
@@ -99,6 +100,8 @@ class MCTS:
                         0.0 = greedy (best action only)
                         1.0 = proportional to visit counts
                         >1.0 = more uniform (more exploration)
+            batch_evaluator: Optional BatchedEvaluator for multi-game batching
+                            If provided, uses centralized batching for better GPU utilization
         """
         self.network = network
         self.encoder = encoder
@@ -106,6 +109,7 @@ class MCTS:
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.temperature = temperature
+        self.batch_evaluator = batch_evaluator
 
         # Detect device from network parameters
         self.device = next(network.parameters()).device
@@ -208,6 +212,9 @@ class MCTS:
         policy output as prior probabilities. Returns the neural network's
         value prediction for this state.
 
+        If a BatchedEvaluator is available, uses centralized batching for
+        better GPU utilization across multiple MCTS instances.
+
         Args:
             node: Leaf node to expand
 
@@ -216,17 +223,23 @@ class MCTS:
         """
         # Encode current state to tensor
         state_tensor = self.encoder.encode(node.game_state, node.player)
-        state_tensor = state_tensor.to(self.device)
 
         # Get legal actions and mask for current game phase
         legal_actions, legal_mask = self._get_legal_actions_and_mask(
             node.game_state, node.player
         )
-        legal_mask = legal_mask.to(self.device)
 
         # Neural network evaluation
-        with torch.no_grad():
-            policy, value = self.network(state_tensor, legal_mask)
+        if self.batch_evaluator is not None:
+            # Use centralized batched evaluator (Phase 2 multi-game batching)
+            policy, value = self.batch_evaluator.evaluate(state_tensor, legal_mask)
+        else:
+            # Direct inference (backward compatibility)
+            state_tensor = state_tensor.to(self.device)
+            legal_mask = legal_mask.to(self.device)
+
+            with torch.no_grad():
+                policy, value = self.network(state_tensor, legal_mask)
 
         # Convert policy tensor to dictionary {action: probability}
         policy_np = policy.cpu().numpy()
@@ -440,25 +453,32 @@ class MCTS:
         batch_size: int = 8,
     ) -> Dict[int, float]:
         """
-        Run MCTS with batched neural network inference.
+        Run MCTS with batched neural network inference and virtual losses.
 
         Accumulates leaf nodes and evaluates them in batches, improving
-        GPU utilization and overall performance. Particularly effective
-        when running on GPU with larger batch sizes.
+        GPU utilization and overall performance. Uses virtual losses to
+        prevent multiple simulations from selecting the same path, ensuring
+        diverse exploration.
 
         Args:
             game_state: Current game state
             player: Current player
             batch_size: Number of leaf nodes to evaluate per batch (default: 8)
                        Larger = better GPU utilization but more memory
-                       Recommended: 8-16 for training, 4-8 for inference
+                       Recommended: 8-16 for training, 90 for self-play
 
         Returns:
             Action probabilities from visit counts
 
+        Note:
+            Virtual loss mechanism ensures that when collecting multiple leaf
+            nodes in a batch, each simulation explores a different part of the
+            tree, avoiding redundant evaluations.
+
         Example:
             >>> # Use batched inference for better GPU utilization
-            >>> action_probs = mcts.search_batched(game, player, batch_size=16)
+            >>> action_probs = mcts.search_batched(game, player, batch_size=90)
+            >>> # Single GPU call evaluates 90 positions instead of 90 sequential calls
         """
         # Create root node
         root = MCTSNode(
@@ -469,36 +489,43 @@ class MCTS:
             prior_prob=0.0,
         )
 
-        # Calculate number of batches needed
-        num_batches = (self.num_simulations + batch_size - 1) // batch_size
+        # Track total simulations performed
+        simulations_done = 0
 
-        for _ in range(num_batches):
-            # Collect leaf nodes for batch evaluation
+        # Run batched simulations until we reach target
+        while simulations_done < self.num_simulations:
+            # Collect leaf nodes for this batch
             leaf_nodes = []
-            current_batch_size = min(batch_size, self.num_simulations - len(leaf_nodes))
+            current_batch_size = min(batch_size, self.num_simulations - simulations_done)
 
             for _ in range(current_batch_size):
-                # Traverse to leaf
-                leaf = self._traverse_to_leaf(root)
+                # Traverse to leaf with virtual loss
+                leaf = self._traverse_to_leaf(root, use_virtual_loss=True)
                 if leaf is not None:
                     leaf_nodes.append(leaf)
+                    simulations_done += 1
+                else:
+                    # Terminal node was handled immediately, count it
+                    simulations_done += 1
 
-            # Batch evaluate all collected leaves
+            # Batch evaluate all collected leaves (single GPU call!)
             if leaf_nodes:
-                self._batch_expand_and_evaluate(leaf_nodes)
+                self._batch_expand_and_evaluate(leaf_nodes, use_virtual_loss=True)
 
         # Get action probabilities from visit counts
         return root.get_action_probabilities(self.temperature)
 
-    def _traverse_to_leaf(self, root: MCTSNode) -> Optional[MCTSNode]:
+    def _traverse_to_leaf(self, root: MCTSNode, use_virtual_loss: bool = False) -> Optional[MCTSNode]:
         """
         Traverse from root to leaf using UCB1.
 
         Helper method for batched inference. Traverses tree until
-        reaching a leaf node (unexpanded node).
+        reaching a leaf node (unexpanded node). Optionally applies
+        virtual losses during traversal to prevent duplicate selections.
 
         Args:
             root: Node to start traversal from
+            use_virtual_loss: If True, add virtual losses to selected path
 
         Returns:
             Leaf node reached, or None if root is terminal
@@ -509,24 +536,35 @@ class MCTS:
         while not node.is_leaf():
             node = node.select_child(self.c_puct)
 
+        # Add virtual loss to the entire path if requested
+        # This prevents other concurrent simulations from selecting the same path
+        if use_virtual_loss:
+            node.add_virtual_loss_to_path()
+
         # Check if terminal (don't return terminal nodes for batch evaluation)
         if self._is_terminal(node.game_state):
             # Handle terminal immediately
             value = self._get_terminal_value(node.game_state, node.player)
             node.backpropagate(value)
+            # Remove virtual loss since we're not batching this node
+            if use_virtual_loss:
+                node.remove_virtual_loss_from_path()
             return None
 
         return node
 
-    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode]) -> None:
+    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode], use_virtual_loss: bool = False) -> None:
         """
         Expand and evaluate multiple nodes in batch.
 
         Performs batch neural network inference on multiple leaf nodes,
         then expands each node with action priors and backpropagates values.
+        If virtual losses were applied during traversal, removes them after
+        backpropagation.
 
         Args:
             nodes: List of leaf nodes to evaluate
+            use_virtual_loss: If True, remove virtual losses after backpropagation
 
         Example:
             >>> leaves = [node1, node2, node3]
@@ -551,11 +589,11 @@ class MCTS:
             masks.append(mask)
             legal_actions_list.append(legal_actions)
 
-        # Stack into batch tensors
-        state_batch = torch.stack(states)
-        mask_batch = torch.stack(masks)
+        # Stack into batch tensors and move to correct device
+        state_batch = torch.stack(states).to(self.device)
+        mask_batch = torch.stack(masks).to(self.device)
 
-        # Batch inference
+        # Batch inference - Single GPU call for entire batch!
         with torch.no_grad():
             policy_batch, value_batch = self.network(state_batch, mask_batch)
 
@@ -575,6 +613,10 @@ class MCTS:
 
             # Backpropagate value
             node.backpropagate(value)
+
+            # Remove virtual loss from path after backpropagation
+            if use_virtual_loss:
+                node.remove_virtual_loss_from_path()
 
 
 class ImperfectInfoMCTS:
@@ -626,6 +668,7 @@ class ImperfectInfoMCTS:
         c_puct: float = 1.5,
         temperature: float = 1.0,
         use_parallel: bool = False,
+        batch_evaluator: Optional["BatchedEvaluator"] = None,
     ):
         """
         Initialize imperfect information MCTS.
@@ -641,6 +684,8 @@ class ImperfectInfoMCTS:
             c_puct: Exploration constant (default: 1.5)
             temperature: Temperature for action selection (default: 1.0)
             use_parallel: Use parallel evaluation of determinizations (default: False)
+            batch_evaluator: Optional BatchedEvaluator for multi-game batching
+                            If provided, uses centralized batching for better GPU utilization
 
         Note:
             Total budget = num_determinizations × simulations_per_determinization
@@ -654,6 +699,7 @@ class ImperfectInfoMCTS:
         self.c_puct = c_puct
         self.temperature = temperature
         self.use_parallel = use_parallel
+        self.batch_evaluator = batch_evaluator
 
         # Import determinization components
         from ml.mcts.belief_tracker import BeliefState
@@ -670,6 +716,7 @@ class ImperfectInfoMCTS:
             num_simulations=simulations_per_determinization,
             c_puct=c_puct,
             temperature=temperature,
+            batch_evaluator=batch_evaluator,
         )
 
     def search(
@@ -742,6 +789,86 @@ class ImperfectInfoMCTS:
         if total_counts == 0:
             # No valid actions found, fall back
             return self.perfect_info_mcts.search(game_state, player)
+
+        action_probs = {
+            action: count / total_counts
+            for action, count in aggregated_counts.items()
+        }
+
+        # Apply temperature
+        if self.temperature != 1.0:
+            action_probs = self._apply_temperature(action_probs, self.temperature)
+
+        return action_probs
+
+    def search_batched(
+        self,
+        game_state: BlobGame,
+        player: Player,
+        batch_size: int = 8,
+        belief: Optional["BeliefState"] = None,
+    ) -> Dict[int, float]:
+        """
+        Run imperfect information MCTS with batched inference (Phase 1 + 2 + 3).
+
+        This method combines:
+        - Phase 1: Intra-game batching (within each determinization)
+        - Phase 2/3: Cross-worker batching (if BatchedEvaluator is used)
+
+        Args:
+            game_state: Current game state
+            player: Player whose turn it is
+            batch_size: Batch size for Phase 1 intra-game batching
+            belief: Belief state (will be created if None)
+
+        Returns:
+            Action probabilities aggregated across determinizations
+        """
+        # Same as search() but uses search_batched() for each determinization
+        from ml.mcts.belief_tracker import BeliefState
+
+        # Create belief state if not provided
+        if belief is None:
+            belief = BeliefState(game_state, player)
+
+        # Sample determinizations
+        determinizations = self.determinizer.sample_adaptive(
+            game_state,
+            belief,
+            num_samples=self.num_determinizations,
+            diversity_weight=0.5,
+        )
+
+        if not determinizations:
+            # Fall back to single MCTS on original state if sampling fails
+            return self.perfect_info_mcts.search_batched(game_state, player, batch_size)
+
+        # Aggregate action counts across determinizations
+        aggregated_counts: Dict[int, int] = {}
+
+        for det_hands in determinizations:
+            # Create determinized game
+            det_game = self.determinizer.create_determinized_game(
+                game_state, belief, det_hands
+            )
+
+            # Run MCTS with Phase 1 batching on this determinization
+            action_probs = self.perfect_info_mcts.search_batched(
+                det_game, player, batch_size
+            )
+
+            # Accumulate visit counts (approximate from probabilities)
+            for action, prob in action_probs.items():
+                # Convert prob back to visit count estimate
+                visit_count = int(prob * self.simulations_per_determinization)
+                aggregated_counts[action] = aggregated_counts.get(action, 0) + visit_count
+
+        # Convert aggregated counts to probabilities
+        total_counts = sum(aggregated_counts.values())
+
+        if total_counts == 0:
+            # No valid actions found, fall back
+            return self.perfect_info_mcts.search_batched(game_state, player, batch_size)
 
         action_probs = {
             action: count / total_counts

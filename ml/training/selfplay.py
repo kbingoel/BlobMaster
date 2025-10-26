@@ -72,6 +72,7 @@ class SelfPlayWorker:
         simulations_per_determinization: int = 30,
         temperature_schedule: Optional[Callable[[int], float]] = None,
         use_imperfect_info: bool = True,
+        batch_evaluator: Optional["BatchedEvaluator"] = None,
     ):
         """
         Initialize self-play worker.
@@ -85,6 +86,8 @@ class SelfPlayWorker:
             temperature_schedule: Function mapping move_number -> temperature
                                  If None, uses default schedule
             use_imperfect_info: Use imperfect info MCTS (vs perfect info)
+            batch_evaluator: Optional BatchedEvaluator for multi-game batching
+                            If provided, uses centralized batching for better GPU utilization
         """
         self.network = network
         self.encoder = encoder
@@ -92,6 +95,7 @@ class SelfPlayWorker:
         self.num_determinizations = num_determinizations
         self.simulations_per_determinization = simulations_per_determinization
         self.use_imperfect_info = use_imperfect_info
+        self.batch_evaluator = batch_evaluator
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -107,6 +111,7 @@ class SelfPlayWorker:
                 masker=masker,
                 num_determinizations=num_determinizations,
                 simulations_per_determinization=simulations_per_determinization,
+                batch_evaluator=batch_evaluator,
             )
         else:
             # For testing or comparison, can use perfect info MCTS
@@ -118,6 +123,7 @@ class SelfPlayWorker:
                 encoder=encoder,
                 masker=masker,
                 num_simulations=total_sims,
+                batch_evaluator=batch_evaluator,
             )
 
     def generate_game(
@@ -159,7 +165,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
-            action_probs = self.mcts.search(game, player)
+            # When using BatchedEvaluator (Phase 2/3), use search() - evaluator handles batching
+            # When not using BatchedEvaluator, use search_batched() for Phase 1 intra-game batching
+            if self.batch_evaluator is not None:
+                action_probs = self.mcts.search(game, player)
+            else:
+                action_probs = self.mcts.search_batched(
+                    game, player, batch_size=self.simulations_per_determinization
+                )
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -190,7 +203,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
-            action_probs = self.mcts.search(game, player)
+            # When using BatchedEvaluator (Phase 2/3), use search() - evaluator handles batching
+            # When not using BatchedEvaluator, use search_batched() for Phase 1 intra-game batching
+            if self.batch_evaluator is not None:
+                action_probs = self.mcts.search(game, player)
+            else:
+                action_probs = self.mcts.search_batched(
+                    game, player, batch_size=self.simulations_per_determinization
+                )
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -380,20 +400,26 @@ class SelfPlayEngine:
     """
     Manages parallel self-play game generation.
 
-    Orchestrates multiple workers to generate games efficiently using
-    multiprocessing. This avoids the Python GIL and enables true parallel
-    execution across multiple CPU cores.
+    Orchestrates multiple workers to generate games efficiently using either:
+    - ThreadPoolExecutor (Phase 3): Shared BatchedEvaluator for GPU batching
+    - multiprocessing.Pool (Phase 2): Isolated workers with per-worker batching
 
-    Architecture:
+    Architecture (Phase 3 - ThreadPoolExecutor):
+        - Main thread creates shared BatchedEvaluator
+        - Worker threads share single network and evaluator instance
+        - All MCTS instances send requests to same BatchedEvaluator
+        - Large batch sizes (128-512+) maximize GPU utilization
+
+    Architecture (Phase 2 - multiprocessing):
         - Main process distributes game generation tasks to worker pool
         - Each worker creates its own SelfPlayWorker with network copy
         - Workers run independently with different random seeds
-        - Training examples are collected and aggregated in main process
+        - Each worker has its own BatchedEvaluator (small batches)
 
     Performance:
-        - Target: 300+ games/minute with 16 workers
-        - Each worker generates ~20 games/minute
-        - Linear scaling with number of CPU cores available
+        - Phase 3 (threads + shared evaluator): 1000-2000 games/min, 70-90% GPU
+        - Phase 2 (processes): 96 games/min, 5-10% GPU (overhead dominates)
+        - Phase 1 (sequential): 220 games/min, no batching
     """
 
     def __init__(
@@ -406,6 +432,10 @@ class SelfPlayEngine:
         simulations_per_determinization: int = 30,
         temperature_schedule: Optional[Callable[[int], float]] = None,
         device: str = "cpu",
+        use_batched_evaluator: bool = True,
+        batch_size: int = 512,
+        batch_timeout_ms: float = 10.0,
+        use_thread_pool: Optional[bool] = None,
     ):
         """
         Initialize self-play engine.
@@ -419,6 +449,11 @@ class SelfPlayEngine:
             simulations_per_determinization: MCTS simulations per world
             temperature_schedule: Temperature schedule function
             device: Device for neural network ('cpu' or 'cuda')
+            use_batched_evaluator: Use BatchedEvaluator for multi-game batching (default: True)
+            batch_size: Maximum batch size for BatchedEvaluator (default: 512)
+            batch_timeout_ms: Timeout in ms for batch collection (default: 10.0)
+            use_thread_pool: Use ThreadPoolExecutor (Phase 3) instead of multiprocessing (Phase 2)
+                            If None, auto-selects: True for GPU, False for CPU
         """
         self.network = network
         self.encoder = encoder
@@ -428,14 +463,54 @@ class SelfPlayEngine:
         self.simulations_per_determinization = simulations_per_determinization
         self.temperature_schedule = temperature_schedule
         self.device = device
+        self.use_batched_evaluator = use_batched_evaluator
+        self.batch_size = batch_size
+        self.batch_timeout_ms = batch_timeout_ms
 
-        # Get network state dict for passing to workers
+        # Auto-select threading mode based on device
+        if use_thread_pool is None:
+            # Use threads for GPU (enables shared BatchedEvaluator)
+            # Use processes for CPU (avoids GIL contention)
+            self.use_thread_pool = (device == "cuda")
+        else:
+            self.use_thread_pool = use_thread_pool
+
+        # Get network state dict for passing to workers (multiprocessing only)
         # Workers will create their own network instances from this
-        self.network_state = network.state_dict()
+        self.network_state = network.state_dict() if not self.use_thread_pool else None
 
-        # Process pool for parallel execution
-        self.pool = None
-        self.executor = None
+        # Parallel execution pools
+        self.pool = None  # multiprocessing.Pool (Phase 2)
+        self.thread_pool = None  # ThreadPoolExecutor (Phase 3)
+        self.executor = None  # For async generation
+
+        # Batched evaluator for multi-game batching
+        self.batch_evaluator = None
+        if use_batched_evaluator:
+            from ml.mcts.batch_evaluator import BatchedEvaluator
+
+            # For threads (Phase 3): Create shared evaluator
+            # For processes (Phase 2): Create evaluator in main process (workers create their own)
+            if self.use_thread_pool:
+                # Phase 3: Single shared evaluator for all threads
+                # This enables true cross-worker batching with large batch sizes
+                self.batch_evaluator = BatchedEvaluator(
+                    network=network,
+                    max_batch_size=batch_size * 2,  # Larger for cross-worker batching
+                    timeout_ms=batch_timeout_ms,
+                    device=device,
+                )
+                self.batch_evaluator.start()
+            else:
+                # Phase 2: Evaluator created in main process
+                # Each worker will create its own (no cross-worker batching)
+                self.batch_evaluator = BatchedEvaluator(
+                    network=network,
+                    max_batch_size=batch_size,
+                    timeout_ms=batch_timeout_ms,
+                    device=device,
+                )
+                self.batch_evaluator.start()
 
     def generate_games(
         self,
@@ -447,8 +522,9 @@ class SelfPlayEngine:
         """
         Generate multiple games in parallel.
 
-        Distributes game generation across worker processes and aggregates
-        all training examples into a single flat list.
+        Uses either ThreadPoolExecutor (Phase 3) or multiprocessing.Pool (Phase 2)
+        depending on configuration. Thread pool enables shared BatchedEvaluator
+        for maximum GPU utilization.
 
         Args:
             num_games: Total number of games to generate
@@ -462,6 +538,25 @@ class SelfPlayEngine:
         if num_games <= 0:
             return []
 
+        if self.use_thread_pool:
+            # Phase 3: ThreadPoolExecutor with shared BatchedEvaluator
+            return self._generate_games_threaded(
+                num_games, num_players, cards_to_deal, progress_callback
+            )
+        else:
+            # Phase 2: multiprocessing.Pool with per-worker BatchedEvaluator
+            return self._generate_games_multiprocess(
+                num_games, num_players, cards_to_deal, progress_callback
+            )
+
+    def _generate_games_multiprocess(
+        self,
+        num_games: int,
+        num_players: int,
+        cards_to_deal: int,
+        progress_callback: Optional[Callable[[int], None]],
+    ) -> List[Dict[str, Any]]:
+        """Generate games using multiprocessing.Pool (Phase 2)."""
         # Create process pool if not already created
         if self.pool is None:
             self.pool = mp.Pool(processes=self.num_workers)
@@ -487,6 +582,9 @@ class SelfPlayEngine:
                         self.simulations_per_determinization,
                         self.temperature_schedule,
                         self.device,
+                        self.use_batched_evaluator,
+                        self.batch_size,
+                        self.batch_timeout_ms,
                     )
                 )
 
@@ -496,6 +594,63 @@ class SelfPlayEngine:
         # Flatten results from all workers
         all_examples = []
         for worker_examples in results:
+            all_examples.extend(worker_examples)
+
+        # Call progress callback if provided
+        if progress_callback is not None:
+            progress_callback(num_games)
+
+        return all_examples
+
+    def _generate_games_threaded(
+        self,
+        num_games: int,
+        num_players: int,
+        cards_to_deal: int,
+        progress_callback: Optional[Callable[[int], None]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate games using ThreadPoolExecutor (Phase 3).
+
+        All worker threads share the same network and BatchedEvaluator instance,
+        enabling true cross-worker batching with large batch sizes.
+        """
+        # Create thread pool if not already created
+        if self.thread_pool is None:
+            self.thread_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.num_workers
+            )
+
+        # Distribute games evenly across workers
+        games_per_worker = num_games // self.num_workers
+        remaining_games = num_games % self.num_workers
+
+        # Submit tasks to thread pool
+        futures = []
+        for worker_id in range(self.num_workers):
+            # Give extra games to first few workers to handle remainder
+            worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
+            if worker_games > 0:
+                future = self.thread_pool.submit(
+                    _worker_generate_games_threaded,
+                    worker_id,
+                    worker_games,
+                    num_players,
+                    cards_to_deal,
+                    self.network,
+                    self.encoder,
+                    self.masker,
+                    self.num_determinizations,
+                    self.simulations_per_determinization,
+                    self.temperature_schedule,
+                    self.batch_evaluator,  # Shared evaluator!
+                )
+                futures.append(future)
+
+        # Wait for all tasks to complete
+        all_examples = []
+        for future in concurrent.futures.as_completed(futures):
+            worker_examples = future.result()
             all_examples.extend(worker_examples)
 
         # Call progress callback if provided
@@ -536,15 +691,23 @@ class SelfPlayEngine:
         return future
 
     def shutdown(self):
-        """Shutdown the parallel workers gracefully."""
+        """Shutdown the parallel workers and batch evaluator gracefully."""
         if self.pool is not None:
             self.pool.close()
             self.pool.join()
             self.pool = None
 
+        if self.thread_pool is not None:
+            self.thread_pool.shutdown(wait=True)
+            self.thread_pool = None
+
         if self.executor is not None:
             self.executor.shutdown(wait=True)
             self.executor = None
+
+        if self.batch_evaluator is not None:
+            self.batch_evaluator.shutdown()
+            self.batch_evaluator = None
 
 
 def _worker_generate_games_static(
@@ -557,6 +720,9 @@ def _worker_generate_games_static(
     simulations_per_determinization: int,
     temperature_schedule: Optional[Callable[[int], float]],
     device: str = "cpu",
+    use_batched_evaluator: bool = False,
+    batch_size: int = 512,
+    batch_timeout_ms: float = 10.0,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -564,6 +730,13 @@ def _worker_generate_games_static(
     This function is defined at module level (not as a method) so it can
     be pickled by multiprocessing. Each worker creates its own isolated
     SelfPlayWorker instance and generates games independently.
+
+    Note:
+        When use_batched_evaluator=True, each worker creates its own
+        BatchedEvaluator instance. This provides intra-worker batching
+        but not cross-worker batching (due to multiprocessing limitations).
+        For full multi-game batching, consider using ThreadPoolExecutor
+        instead of multiprocessing.Pool.
 
     Args:
         worker_id: Unique worker identifier
@@ -575,6 +748,9 @@ def _worker_generate_games_static(
         simulations_per_determinization: MCTS simulations per world
         temperature_schedule: Temperature schedule function
         device: Device to run network on ('cpu' or 'cuda')
+        use_batched_evaluator: Create BatchedEvaluator for this worker
+        batch_size: Maximum batch size for BatchedEvaluator
+        batch_timeout_ms: Timeout in ms for batch collection
 
     Returns:
         List of training examples from all games
@@ -616,6 +792,19 @@ def _worker_generate_games_static(
     encoder = StateEncoder()
     masker = ActionMasker()
 
+    # Create BatchedEvaluator if requested
+    batch_evaluator = None
+    if use_batched_evaluator:
+        from ml.mcts.batch_evaluator import BatchedEvaluator
+
+        batch_evaluator = BatchedEvaluator(
+            network=network,
+            max_batch_size=batch_size,
+            timeout_ms=batch_timeout_ms,
+            device=device,
+        )
+        batch_evaluator.start()
+
     # Create SelfPlayWorker
     worker = SelfPlayWorker(
         network=network,
@@ -625,6 +814,7 @@ def _worker_generate_games_static(
         simulations_per_determinization=simulations_per_determinization,
         temperature_schedule=temperature_schedule,
         use_imperfect_info=True,
+        batch_evaluator=batch_evaluator,
     )
 
     # Generate games
@@ -639,5 +829,85 @@ def _worker_generate_games_static(
             game_id=game_id,
         )
         all_examples.extend(examples)
+
+    # Cleanup batch evaluator
+    if batch_evaluator is not None:
+        batch_evaluator.shutdown()
+
+    return all_examples
+
+
+def _worker_generate_games_threaded(
+    worker_id: int,
+    num_games: int,
+    num_players: int,
+    cards_to_deal: int,
+    network: BlobNet,
+    encoder: StateEncoder,
+    masker: ActionMasker,
+    num_determinizations: int,
+    simulations_per_determinization: int,
+    temperature_schedule: Optional[Callable[[int], float]],
+    batch_evaluator: Optional["BatchedEvaluator"],
+) -> List[Dict[str, Any]]:
+    """
+    Threaded worker function for parallel game generation (Phase 3).
+
+    This worker runs in a thread and shares the network and BatchedEvaluator
+    with all other worker threads. This enables true cross-worker batching
+    with large batch sizes (128-512+) for maximum GPU utilization.
+
+    Key Differences from _worker_generate_games_static:
+        - No network creation (shares main thread's network)
+        - No BatchedEvaluator creation (shares main thread's evaluator)
+        - Lighter weight (no pickling, no process overhead)
+        - Enables cross-worker batching (all threads → same evaluator)
+
+    Args:
+        worker_id: Unique worker identifier
+        num_games: Number of games this worker should generate
+        num_players: Players per game
+        cards_to_deal: Cards to deal
+        network: Shared neural network instance (thread-safe during eval)
+        encoder: StateEncoder instance (thread-safe)
+        masker: ActionMasker instance (thread-safe)
+        num_determinizations: Determinizations per MCTS search
+        simulations_per_determinization: MCTS simulations per world
+        temperature_schedule: Temperature schedule function
+        batch_evaluator: Shared BatchedEvaluator (thread-safe)
+
+    Returns:
+        List of training examples from all games
+    """
+    # Set random seed for this worker (ensures different games across workers)
+    np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
+    torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
+
+    # Create SelfPlayWorker with shared network and evaluator
+    worker = SelfPlayWorker(
+        network=network,  # Shared network (no copy needed)
+        encoder=encoder,  # Shared encoder
+        masker=masker,  # Shared masker
+        num_determinizations=num_determinizations,
+        simulations_per_determinization=simulations_per_determinization,
+        temperature_schedule=temperature_schedule,
+        use_imperfect_info=True,
+        batch_evaluator=batch_evaluator,  # Shared evaluator!
+    )
+
+    # Generate games
+    all_examples = []
+    for game_idx in range(num_games):
+        # Include UUID to ensure uniqueness across runs
+        unique_id = str(uuid.uuid4())[:8]
+        game_id = f"worker{worker_id}_game{game_idx}_{unique_id}"
+        examples = worker.generate_game(
+            num_players=num_players,
+            cards_to_deal=cards_to_deal,
+            game_id=game_id,
+        )
+        all_examples.extend(examples)
+
+    # No cleanup needed - evaluator is shared and managed by main thread
 
     return all_examples

@@ -195,19 +195,25 @@ class TestMCTSNodeSelection:
         # Create child with known statistics
         child = MCTSNode(game, player, parent=parent, prior_prob=0.5)
         child.visit_count = 5
+        child.total_value = 3.0  # 5 visits * 0.6 mean = 3.0 total
         child.mean_value = 0.6
+        child.virtual_losses = 0  # No virtual losses initially
 
         # Compute UCB1 score
         c_puct = 1.5
         score = parent._ucb1_score(child, c_puct)
 
-        # Expected: Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
-        # = 0.6 + 1.5 * 0.5 * sqrt(10) / (1 + 5)
-        # = 0.6 + 1.5 * 0.5 * 3.162 / 6
-        # = 0.6 + 0.395 ≈ 0.995
+        # Expected: Q + c_puct * P * sqrt(N_parent) / (1 + N_child + virtual_losses)
+        # With virtual losses, Q = total_value / (visit_count + virtual_losses)
+        # = 3.0 / (5 + 0) = 0.6
+        # U = 1.5 * 0.5 * sqrt(10) / (1 + 5 + 0)
+        # = 1.5 * 0.5 * 3.162 / 6
+        # = 0.395
+        # Total = 0.6 + 0.395 ≈ 0.995
 
-        expected_q = 0.6
-        expected_u = 1.5 * 0.5 * (np.sqrt(10) / (1 + 5))
+        effective_visits = child.visit_count + child.virtual_losses
+        expected_q = child.total_value / effective_visits if effective_visits > 0 else 0.0
+        expected_u = 1.5 * 0.5 * (np.sqrt(10) / (1 + effective_visits))
         expected = expected_q + expected_u
 
         assert abs(score - expected) < 0.001
