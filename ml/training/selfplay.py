@@ -881,6 +881,14 @@ def _worker_generate_games_static(
     )
     network.load_state_dict(network_state)
     network.to(device)  # Move to specified device (CPU or GPU)
+
+    # DIAGNOSTIC: Verify GPU setup on first worker only
+    if worker_id == 0:
+        actual_device = next(network.parameters()).device
+        print(f"[Worker 0] Network on device: {actual_device} (requested: {device})")
+        if device == "cuda" and torch.cuda.is_available():
+            print(f"[Worker 0] GPU: {torch.cuda.get_device_name(0)}")
+
     network.eval()  # Set to evaluation mode
 
     # Create encoder and masker for this worker
