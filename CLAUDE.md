@@ -12,7 +12,7 @@ BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bid
 
 VERY IMPORTANT:
 You are working in a Windows 11 environment, plan your console commands accordingly!
-When checking for tools, use the correct Windows command syntax! For example, use venv/Scripts/python.exe with forward slash!
+When checking for tools, use the correct Windows command syntax! For example, paths must use forward slashes!
 Use Grep!
 Avoid Unicode encoding errors (checkmarks and card symbols)
 
@@ -164,6 +164,17 @@ Self-Play → Replay Buffer → Network Training → Evaluation → Checkpoint
 - `games.db`: SQLite database (game history, user stats, move analysis)
 - `training_data/`: Self-play game records for training
 
+**`docs/`** - Documentation and analysis:
+- `performance/`: Performance investigation reports and findings
+- `phases/`: Phase completion summaries and historical records
+- `archive/`: Superseded documents and bug fixes
+
+**`benchmarks/`** - Performance benchmarking and testing:
+- `performance/`: Benchmark scripts for self-play, training, and iteration timing
+- `tests/`: Ad-hoc test scripts for configuration validation
+
+**`results/`** - CSV result files from benchmarks and tests
+
 ## Key Technical Decisions
 
 ### Why AlphaZero over PPO/A3C?
@@ -236,14 +247,40 @@ The project is currently in early stages. The README outlines a 7-phase roadmap:
 - **OpenVINO optimization**: Use Intel-specific optimizations for iGPU
 - **ONNX graph optimization**: Operator fusion, constant folding
 
-## Expected Training Timeline
+## Performance Findings & Training Configuration
+
+After extensive performance testing (see [PERFORMANCE-FINDINGS.md](PERFORMANCE-FINDINGS.md)), we determined the optimal configuration:
+
+**Best Configuration** (Phase 2 - Baseline Multiprocessing):
+```bash
+python ml/train.py --workers 32 --device cuda
+```
+
+**Expected Performance**:
+- Light MCTS (2 det × 20 sims): 80 games/min
+- Medium MCTS (3 det × 30 sims): 43 games/min ← **recommended for training**
+- Heavy MCTS (5 det × 50 sims): 25 games/min
+
+**Training Timeline** (500 iterations × 10,000 games each):
+- Medium MCTS: ~54 days continuous training
+- GPU utilization: 15-20% (acceptable for MCTS sequential nature)
+
+**Key Findings**:
+- GPU server architecture (Phase 3.5) failed: 3-5x slower due to small batch sizes
+- Threading + batching failed: GIL contention and overhead exceeded benefits
+- Simple multiprocessing wins: 32 workers with per-worker networks
+- Future optimization: GPU-batched MCTS with virtual loss could achieve 300-600 games/min
+
+**Detailed Analysis**: See [docs/performance/](docs/performance/) for comprehensive investigation
+
+## Expected Training Progression
 
 Based on similar AlphaZero projects:
 
 - **Day 1** (ELO ~800): Random legal moves
 - **Day 3** (ELO ~1200): Learned basic trick-taking rules
 - **Day 7** (ELO ~1600): Strategic bidding and card counting
-- **3-7 days total** on RTX 4060 for strong model
+- **~50 days total** on RTX 4060 for strong model (with Medium MCTS)
 
 **Hardware Requirements**:
 - Training: RTX 4060 8GB GPU, 128GB RAM (parallel workers), 50GB+ storage

@@ -84,6 +84,7 @@ class MCTS:
         c_puct: float = 1.5,
         temperature: float = 1.0,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
+        gpu_server_client: Optional["GPUServerClient"] = None,
     ):
         """
         Initialize MCTS search.
@@ -102,6 +103,8 @@ class MCTS:
                         >1.0 = more uniform (more exploration)
             batch_evaluator: Optional BatchedEvaluator for multi-game batching
                             If provided, uses centralized batching for better GPU utilization
+            gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
+                              If provided, sends requests to centralized GPU server process
         """
         self.network = network
         self.encoder = encoder
@@ -110,15 +113,22 @@ class MCTS:
         self.c_puct = c_puct
         self.temperature = temperature
         self.batch_evaluator = batch_evaluator
+        self.gpu_server_client = gpu_server_client
 
-        # Detect device from network parameters
-        self.device = next(network.parameters()).device
+        # Detect device from network parameters (if network is provided)
+        if network is not None:
+            self.device = next(network.parameters()).device
+        else:
+            # When using GPU server, network is None but device doesn't matter
+            # (requests are sent to server which handles device placement)
+            self.device = torch.device("cpu")
 
         # Tree reuse: Store root node for next search
         self.root: Optional[MCTSNode] = None
 
         # Set network to evaluation mode (disable dropout, etc.)
-        self.network.eval()
+        if self.network is not None:
+            self.network.eval()
 
     def search(
         self,
@@ -229,9 +239,12 @@ class MCTS:
             node.game_state, node.player
         )
 
-        # Neural network evaluation
-        if self.batch_evaluator is not None:
-            # Use centralized batched evaluator (Phase 2 multi-game batching)
+        # Neural network evaluation (priority: GPU server > BatchedEvaluator > direct)
+        if self.gpu_server_client is not None:
+            # Use GPU inference server (Phase 3.5: multiprocessing + centralized GPU)
+            policy, value = self.gpu_server_client.evaluate(state_tensor, legal_mask)
+        elif self.batch_evaluator is not None:
+            # Use centralized batched evaluator (Phase 2/3: multi-game batching)
             policy, value = self.batch_evaluator.evaluate(state_tensor, legal_mask)
         else:
             # Direct inference (backward compatibility)
@@ -589,13 +602,38 @@ class MCTS:
             masks.append(mask)
             legal_actions_list.append(legal_actions)
 
-        # Stack into batch tensors and move to correct device
-        state_batch = torch.stack(states).to(self.device)
-        mask_batch = torch.stack(masks).to(self.device)
+        # Stack into batch tensors
+        state_batch = torch.stack(states)
+        mask_batch = torch.stack(masks)
 
-        # Batch inference - Single GPU call for entire batch!
-        with torch.no_grad():
-            policy_batch, value_batch = self.network(state_batch, mask_batch)
+        # Batch inference (priority: GPU server > BatchedEvaluator > direct)
+        if self.gpu_server_client is not None:
+            # Use GPU inference server - send each state individually
+            # (GPU server handles batching internally)
+            policy_list = []
+            value_list = []
+            for state, mask in zip(states, masks):
+                policy, value = self.gpu_server_client.evaluate(state, mask)
+                policy_list.append(policy)
+                value_list.append(value)
+            policy_batch = torch.stack(policy_list)
+            value_batch = torch.stack(value_list)
+        elif self.batch_evaluator is not None:
+            # Use centralized batched evaluator - send each state individually
+            policy_list = []
+            value_list = []
+            for state, mask in zip(states, masks):
+                policy, value = self.batch_evaluator.evaluate(state, mask)
+                policy_list.append(policy)
+                value_list.append(value)
+            policy_batch = torch.stack(policy_list)
+            value_batch = torch.stack(value_list)
+        else:
+            # Direct inference - move to device for single GPU call
+            state_batch = state_batch.to(self.device)
+            mask_batch = mask_batch.to(self.device)
+            with torch.no_grad():
+                policy_batch, value_batch = self.network(state_batch, mask_batch)
 
         # Expand and backpropagate each node
         for i, node in enumerate(nodes):
@@ -669,6 +707,7 @@ class ImperfectInfoMCTS:
         temperature: float = 1.0,
         use_parallel: bool = False,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
+        gpu_server_client: Optional["GPUServerClient"] = None,
     ):
         """
         Initialize imperfect information MCTS.
@@ -686,6 +725,8 @@ class ImperfectInfoMCTS:
             use_parallel: Use parallel evaluation of determinizations (default: False)
             batch_evaluator: Optional BatchedEvaluator for multi-game batching
                             If provided, uses centralized batching for better GPU utilization
+            gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
+                              If provided, sends requests to centralized GPU server process
 
         Note:
             Total budget = num_determinizations × simulations_per_determinization
@@ -700,6 +741,7 @@ class ImperfectInfoMCTS:
         self.temperature = temperature
         self.use_parallel = use_parallel
         self.batch_evaluator = batch_evaluator
+        self.gpu_server_client = gpu_server_client
 
         # Import determinization components
         from ml.mcts.belief_tracker import BeliefState
@@ -717,6 +759,7 @@ class ImperfectInfoMCTS:
             c_puct=c_puct,
             temperature=temperature,
             batch_evaluator=batch_evaluator,
+            gpu_server_client=gpu_server_client,
         )
 
     def search(

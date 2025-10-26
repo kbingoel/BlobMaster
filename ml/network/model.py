@@ -61,8 +61,13 @@ class BlobNet(nn.Module):
         """
         super(BlobNet, self).__init__()
 
+        # Store all constructor parameters for model serialization
         self.state_dim = state_dim
         self.embedding_dim = embedding_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.feedforward_dim = feedforward_dim
+        self.dropout = dropout
         self.max_bid = max_bid
         self.max_cards = max_cards
 

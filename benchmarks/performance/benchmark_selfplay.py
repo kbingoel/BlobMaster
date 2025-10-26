@@ -85,6 +85,11 @@ class SelfPlayBenchmark:
         simulations_per_det: int,
         num_games: int,
         config_name: str,
+        use_gpu_server: bool = False,
+        gpu_server_max_batch: int = 512,
+        gpu_server_timeout_ms: float = 10.0,
+        use_batched_evaluator: bool = True,
+        use_thread_pool: bool = False,
     ) -> Dict[str, Any]:
         """
         Benchmark a specific configuration.
@@ -95,6 +100,11 @@ class SelfPlayBenchmark:
             simulations_per_det: Simulations per determinization
             num_games: Number of games to generate
             config_name: Human-readable config name
+            use_gpu_server: Enable GPU inference server
+            gpu_server_max_batch: Max batch size for GPU server
+            gpu_server_timeout_ms: Batch accumulation timeout (ms)
+            use_batched_evaluator: Use batched evaluator (ignored if GPU server enabled)
+            use_thread_pool: Use thread pool (ignored if GPU server enabled)
 
         Returns:
             Dictionary with performance metrics
@@ -105,6 +115,14 @@ class SelfPlayBenchmark:
         print(f"  - Simulations/det: {simulations_per_det}")
         print(f"  - Total MCTS sims/move: {num_determinizations * simulations_per_det}")
         print(f"  - Games to generate: {num_games}")
+        if use_gpu_server:
+            print(f"  - GPU Server: ENABLED")
+            print(f"    - Max batch: {gpu_server_max_batch}")
+            print(f"    - Timeout: {gpu_server_timeout_ms}ms")
+        else:
+            print(f"  - GPU Server: DISABLED")
+            print(f"    - Batched evaluator: {use_batched_evaluator}")
+            print(f"    - Thread pool: {use_thread_pool}")
         print(f"{'='*70}")
 
         # Create self-play engine
@@ -116,6 +134,11 @@ class SelfPlayBenchmark:
             num_determinizations=num_determinizations,
             simulations_per_determinization=simulations_per_det,
             device=self.device,
+            use_gpu_server=use_gpu_server,
+            gpu_server_max_batch=gpu_server_max_batch,
+            gpu_server_timeout_ms=gpu_server_timeout_ms,
+            use_batched_evaluator=use_batched_evaluator,
+            use_thread_pool=use_thread_pool,
         )
 
         # Record initial CPU usage
@@ -147,7 +170,10 @@ class SelfPlayBenchmark:
                 progress_callback=progress_callback,
             )
         except Exception as e:
+            import traceback
             print(f"ERROR: {e}")
+            print("Full traceback:")
+            traceback.print_exc()
             engine.shutdown()
             return {
                 "num_workers": num_workers,
@@ -201,6 +227,11 @@ class SelfPlayBenchmark:
         worker_counts: List[int],
         mcts_configs: List[Tuple[str, int, int]],
         games_per_config: int,
+        use_gpu_server: bool = False,
+        gpu_server_max_batch: int = 512,
+        gpu_server_timeout_ms: float = 10.0,
+        use_batched_evaluator: bool = True,
+        use_thread_pool: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Run full benchmark suite.
@@ -209,6 +240,11 @@ class SelfPlayBenchmark:
             worker_counts: List of worker counts to test
             mcts_configs: List of (name, num_det, sims_per_det) tuples
             games_per_config: Games to generate per configuration
+            use_gpu_server: Enable GPU inference server
+            gpu_server_max_batch: Max batch size for GPU server
+            gpu_server_timeout_ms: Batch accumulation timeout (ms)
+            use_batched_evaluator: Use batched evaluator
+            use_thread_pool: Use thread pool
 
         Returns:
             List of benchmark results
@@ -232,6 +268,11 @@ class SelfPlayBenchmark:
                     simulations_per_det=sims_per_det,
                     num_games=games_per_config,
                     config_name=config_name,
+                    use_gpu_server=use_gpu_server,
+                    gpu_server_max_batch=gpu_server_max_batch,
+                    gpu_server_timeout_ms=gpu_server_timeout_ms,
+                    use_batched_evaluator=use_batched_evaluator,
+                    use_thread_pool=use_thread_pool,
                 )
 
                 results.append(metrics)
@@ -371,6 +412,35 @@ def main():
         default="benchmark_selfplay_results.csv",
         help="Output CSV path",
     )
+    parser.add_argument(
+        "--use_gpu_server",
+        action="store_true",
+        help="Enable GPU inference server (multiprocessing-based batching)",
+    )
+    parser.add_argument(
+        "--gpu_server_max_batch",
+        type=int,
+        default=512,
+        help="Max batch size for GPU server (default: 512)",
+    )
+    parser.add_argument(
+        "--gpu_server_timeout_ms",
+        type=float,
+        default=10.0,
+        help="GPU server batch timeout in ms (default: 10.0)",
+    )
+    parser.add_argument(
+        "--use_batched_evaluator",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Use batched evaluator (default: true, ignored if GPU server enabled)",
+    )
+    parser.add_argument(
+        "--use_thread_pool",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="Use thread pool (default: false, ignored if GPU server enabled)",
+    )
 
     args = parser.parse_args()
 
@@ -398,7 +468,16 @@ def main():
 
     # Run benchmark
     benchmark = SelfPlayBenchmark(device=args.device)
-    results = benchmark.run_benchmarks(worker_counts, mcts_configs, games_per_config)
+    results = benchmark.run_benchmarks(
+        worker_counts,
+        mcts_configs,
+        games_per_config,
+        use_gpu_server=args.use_gpu_server,
+        gpu_server_max_batch=args.gpu_server_max_batch,
+        gpu_server_timeout_ms=args.gpu_server_timeout_ms,
+        use_batched_evaluator=args.use_batched_evaluator,
+        use_thread_pool=args.use_thread_pool,
+    )
 
     # Save and display results
     save_results_csv(results, args.output)

@@ -73,6 +73,7 @@ class SelfPlayWorker:
         temperature_schedule: Optional[Callable[[int], float]] = None,
         use_imperfect_info: bool = True,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
+        gpu_server_client: Optional["GPUServerClient"] = None,
     ):
         """
         Initialize self-play worker.
@@ -88,6 +89,8 @@ class SelfPlayWorker:
             use_imperfect_info: Use imperfect info MCTS (vs perfect info)
             batch_evaluator: Optional BatchedEvaluator for multi-game batching
                             If provided, uses centralized batching for better GPU utilization
+            gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
+                              If provided, sends requests to centralized GPU server process
         """
         self.network = network
         self.encoder = encoder
@@ -96,6 +99,7 @@ class SelfPlayWorker:
         self.simulations_per_determinization = simulations_per_determinization
         self.use_imperfect_info = use_imperfect_info
         self.batch_evaluator = batch_evaluator
+        self.gpu_server_client = gpu_server_client
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -112,6 +116,7 @@ class SelfPlayWorker:
                 num_determinizations=num_determinizations,
                 simulations_per_determinization=simulations_per_determinization,
                 batch_evaluator=batch_evaluator,
+                gpu_server_client=gpu_server_client,
             )
         else:
             # For testing or comparison, can use perfect info MCTS
@@ -124,6 +129,7 @@ class SelfPlayWorker:
                 masker=masker,
                 num_simulations=total_sims,
                 batch_evaluator=batch_evaluator,
+                gpu_server_client=gpu_server_client,
             )
 
     def generate_game(
@@ -436,6 +442,9 @@ class SelfPlayEngine:
         batch_size: int = 512,
         batch_timeout_ms: float = 10.0,
         use_thread_pool: Optional[bool] = None,
+        use_gpu_server: bool = False,
+        gpu_server_max_batch: int = 512,
+        gpu_server_timeout_ms: float = 10.0,
     ):
         """
         Initialize self-play engine.
@@ -454,6 +463,10 @@ class SelfPlayEngine:
             batch_timeout_ms: Timeout in ms for batch collection (default: 10.0)
             use_thread_pool: Use ThreadPoolExecutor (Phase 3) instead of multiprocessing (Phase 2)
                             If None, auto-selects: True for GPU, False for CPU
+            use_gpu_server: Use GPU inference server (Phase 3.5) for multiprocessing batching
+                           Overrides use_batched_evaluator and use_thread_pool
+            gpu_server_max_batch: Maximum batch size for GPU server (default: 512)
+            gpu_server_timeout_ms: Batch collection timeout for GPU server (default: 10ms)
         """
         self.network = network
         self.encoder = encoder
@@ -463,17 +476,26 @@ class SelfPlayEngine:
         self.simulations_per_determinization = simulations_per_determinization
         self.temperature_schedule = temperature_schedule
         self.device = device
-        self.use_batched_evaluator = use_batched_evaluator
-        self.batch_size = batch_size
-        self.batch_timeout_ms = batch_timeout_ms
+        self.use_gpu_server = use_gpu_server
+        self.gpu_server_max_batch = gpu_server_max_batch
+        self.gpu_server_timeout_ms = gpu_server_timeout_ms
 
-        # Auto-select threading mode based on device
-        if use_thread_pool is None:
-            # Use threads for GPU (enables shared BatchedEvaluator)
-            # Use processes for CPU (avoids GIL contention)
-            self.use_thread_pool = (device == "cuda")
+        # GPU server takes precedence over other batching methods
+        if use_gpu_server:
+            self.use_batched_evaluator = False
+            self.use_thread_pool = False  # Force multiprocessing
         else:
-            self.use_thread_pool = use_thread_pool
+            self.use_batched_evaluator = use_batched_evaluator
+            self.batch_size = batch_size
+            self.batch_timeout_ms = batch_timeout_ms
+
+            # Auto-select threading mode based on device
+            if use_thread_pool is None:
+                # Use threads for GPU (enables shared BatchedEvaluator)
+                # Use processes for CPU (avoids GIL contention)
+                self.use_thread_pool = (device == "cuda")
+            else:
+                self.use_thread_pool = use_thread_pool
 
         # Get network state dict for passing to workers (multiprocessing only)
         # Workers will create their own network instances from this
@@ -484,9 +506,24 @@ class SelfPlayEngine:
         self.thread_pool = None  # ThreadPoolExecutor (Phase 3)
         self.executor = None  # For async generation
 
+        # GPU inference server (Phase 3.5)
+        self.gpu_server = None
+        self.gpu_clients = {}  # client_id -> GPUServerClient
+        if use_gpu_server:
+            from ml.mcts.gpu_server import GPUInferenceServer
+
+            self.gpu_server = GPUInferenceServer(
+                network=network,
+                device=device,
+                max_batch_size=gpu_server_max_batch,
+                timeout_ms=gpu_server_timeout_ms,
+            )
+            self.gpu_server.start()
+            print(f"[SelfPlayEngine] GPU server started (max_batch={gpu_server_max_batch}, timeout={gpu_server_timeout_ms}ms)")
+
         # Batched evaluator for multi-game batching
         self.batch_evaluator = None
-        if use_batched_evaluator:
+        if self.use_batched_evaluator:
             from ml.mcts.batch_evaluator import BatchedEvaluator
 
             # For threads (Phase 3): Create shared evaluator
@@ -556,7 +593,7 @@ class SelfPlayEngine:
         cards_to_deal: int,
         progress_callback: Optional[Callable[[int], None]],
     ) -> List[Dict[str, Any]]:
-        """Generate games using multiprocessing.Pool (Phase 2)."""
+        """Generate games using multiprocessing.Pool (Phase 2 or Phase 3.5)."""
         # Create process pool if not already created
         if self.pool is None:
             self.pool = mp.Pool(processes=self.num_workers)
@@ -565,31 +602,62 @@ class SelfPlayEngine:
         games_per_worker = num_games // self.num_workers
         remaining_games = num_games % self.num_workers
 
-        # Create tasks for each worker
-        tasks = []
-        for worker_id in range(self.num_workers):
-            # Give extra games to first few workers to handle remainder
-            worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
-            if worker_games > 0:
-                tasks.append(
-                    (
-                        worker_id,
-                        worker_games,
-                        num_players,
-                        cards_to_deal,
-                        self.network_state,
-                        self.num_determinizations,
-                        self.simulations_per_determinization,
-                        self.temperature_schedule,
-                        self.device,
-                        self.use_batched_evaluator,
-                        self.batch_size,
-                        self.batch_timeout_ms,
-                    )
-                )
+        # Different task creation based on GPU server usage
+        if self.use_gpu_server:
+            # Phase 3.5: Use GPU server with multiprocessing
+            # Create clients for each worker
+            tasks = []
+            for worker_id in range(self.num_workers):
+                worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
+                if worker_games > 0:
+                    # Create client for this worker
+                    client_id = f"worker_{worker_id}"
+                    client = self.gpu_server.create_client(client_id)
+                    self.gpu_clients[client_id] = client
 
-        # Execute tasks in parallel
-        results = self.pool.starmap(_worker_generate_games_static, tasks)
+                    tasks.append(
+                        (
+                            worker_id,
+                            worker_games,
+                            num_players,
+                            cards_to_deal,
+                            client.request_queue,
+                            client.response_queue,
+                            client_id,
+                            self.num_determinizations,
+                            self.simulations_per_determinization,
+                            self.temperature_schedule,
+                        )
+                    )
+
+            # Execute tasks with GPU server worker function
+            results = self.pool.starmap(_worker_generate_games_with_gpu_server, tasks)
+
+        else:
+            # Phase 2: Standard multiprocessing with per-worker networks
+            tasks = []
+            for worker_id in range(self.num_workers):
+                worker_games = games_per_worker + (1 if worker_id < remaining_games else 0)
+                if worker_games > 0:
+                    tasks.append(
+                        (
+                            worker_id,
+                            worker_games,
+                            num_players,
+                            cards_to_deal,
+                            self.network_state,
+                            self.num_determinizations,
+                            self.simulations_per_determinization,
+                            self.temperature_schedule,
+                            self.device,
+                            self.use_batched_evaluator,
+                            self.batch_size,
+                            self.batch_timeout_ms,
+                        )
+                    )
+
+            # Execute tasks in parallel
+            results = self.pool.starmap(_worker_generate_games_static, tasks)
 
         # Flatten results from all workers
         all_examples = []
@@ -708,6 +776,19 @@ class SelfPlayEngine:
         if self.batch_evaluator is not None:
             self.batch_evaluator.shutdown()
             self.batch_evaluator = None
+
+        if self.gpu_server is not None:
+            # Print final statistics before shutdown
+            stats = self.gpu_server.get_stats()
+            print(f"[SelfPlayEngine] GPU server statistics:")
+            print(f"  Total requests: {stats.get('total_requests', 0)}")
+            print(f"  Total batches: {stats.get('total_batches', 0)}")
+            print(f"  Avg batch size: {stats.get('avg_batch_size', 0):.1f}")
+            print(f"  Max batch size: {stats.get('max_batch_size', 0)}")
+
+            self.gpu_server.shutdown()
+            self.gpu_server = None
+            self.gpu_clients.clear()
 
 
 def _worker_generate_games_static(
@@ -833,6 +914,85 @@ def _worker_generate_games_static(
     # Cleanup batch evaluator
     if batch_evaluator is not None:
         batch_evaluator.shutdown()
+
+    return all_examples
+
+
+def _worker_generate_games_with_gpu_server(
+    worker_id: int,
+    num_games: int,
+    num_players: int,
+    cards_to_deal: int,
+    gpu_server_request_queue: mp.Queue,
+    gpu_server_response_queue: mp.Queue,
+    client_id: str,
+    num_determinizations: int,
+    simulations_per_determinization: int,
+    temperature_schedule: Optional[Callable[[int], float]],
+) -> List[Dict[str, Any]]:
+    """
+    Worker function for GPU server mode (Phase 3.5).
+
+    This worker does not create its own network. Instead, it receives a GPU
+    server client that sends evaluation requests to the centralized GPU server
+    process running in the main process.
+
+    Args:
+        worker_id: Unique worker identifier
+        num_games: Number of games this worker should generate
+        num_players: Players per game
+        cards_to_deal: Cards to deal
+        gpu_server_request_queue: Shared request queue to GPU server
+        gpu_server_response_queue: Private response queue from GPU server
+        client_id: Unique client identifier for this worker
+        num_determinizations: Determinizations per MCTS search
+        simulations_per_determinization: MCTS simulations per world
+        temperature_schedule: Temperature schedule function
+
+    Returns:
+        List of training examples from all games
+    """
+    # Set random seed for this worker
+    np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
+    torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
+
+    # Create GPU server client
+    from ml.mcts.gpu_server import GPUServerClient
+
+    gpu_client = GPUServerClient(
+        request_queue=gpu_server_request_queue,
+        response_queue=gpu_server_response_queue,
+        client_id=client_id,
+    )
+
+    # Create encoder and masker for this worker
+    encoder = StateEncoder()
+    masker = ActionMasker()
+
+    # Create SelfPlayWorker (no network needed, using GPU server)
+    worker = SelfPlayWorker(
+        network=None,  # Not used when gpu_server_client is provided
+        encoder=encoder,
+        masker=masker,
+        num_determinizations=num_determinizations,
+        simulations_per_determinization=simulations_per_determinization,
+        temperature_schedule=temperature_schedule,
+        use_imperfect_info=True,
+        batch_evaluator=None,
+        gpu_server_client=gpu_client,
+    )
+
+    # Generate games
+    all_examples = []
+    for game_idx in range(num_games):
+        unique_id = str(uuid.uuid4())[:8]
+        game_id = f"worker{worker_id}_game{game_idx}_{unique_id}"
+        examples = worker.generate_game(
+            num_players=num_players,
+            cards_to_deal=cards_to_deal,
+            game_id=game_id,
+        )
+        all_examples.extend(examples)
 
     return all_examples
 
