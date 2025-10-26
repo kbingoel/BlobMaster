@@ -1,0 +1,6 @@
+test_name,num_workers,use_multiprocessing,use_batched_evaluator,num_games,elapsed_seconds,games_per_min,avg_gpu_utilization,max_gpu_utilization,avg_gpu_memory_mb,total_batch_requests,total_batches,avg_batch_size,success,error_message
+"Test 1: 32 workers, multiprocessing, no batching",32,True,False,50,43.918941497802734,68.30765719046508,15.46875,72.0,5648.234375,0,0,0.0,True,
+"Test 2: 128 workers, threading, batching",128,False,True,50,373.5728600025177,8.030561963146308,8.263239875389408,91.0,1318.9221183800623,17516,860,20.367441860465117,True,
+"Test 3: 256 workers, threading, batching",256,False,True,50,373.1427984237671,8.039817497946162,3.8701700154559506,72.0,1448.7480680061824,17523,850,20.61529411764706,True,
+"Test 4: 128 workers, threading, no batching",128,False,False,50,321.3733448982239,9.334937223714286,4.6032315978456015,41.0,1950.5188509874326,0,0,0.0,True,
+"Test 5: 60 workers, multiprocessing, no batching",60,True,False,50,2307.58341383934,1.3000613464319464,99.21518987341773,100.0,7698.933842846907,0,0,0.0,True,
