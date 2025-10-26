@@ -74,6 +74,7 @@ class SelfPlayWorker:
         use_imperfect_info: bool = True,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
         gpu_server_client: Optional["GPUServerClient"] = None,
+        batch_size: Optional[int] = None,
     ):
         """
         Initialize self-play worker.
@@ -91,6 +92,9 @@ class SelfPlayWorker:
                             If provided, uses centralized batching for better GPU utilization
             gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
                               If provided, sends requests to centralized GPU server process
+            batch_size: Optional batch size for Phase 1 intra-game batching
+                       If None, uses sequential search() for baseline
+                       If set, uses search_batched() with virtual loss mechanism
         """
         self.network = network
         self.encoder = encoder
@@ -100,6 +104,7 @@ class SelfPlayWorker:
         self.use_imperfect_info = use_imperfect_info
         self.batch_evaluator = batch_evaluator
         self.gpu_server_client = gpu_server_client
+        self.batch_size = batch_size
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -171,14 +176,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
-            # When using BatchedEvaluator (Phase 2/3), use search() - evaluator handles batching
-            # When not using BatchedEvaluator, use search_batched() for Phase 1 intra-game batching
-            if self.batch_evaluator is not None:
-                action_probs = self.mcts.search(game, player)
-            else:
+            # Phase 1: Use search_batched() if batch_size is set
+            # Baseline: Use search() if batch_size is None
+            if self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
-                    game, player, batch_size=self.simulations_per_determinization
+                    game, player, batch_size=self.batch_size
                 )
+            else:
+                action_probs = self.mcts.search(game, player)
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -209,14 +214,14 @@ class SelfPlayWorker:
             nonlocal move_number
 
             # Run MCTS to get action probabilities
-            # When using BatchedEvaluator (Phase 2/3), use search() - evaluator handles batching
-            # When not using BatchedEvaluator, use search_batched() for Phase 1 intra-game batching
-            if self.batch_evaluator is not None:
-                action_probs = self.mcts.search(game, player)
-            else:
+            # Phase 1: Use search_batched() if batch_size is set
+            # Baseline: Use search() if batch_size is None
+            if self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
-                    game, player, batch_size=self.simulations_per_determinization
+                    game, player, batch_size=self.batch_size
                 )
+            else:
+                action_probs = self.mcts.search(game, player)
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -445,6 +450,7 @@ class SelfPlayEngine:
         use_gpu_server: bool = False,
         gpu_server_max_batch: int = 512,
         gpu_server_timeout_ms: float = 10.0,
+        mcts_batch_size: Optional[int] = None,
     ):
         """
         Initialize self-play engine.
@@ -467,6 +473,9 @@ class SelfPlayEngine:
                            Overrides use_batched_evaluator and use_thread_pool
             gpu_server_max_batch: Maximum batch size for GPU server (default: 512)
             gpu_server_timeout_ms: Batch collection timeout for GPU server (default: 10ms)
+            mcts_batch_size: Phase 1 intra-game batching size (default: None for sequential)
+                            If set, uses search_batched() with virtual loss
+                            If None, uses search() for baseline
         """
         self.network = network
         self.encoder = encoder
@@ -479,6 +488,7 @@ class SelfPlayEngine:
         self.use_gpu_server = use_gpu_server
         self.gpu_server_max_batch = gpu_server_max_batch
         self.gpu_server_timeout_ms = gpu_server_timeout_ms
+        self.mcts_batch_size = mcts_batch_size
 
         # GPU server takes precedence over other batching methods
         if use_gpu_server:
@@ -653,6 +663,7 @@ class SelfPlayEngine:
                             self.use_batched_evaluator,
                             self.batch_size,
                             self.batch_timeout_ms,
+                            self.mcts_batch_size,
                         )
                     )
 
@@ -712,6 +723,7 @@ class SelfPlayEngine:
                     self.simulations_per_determinization,
                     self.temperature_schedule,
                     self.batch_evaluator,  # Shared evaluator!
+                    self.mcts_batch_size,
                 )
                 futures.append(future)
 
@@ -804,6 +816,7 @@ def _worker_generate_games_static(
     use_batched_evaluator: bool = False,
     batch_size: int = 512,
     batch_timeout_ms: float = 10.0,
+    mcts_batch_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -832,6 +845,7 @@ def _worker_generate_games_static(
         use_batched_evaluator: Create BatchedEvaluator for this worker
         batch_size: Maximum batch size for BatchedEvaluator
         batch_timeout_ms: Timeout in ms for batch collection
+        mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
 
     Returns:
         List of training examples from all games
@@ -896,6 +910,7 @@ def _worker_generate_games_static(
         temperature_schedule=temperature_schedule,
         use_imperfect_info=True,
         batch_evaluator=batch_evaluator,
+        batch_size=mcts_batch_size,
     )
 
     # Generate games
@@ -1009,6 +1024,7 @@ def _worker_generate_games_threaded(
     simulations_per_determinization: int,
     temperature_schedule: Optional[Callable[[int], float]],
     batch_evaluator: Optional["BatchedEvaluator"],
+    mcts_batch_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Threaded worker function for parallel game generation (Phase 3).
@@ -1035,6 +1051,7 @@ def _worker_generate_games_threaded(
         simulations_per_determinization: MCTS simulations per world
         temperature_schedule: Temperature schedule function
         batch_evaluator: Shared BatchedEvaluator (thread-safe)
+        mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
 
     Returns:
         List of training examples from all games
@@ -1053,6 +1070,7 @@ def _worker_generate_games_threaded(
         temperature_schedule=temperature_schedule,
         use_imperfect_info=True,
         batch_evaluator=batch_evaluator,  # Shared evaluator!
+        batch_size=mcts_batch_size,
     )
 
     # Generate games

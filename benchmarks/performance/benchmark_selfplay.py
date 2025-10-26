@@ -19,8 +19,13 @@ import time
 import csv
 import psutil
 import torch
+import sys
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+
+# Add project root to path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
