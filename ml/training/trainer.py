@@ -48,6 +48,8 @@ from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.replay_buffer import ReplayBuffer
 from ml.training.selfplay import SelfPlayEngine
+from ml.evaluation.arena import Arena
+from ml.evaluation.elo import ELOTracker
 
 
 class NetworkTrainer:
@@ -468,14 +470,37 @@ class TrainingPipeline:
             device=self.device,
         )
 
+        # Evaluation system
+        self.arena = Arena(
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=config.get("eval_determinizations", 3),
+            simulations_per_determinization=config.get("eval_simulations", 50),
+            device=self.device,
+        )
+
+        self.elo_tracker = ELOTracker(
+            initial_elo=config.get("initial_elo", 1000),
+            k_factor=config.get("elo_k_factor", 32),
+        )
+
+        # Load ELO history if it exists
+        elo_history_path = self.checkpoint_dir / "elo_history.json"
+        if elo_history_path.exists():
+            self.elo_tracker.load_history(str(elo_history_path))
+            print(f"  - Loaded ELO history: Current ELO = {self.elo_tracker.get_current_elo()}")
+
         # Training state
         self.current_iteration = 0
         self.best_model_path = None
+        self.best_model_elo = config.get("initial_elo", 1000)
         self.metrics_history = []
+        self.eval_frequency = config.get("eval_frequency", 5)  # Evaluate every N iterations
 
         print(f"Pipeline initialized:")
         print(f"  - Self-play workers: {config.get('num_workers', 16)}")
         print(f"  - Replay buffer capacity: {config.get('replay_buffer_capacity', 500_000):,}")
+        print(f"  - Evaluation frequency: every {self.eval_frequency} iterations")
         print(f"  - Device: {self.device}")
         print(f"  - Checkpoint directory: {self.checkpoint_dir}")
 
@@ -731,20 +756,124 @@ class TrainingPipeline:
         """
         Evaluate new model vs previous best.
 
+        Runs evaluation every N iterations (configurable via eval_frequency).
+        When evaluation runs, plays a match between current model and best model,
+        updates ELO ratings, and promotes model if it wins decisively.
+
         Args:
             iteration: Current iteration number
 
         Returns:
-            Evaluation metrics (stub for Session 6)
+            Evaluation metrics including:
+            - eval_win_rate: Win rate of current model vs best
+            - eval_games_played: Number of evaluation games
+            - model_promoted: Whether model was promoted to best
+            - current_elo: ELO after evaluation
+            - elo_change: ELO change from evaluation
+            - eval_performed: Whether evaluation actually ran this iteration
         """
-        # TODO: Implement in Session 6 (Arena evaluation with ELO)
-        print("Evaluation not yet implemented (will be added in Session 6)")
-        print("  - Skipping model comparison")
+        # Check if we should run evaluation this iteration
+        should_evaluate = (iteration + 1) % self.eval_frequency == 0
+
+        if not should_evaluate:
+            print(f"Skipping evaluation (runs every {self.eval_frequency} iterations)")
+            return {
+                "eval_win_rate": 0.0,
+                "eval_games_played": 0,
+                "model_promoted": False,
+                "current_elo": self.best_model_elo,
+                "elo_change": 0,
+                "eval_performed": False,
+            }
+
+        print(f"Running model evaluation (iteration {iteration + 1})")
+
+        # If this is the first evaluation, save current model as best
+        if self.best_model_path is None:
+            print("  - First evaluation: Current model becomes best model")
+            return {
+                "eval_win_rate": 1.0,
+                "eval_games_played": 0,
+                "model_promoted": True,
+                "current_elo": self.best_model_elo,
+                "elo_change": 0,
+                "eval_performed": True,
+            }
+
+        # Load best model for comparison
+        print(f"  - Loading best model from {self.best_model_path.name}")
+        best_model = BlobNet(
+            embedding_dim=self.network.embedding_dim,
+            num_layers=self.network.num_layers,
+            num_heads=self.network.num_heads,
+            dropout=self.network.dropout,
+        ).to(self.device)
+
+        checkpoint = torch.load(self.best_model_path, map_location=self.device)
+        best_model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Run arena match
+        num_eval_games = self.config.get("eval_games", 400)
+        print(f"  - Playing {num_eval_games} evaluation games...")
+
+        match_results = self.arena.play_match(
+            model1=self.network,
+            model2=best_model,
+            num_games=num_eval_games,
+            num_players=self.config.get("num_players", 4),
+            cards_to_deal=self.config.get("cards_to_deal", 5),
+            verbose=False,
+        )
+
+        win_rate = match_results['win_rate']
+        print(f"  - Evaluation complete:")
+        print(f"    - Current model win rate: {win_rate:.1%}")
+        print(f"    - Average scores: {match_results['model1_avg_score']:.1f} vs {match_results['model2_avg_score']:.1f}")
+
+        # Update ELO ratings
+        new_elo = self.elo_tracker.add_match_result(
+            iteration=iteration,
+            model_elo=self.best_model_elo,
+            opponent_elo=self.best_model_elo,  # Playing against current best
+            win_rate=win_rate,
+            games_played=match_results['games_played'],
+            model_avg_score=match_results['model1_avg_score'],
+            opponent_avg_score=match_results['model2_avg_score'],
+            metadata={
+                'num_determinizations': self.config.get("eval_determinizations", 3),
+                'simulations_per_determinization': self.config.get("eval_simulations", 50),
+            }
+        )
+
+        elo_change = new_elo - self.best_model_elo
+
+        # Determine if model should be promoted
+        promotion_threshold = self.config.get("promotion_threshold", 0.55)
+        should_promote = self.elo_tracker.should_promote_model(
+            win_rate, promotion_threshold
+        )
+
+        if should_promote:
+            print(f"  - Model PROMOTED! (win rate {win_rate:.1%} >= {promotion_threshold:.1%})")
+            print(f"    - ELO: {self.best_model_elo} -> {new_elo} ({elo_change:+d})")
+            self.best_model_elo = new_elo
+        else:
+            print(f"  - Model NOT promoted (win rate {win_rate:.1%} < {promotion_threshold:.1%})")
+            print(f"    - ELO unchanged: {self.best_model_elo}")
+
+        # Save ELO history
+        elo_history_path = self.checkpoint_dir / "elo_history.json"
+        self.elo_tracker.save_history(str(elo_history_path))
 
         return {
-            "eval_win_rate": 0.0,
-            "eval_games_played": 0,
-            "model_promoted": False,
+            "eval_win_rate": float(win_rate),
+            "eval_games_played": match_results['games_played'],
+            "model_promoted": should_promote,
+            "current_elo": self.best_model_elo,
+            "elo_change": elo_change,
+            "eval_performed": True,
+            "model1_avg_score": match_results['model1_avg_score'],
+            "model2_avg_score": match_results['model2_avg_score'],
         }
 
     def _checkpoint_phase(
@@ -779,22 +908,28 @@ class TrainingPipeline:
             print(f"  - Checkpoint saved: {checkpoint_path.name}")
             print(f"  - Replay buffer saved: {buffer_path.name}")
 
-        # Save best model (based on evaluation, but for now just save latest)
-        # TODO: In Session 6, only save if model wins evaluation
-        best_model_path = self.checkpoint_dir / "best_model.pth"
-        self.trainer.save_checkpoint(
-            str(best_model_path),
-            iteration=iteration,
-            metrics=metrics,
+        # Save best model only if promoted or if this is the first save
+        should_save_best = (
+            metrics.get("model_promoted", False) or
+            self.best_model_path is None
         )
-        self.best_model_path = best_model_path
+
+        if should_save_best:
+            best_model_path = self.checkpoint_dir / "best_model.pth"
+            self.trainer.save_checkpoint(
+                str(best_model_path),
+                iteration=iteration,
+                metrics=metrics,
+            )
+            self.best_model_path = best_model_path
+            print(f"  - Best model updated: {best_model_path.name}")
+        else:
+            print(f"  - Best model unchanged (current model not promoted)")
 
         # Save metrics history
         metrics_path = self.checkpoint_dir / "metrics_history.json"
         with open(metrics_path, "w") as f:
             json.dump(self.metrics_history, f, indent=2)
-
-        print(f"  - Best model updated: {best_model_path.name}")
 
     def _log_metrics(
         self,
