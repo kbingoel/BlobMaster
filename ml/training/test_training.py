@@ -1894,3 +1894,294 @@ class TestTrainingPipeline:
 
         # Clean up
         pipeline.selfplay_engine.shutdown()
+
+
+class TestMainTrainingScript:
+    """Tests for main training script and configuration."""
+
+    def test_config_creation(self):
+        """Test creating training config."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig()
+
+        # Check default values
+        assert config.num_workers == 16
+        assert config.games_per_iteration == 10_000
+        assert config.batch_size == 512
+        assert config.learning_rate == 0.001
+        assert config.device == 'cuda'
+
+    def test_config_to_dict(self):
+        """Test converting config to dictionary."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(
+            num_workers=8,
+            games_per_iteration=5000,
+        )
+
+        config_dict = config.to_dict()
+
+        assert isinstance(config_dict, dict)
+        assert config_dict['num_workers'] == 8
+        assert config_dict['games_per_iteration'] == 5000
+        assert 'batch_size' in config_dict
+        assert 'learning_rate' in config_dict
+
+    def test_config_from_dict(self):
+        """Test creating config from dictionary."""
+        from ml.config import TrainingConfig
+
+        config_dict = {
+            'num_workers': 4,
+            'games_per_iteration': 1000,
+            'batch_size': 256,
+        }
+
+        config = TrainingConfig.from_dict(config_dict)
+
+        assert config.num_workers == 4
+        assert config.games_per_iteration == 1000
+        assert config.batch_size == 256
+        # Other fields should have defaults
+        assert config.learning_rate == 0.001
+
+    def test_config_save_load(self, tmp_path):
+        """Test saving and loading config."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(
+            num_workers=12,
+            games_per_iteration=8000,
+            batch_size=256,
+        )
+
+        # Save config
+        config_path = tmp_path / "config.json"
+        config.save(str(config_path))
+
+        # Check file exists
+        assert config_path.exists()
+
+        # Load config
+        loaded_config = TrainingConfig.from_file(str(config_path))
+
+        # Check values match
+        assert loaded_config.num_workers == 12
+        assert loaded_config.games_per_iteration == 8000
+        assert loaded_config.batch_size == 256
+
+    def test_config_validation_valid(self):
+        """Test config validation accepts valid config."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig()
+        assert config.validate() is True
+
+    def test_config_validation_invalid_workers(self):
+        """Test config validation rejects invalid workers."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(num_workers=0)
+
+        with pytest.raises(ValueError, match="num_workers must be positive"):
+            config.validate()
+
+    def test_config_validation_invalid_learning_rate(self):
+        """Test config validation rejects invalid learning rate."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(learning_rate=-0.1)
+
+        with pytest.raises(ValueError, match="learning_rate must be positive"):
+            config.validate()
+
+    def test_config_validation_invalid_device(self):
+        """Test config validation rejects invalid device."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(device='gpu')  # Should be 'cuda' or 'cpu'
+
+        with pytest.raises(ValueError, match="device must be"):
+            config.validate()
+
+    def test_config_validation_invalid_promotion_threshold(self):
+        """Test config validation rejects invalid promotion threshold."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig(promotion_threshold=1.5)
+
+        with pytest.raises(ValueError, match="promotion_threshold must be in"):
+            config.validate()
+
+    def test_config_validation_invalid_num_players(self):
+        """Test config validation rejects invalid num_players."""
+        from ml.config import TrainingConfig
+
+        # Too few players
+        config = TrainingConfig(num_players=2)
+        with pytest.raises(ValueError, match="num_players must be between"):
+            config.validate()
+
+        # Too many players
+        config = TrainingConfig(num_players=9)
+        with pytest.raises(ValueError, match="num_players must be between"):
+            config.validate()
+
+    def test_fast_config(self):
+        """Test fast config for testing."""
+        from ml.config import get_fast_config
+
+        config = get_fast_config()
+
+        # Should have reduced computational requirements
+        assert config.num_workers < 16
+        assert config.games_per_iteration < 10_000
+        assert config.num_determinizations <= 2
+        assert config.simulations_per_determinization <= 10
+        assert config.batch_size < 512
+        assert config.epochs_per_iteration < 10
+
+    def test_production_config(self):
+        """Test production config."""
+        from ml.config import get_production_config
+
+        config = get_production_config()
+
+        # Should have default values
+        assert config.num_workers == 16
+        assert config.games_per_iteration == 10_000
+        assert config.batch_size == 512
+
+    def test_config_str_representation(self):
+        """Test config string representation."""
+        from ml.config import TrainingConfig
+
+        config = TrainingConfig()
+        config_str = str(config)
+
+        assert "Training Configuration" in config_str
+        assert "Self-play" in config_str
+        assert "MCTS" in config_str
+        assert "Training" in config_str
+        assert "Network" in config_str
+
+    def test_network_creation_from_config(self):
+        """Test creating network from config."""
+        from ml.config import TrainingConfig
+        from ml.train import create_network
+
+        config = TrainingConfig(
+            embedding_dim=128,
+            num_transformer_layers=4,
+            num_heads=4,
+            dropout=0.1,
+        )
+
+        network = create_network(config, device='cpu')
+
+        # Check network created correctly
+        assert network is not None
+        assert hasattr(network, 'forward')
+
+        # Network should be on correct device
+        # Check first parameter's device
+        first_param = next(network.parameters())
+        assert str(first_param.device) == 'cpu'
+
+    def test_config_from_dict_filters_invalid_keys(self):
+        """Test config from_dict filters out invalid keys."""
+        from ml.config import TrainingConfig
+
+        config_dict = {
+            'num_workers': 8,
+            'invalid_key': 'should_be_ignored',
+            'another_invalid': 123,
+            'batch_size': 256,
+        }
+
+        # Should not raise error, just ignore invalid keys
+        config = TrainingConfig.from_dict(config_dict)
+
+        assert config.num_workers == 8
+        assert config.batch_size == 256
+        assert not hasattr(config, 'invalid_key')
+
+    def test_mini_training_run(self, tmp_path):
+        """Test running a small training iteration (integration test)."""
+        from ml.config import TrainingConfig
+        from ml.network.model import BlobNet
+        from ml.network.encode import StateEncoder, ActionMasker
+        from ml.training.trainer import TrainingPipeline
+
+        # Create minimal config
+        config = TrainingConfig(
+            num_workers=1,  # Minimal workers
+            games_per_iteration=5,  # Very small
+            num_determinizations=1,
+            simulations_per_determinization=3,
+            replay_buffer_capacity=100,
+            min_buffer_size=10,
+            batch_size=8,
+            epochs_per_iteration=1,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            device='cpu',
+        )
+
+        # Create components
+        network = BlobNet(
+            state_dim=256,
+            embedding_dim=64,
+            num_layers=1,
+            num_heads=2,
+            feedforward_dim=128,
+            dropout=0.1,
+        )
+        encoder = StateEncoder()
+        masker = ActionMasker()
+
+        # Create pipeline
+        pipeline = TrainingPipeline(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            config=config.to_dict(),
+        )
+
+        # Run one iteration
+        try:
+            pipeline.run_training(num_iterations=1)
+
+            # Check iteration completed
+            assert pipeline.current_iteration >= 0
+
+            # Check replay buffer has examples
+            assert len(pipeline.replay_buffer) > 0
+
+            # Check best model saved
+            best_model_path = pipeline.checkpoint_dir / "best_model.pth"
+            assert best_model_path.exists()
+
+        finally:
+            # Clean up
+            pipeline.selfplay_engine.shutdown()
+
+    def test_determine_device(self):
+        """Test device determination logic."""
+        from ml.train import determine_device
+
+        # Test auto detection
+        device = determine_device('auto')
+        assert device in ['cuda', 'cpu']
+
+        # Test explicit CPU
+        device = determine_device('cpu')
+        assert device == 'cpu'
+
+        # Test CUDA (may fall back to CPU if not available)
+        device = determine_device('cuda')
+        if torch.cuda.is_available():
+            assert device == 'cuda'
+        else:
+            assert device == 'cpu'

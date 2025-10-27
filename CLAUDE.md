@@ -33,41 +33,57 @@ pip install -r ml/requirements.txt
 
 **Testing**:
 ```bash
-# Run all tests
-pytest ml/
+# Run all tests (426+ tests across all phases)
+venv/Scripts/python.exe -m pytest ml/
 
-# Run specific test file
-pytest ml/game/test_blob.py
+# Run specific module tests
+venv/Scripts/python.exe -m pytest ml/game/test_blob.py  # Game engine (135 tests)
+venv/Scripts/python.exe -m pytest ml/network/test_network.py  # Neural network
+venv/Scripts/python.exe -m pytest ml/mcts/test_mcts.py  # MCTS implementation
+venv/Scripts/python.exe -m pytest ml/training/test_training.py  # Training pipeline (93 tests)
+
+# Run integration tests
+venv/Scripts/python.exe -m pytest ml/tests/test_integration.py
+venv/Scripts/python.exe -m pytest ml/tests/test_imperfect_info_integration.py
 
 # Run with coverage
-pytest --cov=ml ml/
+venv/Scripts/python.exe -m pytest --cov=ml ml/
 ```
 
 **Training**:
 ```bash
-# Start training pipeline
-python ml/train.py --iterations 500 --gpu 0
+# Start full training pipeline (3-7 days)
+venv/Scripts/python.exe ml/train.py --iterations 500
 
-# Monitor training progress
+# Fast test run (validates pipeline without long wait)
+venv/Scripts/python.exe ml/train.py --fast --iterations 5
+
+# Resume from checkpoint
+venv/Scripts/python.exe ml/train.py --iterations 500 --resume models/checkpoints/checkpoint_100.pth
+
+# Use custom config
+venv/Scripts/python.exe ml/train.py --config configs/my_config.json --iterations 100
+
+# Monitor training progress (if tensorboard installed)
 tensorboard --logdir=runs/
 ```
 
 **Code Quality**:
 ```bash
 # Format code
-black ml/
+venv/Scripts/black.exe ml/
 
 # Lint
-flake8 ml/
+venv/Scripts/flake8.exe ml/
 
 # Type checking
-mypy ml/
+venv/Scripts/mypy.exe ml/
 ```
 
-**ONNX Export**:
+**ONNX Export** (Phase 5 - not yet implemented):
 ```bash
 # Export trained model for production inference
-python ml/export_onnx.py --checkpoint models/checkpoints/best.pth
+venv/Scripts/python.exe ml/export_onnx.py --checkpoint models/checkpoints/best.pth
 ```
 
 ### Production Environment (Bun/TypeScript)
@@ -138,23 +154,46 @@ Self-Play → Replay Buffer → Network Training → Evaluation → Checkpoint
 
 **`ml/`** - Python training code (not used in production):
 - `game/`: Core game rules (Blob bidding/trick-taking logic)
+  - `blob.py`: Main game engine with BlobGame class
+  - `constants.py`: Card ranks, suits, scoring constants
+  - `test_blob.py`: 135 comprehensive tests for game logic
 - `mcts/`: Monte Carlo Tree Search with determinization for imperfect info
+  - `node.py`: MCTSNode with UCB1 selection
+  - `search.py`: MCTS search algorithm with tree reuse
+  - `belief_tracker.py`: Belief state tracking and suit elimination
+  - `determinization.py`: Sampling consistent opponent hands
+  - `test_mcts.py`, `test_determinization.py`: MCTS tests
 - `network/`: Transformer model, state encoding, training loop
+  - `model.py`: BlobNet Transformer architecture (~4.9M params)
+  - `encode.py`: StateEncoder (game → 256-dim tensor) and ActionMasker
+  - `test_network.py`: Neural network tests
 - `training/`: Self-play engine, replay buffer, training orchestration
+  - `selfplay.py`: SelfPlayWorker and SelfPlayEngine (parallel)
+  - `replay_buffer.py`: ReplayBuffer for experience storage
+  - `trainer.py`: NetworkTrainer and TrainingPipeline
+  - `test_training.py`: 93 training pipeline tests
 - `evaluation/`: Model tournaments, ELO calculation, metrics
+  - `arena.py`: ModelArena for head-to-head evaluation
+  - `elo.py`: ELO rating calculation and tracking
+  - `test_evaluation.py`: Evaluation system tests
+- `tests/`: Integration tests
+  - `test_integration.py`: End-to-end game playing tests
+  - `test_imperfect_info_integration.py`: Imperfect info workflow tests
+- `config.py`: Centralized training configuration system
+- `train.py`: Main training entry point (CLI)
 
 **`models/`** - Model artifacts:
 - `checkpoints/`: PyTorch (.pth) model snapshots during training
 - `best_model.onnx`: Production-ready exported model for inference
 - `elo_history.json`: ELO progression tracking across training iterations
 
-**`backend/`** - Bun/TypeScript API server:
+**`backend/`** - Bun/TypeScript API server (Phase 6 - not yet implemented):
 - `api/`: REST/WebSocket endpoints for game management
 - `inference/`: ONNX model loading and inference (uses ONNX Runtime with OpenVINO for Intel iGPU)
 - `game/`: TypeScript port of game rules for server-side validation
 - `db/`: SQLite queries (game history, user stats)
 
-**`frontend/`** - Svelte UI:
+**`frontend/`** - Svelte UI (Phase 7 - not yet implemented):
 - `lib/components/`: GameBoard, Hand, BidSelector, TrickHistory, ScoreBoard, AIThinking
 - `lib/stores/`: Game state management (reactive stores)
 - `routes/`: SvelteKit pages
@@ -166,7 +205,7 @@ Self-Play → Replay Buffer → Network Training → Evaluation → Checkpoint
 **`docs/`** - Documentation and analysis:
 - `performance/`: Performance investigation reports and findings
 - `phases/`: Phase completion summaries and historical records
-- `archive/`: Superseded documents and bug fixes
+- `archive/`: Superseded documents and bug fixes (including phase plans and session summaries)
 
 **`benchmarks/`** - Performance benchmarking and testing:
 - `performance/`: Benchmark scripts for self-play, training, and iteration timing
@@ -216,22 +255,82 @@ Understanding the game is crucial for debugging AI behavior:
 
 ## Development Workflow
 
-### Starting Fresh (Phase 1 in progress)
-The project is currently in early stages. The README outlines a 7-phase roadmap:
-1. **Core Game Engine** (Weekend 1) - Implement game rules in Python
-2. **MCTS + Neural Network** (Midweek) - Basic AI infrastructure
-3. **Imperfect Information Handling** (Weekend 2) - Belief tracking and determinization
-4. **Self-Play Training Pipeline** (Week 2) - Automated training loop
-5. **ONNX Export & Inference** (Day 15) - Production model export
-6. **Backend API** (Weekend 3) - Bun server with ONNX inference
-7. **Frontend UI** (Days 18-21) - Svelte web interface
+### Current Project Status: Phase 4 Complete ✅
+
+The training infrastructure is fully implemented and ready for multi-day training runs. The README outlines a 7-phase roadmap:
+
+1. ✅ **Core Game Engine** - Complete (135 tests, 97% coverage)
+2. ✅ **MCTS + Neural Network** - Complete (148 tests)
+3. ✅ **Imperfect Information Handling** - Complete (333 tests total)
+4. ✅ **Self-Play Training Pipeline** - Complete (93 training tests, 426+ total tests)
+5. 🔜 **ONNX Export & Inference** - Next phase
+6. 🔜 **Backend API** - Bun server with ONNX inference
+7. 🔜 **Frontend UI** - Svelte web interface
+
+**Current capabilities:**
+- Full game simulation with 3-8 players
+- Neural network with Transformer architecture (~4.9M parameters)
+- MCTS with determinization for imperfect information
+- Belief tracking and suit elimination
+- Parallel self-play workers (16-32 workers)
+- Replay buffer with experience management
+- Training loop with checkpointing and ELO tracking
+- Evaluation arena for model tournaments
+
+**Ready to start:**
+```bash
+venv/Scripts/python.exe ml/train.py --fast --iterations 5  # Quick validation
+venv/Scripts/python.exe ml/train.py --iterations 500        # Full training run
+```
+
+### Training Configuration System
+
+The project uses a centralized configuration system via `ml/config.py`:
+
+**Built-in configs:**
+```python
+from ml.config import TrainingConfig, get_fast_config, get_production_config
+
+# Production config (3-7 day training)
+config = get_production_config()
+
+# Fast config (quick testing)
+config = get_fast_config()  # Fewer games, workers, simulations
+
+# Custom config
+config = TrainingConfig(
+    num_workers=16,
+    games_per_iteration=10000,
+    batch_size=512,
+    learning_rate=0.001,
+    # ... see ml/config.py for all options
+)
+```
+
+**Key parameters:**
+- `num_workers`: Parallel self-play workers (default: 16)
+- `games_per_iteration`: Games per training iteration (default: 10,000)
+- `num_determinizations`: Worlds sampled for imperfect info (default: 3)
+- `simulations_per_determinization`: MCTS simulations per world (default: 30)
+- `batch_size`: Training batch size (default: 512)
+- `replay_buffer_capacity`: Experience replay size (default: 500,000)
+- `eval_games`: Games for model evaluation (default: 400)
+- `promotion_threshold`: Win rate to promote new model (default: 0.55)
+
+**Using configs:**
+```bash
+# Use fast config via CLI
+venv/Scripts/python.exe ml/train.py --fast --iterations 5
+
+# Load from JSON file
+venv/Scripts/python.exe ml/train.py --config my_config.json --iterations 100
+```
 
 ### When Modifying Game Rules
 1. Update `ml/game/blob.py` (Python source of truth)
 2. Add unit tests to verify rule changes
-3. Test with CLI version: `python ml/game/blob.py`
-4. Re-train model from scratch (rules changes invalidate old training data)
-5. Port rule changes to TypeScript backend (`backend/src/game/`)
+3. Re-train model from scratch (rules changes invalidate old training data)
+4. Port rule changes to TypeScript backend (`backend/src/game/`) when implementing Phase 6
 
 ### When Debugging AI Behavior
 1. **Check belief tracking**: Are opponent cards being deduced correctly?
