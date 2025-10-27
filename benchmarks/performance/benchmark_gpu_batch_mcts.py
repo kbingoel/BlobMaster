@@ -34,10 +34,15 @@ Usage:
 import argparse
 import time
 import csv
+import sys
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, List, Any
 import torch
+
+# Add project root to path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
@@ -164,7 +169,7 @@ def benchmark_phase1(num_games: int = 5) -> Dict[str, Any]:
 def worker_process(
     worker_id: int,
     num_games: int,
-    gpu_server,
+    gpu_client,
     results_queue: mp.Queue,
 ):
     """
@@ -173,15 +178,12 @@ def worker_process(
     Args:
         worker_id: Worker identifier
         num_games: Number of games to generate
-        gpu_server: GPUInferenceServer instance
+        gpu_client: GPUServerClient instance (created in main process)
         results_queue: Queue to put results
     """
     try:
         encoder = StateEncoder()
         masker = ActionMasker()
-
-        # Create GPU client for this worker
-        client = gpu_server.create_client(client_id=f"worker_{worker_id}")
 
         # Create worker with GPU-batched parallel expansion
         worker = SelfPlayWorker(
@@ -193,7 +195,7 @@ def worker_process(
             use_imperfect_info=True,
             use_parallel_expansion=True,
             parallel_batch_size=10,  # Cross-worker batching
-            gpu_server_client=client,
+            gpu_server_client=gpu_client,
         )
 
         # Generate games
@@ -244,6 +246,9 @@ def benchmark_gpu_batched(
         # Create results queue
         results_queue = mp.Queue()
 
+        # Create GPU clients for each worker (must be done before spawning processes)
+        clients = [gpu_server.create_client(client_id=f"worker_{i}") for i in range(num_workers)]
+
         # Start workers
         processes = []
         start_time = time.time()
@@ -251,7 +256,7 @@ def benchmark_gpu_batched(
         for worker_id in range(num_workers):
             p = mp.Process(
                 target=worker_process,
-                args=(worker_id, num_games, gpu_server, results_queue),
+                args=(worker_id, num_games, clients[worker_id], results_queue),
             )
             p.start()
             processes.append(p)

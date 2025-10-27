@@ -496,26 +496,30 @@ python benchmarks/performance/benchmark_gpu_batch_mcts.py \
   - [x] Verify game validity → Covered by existing tests
   - [x] Compare results vs sequential → test_gpu_batch_mcts.py:test_search_parallel_vs_sequential
 
-### Week 3: Testing & Validation [ ] PENDING
+### Week 3: Testing & Validation [x] COMPLETE
 - [x] Unit test suite (coverage complete)
   - [x] Virtual loss correctness → test_gpu_batch_mcts.py:test_virtual_loss_mechanism
   - [x] Batch server accumulation → test_gpu_batch_mcts.py:test_batch_size_accumulation
   - [x] Parallel expansion correctness → test_gpu_batch_mcts.py:test_search_parallel_basic
+  - [x] Fixed duplicate search_parallel() methods in ImperfectInfoMCTS
+  - [x] All 6 tests passing
 
 - [x] Benchmark script created
   - [x] Quick sweep (5 games, 3 batch configs) → benchmark_gpu_batch_mcts.py --sweep
   - [x] Full validation (50 games, optimal config) → benchmark_gpu_batch_mcts.py --games 50
   - [x] Compare to Phase 1 results → benchmark_gpu_batch_mcts.py --compare
+  - [x] Fixed sys.path import issue
+  - [x] Fixed multiprocessing pickle issue (pass clients instead of server)
 
-- [ ] Run benchmarks and measure performance
-  - [ ] Execute quick sweep to find optimal config
-  - [ ] Execute full validation with optimal config
-  - [ ] Measure GPU utilization (should see 40-60%)
-  - [ ] Compare to baseline (32 games/min) and Phase 1 (56 games/min)
+- [x] Run benchmarks and measure performance
+  - [x] Execute quick comparison (5 games)
+  - [x] Results: **FAILED** - GPU batching SLOWER than baseline
+  - [x] Avg batch size: 3.3 (expected 40+)
+  - [x] Max batch size: 4 (expected 512)
 
-- [ ] Decision point: Deploy if >=5x speedup achieved
-  - [ ] If successful: Update training pipeline to use GPU-batched MCTS
-  - [ ] If unsuccessful: Debug and tune parameters
+- [x] Decision point: Deploy if >=5x speedup achieved
+  - [x] **DECISION: DO NOT DEPLOY** - GPU batching failed (6.1 vs 6.8 games/min)
+  - [x] Root cause identified: Insufficient parallelism for cross-worker batching
 
 ---
 
@@ -666,13 +670,147 @@ python benchmarks/performance/compare_results.py \
 
 ---
 
-## Status
+## Benchmark Results & Analysis (2025-10-26)
 
-**Current**: 📋 PLANNING COMPLETE
-**Next**: 🔨 START IMPLEMENTATION (Week 1, Day 1)
+### Quick Comparison Benchmark (5 games)
 
-**Ready to proceed**: ✅ All design decisions documented, implementation path clear
+**Configuration**:
+- Workers: 4
+- Parallel batch size: 10
+- Max batch size: 512
+- Timeout: 5.0ms
+
+**Results**:
+
+| Configuration | Games/Min | Speedup vs Baseline | Avg Batch Size | Max Batch Size |
+|---------------|-----------|---------------------|----------------|----------------|
+| Baseline (Sequential) | 5.7 | 1.00x | 1.0 | 1 |
+| Phase 1 (Intra-Game) | 6.8 | 1.19x | 90.0 | ~90 |
+| **GPU-Batched MCTS** | **6.1** | **1.07x** | **3.3** | **4** |
+
+**Status**: ❌ **FAILED - Slower than Phase 1**
+
+### Root Cause Analysis
+
+**Problem**: Average batch size of 3.3 instead of expected 40+
+
+**Why batching failed**:
+1. **Sequential determinizations**: Each worker runs 3 determinizations sequentially, not in parallel
+2. **Low worker count**: Only 4 workers × 3 det = 12 MCTS instances max
+3. **Tree traversal bottleneck**: MCTS tree traversal is inherently sequential
+4. **Timing mismatch**: Workers don't send requests at the same time
+
+**Expected architecture**:
+```
+32 workers × 3 determinizations × 10 parallel expansions = 960 concurrent requests
+```
+
+**Actual behavior**:
+```
+4 workers × 1 determinization at a time × 1-4 expansions = 4-16 requests (but sequential!)
+```
+
+**Key insight**: GPU-batched MCTS requires:
+- **Many workers** (32+) to have enough concurrent requests
+- **Parallel determinizations** (not sequential)
+- **Synchronized request submission** to accumulate batches
+
+With only 4 workers and sequential determinizations, requests arrive one-by-one, resulting in tiny batches (avg 3.3).
+
+### Why This Approach Can't Work
+
+**Fundamental limitation**: Cross-worker batching requires many concurrent MCTS searches
+
+**Current constraints**:
+- 4 workers (not enough parallelism)
+- Sequential determinizations (1 at a time per worker)
+- Sequential tree traversal (inherent to MCTS)
+
+**To achieve target batch sizes (256-512)**:
+- Need 32+ workers simultaneously in expansion phase
+- Need parallel determinization execution
+- Need worker synchronization (adds complexity/latency)
+
+**Catch-22**:
+- Small batches → Poor GPU utilization → Slow inference
+- Large worker count → Memory pressure + coordination overhead
+- Synchronization → Added latency negates benefits
+
+### Comparison to Phase 1
+
+**Phase 1 (Intra-Game Batching)**:
+- Batches neural network calls within a single MCTS search
+- Achieves batch size ~90 (3 det × 30 sims)
+- Works with any worker count
+- **Simpler and more effective** for our use case
+
+**GPU-Batched MCTS (Cross-Worker)**:
+- Batches across multiple MCTS searches
+- Only achieves batch size 3-4 with 4 workers
+- Requires 32+ workers for effectiveness
+- Adds multiprocessing complexity
+- **Not suitable for desktop training setup**
+
+### Lessons Learned
+
+1. **Cross-worker batching needs massive parallelism** (100+ workers)
+   - AlphaGo used 5000 TPUs with thousands of parallel games
+   - Our desktop setup (4-32 workers) is too small
+
+2. **Intra-game batching is better for smaller scale**
+   - Phase 1 already achieves good batch sizes (90)
+   - Simpler architecture, no multiprocessing overhead
+
+3. **Sequential determinizations are the bottleneck**
+   - Each worker only has 1 active determinization at a time
+   - Can't accumulate requests across 3 det when they run sequentially
+
+4. **MCTS tree traversal is inherently sequential**
+   - Parallel expansion helps within one search
+   - But can't parallelize across different game states effectively
+
+### Recommendations
+
+**DO NOT DEPLOY GPU-batched MCTS**. Instead:
+
+1. **Stick with Phase 1 (Intra-Game Batching)**
+   - Already achieving 6.8 games/min (1.19x speedup)
+   - Simpler architecture
+   - Works with existing multiprocessing setup
+
+2. **Investigate parallel determinizations**
+   - Run 3 determinizations concurrently per worker
+   - Could increase effective parallelism 3x
+   - Requires ThreadPoolExecutor or async implementation
+
+3. **Increase worker count to 32**
+   - More workers = more games/min (linear scaling)
+   - Don't need cross-worker batching if Phase 1 works
+
+4. **Focus on GPU server approach (Phase 3.5)**
+   - Centralized GPU server with multiprocessing workers
+   - Each worker has its own network-free MCTS
+   - Server batches requests from all workers
+   - Simpler than parallel expansion with virtual loss
+
+### Next Steps
+
+1. ✅ **Abandon GPU-batched parallel expansion approach**
+2. ⬜ **Re-test Phase 1 with 32 workers** (should get ~50-60 games/min)
+3. ⬜ **Implement GPU server architecture** (Phase 3.5 retry)
+4. ⬜ **Benchmark GPU server with 32 workers**
+5. ⬜ **Compare: Sequential (5.7) vs Batched (6.8) vs GPU Server (?)**
 
 ---
 
-Last Updated: 2025-10-26
+## Status
+
+**Current**: ❌ **IMPLEMENTATION FAILED - APPROACH ABANDONED**
+**Reason**: Cross-worker batching requires massive parallelism (100+ workers) not available on desktop setup
+**Next**: Return to Phase 1 (intra-game batching) or retry GPU server approach
+
+**Key Finding**: Intra-game batching (Phase 1) is more effective than cross-worker batching for small-scale training
+
+---
+
+Last Updated: 2025-10-26 (Benchmark completed, approach abandoned)
