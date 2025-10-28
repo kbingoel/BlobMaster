@@ -1,11 +1,21 @@
 # Comprehensive Benchmark Plan - Correct Network Configuration
 
+> **⚠️ HISTORICAL DOCUMENT - Windows Era**
+>
+> This document contains the benchmark plan and execution results from the Windows/Python 3.12 development era (Phase 1-4).
+> - **Platform:** Windows 10, Python 3.12
+> - **Date:** 2025-10-26 (Phase 1 execution)
+> - **Status:** Phase 1 executed, moderate results (1.76x speedup)
+> - **Current Platform:** Ubuntu 24.04, Python 3.14 (migrated 2025-10-27)
+>
+> For current benchmark results and tracking, see [results/RESULTS-TRACKER.md](results/RESULTS-TRACKER.md)
+
 **Date**: 2025-10-26
 **Status**: ⚠️ PHASE 1 EXECUTED - MODERATE RESULTS (1.76x speedup)
 **Hardware**: NVIDIA RTX 4060 (3,072 CUDA cores, 8GB VRAM), AMD Ryzen 9 7950X (16 cores, 32 threads)
 
-**Execution Summary**: See [docs/performance/PHASE1-EXECUTION-SUMMARY.md](docs/performance/PHASE1-EXECUTION-SUMMARY.md)
-**Next Steps**: See [docs/performance/NEXT-STEPS-GPU-MCTS.md](docs/performance/NEXT-STEPS-GPU-MCTS.md)
+**Execution Summary**: See [docs/findings/PHASE1-EXECUTION-SUMMARY.md](docs/findings/PHASE1-EXECUTION-SUMMARY.md)
+**Next Steps**: See [docs/archive/NEXT-STEPS-GPU-MCTS.md](docs/archive/NEXT-STEPS-GPU-MCTS.md)
 
 ---
 
