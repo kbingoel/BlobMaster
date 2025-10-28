@@ -169,32 +169,36 @@ Loop until convergence:
 
 ## Tech Stack
 
-### Training Environment (Desktop PC with RTX 4060 8GB GPU and 16-core Ryzen 7950X CPU, 128GB DDR5)
+### Training Environment (Linux PC: Ubuntu 24.04, RTX 4060 8GB, Ryzen 9 7950X 16-core, 128GB DDR5)
 
 | Component | Technology | Justification |
 |-----------|------------|---------------|
-| **ML Framework** | PyTorch 2.x (CUDA) | Best flexibility for custom RL, excellent GPU support |
-| **Game Engine** | Python 3.11+ | Clean implementation of game rules, easy testing |
+| **Platform** | Ubuntu Linux 24.04 | Native GPU support, better threading performance |
+| **ML Framework** | PyTorch 2.x (CUDA 12.9) | Best flexibility for custom RL, excellent GPU support |
+| **Game Engine** | Python 3.14 | Clean implementation of game rules, easy testing |
 | **MCTS** | Custom Python | ~200 lines, full control over determinization |
-| **Parallelization** | Python multiprocessing or Ray | 16-32 parallel self-play games |
-| **Metrics/Logging** | Weights & Biases or TensorBoard | Track ELO, loss curves, hyperparameters |
-| **Model Export** | ONNX | Cross-platform inference |
+| **Parallelization** | Python multiprocessing | 32 parallel self-play workers (proven optimal) |
+| **Metrics/Logging** | TensorBoard | Track ELO, loss curves, hyperparameters |
+| **Model Export** | ONNX | Cross-platform inference for future deployment |
 
-### Production Environment (Intel Laptop - CPU/iGPU - Intel i5-1135G7, 16 GB shared)
+### Production Environment (Future - Windows Laptop Deployment)
+
+**Note**: This is Phase 7+ work and may be split into a separate repository.
 
 | Component | Technology | Justification |
 |-----------|------------|---------------|
+| **Platform** | Windows (Intel i5-1135G7 iGPU, 16GB) | Deployment target (future) |
 | **Backend** | Bun (TypeScript) | Fast, single runtime, built-in SQLite, WebSocket support |
 | **Frontend** | Svelte + TypeScript | Lightweight, fast compilation, simple reactivity |
 | **Database** | SQLite | File-based (no browser storage issues), handles game history |
-| **Inference** | ONNX Runtime (OpenVINO) | Intel iGPU acceleration, 50-100ms latency |
+| **Inference** | ONNX Runtime (OpenVINO) | Intel iGPU acceleration, 50-100ms latency target |
 | **Communication** | WebSockets | Real-time game state updates |
 
 ### Why This Stack?
 
-1. **Separation of concerns**: Heavy training (Python/GPU) separate from lightweight inference (Bun/ONNX)
-2. **No Python in production**: Faster startup, easier deployment, better laptop performance
-3. **File-based storage**: SQLite in repo directory (your Tauri motivation without Tauri complexity)
+1. **Separation of concerns**: Heavy training (Linux PC/Python/GPU) separate from lightweight inference (future laptop/Bun/ONNX)
+2. **No Python in production**: Faster startup, easier deployment
+3. **File-based storage**: SQLite in repo directory (simple, portable)
 4. **Modern & maintainable**: Svelte + Bun are fast to develop and debug
 5. **GPU → CPU pipeline**: Train on powerful hardware, run anywhere via ONNX
 
@@ -511,17 +515,22 @@ ELO_PROMOTION_THRESHOLD = 0.55  # 55% win rate to become new best
 
 ### Hardware Requirements
 
-**Training**:
+**Training (Linux PC - Primary Development)**:
+- **Platform**: Ubuntu Linux 24.04
+- **CPU**: AMD Ryzen 9 7950X (16 cores)
 - **GPU**: NVIDIA RTX 4060 8GB
-- **RAM**: 128GB DDR5 (for parallel self-play workers)
+- **RAM**: 128GB DDR5 (for 32 parallel self-play workers)
 - **Storage**: 50GB+ (model checkpoints, replay buffer)
-- **Time**: 3-7 days continuous training
+- **CUDA**: 12.9
+- **Python**: 3.14.0 (with GIL enabled)
+- **Time**: ~50 days continuous training (500 iterations, Medium MCTS config)
 
-**Inference**:
+**Inference (Future Deployment - Windows Laptop)**:
+- **Platform**: Windows (future work, may be separate repository)
 - **CPU**: Intel i5-1135G7 with iGPU
 - **RAM**: 16GB shared
 - **Storage**: 100MB (model + frontend assets)
-- **Latency**: <100ms per move evaluation
+- **Latency**: <100ms per move evaluation target
 
 ### Expected ELO Progression
 

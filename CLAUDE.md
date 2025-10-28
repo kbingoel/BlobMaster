@@ -6,27 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bidding game) using AlphaZero-style reinforcement learning. The project implements a neural network trained through self-play with Monte Carlo Tree Search (MCTS) to master both bidding strategy and optimal card play in an imperfect information game.
 
-**Architecture**: Training happens on a desktop PC with RTX GPU + Python/PyTorch, while inference runs on an Intel laptop with CPU/iGPU using ONNX Runtime. The production stack uses Bun (TypeScript backend), Svelte (frontend), and SQLite (database).
+**Architecture**: Training and development happen on a Linux PC (Ubuntu 24.04) with RTX 4060 GPU + Python 3.14/PyTorch. Future inference deployment (Phase 7+) may use a Windows laptop with Intel iGPU + ONNX Runtime, or may be split into a separate repository. The production stack (when implemented) uses Bun (TypeScript backend), Svelte (frontend), and SQLite (database).
 
 ## Development Environment
 
-VERY IMPORTANT:
-You are working in a Windows 11 environment, plan your console commands accordingly!
-When checking for tools, use the correct Windows command syntax! For example, paths must use forward slashes!
-Use Grep!
-Avoid Unicode encoding errors (checkmarks and card symbols)
+**IMPORTANT - Development Platform:**
+- **Primary Development**: Ubuntu Linux 24.04 on Ryzen 9 7950X + RTX 4060 8GB
+- **Python Version**: Python 3.14.0 (with GIL enabled)
+- **Training Location**: All training happens on the Linux PC
+- **Future Deployment**: Windows laptop inference is Phase 7+ (future work, may be separate repo)
 
 ### Training Environment (Python)
 
 **Setup virtual environment**:
 ```bash
-# Create and activate venv
-python -m venv venv
-venv\Scripts\activate  # Windows
-source venv/bin/activate  # Linux/Mac
+# Create and activate venv with Python 3.14
+python3.14 -m venv venv
+source venv/bin/activate
 
-# Install PyTorch with CUDA support first
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch with CUDA 12.9 support first
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # Install other dependencies
 pip install -r ml/requirements.txt
@@ -283,8 +282,8 @@ Based on similar AlphaZero projects:
 - **~50 days total** on RTX 4060 for strong model (with Medium MCTS)
 
 **Hardware Requirements**:
-- Training: RTX 4060 8GB GPU, 128GB RAM (parallel workers), 50GB+ storage
-- Inference: Intel i5-1135G7 iGPU, 16GB RAM, <100ms latency target
+- **Training** (Linux PC): RTX 4060 8GB GPU, Ryzen 9 7950X 16-core, 128GB DDR5 RAM, 50GB+ storage
+- **Inference** (future, Windows laptop): Intel i5-1135G7, iGPU, 16GB RAM, <500ms latency target
 
 ## Research Questions Being Explored
 
