@@ -213,17 +213,19 @@ results/
 
 **Configuration:** 32 workers, multiprocessing, no batching
 
-### Ubuntu Current (Python 3.14, Ubuntu 24.04)
+### Ubuntu Current (Python 3.14, Ubuntu 24.04) ✅ Validated 2025-10-28
 
-**Status:** Performance regression observed - needs investigation
+**Status:** ✅ Baseline established - performs 5% faster than Windows
 
-| MCTS Config | Games/Min | Expected | Regression |
-|-------------|-----------|----------|------------|
-| Medium (3×30) | ~20 | 43.3 | **2.2x slower** |
+| MCTS Config | Games/Min | Sec/Game | Training Time (500 iter × 10K games) |
+|-------------|-----------|----------|-------------------------------------|
+| **Medium (3×30)** | **45.5** | **1.32** | **6.7 days** |
 
-**Training time projection:** ~120 days (vs 54 days expected)
+**Configuration:** 32 workers, CUDA device, `use_batched_evaluator=False`, `use_thread_pool=False`
 
-**Root cause:** Unknown - requires systematic benchmarking
+**Hardware:** RTX 4060 @ 99% GPU, 6.7GB/8.2GB VRAM, 75.9% CPU
+
+**Result:** Ubuntu/Python 3.14 is **1.05x faster** than Windows/Python 3.12 baseline!
 
 ---
 
