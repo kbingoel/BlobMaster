@@ -354,20 +354,27 @@ After extensive performance testing (see [PERFORMANCE-FINDINGS.md](PERFORMANCE-F
 python ml/train.py --workers 32 --device cuda
 ```
 
-**Expected Performance**:
+**Expected Performance** (Windows baseline benchmarks):
 - Light MCTS (2 det × 20 sims): 80 games/min
 - Medium MCTS (3 det × 30 sims): 43 games/min ← **recommended for training**
 - Heavy MCTS (5 det × 50 sims): 25 games/min
 
+**Linux Performance** (Ubuntu 24.04 + RTX 4060, current):
+- Medium MCTS (3 det × 30 sims): **20 games/min** (2.2x slower than Windows baseline!)
+- GPU-Batched MCTS (experimental): 8.8 games/min (avg batch size: 2.8, needs optimization)
+- Intra-Game Batching: 9.9 games/min (1.5x speedup over sequential)
+
 **Training Timeline** (500 iterations × 10,000 games each):
-- Medium MCTS: ~54 days continuous training
+- Medium MCTS @ 20 games/min: **~120 days continuous training** (vs 54 days expected)
 - GPU utilization: 15-20% (acceptable for MCTS sequential nature)
+- **⚠️ Performance Investigation Needed**: Linux slower than expected, root cause unknown
 
 **Key Findings**:
 - GPU server architecture (Phase 3.5) failed: 3-5x slower due to small batch sizes
 - Threading + batching failed: GIL contention and overhead exceeded benefits
 - Simple multiprocessing wins: 32 workers with per-worker networks
-- Future optimization: GPU-batched MCTS with virtual loss could achieve 300-600 games/min
+- **Linux performance regression**: 2.2x slower than Windows baseline (needs investigation)
+- GPU-batched MCTS: Small batch sizes (2.8 avg) limit speedup potential
 
 **Detailed Analysis**: See [docs/performance/](docs/performance/) for comprehensive investigation
 
