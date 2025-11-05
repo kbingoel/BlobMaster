@@ -33,7 +33,7 @@ pip install -r ml/requirements.txt
 
 **Testing**:
 ```bash
-# Run all tests (426+ tests across all phases)
+# Run all tests (460 tests across all phases)
 venv/Scripts/python.exe -m pytest ml/
 
 # Run specific module tests
@@ -52,7 +52,7 @@ venv/Scripts/python.exe -m pytest --cov=ml ml/
 
 **Training**:
 ```bash
-# Start full training pipeline (3-7 days)
+# Start full training pipeline (136 days @ Medium MCTS or 72 days @ Light MCTS)
 venv/Scripts/python.exe ml/train.py --iterations 500
 
 # Fast test run (validates pipeline without long wait)
@@ -262,7 +262,7 @@ The training infrastructure is fully implemented and ready for multi-day trainin
 1. ✅ **Core Game Engine** - Complete (135 tests, 97% coverage)
 2. ✅ **MCTS + Neural Network** - Complete (148 tests)
 3. ✅ **Imperfect Information Handling** - Complete (333 tests total)
-4. ✅ **Self-Play Training Pipeline** - Complete (93 training tests, 426+ total tests)
+4. ✅ **Self-Play Training Pipeline** - Complete (93 training tests, 460 total tests)
 5. 🔜 **ONNX Export & Inference** - Next phase
 6. 🔜 **Backend API** - Bun server with ONNX inference
 7. 🔜 **Frontend UI** - Svelte web interface
@@ -354,41 +354,49 @@ After extensive performance testing (see [PERFORMANCE-FINDINGS.md](PERFORMANCE-F
 python ml/train.py --workers 32 --device cuda
 ```
 
-**Expected Performance** (Windows baseline benchmarks):
-- Light MCTS (2 det × 20 sims): 80 games/min
-- Medium MCTS (3 det × 30 sims): 43 games/min ← **recommended for training**
-- Heavy MCTS (5 det × 50 sims): 25 games/min
+**Current Performance** (Ubuntu 24.04 + RTX 4060, validated 2025-11-05):
+- Light MCTS (2 det × 20 sims): **69.1 games/min** ← **fastest option**
+- Medium MCTS (3 det × 30 sims): **36.7 games/min** ← **recommended for training**
+- Heavy MCTS (5 det × 50 sims): **16.0 games/min** ← **highest quality**
 
-**Linux Performance** (Ubuntu 24.04 + RTX 4060, current):
-- Medium MCTS (3 det × 30 sims): **20 games/min** (2.2x slower than Windows baseline!)
-- GPU-Batched MCTS (experimental): 8.8 games/min (avg batch size: 2.8, needs optimization)
-- Intra-Game Batching: 9.9 games/min (1.5x speedup over sequential)
+**Worker Scaling** (Medium MCTS, 50 games tested per config):
+- 1 worker: 2.6 games/min (baseline)
+- 4 workers: 9.5 games/min (3.7x speedup, 92% efficiency)
+- 8 workers: 17.1 games/min (6.6x speedup, 82% efficiency)
+- 16 workers: 26.6 games/min (10.2x speedup, 64% efficiency)
+- 32 workers: 36.7 games/min (14.1x speedup, 44% efficiency)
+- **48 workers: FAILED** (CUDA out of memory - GPU VRAM exhausted)
+- **64 workers: FAILED** (CUDA out of memory - GPU VRAM exhausted)
+
+**Hardware Limit Identified**: RTX 4060 8GB can support maximum **32 workers** (each worker uses ~150MB GPU memory, total ~5-6GB). Beyond 32 workers causes CUDA OOM errors.
 
 **Training Timeline** (500 iterations × 10,000 games each):
-- Medium MCTS @ 20 games/min: **~120 days continuous training** (vs 54 days expected)
-- GPU utilization: 15-20% (acceptable for MCTS sequential nature)
-- **⚠️ Performance Investigation Needed**: Linux slower than expected, root cause unknown
+- Light MCTS @ 69.1 games/min: **~72 days continuous training**
+- Medium MCTS @ 36.7 games/min: **~136 days continuous training**
+- Heavy MCTS @ 16.0 games/min: **~312 days continuous training**
 
 **Key Findings**:
 - GPU server architecture (Phase 3.5) failed: 3-5x slower due to small batch sizes
 - Threading + batching failed: GIL contention and overhead exceeded benefits
 - Simple multiprocessing wins: 32 workers with per-worker networks
-- **Linux performance regression**: 2.2x slower than Windows baseline (needs investigation)
-- GPU-batched MCTS: Small batch sizes (2.8 avg) limit speedup potential
+- **32 workers is optimal**: Hardware limit for RTX 4060 8GB VRAM
+- Scaling efficiency degrades beyond 16 workers (diminishing returns + memory pressure)
+- Linux performance validated (36.7 games/min Medium MCTS, 15% slower than historical Windows baseline of 43.3 games/min)
 
 **Detailed Analysis**: See [docs/performance/](docs/performance/) for comprehensive investigation
 
 ## Expected Training Progression
 
-Based on similar AlphaZero projects:
+Based on similar AlphaZero projects and validated benchmarks:
 
 - **Day 1** (ELO ~800): Random legal moves
 - **Day 3** (ELO ~1200): Learned basic trick-taking rules
 - **Day 7** (ELO ~1600): Strategic bidding and card counting
-- **~50 days total** on RTX 4060 for strong model (with Medium MCTS)
+- **~136 days total** on RTX 4060 for strong model (with Medium MCTS @ 36.7 games/min)
+- **~72 days total** if using Light MCTS (@ 69.1 games/min, slightly lower quality)
 
 **Hardware Requirements**:
-- **Training** (Linux PC): RTX 4060 8GB GPU, Ryzen 9 7950X 16-core, 128GB DDR5 RAM, 50GB+ storage
+- **Training** (Linux PC): RTX 4060 8GB GPU (supports max 32 workers), Ryzen 9 7950X 16-core, 128GB DDR5 RAM, 50GB+ storage
 - **Inference** (future, Windows laptop): Intel i5-1135G7, iGPU, 16GB RAM, <500ms latency target
 
 ## Research Questions Being Explored

@@ -457,7 +457,11 @@ def main():
         print("\nQUICK TEST MODE: Limited configurations")
     else:
         worker_counts = args.workers if args.workers else [32]  # Default: single worker count
-        mcts_configs = QUICK_MCTS_CONFIGS  # Default: medium MCTS only
+        # If multiple worker counts specified, test all MCTS configs; otherwise just medium
+        if args.workers and len(args.workers) > 1:
+            mcts_configs = DEFAULT_MCTS_CONFIGS  # Test all MCTS configs
+        else:
+            mcts_configs = QUICK_MCTS_CONFIGS  # Default: medium MCTS only
         games_per_config = args.games
 
     # Print benchmark plan

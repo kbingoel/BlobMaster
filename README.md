@@ -342,7 +342,7 @@ blobmaster/
   - **Result**: 14 integration tests, all passing
 
 **Progress**: 9/9 sessions complete ✅ **PHASE 2 COMPLETE**
-**Total Tests**: 246 tests passing (135 game engine + 111 ML pipeline)
+**Total Tests**: 283 tests passing (135 game engine + 148 ML pipeline)
 **Deliverable**: ✅ AI plays valid games end-to-end with MCTS + Neural Network
 
 ### Phase 3: Imperfect Information Handling ✅ COMPLETE
@@ -379,7 +379,7 @@ blobmaster/
 
 **Test Results:**
 - **87 new tests** for Phase 3 (belief tracking, determinization, imperfect info MCTS)
-- **Total Tests**: 333 tests passing (135 game engine + 111 ML pipeline + 87 imperfect info)
+- **Total Tests**: 367 tests passing (135 game engine + 148 ML pipeline + 84 imperfect info)
 - All performance benchmarks met
 - Memory usage within targets (<100KB)
 
@@ -430,7 +430,13 @@ blobmaster/
   - Integration tests for full pipeline
   - **Result**: High test coverage ensures reliability
 
-- [ ] **Run training**: 3-7 days on RTX GPU (READY TO START)
+**Test Results:**
+- **93 new tests** for Phase 4 (self-play, replay buffer, training, evaluation)
+- **Total Tests**: 460 tests passing (135 game engine + 148 ML + 84 imperfect info + 93 training)
+- All integration tests passing
+- Performance validated: 36.7 games/min @ Medium MCTS (32 workers, RTX 4060)
+
+- [ ] **Run training**: 136 days on RTX 4060 (Medium MCTS) or 72 days (Light MCTS)
 
 **Deliverable**: Complete training system ready for multi-day training runs. Can execute:
 ```bash
