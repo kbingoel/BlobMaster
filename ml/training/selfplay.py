@@ -471,6 +471,8 @@ class SelfPlayEngine:
         gpu_server_max_batch: int = 512,
         gpu_server_timeout_ms: float = 10.0,
         mcts_batch_size: Optional[int] = None,
+        use_parallel_expansion: bool = True,
+        parallel_batch_size: int = 10,
     ):
         """
         Initialize self-play engine.
@@ -496,6 +498,8 @@ class SelfPlayEngine:
             mcts_batch_size: Phase 1 intra-game batching size (default: None for sequential)
                             If set, uses search_batched() with virtual loss
                             If None, uses search() for baseline
+            use_parallel_expansion: Use parallel MCTS expansion for better batching (default: True)
+            parallel_batch_size: Number of leaves to expand per iteration (default: 10)
         """
         self.network = network
         self.encoder = encoder
@@ -509,6 +513,8 @@ class SelfPlayEngine:
         self.gpu_server_max_batch = gpu_server_max_batch
         self.gpu_server_timeout_ms = gpu_server_timeout_ms
         self.mcts_batch_size = mcts_batch_size
+        self.use_parallel_expansion = use_parallel_expansion
+        self.parallel_batch_size = parallel_batch_size
 
         # GPU server takes precedence over other batching methods
         if use_gpu_server:
@@ -657,6 +663,8 @@ class SelfPlayEngine:
                             self.num_determinizations,
                             self.simulations_per_determinization,
                             self.temperature_schedule,
+                            self.use_parallel_expansion,
+                            self.parallel_batch_size,
                         )
                     )
 
@@ -684,6 +692,8 @@ class SelfPlayEngine:
                             self.batch_size,
                             self.batch_timeout_ms,
                             self.mcts_batch_size,
+                            self.use_parallel_expansion,
+                            self.parallel_batch_size,
                         )
                     )
 
@@ -744,6 +754,8 @@ class SelfPlayEngine:
                     self.temperature_schedule,
                     self.batch_evaluator,  # Shared evaluator!
                     self.mcts_batch_size,
+                    self.use_parallel_expansion,
+                    self.parallel_batch_size,
                 )
                 futures.append(future)
 
@@ -837,6 +849,8 @@ def _worker_generate_games_static(
     batch_size: int = 512,
     batch_timeout_ms: float = 10.0,
     mcts_batch_size: Optional[int] = None,
+    use_parallel_expansion: bool = True,
+    parallel_batch_size: int = 10,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -866,6 +880,8 @@ def _worker_generate_games_static(
         batch_size: Maximum batch size for BatchedEvaluator
         batch_timeout_ms: Timeout in ms for batch collection
         mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
+        use_parallel_expansion: Use parallel MCTS expansion for better batching
+        parallel_batch_size: Number of leaves to expand per iteration
 
     Returns:
         List of training examples from all games
@@ -939,6 +955,8 @@ def _worker_generate_games_static(
         use_imperfect_info=True,
         batch_evaluator=batch_evaluator,
         batch_size=mcts_batch_size,
+        use_parallel_expansion=use_parallel_expansion,
+        parallel_batch_size=parallel_batch_size,
     )
 
     # Generate games
@@ -972,6 +990,8 @@ def _worker_generate_games_with_gpu_server(
     num_determinizations: int,
     simulations_per_determinization: int,
     temperature_schedule: Optional[Callable[[int], float]],
+    use_parallel_expansion: bool = True,
+    parallel_batch_size: int = 10,
 ) -> List[Dict[str, Any]]:
     """
     Worker function for GPU server mode (Phase 3.5).
@@ -991,6 +1011,8 @@ def _worker_generate_games_with_gpu_server(
         num_determinizations: Determinizations per MCTS search
         simulations_per_determinization: MCTS simulations per world
         temperature_schedule: Temperature schedule function
+        use_parallel_expansion: Use parallel MCTS expansion for better batching
+        parallel_batch_size: Number of leaves to expand per iteration
 
     Returns:
         List of training examples from all games
@@ -1023,6 +1045,8 @@ def _worker_generate_games_with_gpu_server(
         use_imperfect_info=True,
         batch_evaluator=None,
         gpu_server_client=gpu_client,
+        use_parallel_expansion=use_parallel_expansion,
+        parallel_batch_size=parallel_batch_size,
     )
 
     # Generate games
@@ -1053,6 +1077,8 @@ def _worker_generate_games_threaded(
     temperature_schedule: Optional[Callable[[int], float]],
     batch_evaluator: Optional["BatchedEvaluator"],
     mcts_batch_size: Optional[int] = None,
+    use_parallel_expansion: bool = True,
+    parallel_batch_size: int = 10,
 ) -> List[Dict[str, Any]]:
     """
     Threaded worker function for parallel game generation (Phase 3).
@@ -1080,6 +1106,8 @@ def _worker_generate_games_threaded(
         temperature_schedule: Temperature schedule function
         batch_evaluator: Shared BatchedEvaluator (thread-safe)
         mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
+        use_parallel_expansion: Use parallel MCTS expansion for better batching
+        parallel_batch_size: Number of leaves to expand per iteration
 
     Returns:
         List of training examples from all games
@@ -1096,6 +1124,8 @@ def _worker_generate_games_threaded(
         num_determinizations=num_determinizations,
         simulations_per_determinization=simulations_per_determinization,
         temperature_schedule=temperature_schedule,
+        use_parallel_expansion=use_parallel_expansion,
+        parallel_batch_size=parallel_batch_size,
         use_imperfect_info=True,
         batch_evaluator=batch_evaluator,  # Shared evaluator!
         batch_size=mcts_batch_size,

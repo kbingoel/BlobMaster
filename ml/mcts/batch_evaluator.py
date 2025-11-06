@@ -259,6 +259,61 @@ class BatchedEvaluator:
 
         return result.policy, result.value
 
+    def evaluate_many(
+        self,
+        states: list[torch.Tensor],
+        masks: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        Evaluate multiple game states using batched neural network inference.
+
+        Submits all requests at once for better cross-request batching.
+
+        Args:
+            states: List of encoded game state tensors (256-dim)
+            masks: List of legal action mask tensors (52-dim)
+
+        Returns:
+            Tuple of (policies, values) lists
+        """
+        if not self.running:
+            raise RuntimeError(
+                "BatchedEvaluator is not running. Call start() first."
+            )
+
+        # Create result queues for all requests
+        result_queues = [queue.Queue(maxsize=1) for _ in states]
+
+        # Submit all requests
+        for state, mask, result_queue in zip(states, masks, result_queues):
+            with self.request_id_lock:
+                request_id = self.next_request_id
+                self.next_request_id += 1
+
+            request = EvaluationRequest(
+                request_id=request_id,
+                state=state,
+                mask=mask,
+                result_queue=result_queue,
+            )
+
+            self.request_queue.put(request)
+
+        # Gather all results
+        policies = []
+        values = []
+
+        for result_queue in result_queues:
+            result = result_queue.get()
+
+            if result.error is not None:
+                raise RuntimeError(f"Evaluation failed: {result.error}")
+
+            policies.append(result.policy)
+            values.append(result.value)
+
+        return policies, values
+
     def _evaluation_loop(self):
         """
         Background thread that processes evaluation requests in batches.

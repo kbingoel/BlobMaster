@@ -737,24 +737,13 @@ class MCTS:
 
         # Batch inference (priority: GPU server > BatchedEvaluator > direct)
         if self.gpu_server_client is not None:
-            # Use GPU inference server - send each state individually
-            # (GPU server handles batching internally)
-            policy_list = []
-            value_list = []
-            for state, mask in zip(states, masks):
-                policy, value = self.gpu_server_client.evaluate(state, mask)
-                policy_list.append(policy)
-                value_list.append(value)
+            # Use GPU inference server - batch submit all states
+            policy_list, value_list = self.gpu_server_client.evaluate_many(states, masks)
             policy_batch = torch.stack(policy_list)
             value_batch = torch.stack(value_list)
         elif self.batch_evaluator is not None:
-            # Use centralized batched evaluator - send each state individually
-            policy_list = []
-            value_list = []
-            for state, mask in zip(states, masks):
-                policy, value = self.batch_evaluator.evaluate(state, mask)
-                policy_list.append(policy)
-                value_list.append(value)
+            # Use centralized batched evaluator - batch submit all states
+            policy_list, value_list = self.batch_evaluator.evaluate_many(states, masks)
             policy_batch = torch.stack(policy_list)
             value_batch = torch.stack(value_list)
         else:

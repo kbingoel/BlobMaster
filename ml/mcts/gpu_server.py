@@ -165,6 +165,69 @@ class GPUServerClient:
 
         return result.policy, result.value
 
+    def evaluate_many(
+        self,
+        states: list[torch.Tensor],
+        masks: list[torch.Tensor],
+        timeout: float = 30.0,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        Request neural network evaluation for multiple states (batch submission).
+
+        Submits all requests at once, then waits for all results. This allows
+        GPU server to batch across workers for maximum throughput.
+
+        Args:
+            states: List of encoded game state tensors (256-dim)
+            masks: List of legal action mask tensors (52-dim)
+            timeout: Maximum time to wait for all results (seconds)
+
+        Returns:
+            Tuple of (policies, values) lists
+        """
+        request_ids = []
+
+        # Submit all requests
+        for state, mask in zip(states, masks):
+            request_id = f"{self.client_id}_{uuid.uuid4().hex[:8]}"
+            request = InferenceRequest(
+                request_id=request_id,
+                state=state.cpu(),
+                mask=mask.cpu(),
+                response_queue_id=self.client_id,
+            )
+            self.request_queue.put(request)
+            request_ids.append(request_id)
+
+        # Gather all results
+        policies = []
+        values = []
+        results_map = {}
+
+        deadline = time.time() + timeout
+        for _ in range(len(request_ids)):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"GPU server batch timeout after {timeout}s")
+
+            try:
+                result = self.response_queue.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError(f"GPU server batch timeout after {timeout}s")
+
+            if result.error is not None:
+                raise RuntimeError(f"GPU server error: {result.error}")
+
+            results_map[result.request_id] = result
+
+        # Reorder results to match input order
+        for request_id in request_ids:
+            result = results_map[request_id]
+            policies.append(result.policy)
+            values.append(result.value)
+
+        return policies, values
+
 
 class GPUInferenceServer:
     """

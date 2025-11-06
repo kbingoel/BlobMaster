@@ -19,6 +19,10 @@ class TrainingConfig:
     num_determinizations: int = 3
     simulations_per_determinization: int = 30
 
+    # MCTS parallelization
+    use_parallel_expansion: bool = True
+    parallel_batch_size: int = 10
+
     # Replay buffer settings
     replay_buffer_capacity: int = 500_000
     min_buffer_size: int = 10_000

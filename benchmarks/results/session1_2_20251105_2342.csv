@@ -1,0 +1,2 @@
+num_workers,mcts_config,num_determinizations,simulations_per_det,total_sims_per_move,num_games,elapsed_time_sec,games_per_minute,seconds_per_game,num_examples,examples_per_minute,cpu_percent
+32,medium,3,30,90,50,47.15811538696289,63.615773772617004,0.9431623077392578,1200,1526.778570542808,1.5
