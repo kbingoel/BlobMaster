@@ -247,7 +247,7 @@ class MCTS:
             # Use centralized batched evaluator (Phase 2/3: multi-game batching)
             policy, value = self.batch_evaluator.evaluate(state_tensor, legal_mask)
         else:
-            # Direct inference (backward compatibility)
+            # Direct inference (backward compatibility, TF32 enabled via performance_init)
             state_tensor = state_tensor.to(self.device)
             legal_mask = legal_mask.to(self.device)
 
@@ -747,7 +747,7 @@ class MCTS:
             policy_batch = torch.stack(policy_list)
             value_batch = torch.stack(value_list)
         else:
-            # Direct inference - move to device for single GPU call
+            # Direct inference - move to device for single GPU call (TF32 enabled via performance_init)
             state_batch = state_batch.to(self.device)
             mask_batch = mask_batch.to(self.device)
             with torch.no_grad():

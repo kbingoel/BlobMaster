@@ -398,7 +398,7 @@ class BatchedEvaluator:
             state_batch = torch.stack(states).to(self.device)
             mask_batch = torch.stack(masks).to(self.device)
 
-            # Batched neural network inference (single GPU call!)
+            # Batched neural network inference (single GPU call, TF32 enabled via performance_init)
             with torch.no_grad():
                 policy_batch, value_batch = self.network(state_batch, mask_batch)
 

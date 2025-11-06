@@ -41,6 +41,7 @@ from ml.config import TrainingConfig, get_fast_config, get_production_config
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.trainer import TrainingPipeline
+from ml.performance_init import init_performance
 
 
 def parse_args() -> argparse.Namespace:
@@ -320,6 +321,9 @@ def run_training_pipeline(
 
 def main():
     """Main training entry point."""
+    # Initialize performance optimizations (TF32, etc.)
+    init_performance()
+
     # Parse arguments
     args = parse_args()
 

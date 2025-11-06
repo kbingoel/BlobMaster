@@ -21,7 +21,7 @@ class TrainingConfig:
 
     # MCTS parallelization
     use_parallel_expansion: bool = True
-    parallel_batch_size: int = 10
+    parallel_batch_size: int = 30  # Optimal value from Session 2 tuning
 
     # Replay buffer settings
     replay_buffer_capacity: int = 500_000

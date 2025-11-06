@@ -497,7 +497,7 @@ def _server_process_loop(
             states = torch.stack([req.state for req in batch_requests]).to(device)
             masks = torch.stack([req.mask for req in batch_requests]).to(device)
 
-            # Run neural network
+            # Run neural network (TF32 enabled via performance_init for speedup)
             with torch.no_grad():
                 policies, values = network(states, masks)
 

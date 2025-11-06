@@ -30,6 +30,7 @@ sys.path.insert(0, str(project_root))
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.training.selfplay import SelfPlayEngine
+from ml.performance_init import init_performance
 
 
 # Test configurations
@@ -448,6 +449,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Initialize performance optimizations (TF32, etc.)
+    init_performance()
 
     # Determine configurations
     if args.quick:

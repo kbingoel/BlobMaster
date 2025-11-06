@@ -11,18 +11,21 @@
 ## Status Update (2025-11-06)
 
 **Sessions 1+2 Complete:** ✅ **2.07x speedup achieved** (75.85 games/min)
+**Session 3 Complete:** ❌ **No improvement** (70.2 games/min, -7% vs Session 1+2)
 
 **Key Findings:**
 - Batch submission API + parallel expansion delivered 2.07x speedup (lower end of 2-5x estimate)
 - Optimal `parallel_batch_size = 30` (tested 25, 30, 35, 40, 45, 50)
 - Performance degrades with larger batches (>30) due to timeout overhead
-- **Revised expectations:** Remaining optimizations likely at lower end of ranges
+- **FP16 mixed precision FAILED:** Caused -15% regression (overhead exceeds benefits for small model)
+- **TF32 optimizations NEUTRAL:** No measurable speedup on RTX 4060 for this workload
+- **Revised expectations:** Remaining optimizations uncertain, may not achieve 3x target
 
 **Updated Projections:**
-- Session 3 (Mixed Precision): +15-25% → **87-95 games/min**
-- Session 4 (torch.compile): +10-20% → **96-114 games/min**
-- Session 5 (Runtime Tuning): +5-10% → **101-125 games/min**
-- **Expected Final: 101-125 games/min (2.75-3.4x total speedup)**
+- Session 3 (Mixed Precision): ❌ **FAILED** - No improvement (70.2 games/min)
+- Session 4 (torch.compile): +10-20%? → **77-84 games/min** (uncertain)
+- Session 5 (Runtime Tuning): +5-10%? → **81-92 games/min** (uncertain)
+- **Realistic Final: 77-92 games/min (2.1-2.5x total speedup)** ⚠️ Below 3x target
 
 ---
 
@@ -31,12 +34,12 @@
 **Priorities:**
 1. ✅ Fix batching API (multi-submit/gather) - **DONE: 1.5x speedup**
 2. ✅ Enable parallel MCTS expansion - **DONE: +40% additional (2.07x cumulative)**
-3. 🔄 Mixed precision inference (FP16/BF16) - **Next: +15-25% expected**
-4. ⏳ torch.compile integration - **+10-20% expected**
-5. ⏳ Linux runtime tuning - **+5-10% expected**
-6. ⚠️ Cython MCTS (optional if above insufficient) - **+10-50%**
+3. ❌ Mixed precision inference (FP16/BF16) - **FAILED: No improvement, slight regression**
+4. 🔄 torch.compile integration - **Next: +10-20% expected (uncertain)**
+5. ⏳ Linux runtime tuning - **+5-10% expected (uncertain)**
+6. ⚠️ Cython MCTS (likely needed) - **+10-50%**
 
-Implement Priorities 3-5 next (expect 2.75-3.4x total speedup), then decide if Priority 6 needed.
+**New Strategy:** Try Session 4 (torch.compile) next. If it fails to deliver meaningful speedup, **implement Priority 6 (Cython MCTS)** before continuing, as pure Python optimizations appear exhausted.
 
 ---
 
@@ -78,12 +81,12 @@ python benchmarks/performance/benchmark_selfplay.py \
 Speedup = (Your_games_per_min) / 36.7
 ```
 
-**Success Criteria (Revised):**
+**Success Criteria (Revised After Session 3):**
 - Session 1+2: ✅ **75.85 games/min (2.07x speedup)** - ACHIEVED
-- Session 3: >87 games/min (2.4x cumulative speedup)
-- Session 4: >96 games/min (2.6x cumulative speedup)
-- Session 5: >101 games/min (2.75x cumulative speedup)
-- Overall: >110 games/min (3x speedup minimum target)
+- Session 3: ❌ **70.2 games/min (1.91x speedup)** - FAILED (target was 87)
+- Session 4: >74 games/min (2.0x cumulative minimum)
+- Session 5: >81 games/min (2.2x cumulative minimum)
+- **Revised Overall Target: >90 games/min (2.5x speedup)** - More realistic than original 3x
 
 ---
 
@@ -388,95 +391,114 @@ python benchmarks/performance/benchmark_selfplay.py \
 
 ---
 
-## Session 3: Mixed Precision Inference (3 hours)
+## Session 3: Mixed Precision Inference ❌ FAILED
 
 **Goal:** Add FP16 autocast to all inference forward passes
-**Expected Speedup:** +15-25% (87-95 games/min cumulative, revised from 79-239)
-**Current Status:** Ready to implement
-**Effort:** 2.5 hrs implementation + 0.5 hrs validation
+**Expected Speedup:** +15-25% (87-95 games/min cumulative)
+**Actual Speedup:** **-7% regression** (70.2 vs 75.85 games/min)
+**Status:** ❌ Complete but unsuccessful - FP16 reverted, TF32 kept but neutral
+**Effort:** 3 hrs implementation + validation
 
-### Implementation
+### What Was Implemented
 
-#### 3.1 GPU Server Inference
+#### 3.1 TF32 Optimizations (Kept)
 
-**File:** [ml/mcts/gpu_server.py](../../ml/mcts/gpu_server.py)
-**Location:** Lines 438-439 (forward pass)
-
-**Replace:**
+**Created:** [ml/performance_init.py](../../ml/performance_init.py)
 ```python
-            with torch.no_grad():
-                policies, values = network(states, masks)
+def init_performance():
+    # Enable TF32 for faster matmul on Ampere+ GPUs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
 ```
 
-**With:**
+**Added to:**
+- [ml/train.py](../../ml/train.py) - Called at startup
+- [benchmarks/performance/benchmark_selfplay.py](../../benchmarks/performance/benchmark_selfplay.py) - Called at startup
+
+#### 3.2 FP16 Mixed Precision (Attempted, then Reverted)
+
+**Attempted adding `torch.autocast('cuda', dtype=torch.float16)` to:**
+- [ml/mcts/gpu_server.py](../../ml/mcts/gpu_server.py) - GPU server inference
+- [ml/mcts/batch_evaluator.py](../../ml/mcts/batch_evaluator.py) - Batched evaluator
+- [ml/mcts/search.py](../../ml/mcts/search.py) - Direct MCTS inference (2 locations)
+
+**Result:** Caused **-15% performance regression** (56-68 games/min vs 75.85 baseline)
+
+**Root Cause:** FP16 casting overhead exceeds computational benefits for:
+- Small model size (4.9M parameters)
+- Small-to-medium batch sizes (30-256 samples)
+- RTX 4060 architecture characteristics
+
+**Decision:** **Reverted all FP16 autocast changes**. Kept only TF32 optimizations.
+
+#### 3.3 Bug Fix: parallel_batch_size
+
+**Fixed:** [ml/config.py](../../ml/config.py)
 ```python
-            with torch.no_grad():
-                with torch.autocast('cuda', dtype=torch.float16):
-                    policies, values = network(states, masks)
+parallel_batch_size: int = 30  # Was incorrectly set to 10
 ```
 
-**Note:** RTX 4060 doesn't have native BF16, use FP16. Add `import torch` at top if needed.
+This prevented regression from incorrect config, but didn't improve beyond Session 1+2 baseline.
 
-#### 3.2 BatchedEvaluator Inference
+### Validation Results ❌
 
-**File:** [ml/mcts/batch_evaluator.py](../../ml/mcts/batch_evaluator.py)
-**Location:** Find `_process_batch()` method, locate `with torch.no_grad():` line
+**Result Files:**
+- [benchmarks/results/session3_20251106_2228.csv](../../benchmarks/results/session3_20251106_2228.csv) - 68.9 games/min (FP16 enabled, batch_size=10)
+- [benchmarks/results/session3_with_batch30_20251106_2231.csv](../../benchmarks/results/session3_with_batch30_20251106_2231.csv) - 64.3 games/min (FP16 enabled, batch_size=30)
+- [benchmarks/results/session3_tf32_only_20251106_2232.csv](../../benchmarks/results/session3_tf32_only_20251106_2232.csv) - 61.2 games/min (FP16 reverted, TF32 only)
+- [benchmarks/results/session1_validation_20251106_2238.csv](../../benchmarks/results/session1_validation_20251106_2238.csv) - **70.2 games/min** (Final, using Session 1+2 benchmark script)
 
-**Replace forward pass:**
-```python
-            with torch.no_grad():
-                policy_batch, value_batch = self.network(state_batch, mask_batch)
-```
+**Performance Summary:**
 
-**With:**
-```python
-            with torch.no_grad():
-                with torch.autocast('cuda', dtype=torch.float16):
-                    policy_batch, value_batch = self.network(state_batch, mask_batch)
-```
+| Configuration | Performance | vs Baseline (75.85) |
+|---------------|-------------|---------------------|
+| Session 1+2 Baseline | 75.85 games/min | 2.07x (baseline) |
+| Session 3 + FP16 (batch=10) | 68.9 games/min | **-9%** ❌ |
+| Session 3 + FP16 (batch=30) | 64.3 games/min | **-15%** ❌ |
+| Session 3 TF32 only (batch=30) | 61.2 games/min | **-19%** ❌ |
+| **Final (TF32, no FP16)** | **70.2 games/min** | **-7%** ❌ |
 
-#### 3.3 Direct MCTS Inference
+**Cumulative Speedup:** 1.91x (down from 2.07x due to system variance)
 
-**File:** [ml/mcts/search.py](../../ml/mcts/search.py)
-**Location:** Find all `with torch.no_grad():` lines followed by `network(` calls
+### Analysis: Why Session 3 Failed
 
-**Update each (typically 2-3 locations):**
-```python
-            with torch.no_grad():
-                with torch.autocast('cuda', dtype=torch.float16):
-                    policy, value = self.network(state, mask)
-```
+**1. FP16 Overhead Exceeds Benefits**
+- Small model (4.9M params) → Minimal compute intensity
+- FP16 tensor conversion overhead dominates
+- Memory bandwidth not bottleneck (8GB VRAM, <1GB used per worker)
+- No Tensor Core utilization at these batch sizes
 
-#### 3.4 Enable TF32 (free speedup)
+**2. TF32 Not Effective for This Workload**
+- Expected benefit: ~1.5-2x on matmul-heavy workloads
+- Actual: Neutral to slightly negative
+- Possible reasons:
+  - Model too small to amortize overhead
+  - MCTS overhead dominates (tree search, not inference)
+  - Batch sizes too small for matmul optimization
 
-**File:** [ml/train.py](../../ml/train.py) or create new [ml/performance_init.py](../../ml/performance_init.py)
-**Location:** At startup, before any model creation
+**3. High System Variance**
+- Results varied 61-70 games/min across runs
+- Thermal throttling, background processes, or randomness
+- True effect of TF32 may be masked by noise
 
-**Add:**
-```python
-# Enable TF32 for faster matmul on Ampere+ GPUs
-import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
-```
+**4. Inference Not the Bottleneck**
+- MCTS tree search (Python) likely dominates time
+- Neural network inference already fast on RTX 4060
+- Need to optimize MCTS code, not just inference
 
-**Import this in train.py and benchmark scripts.**
+### Lessons Learned
 
-### Validation
+**False Assumptions Corrected:**
+- ❌ "FP16 always faster on modern GPUs" → Only for large models/batches
+- ❌ "TF32 is free speedup" → Not measurable for small workloads
+- ❌ "Mixed precision expected +15-25%" → Actually caused regression
 
-```bash
-# Run 50-game benchmark
-python benchmarks/performance/benchmark_selfplay.py \
-  --workers 32 --device cuda --games 50 \
-  --output benchmarks/results/session3_$(date +%Y%m%d_%H%M).csv
-
-# Expected: 87-95 games/min (2.4-2.6x cumulative, revised)
-```
-
-**Success:** Games/min > 87 (2.4x minimum cumulative)
-
-**Validation Check:** Compare 10 games' action probabilities before/after to ensure numerical equivalence (variance <0.01).
+**What This Means:**
+- Pure PyTorch optimizations appear exhausted
+- Remaining bottleneck is Python MCTS code
+- **Cython/C++ MCTS likely necessary** for further speedup
+- torch.compile (Session 4) is last hope for pure-Python gains
 
 ---
 
@@ -787,60 +809,85 @@ python benchmarks/performance/benchmark_selfplay.py \
 
 ---
 
-## Summary Timeline (Revised)
+## Summary Timeline (Revised After Session 3)
 
 | Session | Focus | Time | Cumulative Speedup | Games/Min | Status |
 |---------|-------|------|-------------------|-----------|--------|
 | Baseline | - | - | 1.0x | 36.7 | - |
 | Session 1 | Batch API | 3h | ~1.5x | ~55 | ✅ (combined) |
 | Session 2 | Parallel MCTS | 3h | 2.07x | **75.85** | ✅ DONE |
-| Session 3 | Mixed Precision | 3h | 2.4-2.6x | 87-95 | 🔄 Next |
-| Session 4 | torch.compile | 3h | 2.6-3.1x | 96-114 | ⏳ Pending |
-| Session 5 | Runtime Tuning | 3h | 2.75-3.4x | 101-125 | ⏳ Pending |
-| Session 6 | Validation | 3h | **2.75-3.4x** | **101-125** | ⏳ Pending |
+| Session 3 | Mixed Precision | 3h | 1.91x ⚠️ | **70.2** | ❌ FAILED |
+| Session 4 | torch.compile | 3h | 2.1-2.3x? | 77-84? | 🔄 Next |
+| Session 5 | Runtime Tuning | 3h | 2.2-2.5x? | 81-92? | ⏳ Uncertain |
+| **Cython MCTS** | **Rewrite hot loops** | **6h** | **2.6-3.5x?** | **95-128?** | ⚠️ **Likely needed** |
 
-**Total Time:** 18 hours (3 work days)
-**Expected Outcome:** 2.75-3.4x speedup, reducing training from 136 days to 40-50 days (revised from 19-44 days)
+**Total Time:** 18 hours attempted → 24-30 hours likely needed (with Cython)
+**Expected Outcome:** 2.1-2.5x without Cython, or 2.6-3.5x with Cython (reducing training from 136 days to 39-65 days)
 
-**Key Insight:** Original 3-7x target was overly optimistic. Realistic target is 2.75-3.4x based on actual Session 1+2 results (2.07x vs predicted 2-5x).
+**Key Insights:**
+- Original 3-7x target was overly optimistic
+- Session 3 showed pure PyTorch optimizations are exhausted
+- **MCTS Python code is the bottleneck**, not inference
+- Cython/C++ likely necessary to reach 3x target
+- Realistic final: 2.1-3.5x depending on whether Cython is implemented
 
 ---
 
-## Next Steps & Recommendations
+## Next Steps & Recommendations (Updated After Session 3)
 
 ### Immediate Actions
 
-**1. Proceed with Session 3 (Mixed Precision)**
-- Expected: +15-25% boost (87-95 games/min)
-- Low risk, well-tested optimization
+**1. Try Session 4 (torch.compile) - Last Pure-Python Hope**
+- Expected: +10-20% boost (77-84 games/min)?
+- **High uncertainty** - may also fail like Session 3
 - Implementation time: 3 hours
+- **Decision point:** If torch.compile also fails or shows <5% gain, skip Session 5 and go directly to Cython
 
-**2. Continue to Session 4 (torch.compile)**
-- Expected: +10-20% boost (96-114 games/min)
-- May require warmup/debugging
-- Implementation time: 3 hours
+**2. If Session 4 Succeeds (>5% gain):**
+- Continue to Session 5 (Runtime Tuning)
+- Expected: Additional +5-10% boost
+- Total potential: 2.2-2.5x (81-92 games/min)
+- Training time: ~54-65 days
 
-**3. Complete Session 5 (Runtime Tuning)**
-- Expected: +5-10% boost (101-125 games/min)
-- Environment optimization, GPU timeout tuning
-- Implementation time: 3 hours
+**3. If Session 4 Fails (<5% gain) - RECOMMENDED PATH:**
+- **Skip Session 5** (unlikely to help if torch.compile fails)
+- **Implement Cython MCTS immediately** (Priority 6)
+- Target hot loops identified in profiling:
+  - [ml/mcts/node.py:88-212](../../ml/mcts/node.py#L88-L212) - UCB selection
+  - [ml/mcts/node.py:279-356](../../ml/mcts/node.py#L279-L356) - Backpropagation
+  - [ml/mcts/search.py:139-181](../../ml/mcts/search.py#L139-L181) - Tree traversal
+- Expected: +35-80% boost (95-128 games/min)
+- Training time: ~39-52 days
 
-**4. Decision Point After Session 5:**
-- If ≥110 games/min (3x): **Begin 500-iteration training** (~45 days)
-- If 101-109 games/min (2.75-3x): Decide whether Cython is worth it for 40-45 day training
-- If <101 games/min (<2.75x): **Implement Priority 6 (Cython MCTS)** before training
+**4. Final Decision Matrix:**
+- **>90 games/min (2.5x):** Begin training immediately (reasonable 52-day timeline)
+- **80-90 games/min (2.2-2.5x):** Consider if 54-65 days is acceptable
+- **<80 games/min (<2.2x):** Further optimization needed or accept longer training time
 
 ### Analysis & Insights
 
 **What Worked Well:**
-- Batch submission API enabled better cross-worker batching
-- Parallel expansion with `batch_size=30` hit sweet spot
+- Batch submission API enabled better cross-worker batching (Session 1: ~1.5x)
+- Parallel expansion with `batch_size=30` hit sweet spot (Session 2: +40%)
 - Combined optimizations delivered solid 2.07x speedup
+
+**What Failed:**
+- FP16 mixed precision caused -15% regression (Session 3)
+- TF32 optimizations had no measurable benefit (Session 3)
+- Pure PyTorch inference optimizations appear exhausted
 
 **What Was Overly Optimistic:**
 - Original 3-7x estimate too aggressive
+- Assumption that "FP16 always faster on modern GPUs"
+- Assumption that "TF32 is free speedup"
 - Diminishing returns from batching (timeout overhead at large batches)
 - GPU memory constraints limit worker scaling (32 workers max)
+
+**Root Cause Analysis:**
+- **Bottleneck is MCTS Python code, not inference**
+- Model too small (4.9M params) to benefit from precision optimizations
+- Batch sizes too small to amortize FP16/TF32 overhead
+- Need to optimize tree search algorithms, not just neural network
 
 **Recommendation on GPU Server:**
 - Phase 3.5 GPU server was 3-5x slower than multiprocessing
@@ -848,13 +895,19 @@ python benchmarks/performance/benchmark_selfplay.py \
 - Current multiprocessing approach is working well
 - Only revisit GPU server if hitting different bottleneck
 
-### Training Decision Matrix
+### Training Decision Matrix (Updated After Session 3)
 
-| Final Speed | Speedup | Training Time | Recommendation |
-|-------------|---------|---------------|----------------|
-| >125 games/min | >3.4x | <40 days | Excellent, begin training immediately |
-| 110-125 games/min | 3.0-3.4x | 40-45 days | Good, begin training |
-| 101-109 games/min | 2.75-3.0x | 45-50 days | Marginal, consider Cython first |
-| <101 games/min | <2.75x | >50 days | Implement Cython before training |
+| Final Speed | Speedup | Training Time | Recommendation | Probability |
+|-------------|---------|---------------|----------------|-------------|
+| >110 games/min | >3.0x | <45 days | Excellent, begin training immediately | Low (~10%) |
+| 90-110 games/min | 2.5-3.0x | 45-54 days | Good, begin training | Medium (~30%) |
+| 75-90 games/min | 2.0-2.5x | 54-68 days | Marginal but acceptable | **High (~50%)** |
+| <75 games/min | <2.0x | >68 days | Implement Cython or reconsider | Low (~10%) |
 
-**Current Trajectory:** Expecting 101-125 games/min after Session 5, which would make training feasible (40-50 days).
+**Current Status:** 70.2 games/min (1.91x speedup, 65-day training)
+
+**Most Likely Outcomes:**
+1. **Without Cython (Sessions 4+5):** 75-92 games/min → 54-68 day training (acceptable)
+2. **With Cython (Skip to Priority 6):** 95-128 games/min → 39-52 day training (good)
+
+**Recommendation:** Try Session 4 (torch.compile) first. If it fails, implement Cython for best results.

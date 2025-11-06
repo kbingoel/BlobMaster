@@ -1,0 +1,2 @@
+workers,num_determinizations,simulations_per_determinization,total_sims_per_move,games,use_parallel_expansion,parallel_batch_size,batch_timeout_ms,mode,cards_per_game,elapsed_seconds,games_per_minute,seconds_per_game,total_examples,examples_per_minute
+32,3,30,90,50,True,30,10.0,mp,5,46.84388208389282,64.04251455136217,0.9368776416778565,1200,1537.0203492326923
