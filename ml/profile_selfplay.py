@@ -439,6 +439,10 @@ def analyze_batch_evaluator_overhead(device="cuda"):
         with torch.no_grad():
             policy, value = network(state, mask)
 
+    # Synchronize GPU to measure actual execution time, not just kernel launch
+    if device == "cuda":
+        torch.cuda.synchronize()
+
     direct_time = time.time() - start
     direct_per_call = (direct_time / num_calls) * 1000  # ms
 
@@ -463,6 +467,10 @@ def analyze_batch_evaluator_overhead(device="cuda"):
         mask = masker.create_bidding_mask(3, False, None)
 
         policy, value = evaluator.evaluate(state, mask)
+
+    # Synchronize GPU to measure actual execution time (includes async .cpu() transfers)
+    if device == "cuda":
+        torch.cuda.synchronize()
 
     batched_time = time.time() - start
     batched_per_call = (batched_time / num_calls) * 1000  # ms
@@ -501,6 +509,10 @@ def analyze_batch_evaluator_overhead(device="cuda"):
             state = encoder.encode(game, player)
             mask = masker.create_bidding_mask(3, False, None)
             policy, value = evaluator.evaluate(state, mask)
+
+        # Synchronize GPU at end of worker to ensure all operations complete
+        if device == "cuda":
+            torch.cuda.synchronize()
 
     threads = [threading.Thread(target=worker) for _ in range(4)]
 

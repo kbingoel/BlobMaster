@@ -157,6 +157,12 @@ class BatchedEvaluator:
         self.total_batch_size = 0
         self.stats_lock = threading.Lock()
 
+        # Queue timing statistics (added for profiling insights)
+        self.total_queue_wait_time = 0.0  # Total time waiting in queue.get()
+        self.total_collect_time = 0.0  # Total time collecting batches
+        self.timeout_hits = 0  # Times we exited due to timeout
+        self.batch_full_hits = 0  # Times we hit max batch size
+
     def start(self):
         """
         Start the background evaluation thread.
@@ -349,8 +355,10 @@ class BatchedEvaluator:
         Returns:
             List of evaluation requests (may be empty if no requests available)
         """
+        collect_start = time.time()
         batch: List[EvaluationRequest] = []
         deadline = time.time() + self.timeout_ms
+        queue_wait_times = []
 
         while len(batch) < self.max_batch_size:
             # Calculate remaining time until deadline
@@ -358,21 +366,38 @@ class BatchedEvaluator:
 
             if remaining_time <= 0 and batch:
                 # Timeout expired and we have at least one request
+                with self.stats_lock:
+                    self.timeout_hits += 1
                 break
 
             try:
                 # Try to get request with timeout
                 timeout = max(0.001, remaining_time)  # At least 1ms
+                queue_start = time.time()
                 request = self.request_queue.get(timeout=timeout)
+                queue_wait_times.append(time.time() - queue_start)
                 batch.append(request)
             except queue.Empty:
                 # No request available within timeout
                 if batch:
                     # We have some requests, process them
+                    with self.stats_lock:
+                        self.timeout_hits += 1
                     break
                 else:
                     # No requests at all, return empty batch
                     return []
+
+        # Track if we hit max batch size
+        if len(batch) == self.max_batch_size:
+            with self.stats_lock:
+                self.batch_full_hits += 1
+
+        # Update timing statistics
+        with self.stats_lock:
+            if queue_wait_times:
+                self.total_queue_wait_time += sum(queue_wait_times)
+            self.total_collect_time += time.time() - collect_start
 
         return batch
 
@@ -401,6 +426,10 @@ class BatchedEvaluator:
             # Batched neural network inference (single GPU call, TF32 enabled via performance_init)
             with torch.no_grad():
                 policy_batch, value_batch = self.network(state_batch, mask_batch)
+
+            # Synchronize GPU to ensure inference completes before .cpu() transfers
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
 
             # Distribute results back to requesters
             for i, request in enumerate(batch):
@@ -437,15 +466,37 @@ class BatchedEvaluator:
                 - total_batches: Total number of batches processed
                 - avg_batch_size: Average batch size
                 - queue_size: Current number of pending requests
+                - avg_queue_wait_ms: Average time waiting in queue.get() (ms)
+                - avg_collect_time_ms: Average batch collection time (ms)
+                - timeout_hit_rate: Fraction of batches that exited due to timeout
+                - batch_full_hits: Number of times max batch size was reached
 
         Example:
             >>> stats = evaluator.get_stats()
             >>> print(f"Average batch size: {stats['avg_batch_size']:.1f}")
-            >>> print(f"Pending requests: {stats['queue_size']}")
+            >>> print(f"Queue wait: {stats['avg_queue_wait_ms']:.2f}ms")
         """
         with self.stats_lock:
             avg_batch_size = (
                 self.total_batch_size / self.total_batches
+                if self.total_batches > 0
+                else 0.0
+            )
+
+            avg_queue_wait = (
+                (self.total_queue_wait_time / self.total_requests) * 1000
+                if self.total_requests > 0
+                else 0.0
+            )
+
+            avg_collect_time = (
+                (self.total_collect_time / self.total_batches) * 1000
+                if self.total_batches > 0
+                else 0.0
+            )
+
+            timeout_hit_rate = (
+                self.timeout_hits / self.total_batches
                 if self.total_batches > 0
                 else 0.0
             )
@@ -455,6 +506,10 @@ class BatchedEvaluator:
                 "total_batches": self.total_batches,
                 "avg_batch_size": avg_batch_size,
                 "queue_size": self.request_queue.qsize(),
+                "avg_queue_wait_ms": avg_queue_wait,
+                "avg_collect_time_ms": avg_collect_time,
+                "timeout_hit_rate": timeout_hit_rate,
+                "batch_full_hits": self.batch_full_hits,
             }
 
     def reset_stats(self):
@@ -463,6 +518,10 @@ class BatchedEvaluator:
             self.total_requests = 0
             self.total_batches = 0
             self.total_batch_size = 0
+            self.total_queue_wait_time = 0.0
+            self.total_collect_time = 0.0
+            self.timeout_hits = 0
+            self.batch_full_hits = 0
 
     def __enter__(self):
         """Context manager entry - start the evaluator."""

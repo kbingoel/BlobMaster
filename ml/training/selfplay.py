@@ -575,15 +575,10 @@ class SelfPlayEngine:
                 )
                 self.batch_evaluator.start()
             else:
-                # Phase 2: Evaluator created in main process
-                # Each worker will create its own (no cross-worker batching)
-                self.batch_evaluator = BatchedEvaluator(
-                    network=network,
-                    max_batch_size=batch_size,
-                    timeout_ms=batch_timeout_ms,
-                    device=device,
-                )
-                self.batch_evaluator.start()
+                # Phase 2: Multiprocess mode - workers create their own evaluators
+                # Parent process doesn't need an evaluator (avoids idle thread overhead)
+                # Each worker creates its own BatchedEvaluator in _worker_generate_games_static
+                self.batch_evaluator = None
 
     def generate_games(
         self,
@@ -890,6 +885,12 @@ def _worker_generate_games_static(
     np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
     torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
 
+    # Enable profiling for worker 0 to capture actual bottlenecks
+    import cProfile
+    profiler = cProfile.Profile() if worker_id == 0 else None
+    if profiler:
+        profiler.enable()
+
     # Create network instance for this worker
     # Infer network architecture from state dict
     state_dim = network_state["input_embedding.weight"].shape[1]
@@ -976,6 +977,13 @@ def _worker_generate_games_static(
     if batch_evaluator is not None:
         batch_evaluator.shutdown()
 
+    # Save worker profile to reveal actual bottlenecks (MCTS, network, game logic)
+    if profiler:
+        profiler.disable()
+        profile_file = f"profile_worker{worker_id}.prof"
+        profiler.dump_stats(profile_file)
+        print(f"Worker {worker_id} profile saved to {profile_file}")
+
     return all_examples
 
 
@@ -1021,6 +1029,12 @@ def _worker_generate_games_with_gpu_server(
     np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
     torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
 
+    # Enable profiling for worker 0 to capture actual bottlenecks
+    import cProfile
+    profiler = cProfile.Profile() if worker_id == 0 else None
+    if profiler:
+        profiler.enable()
+
     # Create GPU server client
     from ml.mcts.gpu_server import GPUServerClient
 
@@ -1060,6 +1074,13 @@ def _worker_generate_games_with_gpu_server(
             game_id=game_id,
         )
         all_examples.extend(examples)
+
+    # Save worker profile to reveal actual bottlenecks (MCTS, network, IPC)
+    if profiler:
+        profiler.disable()
+        profile_file = f"profile_worker{worker_id}_gpu_server.prof"
+        profiler.dump_stats(profile_file)
+        print(f"Worker {worker_id} (GPU server mode) profile saved to {profile_file}")
 
     return all_examples
 
