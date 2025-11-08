@@ -29,11 +29,13 @@ from ml.training.selfplay import SelfPlayEngine
 
 
 def profile_selfplay_with_cprofile(
-    num_workers=16,
+    num_workers=32,
     num_games=10,
     cards_to_deal=3,
     use_batched=True,
-    use_threads=True,
+    use_threads=False,
+    use_parallel_expansion=True,
+    parallel_batch_size=30,
     device="cuda"
 ):
     """
@@ -45,6 +47,8 @@ def profile_selfplay_with_cprofile(
         cards_to_deal: Cards per player
         use_batched: Use BatchedEvaluator
         use_threads: Use ThreadPoolExecutor
+        use_parallel_expansion: Enable parallel MCTS expansion
+        parallel_batch_size: Batch size for parallel expansion
         device: Device to use
     """
     print("="*80)
@@ -54,6 +58,8 @@ def profile_selfplay_with_cprofile(
     print(f"  Cards: {cards_to_deal}")
     print(f"  Batched: {use_batched}")
     print(f"  Threads: {use_threads}")
+    print(f"  Parallel Expansion: {use_parallel_expansion}")
+    print(f"  Parallel Batch Size: {parallel_batch_size}")
     print("="*80)
 
     # Create network
@@ -78,12 +84,14 @@ def profile_selfplay_with_cprofile(
         masker=masker,
         num_workers=num_workers,
         num_determinizations=3,
-        simulations_per_determinization=10,
+        simulations_per_determinization=30,
         device=device,
         use_batched_evaluator=use_batched,
         batch_size=512,
         batch_timeout_ms=10.0,
         use_thread_pool=use_threads,
+        use_parallel_expansion=use_parallel_expansion,
+        parallel_batch_size=parallel_batch_size,
     )
 
     # Profile the generation
@@ -135,7 +143,7 @@ def profile_selfplay_with_cprofile(
 
 
 def manual_timing_profile(
-    num_workers=16,
+    num_workers=32,
     num_games=10,
     cards_to_deal=3,
     device="cuda"
@@ -166,15 +174,17 @@ def manual_timing_profile(
     masker = ActionMasker()
 
     # Time different configurations
+    # Format: (name, use_batched, use_threads, use_parallel_expansion, parallel_batch_size)
     configs = [
-        ("Direct (no batching, threads)", False, True),
-        ("Batched (threads)", True, True),
-        ("Batched (processes)", True, False),
+        ("Direct (no batching, threads)", False, True, False, 10),
+        ("Batched (threads)", True, True, False, 10),
+        ("Batched (processes)", True, False, False, 10),
+        ("Sessions 1+2 Optimized (batched + parallel expansion)", True, False, True, 30),
     ]
 
     results = []
 
-    for name, use_batched, use_threads in configs:
+    for name, use_batched, use_threads, use_parallel_expansion, parallel_batch_size in configs:
         print(f"\nTesting: {name}")
 
         engine = SelfPlayEngine(
@@ -183,12 +193,14 @@ def manual_timing_profile(
             masker=masker,
             num_workers=num_workers,
             num_determinizations=3,
-            simulations_per_determinization=10,
+            simulations_per_determinization=30,
             device=device,
             use_batched_evaluator=use_batched,
             batch_size=512,
             batch_timeout_ms=10.0,
             use_thread_pool=use_threads,
+            use_parallel_expansion=use_parallel_expansion,
+            parallel_batch_size=parallel_batch_size,
         )
 
         # Warm-up
@@ -243,6 +255,138 @@ def manual_timing_profile(
         print(f"{r['name']:<30} {r['games_per_min']:<15.1f} {speedup:.2f}x")
 
     return results
+
+
+def profile_sessions_1_2_config(
+    num_workers=32,
+    num_games=50,
+    cards_to_deal=5,  # Fixed: was 3, should be 5 to match 75.85 games/min benchmark
+    device="cuda"
+):
+    """
+    Profile the exact Sessions 1+2 optimized configuration (75.85 games/min).
+
+    This is the validated best-performing setup from session1_validation_20251106_1951.csv:
+    - 32 workers (multiprocessing)
+    - Medium MCTS: 3 determinizations × 30 simulations
+    - 5 cards per game (NOT 3!)
+    - Cross-worker batching via BatchedEvaluator
+    - Parallel MCTS expansion with virtual loss
+    - parallel_batch_size=30
+
+    Args:
+        num_workers: Number of parallel workers (default: 32)
+        num_games: Number of games to profile (default: 50)
+        cards_to_deal: Cards per player (default: 3)
+        device: Device to use (default: "cuda")
+
+    Returns:
+        Dict with timing statistics and throughput metrics
+    """
+    print("\n" + "="*80)
+    print("PROFILING SESSIONS 1+2 OPTIMIZED CONFIGURATION")
+    print("="*80)
+    print(f"  Workers: {num_workers}")
+    print(f"  Games: {num_games}")
+    print(f"  Cards: {cards_to_deal}")
+    print(f"  MCTS: 3 det × 30 sims (Medium)")
+    print(f"  Batching: Enabled (512 batch size, 10ms timeout)")
+    print(f"  Parallel Expansion: Enabled (batch_size=30)")
+    print(f"  Threading: Disabled (multiprocessing)")
+    print("="*80)
+
+    # Create network
+    network = BlobNet(
+        state_dim=256,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.0,
+    )
+    network.to(device)
+    network.eval()
+
+    encoder = StateEncoder()
+    masker = ActionMasker()
+
+    # Create engine with exact Sessions 1+2 configuration
+    engine = SelfPlayEngine(
+        network=network,
+        encoder=encoder,
+        masker=masker,
+        num_workers=num_workers,
+        num_determinizations=3,
+        simulations_per_determinization=30,
+        device=device,
+        use_batched_evaluator=True,
+        batch_size=512,
+        batch_timeout_ms=10.0,
+        use_thread_pool=False,  # multiprocessing
+        use_parallel_expansion=True,
+        parallel_batch_size=30,
+    )
+
+    print("\nWarm-up (2 games)...")
+    engine.generate_games(num_games=2, num_players=4, cards_to_deal=cards_to_deal)
+
+    print(f"Running timed test ({num_games} games)...")
+    start = time.time()
+    examples = engine.generate_games(
+        num_games=num_games,
+        num_players=4,
+        cards_to_deal=cards_to_deal
+    )
+    elapsed = time.time() - start
+
+    games_per_min = (num_games / elapsed) * 60
+
+    # Get batch evaluator stats
+    stats = {}
+    if engine.batch_evaluator:
+        batch_stats = engine.batch_evaluator.get_stats()
+        stats['avg_batch_size'] = batch_stats['avg_batch_size']
+        stats['total_batches'] = batch_stats['total_batches']
+        stats['total_evals'] = batch_stats['total_requests']  # Fixed: use total_requests instead of total_evals
+
+    print("\n" + "="*80)
+    print("RESULTS")
+    print("="*80)
+    print(f"  Total time: {elapsed:.2f}s")
+    print(f"  Games/min: {games_per_min:.2f}")
+    print(f"  Examples generated: {len(examples)}")
+
+    if stats:
+        print(f"\nBatch Evaluator Stats:")
+        print(f"  Total evaluations: {stats.get('total_evals', 0)}")
+        print(f"  Total batches: {stats.get('total_batches', 0)}")
+        print(f"  Avg batch size: {stats.get('avg_batch_size', 0):.1f}")
+
+    # Compare to expected performance
+    expected_games_per_min = 75.85
+    performance_ratio = games_per_min / expected_games_per_min
+
+    print(f"\nPerformance vs Expected (75.85 games/min):")
+    print(f"  Ratio: {performance_ratio:.2f}x")
+
+    if performance_ratio < 0.9:
+        print(f"  ⚠️  WARNING: Performance is {(1-performance_ratio)*100:.1f}% below expected!")
+        print(f"      This profiling may not reflect the actual best configuration.")
+    elif performance_ratio > 0.95:
+        print(f"  ✅ Performance is within expected range")
+
+    print("="*80)
+
+    engine.shutdown()
+
+    return {
+        'elapsed': elapsed,
+        'games_per_min': games_per_min,
+        'examples': len(examples),
+        'expected_games_per_min': expected_games_per_min,
+        'performance_ratio': performance_ratio,
+        **stats
+    }
 
 
 def analyze_batch_evaluator_overhead(device="cuda"):
@@ -401,29 +545,52 @@ def main():
 
     print(f"GPU: {torch.cuda.get_device_name(0)}\n")
 
-    # 1. cProfile analysis
+    # 0. Validate Sessions 1+2 configuration performance
     print("\n" + "="*80)
-    print("PHASE 1: cProfile Analysis")
+    print("PHASE 0: Sessions 1+2 Configuration Validation")
+    print("="*80)
+
+    sessions_result = profile_sessions_1_2_config(
+        num_workers=32,
+        num_games=50,
+        cards_to_deal=5,  # Fixed: Match benchmark config (5 cards, not 3)
+        device="cuda"
+    )
+
+    # Warn if performance is significantly below expected
+    if sessions_result['performance_ratio'] < 0.9:
+        print("\n⚠️  WARNING: Performance is below expected!")
+        print("The profiling results may not reflect the actual best configuration.")
+        response = input("\nContinue with remaining profiling phases? (y/n): ")
+        if response.lower() != 'y':
+            print("Profiling aborted.")
+            return
+
+    # 1. cProfile analysis (using Sessions 1+2 config)
+    print("\n" + "="*80)
+    print("PHASE 1: cProfile Analysis (Sessions 1+2 Config)")
     print("="*80)
 
     profile_selfplay_with_cprofile(
-        num_workers=16,
+        num_workers=32,
         num_games=10,
-        cards_to_deal=3,
+        cards_to_deal=5,  # Fixed: Match benchmark config (5 cards, not 3)
         use_batched=True,
-        use_threads=True,
+        use_threads=False,
+        use_parallel_expansion=True,
+        parallel_batch_size=30,
         device="cuda"
     )
 
     # 2. Manual timing
     print("\n" + "="*80)
-    print("PHASE 2: Manual Timing Profile")
+    print("PHASE 2: Manual Timing Profile (Compare Configs)")
     print("="*80)
 
     manual_timing_profile(
-        num_workers=16,
+        num_workers=32,
         num_games=10,
-        cards_to_deal=3,
+        cards_to_deal=5,  # Fixed: Match benchmark config (5 cards, not 3)
         device="cuda"
     )
 
