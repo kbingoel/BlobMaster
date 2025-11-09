@@ -1,7 +1,7 @@
 #!/bin/bash
 source venv/bin/activate
 
-# Auto-detect most recent profile file (handles both c3 and c5 variants, plus worker profiles)
+# Auto-detect most recent profile file
 PROFILE_FILE=$(ls -t profile_*.prof 2>/dev/null | head -1)
 
 if [ -z "$PROFILE_FILE" ]; then

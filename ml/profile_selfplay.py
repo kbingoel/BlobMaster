@@ -15,6 +15,7 @@ import pstats
 import io
 import time
 import torch
+import argparse
 from pathlib import Path
 import sys
 
@@ -548,14 +549,255 @@ def analyze_batch_evaluator_overhead(device="cuda"):
     }
 
 
+def profile_with_and_without_worker_profiling(
+    num_workers=32,
+    num_games=50,
+    cards_to_deal=5,
+    device="cuda"
+):
+    """
+    Compare performance WITH and WITHOUT worker profiling enabled.
+
+    This function runs the same configuration twice:
+    1. With worker profiling disabled (baseline performance)
+    2. With worker profiling enabled (measures overhead)
+
+    The difference reveals the actual overhead cost of cProfile on worker 0.
+
+    Args:
+        num_workers: Number of parallel workers (default: 32)
+        num_games: Number of games to profile (default: 50)
+        cards_to_deal: Cards per player (default: 5)
+        device: Device to use (default: "cuda")
+
+    Returns:
+        Dict with comparison statistics
+    """
+    print("\n" + "="*80)
+    print("WORKER PROFILING OVERHEAD COMPARISON")
+    print("="*80)
+    print(f"  Workers: {num_workers}")
+    print(f"  Games: {num_games}")
+    print(f"  Cards: {cards_to_deal}")
+    print(f"  MCTS: 3 det × 30 sims (Medium)")
+    print(f"  Device: {device}")
+    print("="*80)
+
+    # Create network once (shared for both runs)
+    network = BlobNet(
+        state_dim=256,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.0,
+    )
+    network.to(device)
+    network.eval()
+
+    encoder = StateEncoder()
+    masker = ActionMasker()
+
+    results = {}
+
+    # ========================================================================
+    # Run 1: WITHOUT worker profiling (baseline)
+    # ========================================================================
+    print("\n" + "-"*80)
+    print("RUN 1: Worker Profiling DISABLED (baseline)")
+    print("-"*80)
+
+    engine = SelfPlayEngine(
+        network=network,
+        encoder=encoder,
+        masker=masker,
+        num_workers=num_workers,
+        num_determinizations=3,
+        simulations_per_determinization=30,
+        device=device,
+        use_batched_evaluator=True,
+        batch_size=512,
+        batch_timeout_ms=10.0,
+        use_thread_pool=False,
+        use_parallel_expansion=True,
+        parallel_batch_size=30,
+        enable_worker_profiling=False,  # DISABLED
+    )
+
+    print("Warm-up (2 games)...")
+    engine.generate_games(num_games=2, num_players=4, cards_to_deal=cards_to_deal)
+
+    print(f"Running timed test ({num_games} games)...")
+    start = time.time()
+    examples = engine.generate_games(
+        num_games=num_games,
+        num_players=4,
+        cards_to_deal=cards_to_deal
+    )
+    elapsed_without = time.time() - start
+
+    games_per_min_without = (num_games / elapsed_without) * 60
+
+    print(f"  Time: {elapsed_without:.2f}s")
+    print(f"  Games/min: {games_per_min_without:.2f}")
+    print(f"  Examples: {len(examples)}")
+
+    engine.shutdown()
+
+    # ========================================================================
+    # Run 2: WITH worker profiling (overhead measurement)
+    # ========================================================================
+    print("\n" + "-"*80)
+    print("RUN 2: Worker Profiling ENABLED (measuring overhead)")
+    print("-"*80)
+
+    engine = SelfPlayEngine(
+        network=network,
+        encoder=encoder,
+        masker=masker,
+        num_workers=num_workers,
+        num_determinizations=3,
+        simulations_per_determinization=30,
+        device=device,
+        use_batched_evaluator=True,
+        batch_size=512,
+        batch_timeout_ms=10.0,
+        use_thread_pool=False,
+        use_parallel_expansion=True,
+        parallel_batch_size=30,
+        enable_worker_profiling=True,  # ENABLED
+    )
+
+    print("Warm-up (2 games)...")
+    engine.generate_games(num_games=2, num_players=4, cards_to_deal=cards_to_deal)
+
+    print(f"Running timed test ({num_games} games)...")
+    start = time.time()
+    examples = engine.generate_games(
+        num_games=num_games,
+        num_players=4,
+        cards_to_deal=cards_to_deal
+    )
+    elapsed_with = time.time() - start
+
+    games_per_min_with = (num_games / elapsed_with) * 60
+
+    print(f"  Time: {elapsed_with:.2f}s")
+    print(f"  Games/min: {games_per_min_with:.2f}")
+    print(f"  Examples: {len(examples)}")
+
+    engine.shutdown()
+
+    # ========================================================================
+    # Calculate overhead
+    # ========================================================================
+    overhead_seconds = elapsed_with - elapsed_without
+    overhead_percent = (overhead_seconds / elapsed_without) * 100
+    throughput_ratio = games_per_min_without / games_per_min_with if games_per_min_with > 0 else 0
+    throughput_loss_percent = ((games_per_min_without - games_per_min_with) / games_per_min_without) * 100
+
+    print("\n" + "="*80)
+    print("OVERHEAD ANALYSIS")
+    print("="*80)
+    print(f"\nWithout profiling:")
+    print(f"  Time: {elapsed_without:.2f}s")
+    print(f"  Games/min: {games_per_min_without:.2f}")
+
+    print(f"\nWith profiling:")
+    print(f"  Time: {elapsed_with:.2f}s")
+    print(f"  Games/min: {games_per_min_with:.2f}")
+
+    print(f"\nOverhead:")
+    print(f"  Additional time: {overhead_seconds:.2f}s ({overhead_percent:.1f}%)")
+    print(f"  Throughput loss: {throughput_loss_percent:.1f}%")
+    print(f"  Throughput ratio: {throughput_ratio:.3f}x")
+
+    if overhead_percent < 5:
+        print(f"\n  ✅ Profiling overhead is minimal (<5%)")
+    elif overhead_percent < 10:
+        print(f"\n  ⚠️  Profiling overhead is moderate (5-10%)")
+    else:
+        print(f"\n  🔴 Profiling overhead is significant (>10%)")
+        print(f"      Consider disabling worker profiling for production benchmarks")
+
+    print("="*80)
+
+    return {
+        'elapsed_without_profiling': elapsed_without,
+        'elapsed_with_profiling': elapsed_with,
+        'games_per_min_without': games_per_min_without,
+        'games_per_min_with': games_per_min_with,
+        'overhead_seconds': overhead_seconds,
+        'overhead_percent': overhead_percent,
+        'throughput_loss_percent': throughput_loss_percent,
+        'throughput_ratio': throughput_ratio,
+    }
+
+
 def main():
     """Run all profiling tests."""
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Profile BlobMaster self-play pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run default profiling phases (no worker profiling)
+  python ml/profile_selfplay.py
+
+  # Compare overhead with and without worker profiling
+  python ml/profile_selfplay.py --compare-overhead
+
+  # Run custom overhead comparison
+  python ml/profile_selfplay.py --compare-overhead --workers 16 --games 100
+"""
+    )
+
+    parser.add_argument(
+        '--compare-overhead',
+        action='store_true',
+        help='Run overhead comparison (with/without worker profiling) instead of default phases'
+    )
+
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=32,
+        help='Number of workers for overhead comparison (default: 32)'
+    )
+
+    parser.add_argument(
+        '--games',
+        type=int,
+        default=50,
+        help='Number of games for overhead comparison (default: 50)'
+    )
+
+    parser.add_argument(
+        '--cards',
+        type=int,
+        default=5,
+        help='Cards per player for overhead comparison (default: 5)'
+    )
+
+    args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available. This profiling requires a GPU.")
         sys.exit(1)
 
     print(f"GPU: {torch.cuda.get_device_name(0)}\n")
+
+    # If --compare-overhead flag is set, run overhead comparison and exit
+    if args.compare_overhead:
+        profile_with_and_without_worker_profiling(
+            num_workers=args.workers,
+            num_games=args.games,
+            cards_to_deal=args.cards,
+            device="cuda"
+        )
+        return
 
     # 0. Validate Sessions 1+2 configuration performance
     print("\n" + "="*80)

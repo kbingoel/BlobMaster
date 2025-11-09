@@ -473,6 +473,7 @@ class SelfPlayEngine:
         mcts_batch_size: Optional[int] = None,
         use_parallel_expansion: bool = True,
         parallel_batch_size: int = 10,
+        enable_worker_profiling: bool = False,
     ):
         """
         Initialize self-play engine.
@@ -500,6 +501,9 @@ class SelfPlayEngine:
                             If None, uses search() for baseline
             use_parallel_expansion: Use parallel MCTS expansion for better batching (default: True)
             parallel_batch_size: Number of leaves to expand per iteration (default: 10)
+            enable_worker_profiling: Enable cProfile profiling for worker 0 (default: False)
+                                    When enabled, saves profiling data to profile_worker0.prof
+                                    Useful for performance analysis but adds overhead (~5-10%)
         """
         self.network = network
         self.encoder = encoder
@@ -515,6 +519,7 @@ class SelfPlayEngine:
         self.mcts_batch_size = mcts_batch_size
         self.use_parallel_expansion = use_parallel_expansion
         self.parallel_batch_size = parallel_batch_size
+        self.enable_worker_profiling = enable_worker_profiling
 
         # GPU server takes precedence over other batching methods
         if use_gpu_server:
@@ -660,6 +665,7 @@ class SelfPlayEngine:
                             self.temperature_schedule,
                             self.use_parallel_expansion,
                             self.parallel_batch_size,
+                            self.enable_worker_profiling,
                         )
                     )
 
@@ -689,6 +695,7 @@ class SelfPlayEngine:
                             self.mcts_batch_size,
                             self.use_parallel_expansion,
                             self.parallel_batch_size,
+                            self.enable_worker_profiling,
                         )
                     )
 
@@ -751,6 +758,7 @@ class SelfPlayEngine:
                     self.mcts_batch_size,
                     self.use_parallel_expansion,
                     self.parallel_batch_size,
+                    self.enable_worker_profiling,
                 )
                 futures.append(future)
 
@@ -846,6 +854,7 @@ def _worker_generate_games_static(
     mcts_batch_size: Optional[int] = None,
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
+    enable_worker_profiling: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -877,6 +886,7 @@ def _worker_generate_games_static(
         mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
         use_parallel_expansion: Use parallel MCTS expansion for better batching
         parallel_batch_size: Number of leaves to expand per iteration
+        enable_worker_profiling: Enable cProfile profiling for worker 0 (default: False)
 
     Returns:
         List of training examples from all games
@@ -885,9 +895,9 @@ def _worker_generate_games_static(
     np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
     torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
 
-    # Enable profiling for worker 0 to capture actual bottlenecks
+    # Enable profiling for worker 0 if requested (useful for performance analysis)
     import cProfile
-    profiler = cProfile.Profile() if worker_id == 0 else None
+    profiler = cProfile.Profile() if (enable_worker_profiling and worker_id == 0) else None
     if profiler:
         profiler.enable()
 
@@ -1000,6 +1010,7 @@ def _worker_generate_games_with_gpu_server(
     temperature_schedule: Optional[Callable[[int], float]],
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
+    enable_worker_profiling: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Worker function for GPU server mode (Phase 3.5).
@@ -1021,6 +1032,7 @@ def _worker_generate_games_with_gpu_server(
         temperature_schedule: Temperature schedule function
         use_parallel_expansion: Use parallel MCTS expansion for better batching
         parallel_batch_size: Number of leaves to expand per iteration
+        enable_worker_profiling: Enable cProfile profiling for worker 0 (default: False)
 
     Returns:
         List of training examples from all games
@@ -1029,9 +1041,9 @@ def _worker_generate_games_with_gpu_server(
     np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
     torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
 
-    # Enable profiling for worker 0 to capture actual bottlenecks
+    # Enable profiling for worker 0 if requested (useful for performance analysis)
     import cProfile
-    profiler = cProfile.Profile() if worker_id == 0 else None
+    profiler = cProfile.Profile() if (enable_worker_profiling and worker_id == 0) else None
     if profiler:
         profiler.enable()
 
@@ -1100,6 +1112,7 @@ def _worker_generate_games_threaded(
     mcts_batch_size: Optional[int] = None,
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
+    enable_worker_profiling: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Threaded worker function for parallel game generation (Phase 3).
@@ -1129,6 +1142,7 @@ def _worker_generate_games_threaded(
         mcts_batch_size: Phase 1 intra-game batching size (None for sequential)
         use_parallel_expansion: Use parallel MCTS expansion for better batching
         parallel_batch_size: Number of leaves to expand per iteration
+        enable_worker_profiling: Enable cProfile profiling for worker 0 (default: False)
 
     Returns:
         List of training examples from all games
@@ -1136,6 +1150,12 @@ def _worker_generate_games_threaded(
     # Set random seed for this worker (ensures different games across workers)
     np.random.seed(worker_id + int(uuid.uuid4().int % 10000))
     torch.manual_seed(worker_id + int(uuid.uuid4().int % 10000))
+
+    # Enable profiling for worker 0 if requested (useful for performance analysis)
+    import cProfile
+    profiler = cProfile.Profile() if (enable_worker_profiling and worker_id == 0) else None
+    if profiler:
+        profiler.enable()
 
     # Create SelfPlayWorker with shared network and evaluator
     worker = SelfPlayWorker(
@@ -1166,5 +1186,12 @@ def _worker_generate_games_threaded(
         all_examples.extend(examples)
 
     # No cleanup needed - evaluator is shared and managed by main thread
+
+    # Save worker profile to reveal actual bottlenecks (MCTS, network, batching)
+    if profiler:
+        profiler.disable()
+        profile_file = f"profile_worker{worker_id}_threaded.prof"
+        profiler.dump_stats(profile_file)
+        print(f"Worker {worker_id} (threaded mode) profile saved to {profile_file}")
 
     return all_examples
