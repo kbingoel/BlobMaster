@@ -38,6 +38,7 @@ Quality Metrics:
 
 import random
 import numpy as np
+import time
 from typing import Dict, List, Optional, Set
 from ml.game.blob import BlobGame, Card, Player
 from ml.mcts.belief_tracker import BeliefState
@@ -70,6 +71,8 @@ class Determinizer:
         self.use_caching = use_caching
         self.sample_cache: List[Dict[int, List[Card]]] = []
         self.cache_size = 20
+        # Instrumentation toggle (module-level control functions below)
+        self._profiling_enabled = _DET_PROFILING_ENABLED
 
     def sample_determinization(
         self,
@@ -93,15 +96,35 @@ class Determinizer:
             Dictionary mapping player_position → List[Card] (hand)
             Returns None if no consistent sample found
         """
+        start_t = time.perf_counter() if self._profiling_enabled else 0.0
+        if self._profiling_enabled:
+            _DET_METRICS['sample_determinization_calls'] += 1
+
         for attempt in range(self.max_attempts):
+            if self._profiling_enabled:
+                _DET_METRICS['attempts_total'] += 1
             sampled_hands = self._attempt_sample(game, belief, use_probabilities)
 
             if sampled_hands is not None:
                 # Validate consistency
-                if self._validate_sample(sampled_hands, belief):
+                valid_start = time.perf_counter() if self._profiling_enabled else 0.0
+                is_valid = self._validate_sample(sampled_hands, belief)
+                if self._profiling_enabled:
+                    _DET_METRICS['validate_calls'] += 1
+                    _DET_METRICS['validate_total_sec'] += time.perf_counter() - valid_start
+                if is_valid:
+                    if self._profiling_enabled:
+                        _DET_METRICS['samples_succeeded'] += 1
+                        _DET_METRICS['sample_determinization_total_sec'] += (
+                            time.perf_counter() - start_t
+                        )
                     return sampled_hands
 
         # Failed to find consistent sample
+        if self._profiling_enabled:
+            _DET_METRICS['sample_determinization_total_sec'] += (
+                time.perf_counter() - start_t
+            )
         return None
 
     def _attempt_sample(
@@ -459,6 +482,9 @@ class Determinizer:
             List of diverse determinizations
         """
         samples = []
+        start_t = time.perf_counter() if self._profiling_enabled else 0.0
+        if self._profiling_enabled:
+            _DET_METRICS['sample_adaptive_calls'] += 1
 
         for i in range(num_samples):
             if i == 0 or random.random() > diversity_weight:
@@ -473,4 +499,55 @@ class Determinizer:
             if sample is not None:
                 samples.append(sample)
 
+        if self._profiling_enabled:
+            _DET_METRICS['sample_adaptive_total_sec'] += time.perf_counter() - start_t
         return samples
+
+
+# -------------------
+# Lightweight metrics
+# -------------------
+
+# Module-level flag and store for determinization profiling metrics
+_DET_PROFILING_ENABLED = False
+_DET_METRICS = {
+    'sample_determinization_calls': 0,
+    'sample_determinization_total_sec': 0.0,
+    'attempts_total': 0,
+    'samples_succeeded': 0,
+    'validate_calls': 0,
+    'validate_total_sec': 0.0,
+    'sample_adaptive_calls': 0,
+    'sample_adaptive_total_sec': 0.0,
+}
+
+
+def enable_metrics(enabled: bool = True) -> None:
+    """Enable or disable determinization instrumentation for this process."""
+    global _DET_PROFILING_ENABLED
+    _DET_PROFILING_ENABLED = bool(enabled)
+
+
+def reset_metrics() -> None:
+    """Reset determinization metrics counters for this process."""
+    for k in list(_DET_METRICS.keys()):
+        _DET_METRICS[k] = 0.0 if k.endswith('_sec') else 0
+
+
+def get_metrics() -> dict:
+    """Return a shallow copy of current determinization metrics."""
+    # Derive helper KPI without recomputing on the hot path
+    m = dict(_DET_METRICS)
+    attempts = m.get('attempts_total', 0) or 0
+    successes = m.get('samples_succeeded', 0) or 0
+    calls = m.get('sample_determinization_calls', 0) or 0
+    m['avg_attempts_per_call'] = (attempts / calls) if calls else 0.0
+    m['avg_attempts_per_success'] = (attempts / successes) if successes else 0.0
+    m['avg_validate_ms'] = (
+        (m.get('validate_total_sec', 0.0) / m.get('validate_calls', 1)) * 1000.0
+        if m.get('validate_calls', 0) > 0 else 0.0
+    )
+    m['avg_sample_determinization_ms'] = (
+        (m.get('sample_determinization_total_sec', 0.0) / (calls or 1)) * 1000.0
+    )
+    return m

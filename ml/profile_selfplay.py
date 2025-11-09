@@ -18,6 +18,130 @@ import torch
 import argparse
 from pathlib import Path
 import sys
+import uuid
+import json
+import glob
+
+
+# ---------------------------
+# Aggregation helper routines
+# ---------------------------
+
+def _aggregate_worker_metrics(run_id: str) -> dict:
+    pattern = f"profile_{run_id}_*_metrics.json"
+    files = glob.glob(pattern)
+    agg = {
+        'workers': 0,
+        'determinization': {
+            'sample_determinization_calls': 0,
+            'samples_succeeded': 0,
+            'attempts_total': 0,
+            'sample_determinization_total_sec': 0.0,
+            'validate_calls': 0,
+            'validate_total_sec': 0.0,
+        },
+        'node': {
+            'simulate_action_calls': 0,
+            'simulate_action_total_sec': 0.0,
+        },
+        'batch_evaluator': {
+            'total_requests': 0,
+            'total_batches': 0,
+            'total_batch_size': 0,
+            'min_batch_size': None,
+            'max_batch_size': None,
+            'total_infer_time_ms': 0.0,
+        }
+    }
+
+    for fp in files:
+        try:
+            with open(fp, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        agg['workers'] += 1
+        d = data.get('determinization', {})
+        n = data.get('node', {})
+        be = data.get('batch_evaluator') or {}
+
+        for k in agg['determinization']:
+            agg['determinization'][k] += d.get(k, 0)
+        for k in agg['node']:
+            agg['node'][k] += n.get(k, 0)
+
+        # Merge batch evaluator stats (sum totals, min/max across workers)
+        agg['batch_evaluator']['total_requests'] += int(be.get('total_requests', 0))
+        agg['batch_evaluator']['total_batches'] += int(be.get('total_batches', 0))
+        # total_batch_size may not be directly in stats; derive from avg * count if needed
+        if 'total_batch_size' in be:
+            agg['batch_evaluator']['total_batch_size'] += int(be.get('total_batch_size', 0))
+        else:
+            agg['batch_evaluator']['total_batch_size'] += int(be.get('avg_batch_size', 0) * be.get('total_batches', 0))
+        if be.get('min_batch_size') is not None:
+            mb = be.get('min_batch_size')
+            cur = agg['batch_evaluator']['min_batch_size']
+            agg['batch_evaluator']['min_batch_size'] = mb if cur is None else min(cur, mb)
+        if be.get('max_batch_size') is not None:
+            xb = be.get('max_batch_size')
+            curx = agg['batch_evaluator']['max_batch_size']
+            agg['batch_evaluator']['max_batch_size'] = xb if curx is None else max(curx, xb)
+        agg['batch_evaluator']['total_infer_time_ms'] += float(be.get('total_infer_time_ms', 0.0))
+
+    # Derive averages
+    det = agg['determinization']
+    calls = det['sample_determinization_calls'] or 0
+    successes = det['samples_succeeded'] or 0
+    validate_calls = det['validate_calls'] or 0
+    agg['determinization']['avg_attempts_per_call'] = (det['attempts_total'] / calls) if calls else 0.0
+    agg['determinization']['avg_attempts_per_success'] = (det['attempts_total'] / successes) if successes else 0.0
+    agg['determinization']['avg_sample_ms'] = ((det['sample_determinization_total_sec'] / (calls or 1)) * 1000.0)
+    agg['determinization']['avg_validate_ms'] = ((det['validate_total_sec'] / (validate_calls or 1)) * 1000.0) if validate_calls else 0.0
+
+    node = agg['node']
+    node_calls = node['simulate_action_calls'] or 0
+    agg['node']['avg_simulate_action_ms'] = ((node['simulate_action_total_sec'] / (node_calls or 1)) * 1000.0)
+
+    be = agg['batch_evaluator']
+    if be['total_batches'] > 0:
+        be['avg_batch_size'] = be['total_batch_size'] / be['total_batches']
+    else:
+        be['avg_batch_size'] = 0.0
+    if be['total_requests'] > 0:
+        be['avg_infer_per_item_us'] = (be['total_infer_time_ms'] / 1000.0) / be['total_requests'] * 1e6
+    else:
+        be['avg_infer_per_item_us'] = 0.0
+
+    return agg
+
+
+def _print_and_save_aggregate(run_id: str) -> None:
+    agg = _aggregate_worker_metrics(run_id)
+    if agg.get('workers', 0) == 0:
+        print(f"No instrumentation metrics found for run_id={run_id}")
+        return
+    print("\n" + "=" * 80)
+    print(f"INSTRUMENTATION SUMMARY (run {run_id})")
+    print("=" * 80)
+    det = agg['determinization']
+    print("Determinization:")
+    print(f"  calls={det['sample_determinization_calls']} successes={det['samples_succeeded']} attempts={det['attempts_total']}")
+    print(f"  avg_attempts_per_call={det['avg_attempts_per_call']:.2f} avg_attempts_per_success={det['avg_attempts_per_success']:.2f}")
+    print(f"  avg_sample_ms={det['avg_sample_ms']:.2f} avg_validate_ms={det['avg_validate_ms']:.2f}")
+    node = agg['node']
+    print("Node simulate_action:")
+    print(f"  calls={node['simulate_action_calls']} avg_ms={node['avg_simulate_action_ms']:.3f}")
+    be = agg['batch_evaluator']
+    print("Batch evaluator (per-worker totals combined):")
+    print(f"  total_requests={be['total_requests']} total_batches={be['total_batches']} avg_batch_size={be['avg_batch_size']:.1f}")
+    if be['min_batch_size'] is not None:
+        print(f"  min_batch={be['min_batch_size']} max_batch={be['max_batch_size']}")
+    print(f"  total_infer_time_ms={be['total_infer_time_ms']:.1f} avg_infer_per_item_us={be['avg_infer_per_item_us']:.1f}")
+
+    out_path = f"profile_{run_id}_aggregate.json"
+    with open(out_path, 'w') as f:
+        json.dump(agg, f, indent=2)
+    print(f"Aggregate metrics saved to {out_path}")
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent
@@ -37,7 +161,9 @@ def profile_selfplay_with_cprofile(
     use_threads=False,
     use_parallel_expansion=True,
     parallel_batch_size=30,
-    device="cuda"
+    device="cuda",
+    enable_metrics=False,
+    run_id=None,
 ):
     """
     Profile self-play using cProfile.
@@ -93,6 +219,8 @@ def profile_selfplay_with_cprofile(
         use_thread_pool=use_threads,
         use_parallel_expansion=use_parallel_expansion,
         parallel_batch_size=parallel_batch_size,
+        enable_worker_metrics=enable_metrics,
+        run_id=run_id,
     )
 
     # Profile the generation
@@ -147,7 +275,9 @@ def manual_timing_profile(
     num_workers=32,
     num_games=10,
     cards_to_deal=3,
-    device="cuda"
+    device="cuda",
+    enable_metrics=False,
+    run_id=None,
 ):
     """
     Manual timing profile to understand component breakdown.
@@ -202,6 +332,8 @@ def manual_timing_profile(
             use_thread_pool=use_threads,
             use_parallel_expansion=use_parallel_expansion,
             parallel_batch_size=parallel_batch_size,
+            enable_worker_metrics=enable_metrics,
+            run_id=run_id,
         )
 
         # Warm-up
@@ -262,7 +394,9 @@ def profile_sessions_1_2_config(
     num_workers=32,
     num_games=50,
     cards_to_deal=5,  # Fixed: was 3, should be 5 to match 75.85 games/min benchmark
-    device="cuda"
+    device="cuda",
+    enable_metrics=False,
+    run_id=None,
 ):
     """
     Profile the exact Sessions 1+2 optimized configuration (75.85 games/min).
@@ -326,6 +460,8 @@ def profile_sessions_1_2_config(
         use_thread_pool=False,  # multiprocessing
         use_parallel_expansion=True,
         parallel_batch_size=30,
+        enable_worker_metrics=enable_metrics,
+        run_id=run_id,
     )
 
     print("\nWarm-up (2 games)...")
@@ -553,7 +689,9 @@ def profile_with_and_without_worker_profiling(
     num_workers=32,
     num_games=50,
     cards_to_deal=5,
-    device="cuda"
+    device="cuda",
+    enable_metrics=False,
+    run_id=None,
 ):
     """
     Compare performance WITH and WITHOUT worker profiling enabled.
@@ -622,6 +760,8 @@ def profile_with_and_without_worker_profiling(
         use_parallel_expansion=True,
         parallel_batch_size=30,
         enable_worker_profiling=False,  # DISABLED
+        enable_worker_metrics=enable_metrics,
+        run_id=run_id,
     )
 
     print("Warm-up (2 games)...")
@@ -666,6 +806,8 @@ def profile_with_and_without_worker_profiling(
         use_parallel_expansion=True,
         parallel_batch_size=30,
         enable_worker_profiling=True,  # ENABLED
+        enable_worker_metrics=enable_metrics,
+        run_id=run_id,
     )
 
     print("Warm-up (2 games)...")
@@ -781,6 +923,12 @@ Examples:
         help='Cards per player for overhead comparison (default: 5)'
     )
 
+    parser.add_argument(
+        '--instrument',
+        action='store_true',
+        help='Enable lightweight instrumentation and per-worker JSON metrics'
+    )
+
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -791,12 +939,17 @@ Examples:
 
     # If --compare-overhead flag is set, run overhead comparison and exit
     if args.compare_overhead:
+        run_id = uuid.uuid4().hex[:8]
         profile_with_and_without_worker_profiling(
             num_workers=args.workers,
             num_games=args.games,
             cards_to_deal=args.cards,
-            device="cuda"
+            device="cuda",
+            enable_metrics=args.instrument,
+            run_id=run_id,
         )
+        if args.instrument:
+            _print_and_save_aggregate(run_id)
         return
 
     # 0. Validate Sessions 1+2 configuration performance
@@ -804,12 +957,17 @@ Examples:
     print("PHASE 0: Sessions 1+2 Configuration Validation")
     print("="*80)
 
+    run_id_0 = uuid.uuid4().hex[:8]
     sessions_result = profile_sessions_1_2_config(
         num_workers=32,
         num_games=50,
         cards_to_deal=5,  # Fixed: Match benchmark config (5 cards, not 3)
-        device="cuda"
+        device="cuda",
+        enable_metrics=args.instrument,
+        run_id=run_id_0,
     )
+    if args.instrument:
+        _print_and_save_aggregate(run_id_0)
 
     # Warn if performance is significantly below expected
     if sessions_result['performance_ratio'] < 0.9:
@@ -825,6 +983,7 @@ Examples:
     print("PHASE 1: cProfile Analysis (Sessions 1+2 Config)")
     print("="*80)
 
+    run_id_1 = uuid.uuid4().hex[:8]
     profile_selfplay_with_cprofile(
         num_workers=32,
         num_games=10,
@@ -833,20 +992,29 @@ Examples:
         use_threads=False,
         use_parallel_expansion=True,
         parallel_batch_size=30,
-        device="cuda"
+        device="cuda",
+        enable_metrics=args.instrument,
+        run_id=run_id_1,
     )
+    if args.instrument:
+        _print_and_save_aggregate(run_id_1)
 
     # 2. Manual timing
     print("\n" + "="*80)
     print("PHASE 2: Manual Timing Profile (Compare Configs)")
     print("="*80)
 
+    run_id_2 = uuid.uuid4().hex[:8]
     manual_timing_profile(
         num_workers=32,
         num_games=10,
         cards_to_deal=5,  # Fixed: Match benchmark config (5 cards, not 3)
-        device="cuda"
+        device="cuda",
+        enable_metrics=args.instrument,
+        run_id=run_id_2,
     )
+    if args.instrument:
+        _print_and_save_aggregate(run_id_2)
 
     # 3. Batch evaluator overhead
     print("\n" + "="*80)
@@ -862,3 +1030,122 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
+
+# (duplicate aggregation helpers removed; see definitions near top of file)
+
+def _aggregate_worker_metrics(run_id: str) -> dict:
+    pattern = f"profile_{run_id}_*_metrics.json"
+    files = glob.glob(pattern)
+    agg = {
+        'workers': 0,
+        'determinization': {
+            'sample_determinization_calls': 0,
+            'samples_succeeded': 0,
+            'attempts_total': 0,
+            'sample_determinization_total_sec': 0.0,
+            'validate_calls': 0,
+            'validate_total_sec': 0.0,
+        },
+        'node': {
+            'simulate_action_calls': 0,
+            'simulate_action_total_sec': 0.0,
+        },
+        'batch_evaluator': {
+            'total_requests': 0,
+            'total_batches': 0,
+            'total_batch_size': 0,
+            'min_batch_size': None,
+            'max_batch_size': None,
+            'total_infer_time_ms': 0.0,
+        }
+    }
+
+    for fp in files:
+        try:
+            with open(fp, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        agg['workers'] += 1
+        d = data.get('determinization', {})
+        n = data.get('node', {})
+        be = data.get('batch_evaluator') or {}
+
+        for k in agg['determinization']:
+            agg['determinization'][k] += d.get(k, 0)
+        for k in agg['node']:
+            agg['node'][k] += n.get(k, 0)
+
+        # Merge batch evaluator stats (sum totals, min/max across workers)
+        agg['batch_evaluator']['total_requests'] += int(be.get('total_requests', 0))
+        agg['batch_evaluator']['total_batches'] += int(be.get('total_batches', 0))
+        # total_batch_size may not be directly in stats; derive from avg * count if needed
+        if 'total_batch_size' in be:
+            agg['batch_evaluator']['total_batch_size'] += int(be.get('total_batch_size', 0))
+        else:
+            agg['batch_evaluator']['total_batch_size'] += int(be.get('avg_batch_size', 0) * be.get('total_batches', 0))
+        if be.get('min_batch_size') is not None:
+            mb = be.get('min_batch_size')
+            cur = agg['batch_evaluator']['min_batch_size']
+            agg['batch_evaluator']['min_batch_size'] = mb if cur is None else min(cur, mb)
+        if be.get('max_batch_size') is not None:
+            xb = be.get('max_batch_size')
+            curx = agg['batch_evaluator']['max_batch_size']
+            agg['batch_evaluator']['max_batch_size'] = xb if curx is None else max(curx, xb)
+        agg['batch_evaluator']['total_infer_time_ms'] += float(be.get('total_infer_time_ms', 0.0))
+
+    # Derive averages
+    det = agg['determinization']
+    calls = det['sample_determinization_calls'] or 0
+    successes = det['samples_succeeded'] or 0
+    validate_calls = det['validate_calls'] or 0
+    agg['determinization']['avg_attempts_per_call'] = (det['attempts_total'] / calls) if calls else 0.0
+    agg['determinization']['avg_attempts_per_success'] = (det['attempts_total'] / successes) if successes else 0.0
+    agg['determinization']['avg_sample_ms'] = ((det['sample_determinization_total_sec'] / (calls or 1)) * 1000.0)
+    agg['determinization']['avg_validate_ms'] = ((det['validate_total_sec'] / (validate_calls or 1)) * 1000.0) if validate_calls else 0.0
+
+    node = agg['node']
+    node_calls = node['simulate_action_calls'] or 0
+    agg['node']['avg_simulate_action_ms'] = ((node['simulate_action_total_sec'] / (node_calls or 1)) * 1000.0)
+
+    be = agg['batch_evaluator']
+    if be['total_batches'] > 0:
+        be['avg_batch_size'] = be['total_batch_size'] / be['total_batches']
+    else:
+        be['avg_batch_size'] = 0.0
+    if be['total_requests'] > 0:
+        be['avg_infer_per_item_us'] = (be['total_infer_time_ms'] / 1000.0) / be['total_requests'] * 1e6
+    else:
+        be['avg_infer_per_item_us'] = 0.0
+
+    return agg
+
+
+def _print_and_save_aggregate(run_id: str) -> None:
+    agg = _aggregate_worker_metrics(run_id)
+    if agg.get('workers', 0) == 0:
+        print(f"No instrumentation metrics found for run_id={run_id}")
+        return
+    print("\n" + "=" * 80)
+    print(f"INSTRUMENTATION SUMMARY (run {run_id})")
+    print("=" * 80)
+    det = agg['determinization']
+    print("Determinization:")
+    print(f"  calls={det['sample_determinization_calls']} successes={det['samples_succeeded']} attempts={det['attempts_total']}")
+    print(f"  avg_attempts_per_call={det['avg_attempts_per_call']:.2f} avg_attempts_per_success={det['avg_attempts_per_success']:.2f}")
+    print(f"  avg_sample_ms={det['avg_sample_ms']:.2f} avg_validate_ms={det['avg_validate_ms']:.2f}")
+    node = agg['node']
+    print("Node simulate_action:")
+    print(f"  calls={node['simulate_action_calls']} avg_ms={node['avg_simulate_action_ms']:.3f}")
+    be = agg['batch_evaluator']
+    print("Batch evaluator (per-worker totals combined):")
+    print(f"  total_requests={be['total_requests']} total_batches={be['total_batches']} avg_batch_size={be['avg_batch_size']:.1f}")
+    if be['min_batch_size'] is not None:
+        print(f"  min_batch={be['min_batch_size']} max_batch={be['max_batch_size']}")
+    print(f"  total_infer_time_ms={be['total_infer_time_ms']:.1f} avg_infer_per_item_us={be['avg_infer_per_item_us']:.1f}")
+
+    out_path = f"profile_{run_id}_aggregate.json"
+    with open(out_path, 'w') as f:
+        json.dump(agg, f, indent=2)
+    print(f"Aggregate metrics saved to {out_path}")

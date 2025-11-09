@@ -42,6 +42,8 @@ Training Example Format:
 import torch
 import numpy as np
 import uuid
+import json
+import time as _time
 import multiprocessing as mp
 import concurrent.futures
 from typing import Dict, List, Any, Optional, Callable
@@ -474,6 +476,8 @@ class SelfPlayEngine:
         use_parallel_expansion: bool = True,
         parallel_batch_size: int = 10,
         enable_worker_profiling: bool = False,
+        enable_worker_metrics: bool = False,
+        run_id: Optional[str] = None,
     ):
         """
         Initialize self-play engine.
@@ -520,6 +524,8 @@ class SelfPlayEngine:
         self.use_parallel_expansion = use_parallel_expansion
         self.parallel_batch_size = parallel_batch_size
         self.enable_worker_profiling = enable_worker_profiling
+        self.enable_worker_metrics = enable_worker_metrics
+        self.run_id = run_id or str(uuid.uuid4())
 
         # GPU server takes precedence over other batching methods
         if use_gpu_server:
@@ -577,6 +583,7 @@ class SelfPlayEngine:
                     max_batch_size=batch_size * 2,  # Larger for cross-worker batching
                     timeout_ms=batch_timeout_ms,
                     device=device,
+                    enable_profiling_metrics=self.enable_worker_metrics,
                 )
                 self.batch_evaluator.start()
             else:
@@ -666,6 +673,8 @@ class SelfPlayEngine:
                             self.use_parallel_expansion,
                             self.parallel_batch_size,
                             self.enable_worker_profiling,
+                            self.enable_worker_metrics,
+                            self.run_id,
                         )
                     )
 
@@ -696,6 +705,8 @@ class SelfPlayEngine:
                             self.use_parallel_expansion,
                             self.parallel_batch_size,
                             self.enable_worker_profiling,
+                            self.enable_worker_metrics,
+                            self.run_id,
                         )
                     )
 
@@ -759,6 +770,8 @@ class SelfPlayEngine:
                     self.use_parallel_expansion,
                     self.parallel_batch_size,
                     self.enable_worker_profiling,
+                    self.enable_worker_metrics,
+                    self.run_id,
                 )
                 futures.append(future)
 
@@ -855,6 +868,8 @@ def _worker_generate_games_static(
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
     enable_worker_profiling: bool = False,
+    enable_worker_metrics: bool = False,
+    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -900,6 +915,20 @@ def _worker_generate_games_static(
     profiler = cProfile.Profile() if (enable_worker_profiling and worker_id == 0) else None
     if profiler:
         profiler.enable()
+
+    # Optional lightweight instrumentation
+    if enable_worker_metrics:
+        try:
+            from ml.mcts import determinization as _det
+            from ml.mcts import node as _node
+            if hasattr(_det, 'reset_metrics') and hasattr(_det, 'enable_metrics'):
+                _det.reset_metrics()
+                _det.enable_metrics(True)
+            if hasattr(_node, 'reset_metrics') and hasattr(_node, 'enable_metrics'):
+                _node.reset_metrics()
+                _node.enable_metrics(True)
+        except Exception:
+            pass
 
     # Create network instance for this worker
     # Infer network architecture from state dict
@@ -952,6 +981,7 @@ def _worker_generate_games_static(
             max_batch_size=batch_size,
             timeout_ms=batch_timeout_ms,
             device=device,
+            enable_profiling_metrics=enable_worker_metrics,
         )
         batch_evaluator.start()
 
@@ -994,6 +1024,47 @@ def _worker_generate_games_static(
         profiler.dump_stats(profile_file)
         print(f"Worker {worker_id} profile saved to {profile_file}")
 
+    # Save lightweight instrumentation metrics (per-worker JSON)
+    if enable_worker_metrics:
+        try:
+            det_m = {}
+            node_m = {}
+            be_stats = None
+            try:
+                from ml.mcts import determinization as _det
+                if hasattr(_det, 'get_metrics'):
+                    det_m = _det.get_metrics()
+            except Exception:
+                pass
+            try:
+                from ml.mcts import node as _node
+                if hasattr(_node, 'get_metrics'):
+                    node_m = _node.get_metrics()
+            except Exception:
+                pass
+            try:
+                if use_batched_evaluator and batch_evaluator is not None:
+                    be_stats = batch_evaluator.get_stats()
+            except Exception:
+                be_stats = None
+
+            out = {
+                'worker_id': worker_id,
+                'run_id': run_id or 'unknown',
+                'timestamp': int(_time.time()),
+                'determinization': det_m,
+                'node': node_m,
+                'batch_evaluator': be_stats,
+                'num_games': num_games,
+                'device': device,
+            }
+            out_path = f"profile_{(run_id or 'run')}_worker{worker_id}_metrics.json"
+            with open(out_path, 'w') as f:
+                json.dump(out, f, indent=2)
+            print(f"Worker {worker_id} metrics saved to {out_path}")
+        except Exception as _e:
+            print(f"[Worker {worker_id}] Failed to write metrics: {_e}")
+
     return all_examples
 
 
@@ -1011,6 +1082,8 @@ def _worker_generate_games_with_gpu_server(
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
     enable_worker_profiling: bool = False,
+    enable_worker_metrics: bool = False,
+    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Worker function for GPU server mode (Phase 3.5).
@@ -1094,6 +1167,40 @@ def _worker_generate_games_with_gpu_server(
         profiler.dump_stats(profile_file)
         print(f"Worker {worker_id} (GPU server mode) profile saved to {profile_file}")
 
+    # Save lightweight instrumentation metrics (per-worker JSON)
+    if enable_worker_metrics:
+        try:
+            det_m = {}
+            node_m = {}
+            try:
+                from ml.mcts import determinization as _det
+                if hasattr(_det, 'get_metrics'):
+                    det_m = _det.get_metrics()
+            except Exception:
+                pass
+            try:
+                from ml.mcts import node as _node
+                if hasattr(_node, 'get_metrics'):
+                    node_m = _node.get_metrics()
+            except Exception:
+                pass
+            out = {
+                'worker_id': worker_id,
+                'run_id': run_id or 'unknown',
+                'timestamp': int(_time.time()),
+                'determinization': det_m,
+                'node': node_m,
+                'batch_evaluator': None,
+                'num_games': num_games,
+                'device': 'cuda',
+            }
+            out_path = f"profile_{(run_id or 'run')}_worker{worker_id}_metrics.json"
+            with open(out_path, 'w') as f:
+                json.dump(out, f, indent=2)
+            print(f"Worker {worker_id} metrics saved to {out_path}")
+        except Exception as _e:
+            print(f"[Worker {worker_id}] Failed to write metrics: {_e}")
+
     return all_examples
 
 
@@ -1113,6 +1220,8 @@ def _worker_generate_games_threaded(
     use_parallel_expansion: bool = True,
     parallel_batch_size: int = 10,
     enable_worker_profiling: bool = False,
+    enable_worker_metrics: bool = False,
+    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Threaded worker function for parallel game generation (Phase 3).
@@ -1157,6 +1266,20 @@ def _worker_generate_games_threaded(
     if profiler:
         profiler.enable()
 
+    # Optional lightweight instrumentation (threaded mode)
+    if enable_worker_metrics:
+        try:
+            from ml.mcts import determinization as _det
+            from ml.mcts import node as _node
+            if hasattr(_det, 'reset_metrics') and hasattr(_det, 'enable_metrics'):
+                _det.reset_metrics()
+                _det.enable_metrics(True)
+            if hasattr(_node, 'reset_metrics') and hasattr(_node, 'enable_metrics'):
+                _node.reset_metrics()
+                _node.enable_metrics(True)
+        except Exception:
+            pass
+
     # Create SelfPlayWorker with shared network and evaluator
     worker = SelfPlayWorker(
         network=network,  # Shared network (no copy needed)
@@ -1194,4 +1317,51 @@ def _worker_generate_games_threaded(
         profiler.dump_stats(profile_file)
         print(f"Worker {worker_id} (threaded mode) profile saved to {profile_file}")
 
+    # Save lightweight instrumentation metrics (per-thread JSON)
+    if enable_worker_metrics:
+        try:
+            det_m = {}
+            node_m = {}
+            try:
+                from ml.mcts import determinization as _det
+                if hasattr(_det, 'get_metrics'):
+                    det_m = _det.get_metrics()
+            except Exception:
+                pass
+            try:
+                from ml.mcts import node as _node
+                if hasattr(_node, 'get_metrics'):
+                    node_m = _node.get_metrics()
+            except Exception:
+                pass
+            out = {
+                'worker_id': worker_id,
+                'run_id': run_id or 'unknown',
+                'timestamp': int(_time.time()),
+                'determinization': det_m,
+                'node': node_m,
+                'batch_evaluator': None,  # shared, summarized by main thread
+                'num_games': num_games,
+                'device': 'cuda',
+            }
+            out_path = f"profile_{(run_id or 'run')}_thread{worker_id}_metrics.json"
+            with open(out_path, 'w') as f:
+                json.dump(out, f, indent=2)
+            print(f"Thread worker {worker_id} metrics saved to {out_path}")
+        except Exception as _e:
+            print(f"[Thread worker {worker_id}] Failed to write metrics: {_e}")
+
     return all_examples
+    # Optional lightweight instrumentation
+    if enable_worker_metrics:
+        try:
+            from ml.mcts import determinization as _det
+            from ml.mcts import node as _node
+            if hasattr(_det, 'reset_metrics') and hasattr(_det, 'enable_metrics'):
+                _det.reset_metrics()
+                _det.enable_metrics(True)
+            if hasattr(_node, 'reset_metrics') and hasattr(_node, 'enable_metrics'):
+                _node.reset_metrics()
+                _node.enable_metrics(True)
+        except Exception:
+            pass

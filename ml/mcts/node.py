@@ -13,6 +13,7 @@ Architecture Note (Session 7.5 - 2025-10-25):
 """
 
 from typing import Dict, Optional, List
+import time
 import numpy as np
 from ml.game.blob import BlobGame, Player
 
@@ -296,6 +297,7 @@ class MCTSNode:
             True
         """
         # Create deep copy of game state
+        _start = time.perf_counter() if _NODE_PROFILING_ENABLED else 0.0
         new_game = self.game_state.copy()
 
         # Find the corresponding player in the copied game
@@ -304,6 +306,10 @@ class MCTSNode:
 
         # Apply action to the copy
         new_game.apply_action(action, copied_player)
+
+        if _NODE_PROFILING_ENABLED:
+            _NODE_METRICS['simulate_action_calls'] += 1
+            _NODE_METRICS['simulate_action_total_sec'] += (time.perf_counter() - _start)
 
         return new_game
 
@@ -528,3 +534,32 @@ class MCTSNode:
             f"prior={self.prior_prob:.3f}, "
             f"children={len(self.children)})"
         )
+
+
+# -------------------
+# Lightweight metrics
+# -------------------
+_NODE_PROFILING_ENABLED = False
+_NODE_METRICS = {
+    'simulate_action_calls': 0,
+    'simulate_action_total_sec': 0.0,
+}
+
+
+def enable_metrics(enabled: bool = True) -> None:
+    global _NODE_PROFILING_ENABLED
+    _NODE_PROFILING_ENABLED = bool(enabled)
+
+
+def reset_metrics() -> None:
+    for k in list(_NODE_METRICS.keys()):
+        _NODE_METRICS[k] = 0.0 if k.endswith('_sec') else 0
+
+
+def get_metrics() -> dict:
+    m = dict(_NODE_METRICS)
+    calls = m.get('simulate_action_calls', 0) or 0
+    m['avg_simulate_action_ms'] = (
+        (m.get('simulate_action_total_sec', 0.0) / (calls or 1)) * 1000.0
+    )
+    return m

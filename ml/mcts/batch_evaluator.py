@@ -111,6 +111,7 @@ class BatchedEvaluator:
         max_batch_size: int = 512,
         timeout_ms: float = 10.0,
         device: Optional[str] = None,
+        enable_profiling_metrics: bool = False,
     ):
         """
         Initialize batched evaluator.
@@ -125,6 +126,8 @@ class BatchedEvaluator:
                        Higher = larger batches but more latency
             device: Device to run network on ('cpu' or 'cuda')
                    If None, infers from network parameters
+            enable_profiling_metrics: If True, collect per-batch timing metrics
+                   (adds small overhead). Defaults to False.
         """
         self.network = network
         self.max_batch_size = max_batch_size
@@ -162,6 +165,12 @@ class BatchedEvaluator:
         self.total_collect_time = 0.0  # Total time collecting batches
         self.timeout_hits = 0  # Times we exited due to timeout
         self.batch_full_hits = 0  # Times we hit max batch size
+        # Optional timing metrics for inference and distribution
+        self.enable_profiling = bool(enable_profiling_metrics)
+        self.total_infer_time = 0.0  # Total time spent in network forward + sync
+        self.total_distribute_time = 0.0  # Total time distributing results back
+        self.min_batch_size_observed = None
+        self.max_batch_size_observed = None
 
     def start(self):
         """
@@ -424,26 +433,41 @@ class BatchedEvaluator:
             mask_batch = torch.stack(masks).to(self.device)
 
             # Batched neural network inference (single GPU call, TF32 enabled via performance_init)
+            infer_start = time.time() if self.enable_profiling else 0.0
             with torch.no_grad():
                 policy_batch, value_batch = self.network(state_batch, mask_batch)
 
             # Synchronize GPU to ensure inference completes before .cpu() transfers
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
+            if self.enable_profiling:
+                infer_dt = time.time() - infer_start
+                with self.stats_lock:
+                    self.total_infer_time += infer_dt
 
             # Distribute results back to requesters
+            dist_start = time.time() if self.enable_profiling else 0.0
             for i, request in enumerate(batch):
-                policy = policy_batch[i].cpu()  # Move back to CPU
+                policy = policy_batch[i].cpu()  # Move back to CPU per-item (preserve baseline behavior)
                 value = value_batch[i].cpu()
 
                 result = EvaluationResult(policy=policy, value=value)
                 request.result_queue.put(result)
+            if self.enable_profiling:
+                dist_dt = time.time() - dist_start
+                with self.stats_lock:
+                    self.total_distribute_time += dist_dt
 
             # Update statistics
             with self.stats_lock:
                 self.total_requests += len(batch)
                 self.total_batches += 1
                 self.total_batch_size += len(batch)
+                # Track observed batch size range
+                if self.min_batch_size_observed is None or len(batch) < self.min_batch_size_observed:
+                    self.min_batch_size_observed = len(batch)
+                if self.max_batch_size_observed is None or len(batch) > self.max_batch_size_observed:
+                    self.max_batch_size_observed = len(batch)
 
         except Exception as e:
             # Send error to all requesters
@@ -501,7 +525,7 @@ class BatchedEvaluator:
                 else 0.0
             )
 
-            return {
+            stats = {
                 "total_requests": self.total_requests,
                 "total_batches": self.total_batches,
                 "avg_batch_size": avg_batch_size,
@@ -511,6 +535,22 @@ class BatchedEvaluator:
                 "timeout_hit_rate": timeout_hit_rate,
                 "batch_full_hits": self.batch_full_hits,
             }
+            if self.enable_profiling:
+                stats.update({
+                    "total_infer_time_ms": self.total_infer_time * 1000.0,
+                    "avg_infer_time_ms": (
+                        (self.total_infer_time / self.total_batches) * 1000.0
+                        if self.total_batches > 0 else 0.0
+                    ),
+                    "avg_infer_per_item_us": (
+                        (self.total_infer_time / self.total_requests) * 1e6
+                        if self.total_requests > 0 else 0.0
+                    ),
+                    "total_distribute_time_ms": self.total_distribute_time * 1000.0,
+                    "min_batch_size": self.min_batch_size_observed or 0,
+                    "max_batch_size": self.max_batch_size_observed or 0,
+                })
+            return stats
 
     def reset_stats(self):
         """Reset statistics counters."""
@@ -522,6 +562,11 @@ class BatchedEvaluator:
             self.total_collect_time = 0.0
             self.timeout_hits = 0
             self.batch_full_hits = 0
+            if self.enable_profiling:
+                self.total_infer_time = 0.0
+                self.total_distribute_time = 0.0
+                self.min_batch_size_observed = None
+                self.max_batch_size_observed = None
 
     def __enter__(self):
         """Context manager entry - start the evaluator."""
