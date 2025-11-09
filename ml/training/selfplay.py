@@ -79,6 +79,7 @@ class SelfPlayWorker:
         batch_size: Optional[int] = None,
         use_parallel_expansion: bool = False,
         parallel_batch_size: int = 10,
+        must_have_suit_bias: float = 1.0,
     ):
         """
         Initialize self-play worker.
@@ -105,6 +106,8 @@ class SelfPlayWorker:
             parallel_batch_size: Batch size for parallel expansion (default: 10)
                                 Number of leaves to expand per iteration
                                 Recommended: 10 for 32 workers (32×10=320 batch size)
+            must_have_suit_bias: Probability multiplier for must-have suits during determinization (default: 1.0)
+                                1.0 = no bias (maximum entropy), higher values = stronger preference
         """
         self.network = network
         self.encoder = encoder
@@ -117,6 +120,7 @@ class SelfPlayWorker:
         self.batch_size = batch_size
         self.use_parallel_expansion = use_parallel_expansion
         self.parallel_batch_size = parallel_batch_size
+        self.must_have_suit_bias = must_have_suit_bias
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -134,6 +138,7 @@ class SelfPlayWorker:
                 simulations_per_determinization=simulations_per_determinization,
                 batch_evaluator=batch_evaluator,
                 gpu_server_client=gpu_server_client,
+                must_have_suit_bias=must_have_suit_bias,
             )
         else:
             # For testing or comparison, can use perfect info MCTS
@@ -478,6 +483,7 @@ class SelfPlayEngine:
         enable_worker_profiling: bool = False,
         enable_worker_metrics: bool = False,
         run_id: Optional[str] = None,
+        must_have_suit_bias: float = 1.0,
     ):
         """
         Initialize self-play engine.
@@ -508,6 +514,8 @@ class SelfPlayEngine:
             enable_worker_profiling: Enable cProfile profiling for worker 0 (default: False)
                                     When enabled, saves profiling data to profile_worker0.prof
                                     Useful for performance analysis but adds overhead (~5-10%)
+            must_have_suit_bias: Probability multiplier for must-have suits during determinization (default: 1.0)
+                                1.0 = no bias (maximum entropy), higher values = stronger preference
         """
         self.network = network
         self.encoder = encoder
@@ -526,6 +534,7 @@ class SelfPlayEngine:
         self.enable_worker_profiling = enable_worker_profiling
         self.enable_worker_metrics = enable_worker_metrics
         self.run_id = run_id or str(uuid.uuid4())
+        self.must_have_suit_bias = must_have_suit_bias
 
         # GPU server takes precedence over other batching methods
         if use_gpu_server:
@@ -675,6 +684,7 @@ class SelfPlayEngine:
                             self.enable_worker_profiling,
                             self.enable_worker_metrics,
                             self.run_id,
+                            self.must_have_suit_bias,
                         )
                     )
 
@@ -707,6 +717,7 @@ class SelfPlayEngine:
                             self.enable_worker_profiling,
                             self.enable_worker_metrics,
                             self.run_id,
+                            self.must_have_suit_bias,
                         )
                     )
 
@@ -772,6 +783,7 @@ class SelfPlayEngine:
                     self.enable_worker_profiling,
                     self.enable_worker_metrics,
                     self.run_id,
+                    self.must_have_suit_bias,
                 )
                 futures.append(future)
 
@@ -870,6 +882,7 @@ def _worker_generate_games_static(
     enable_worker_profiling: bool = False,
     enable_worker_metrics: bool = False,
     run_id: Optional[str] = None,
+    must_have_suit_bias: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """
     Static worker function for parallel game generation.
@@ -998,6 +1011,7 @@ def _worker_generate_games_static(
         batch_size=mcts_batch_size,
         use_parallel_expansion=use_parallel_expansion,
         parallel_batch_size=parallel_batch_size,
+        must_have_suit_bias=must_have_suit_bias,
     )
 
     # Generate games
@@ -1084,6 +1098,7 @@ def _worker_generate_games_with_gpu_server(
     enable_worker_profiling: bool = False,
     enable_worker_metrics: bool = False,
     run_id: Optional[str] = None,
+    must_have_suit_bias: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """
     Worker function for GPU server mode (Phase 3.5).
@@ -1146,6 +1161,7 @@ def _worker_generate_games_with_gpu_server(
         gpu_server_client=gpu_client,
         use_parallel_expansion=use_parallel_expansion,
         parallel_batch_size=parallel_batch_size,
+        must_have_suit_bias=must_have_suit_bias,
     )
 
     # Generate games
@@ -1222,6 +1238,7 @@ def _worker_generate_games_threaded(
     enable_worker_profiling: bool = False,
     enable_worker_metrics: bool = False,
     run_id: Optional[str] = None,
+    must_have_suit_bias: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """
     Threaded worker function for parallel game generation (Phase 3).
@@ -1293,6 +1310,7 @@ def _worker_generate_games_threaded(
         use_imperfect_info=True,
         batch_evaluator=batch_evaluator,  # Shared evaluator!
         batch_size=mcts_batch_size,
+        must_have_suit_bias=must_have_suit_bias,
     )
 
     # Generate games

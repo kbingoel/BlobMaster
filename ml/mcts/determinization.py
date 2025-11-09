@@ -59,16 +59,19 @@ class Determinizer:
         max_attempts: Maximum sampling attempts before giving up
     """
 
-    def __init__(self, max_attempts: int = 100, use_caching: bool = True):
+    def __init__(self, max_attempts: int = 100, use_caching: bool = True, must_have_bias: float = 1.0):
         """
         Initialize determinizer.
 
         Args:
             max_attempts: Maximum sampling attempts before giving up
             use_caching: Whether to cache recent samples for diversity
+            must_have_bias: Probability multiplier for must-have suits during sampling
+                           1.0 = no bias (maximum entropy), higher values = stronger preference
         """
         self.max_attempts = max_attempts
         self.use_caching = use_caching
+        self.must_have_bias = must_have_bias
         self.sample_cache: List[Dict[int, List[Card]]] = []
         self.cache_size = 20
         # Instrumentation toggle (module-level control functions below)
@@ -215,7 +218,7 @@ class Determinizer:
         # Apply soft prior bias for must-have suits
         for i, card in enumerate(available_cards):
             if card.suit in constraints.must_have_suits:
-                probs[i] *= 2.5  # Boost probability for must-have suits
+                probs[i] *= self.must_have_bias  # Boost probability for must-have suits
 
         # Normalize
         if probs.sum() > 0:

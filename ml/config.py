@@ -18,6 +18,7 @@ class TrainingConfig:
     games_per_iteration: int = 10_000
     num_determinizations: int = 3
     simulations_per_determinization: int = 30
+    must_have_suit_bias: float = 1.0  # Probability multiplier for must-have suits during determinization (1.0 = no bias/maximum entropy, 1.5-3.0 = increasing preference)
 
     # MCTS parallelization
     use_parallel_expansion: bool = True

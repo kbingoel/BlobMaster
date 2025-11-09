@@ -788,7 +788,8 @@ class TestDeterminization:
         constraints = belief.player_constraints[opponent_pos]
         constraints.must_have_suits.add("♥")
 
-        determinizer = Determinizer()
+        # Use bias=2.5 to validate the bias mechanism (default is now 1.0)
+        determinizer = Determinizer(must_have_bias=2.5)
 
         # Run multiple samples to verify bias
         num_samples = 50
@@ -801,9 +802,9 @@ class TestDeterminization:
                 if any(c.suit == "♥" for c in opponent_hand):
                     hearts_count += 1
 
-        # Soft prior should result in >60% hearts (vs ~25% random baseline)
+        # Soft prior with bias=2.5 should result in >60% hearts (vs ~25% random baseline)
         hearts_rate = hearts_count / num_samples
-        assert hearts_rate > 0.6, f"Hearts appeared in {hearts_rate:.1%} of samples (expected >60%)"
+        assert hearts_rate > 0.6, f"Hearts appeared in {hearts_rate:.1%} of samples (expected >60% with bias=2.5)"
 
     def test_must_have_suits_after_exhaustion(self):
         """Test that sampling succeeds when player exhausts must-have suit.

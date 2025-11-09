@@ -826,6 +826,7 @@ class ImperfectInfoMCTS:
         use_parallel: bool = False,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
         gpu_server_client: Optional["GPUServerClient"] = None,
+        must_have_suit_bias: float = 1.0,
     ):
         """
         Initialize imperfect information MCTS.
@@ -845,6 +846,8 @@ class ImperfectInfoMCTS:
                             If provided, uses centralized batching for better GPU utilization
             gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
                               If provided, sends requests to centralized GPU server process
+            must_have_suit_bias: Probability multiplier for must-have suits during determinization (default: 1.0)
+                                1.0 = no bias (maximum entropy), higher values = stronger preference
 
         Note:
             Total budget = num_determinizations × simulations_per_determinization
@@ -860,13 +863,14 @@ class ImperfectInfoMCTS:
         self.use_parallel = use_parallel
         self.batch_evaluator = batch_evaluator
         self.gpu_server_client = gpu_server_client
+        self.must_have_suit_bias = must_have_suit_bias
 
         # Import determinization components
         from ml.mcts.belief_tracker import BeliefState
         from ml.mcts.determinization import Determinizer
 
         # Create determinizer
-        self.determinizer = Determinizer()
+        self.determinizer = Determinizer(must_have_bias=must_have_suit_bias)
 
         # Perfect info MCTS for each determinization
         self.perfect_info_mcts = MCTS(
