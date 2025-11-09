@@ -205,10 +205,17 @@ class Determinizer:
         Returns:
             List of sampled cards
         """
+        constraints = belief.player_constraints[player_pos]
+
         # Get probabilities for each card
         probs = np.array(
             [belief.get_card_probability(player_pos, card) for card in available_cards]
         )
+
+        # Apply soft prior bias for must-have suits
+        for i, card in enumerate(available_cards):
+            if card.suit in constraints.must_have_suits:
+                probs[i] *= 2.5  # Boost probability for must-have suits
 
         # Normalize
         if probs.sum() > 0:

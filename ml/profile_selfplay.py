@@ -13,6 +13,7 @@ Profiles:
 import cProfile
 import pstats
 import io
+import os
 import time
 import torch
 import argparse
@@ -142,6 +143,14 @@ def _print_and_save_aggregate(run_id: str) -> None:
     with open(out_path, 'w') as f:
         json.dump(agg, f, indent=2)
     print(f"Aggregate metrics saved to {out_path}")
+
+    # Clean up individual worker/thread metrics files after aggregation
+    pattern = f"profile_{run_id}_*_metrics.json"
+    for fp in glob.glob(pattern):
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent
@@ -1149,3 +1158,11 @@ def _print_and_save_aggregate(run_id: str) -> None:
     with open(out_path, 'w') as f:
         json.dump(agg, f, indent=2)
     print(f"Aggregate metrics saved to {out_path}")
+
+    # Clean up individual worker/thread metrics files after aggregation
+    pattern = f"profile_{run_id}_*_metrics.json"
+    for fp in glob.glob(pattern):
+        try:
+            os.remove(fp)
+        except Exception:
+            pass

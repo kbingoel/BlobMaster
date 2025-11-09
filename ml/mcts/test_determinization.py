@@ -141,7 +141,11 @@ class TestBeliefState:
         assert not belief.is_consistent_hand(opponent_pos, wrong_size_hand)
 
     def test_is_consistent_hand_checks_must_have_suits(self):
-        """Test hand consistency checks must-have suits."""
+        """Test hand consistency with must-have suits as soft prior.
+
+        Note: must_have_suits is now a soft prior (biases sampling) rather than
+        a hard constraint. This allows sampling to succeed after suit exhaustion.
+        """
         game = BlobGame(num_players=4)
         game.setup_round(cards_to_deal=5)
         observer = game.players[0]
@@ -153,25 +157,26 @@ class TestBeliefState:
         constraints = belief.player_constraints[opponent_pos]
         constraints.must_have_suits.add("♥")
 
-        # Valid hand (has Hearts)
-        valid_hand = [
+        # Hand with Hearts is valid
+        hand_with_hearts = [
             Card("2", "♥"),
             Card("3", "♣"),
             Card("4", "♣"),
             Card("5", "♦"),
             Card("6", "♦"),
         ]
-        assert belief.is_consistent_hand(opponent_pos, valid_hand)
+        assert belief.is_consistent_hand(opponent_pos, hand_with_hearts)
 
-        # Invalid hand (no Hearts)
-        invalid_hand = [
+        # Hand without Hearts is also valid (player may have exhausted suit)
+        # The soft prior biases sampling toward hearts, but doesn't reject without
+        hand_without_hearts = [
             Card("2", "♣"),
             Card("3", "♣"),
             Card("4", "♣"),
             Card("5", "♦"),
             Card("6", "♦"),
         ]
-        assert not belief.is_consistent_hand(opponent_pos, invalid_hand)
+        assert belief.is_consistent_hand(opponent_pos, hand_without_hearts)
 
     def test_update_on_card_played_updates_unseen_cards(self):
         """Test that played cards are removed from unseen set."""
@@ -764,7 +769,12 @@ class TestDeterminization:
         assert len(all_sampled_cards) == len(set(all_sampled_cards))
 
     def test_determinizer_respects_must_have_suits(self):
-        """Test determinizer respects must-have suit constraints."""
+        """Test determinizer biases toward must-have suits (soft prior).
+
+        Since must_have_suits is now a soft prior rather than hard constraint,
+        we verify it works probabilistically: hearts should appear more often
+        than random chance (>60% of samples vs ~25% baseline for 4 suits).
+        """
         from ml.mcts.determinization import Determinizer
 
         game = BlobGame(num_players=4)
@@ -774,18 +784,62 @@ class TestDeterminization:
 
         belief = BeliefState(game, observer)
 
-        # Add constraint: opponent must have Hearts
+        # Add constraint: opponent should prefer Hearts
         constraints = belief.player_constraints[opponent_pos]
         constraints.must_have_suits.add("♥")
 
         determinizer = Determinizer()
+
+        # Run multiple samples to verify bias
+        num_samples = 50
+        hearts_count = 0
+
+        for _ in range(num_samples):
+            sample = determinizer.sample_determinization(game, belief)
+            if sample is not None:
+                opponent_hand = sample[opponent_pos]
+                if any(c.suit == "♥" for c in opponent_hand):
+                    hearts_count += 1
+
+        # Soft prior should result in >60% hearts (vs ~25% random baseline)
+        hearts_rate = hearts_count / num_samples
+        assert hearts_rate > 0.6, f"Hearts appeared in {hearts_rate:.1%} of samples (expected >60%)"
+
+    def test_must_have_suits_after_exhaustion(self):
+        """Test that sampling succeeds when player exhausts must-have suit.
+
+        This validates the key fix: players can be marked as must_have a suit
+        early in the game, but after playing all cards of that suit, sampling
+        should still succeed (soft prior allows hands without that suit).
+        """
+        from ml.mcts.determinization import Determinizer
+
+        game = BlobGame(num_players=4)
+        game.setup_round(cards_to_deal=5)
+        observer = game.players[0]
+        opponent_pos = 1
+
+        belief = BeliefState(game, observer)
+
+        # Simulate: player followed hearts earlier (tracked)
+        constraints = belief.player_constraints[opponent_pos]
+        constraints.must_have_suits.add("♥")
+
+        # Remove all hearts from unseen pool (player exhausted their hearts)
+        hearts_to_remove = [c for c in belief.unseen_cards if c.suit == "♥"]
+        for card in hearts_to_remove:
+            belief.unseen_cards.remove(card)
+
+        # Should still be able to sample (soft prior allows no hearts)
+        determinizer = Determinizer()
         sample = determinizer.sample_determinization(game, belief)
 
-        if sample is not None:
-            # Opponent's hand should have at least one Heart
-            opponent_hand = sample[opponent_pos]
-            hearts_in_hand = [c for c in opponent_hand if c.suit == "♥"]
-            assert len(hearts_in_hand) > 0
+        assert sample is not None, "Sampling should succeed even with exhausted must-have suit"
+
+        # Verify opponent got a valid hand (correct size, no hearts available)
+        opponent_hand = sample[opponent_pos]
+        assert len(opponent_hand) == constraints.cards_in_hand
+        assert all(c.suit != "♥" for c in opponent_hand), "No hearts should be in hand (none available)"
 
     def test_uniform_vs_probability_sampling(self):
         """Test both uniform and probability-weighted sampling work."""

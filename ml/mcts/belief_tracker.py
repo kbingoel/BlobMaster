@@ -308,10 +308,8 @@ class BeliefState:
             if not constraints.can_have_card(card):
                 return False
 
-        # Check must-have suits
-        hand_suits = set(card.suit for card in hand)
-        if not constraints.must_have_suits.issubset(hand_suits):
-            return False
+        # Note: must_have_suits is now a soft prior (used in sampling bias)
+        # not a hard constraint, to allow sampling after suit exhaustion
 
         return True
 
