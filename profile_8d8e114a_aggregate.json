@@ -1,0 +1,30 @@
+{
+  "workers": 10,
+  "determinization": {
+    "sample_determinization_calls": 721,
+    "samples_succeeded": 721,
+    "attempts_total": 721,
+    "sample_determinization_total_sec": 0.12790452399804053,
+    "validate_calls": 721,
+    "validate_total_sec": 0.0033181849978518585,
+    "avg_attempts_per_call": 1.0,
+    "avg_attempts_per_success": 1.0,
+    "avg_sample_ms": 0.17739878501808673,
+    "avg_validate_ms": 0.004602198332665546
+  },
+  "node": {
+    "simulate_action_calls": 1950,
+    "simulate_action_total_sec": 0.5262637090004318,
+    "avg_simulate_action_ms": 0.2698788251284266
+  },
+  "batch_evaluator": {
+    "total_requests": 21600,
+    "total_batches": 722,
+    "total_batch_size": 21600,
+    "min_batch_size": 1,
+    "max_batch_size": 30,
+    "total_infer_time_ms": 2848.2558727264404,
+    "avg_batch_size": 29.916897506925206,
+    "avg_infer_per_item_us": 131.86369781140928
+  }
+}

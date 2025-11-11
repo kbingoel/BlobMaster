@@ -1,0 +1,365 @@
+GPU: NVIDIA GeForce RTX 4060
+
+
+================================================================================
+PHASE 0: Sessions 1+2 Configuration Validation
+================================================================================
+
+================================================================================
+PROFILING SESSIONS 1+2 OPTIMIZED CONFIGURATION
+================================================================================
+  Workers: 32
+  Games: 50
+  Cards: 5
+  MCTS: 3 det × 30 sims (Medium)
+  Batching: Enabled (512 batch size, 10ms timeout)
+  Parallel Expansion: Enabled (batch_size=30)
+  Threading: Disabled (multiprocessing)
+================================================================================
+
+Warm-up (2 games)...
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_73ace5bc_worker0_metrics.json
+Worker 31 metrics saved to profile_73ace5bc_worker31_metrics.json
+Worker 1 metrics saved to profile_73ace5bc_worker1_metrics.json
+Worker 30 metrics saved to profile_73ace5bc_worker30_metrics.json
+Worker 20 metrics saved to profile_73ace5bc_worker20_metrics.json
+Worker 28 metrics saved to profile_73ace5bc_worker28_metrics.json
+Worker 29 metrics saved to profile_73ace5bc_worker29_metrics.json
+Worker 23 metrics saved to profile_73ace5bc_worker23_metrics.json
+Worker 27 metrics saved to profile_73ace5bc_worker27_metrics.json
+Worker 24 metrics saved to profile_73ace5bc_worker24_metrics.json
+Worker 25 metrics saved to profile_73ace5bc_worker25_metrics.json
+Worker 22 metrics saved to profile_73ace5bc_worker22_metrics.json
+Worker 21 metrics saved to profile_73ace5bc_worker21_metrics.json
+Worker 18 metrics saved to profile_73ace5bc_worker18_metrics.json
+Worker 19 metrics saved to profile_73ace5bc_worker19_metrics.json
+Worker 26 metrics saved to profile_73ace5bc_worker26_metrics.json
+Worker 12 metrics saved to profile_73ace5bc_worker12_metrics.json
+Worker 11 metrics saved to profile_73ace5bc_worker11_metrics.json
+Worker 4 metrics saved to profile_73ace5bc_worker4_metrics.json
+Worker 6 metrics saved to profile_73ace5bc_worker6_metrics.json
+Worker 1 metrics saved to profile_73ace5bc_worker1_metrics.json
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_73ace5bc_worker0_metrics.json
+Worker 5 metrics saved to profile_73ace5bc_worker5_metrics.json
+Worker 16 metrics saved to profile_73ace5bc_worker16_metrics.json
+Worker 9 metrics saved to profile_73ace5bc_worker9_metrics.json
+Worker 13 metrics saved to profile_73ace5bc_worker13_metrics.json
+Worker 15 metrics saved to profile_73ace5bc_worker15_metrics.json
+Worker 8 metrics saved to profile_73ace5bc_worker8_metrics.json
+Worker 2 metrics saved to profile_73ace5bc_worker2_metrics.json
+Worker 7 metrics saved to profile_73ace5bc_worker7_metrics.json
+Worker 3 metrics saved to profile_73ace5bc_worker3_metrics.json
+Worker 17 metrics saved to profile_73ace5bc_worker17_metrics.json
+Worker 14 metrics saved to profile_73ace5bc_worker14_metrics.json
+Worker 10 metrics saved to profile_73ace5bc_worker10_metrics.json
+Running timed test (50 games)...
+
+================================================================================
+RESULTS
+================================================================================
+  Total time: 8.13s
+  Games/min: 368.83
+  Examples generated: 1200
+
+Performance vs Expected (75.85 games/min):
+  Ratio: 4.86x
+  ✅ Performance is within expected range
+================================================================================
+
+================================================================================
+INSTRUMENTATION SUMMARY (run 73ace5bc)
+================================================================================
+Determinization:
+  calls=3602 successes=3602 attempts=3602
+  avg_attempts_per_call=1.00 avg_attempts_per_success=1.00
+  avg_sample_ms=0.24 avg_validate_ms=0.01
+Node simulate_action:
+  calls=9978 avg_ms=0.361
+Batch evaluator (per-worker totals combined):
+  total_requests=108000 total_batches=3731 avg_batch_size=28.9
+  min_batch=1 max_batch=30
+  total_infer_time_ms=28208.9 avg_infer_per_item_us=261.2
+Aggregate metrics saved to profile_73ace5bc_aggregate.json
+
+================================================================================
+PHASE 1: cProfile Analysis (Sessions 1+2 Config)
+================================================================================
+================================================================================
+Profiling Self-Play with cProfile
+  Workers: 32
+  Games: 10
+  Cards: 5
+  Batched: True
+  Threads: False
+  Parallel Expansion: True
+  Parallel Batch Size: 30
+================================================================================
+
+Starting profiling...
+Worker 2 metrics saved to profile_8d8e114a_worker2_metrics.json
+Worker 3 metrics saved to profile_8d8e114a_worker3_metrics.json
+Worker 1 metrics saved to profile_8d8e114a_worker1_metrics.json
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_8d8e114a_worker0_metrics.json
+Worker 4 metrics saved to profile_8d8e114a_worker4_metrics.json
+Worker 5 metrics saved to profile_8d8e114a_worker5_metrics.json
+Worker 6 metrics saved to profile_8d8e114a_worker6_metrics.json
+Worker 7 metrics saved to profile_8d8e114a_worker7_metrics.json
+Worker 9 metrics saved to profile_8d8e114a_worker9_metrics.json
+Worker 8 metrics saved to profile_8d8e114a_worker8_metrics.json
+Generated 240 examples
+
+================================================================================
+TOP 30 FUNCTIONS BY CUMULATIVE TIME
+================================================================================
+         60417 function calls (60396 primitive calls) in 3.519 seconds
+
+   Ordered by: cumulative time
+   List reduced from 285 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      869    0.001    0.000    6.903    0.008 /usr/local/lib/python3.14/multiprocessing/connection.py:1151(wait)
+       11    0.000    0.000    6.897    0.627 /usr/local/lib/python3.14/multiprocessing/pool.py:500(_wait_for_updates)
+      869    0.000    0.000    3.462    0.004 /usr/local/lib/python3.14/selectors.py:385(select)
+      869    0.007    0.000    3.462    0.004 {method 'poll' of 'select.poll' objects}
+      3/1    0.000    0.000    3.456    3.456 /usr/local/lib/python3.14/threading.py:1029(_bootstrap)
+        1    0.000    0.000    3.456    3.456 /usr/local/lib/python3.14/multiprocessing/pool.py:506(_handle_workers)
+      2/1    0.000    0.000    3.455    3.455 /home/kbuntu/Documents/Github/BlobMaster/ml/training/selfplay.py:604(generate_games)
+      2/1    0.000    0.000    3.455    3.455 /home/kbuntu/Documents/Github/BlobMaster/ml/training/selfplay.py:641(_generate_games_multiprocess)
+        1    0.000    0.000    3.455    3.455 /usr/local/lib/python3.14/multiprocessing/pool.py:369(starmap)
+        1    0.000    0.000    3.455    3.455 /usr/local/lib/python3.14/multiprocessing/pool.py:767(get)
+      212    0.000    0.000    3.453    0.016 /usr/local/lib/python3.14/multiprocessing/connection.py:406(_recv)
+      212    1.986    0.009    3.452    0.016 {built-in method posix.read}
+       10    0.000    0.000    1.466    0.147 /usr/local/lib/python3.14/multiprocessing/connection.py:208(send)
+      107    0.000    0.000    1.434    0.013 /usr/local/lib/python3.14/multiprocessing/connection.py:423(_send_bytes)
+      193    1.434    0.007    1.434    0.007 {built-in method posix.write}
+      117    0.000    0.000    1.434    0.012 /usr/local/lib/python3.14/multiprocessing/connection.py:397(_send)
+        1    0.000    0.000    0.062    0.062 /usr/local/lib/python3.14/multiprocessing/pool.py:305(_repopulate_pool)
+        1    0.000    0.000    0.062    0.062 /usr/local/lib/python3.14/multiprocessing/pool.py:314(_repopulate_pool_static)
+       32    0.000    0.000    0.061    0.002 /usr/local/lib/python3.14/multiprocessing/process.py:110(start)
+       32    0.000    0.000    0.056    0.002 /usr/local/lib/python3.14/multiprocessing/context.py:297(_Popen)
+       32    0.000    0.000    0.056    0.002 /usr/local/lib/python3.14/multiprocessing/popen_forkserver.py:33(__init__)
+       32    0.000    0.000    0.056    0.002 /usr/local/lib/python3.14/multiprocessing/popen_fork.py:16(__init__)
+       32    0.000    0.000    0.056    0.002 /usr/local/lib/python3.14/multiprocessing/popen_forkserver.py:41(_launch)
+       32    0.000    0.000    0.041    0.001 /usr/local/lib/python3.14/multiprocessing/forkserver.py:81(connect_to_new_process)
+       11    0.001    0.000    0.032    0.003 /usr/local/lib/python3.14/multiprocessing/reduction.py:48(dumps)
+       75    0.005    0.000    0.032    0.000 {method 'dump' of '_pickle.Pickler' objects}
+      850    0.007    0.000    0.027    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/multiprocessing/reductions.py:223(reduce_tensor)
+       67    0.020    0.000    0.020    0.000 {built-in method posix.pipe}
+      106    0.000    0.000    0.019    0.000 /usr/local/lib/python3.14/multiprocessing/connection.py:446(_recv_bytes)
+       32    0.000    0.000    0.012    0.000 /usr/local/lib/python3.14/multiprocessing/forkserver.py:388(read_signed)
+
+
+
+
+================================================================================
+TOP 30 FUNCTIONS BY TOTAL TIME
+================================================================================
+         60417 function calls (60396 primitive calls) in 3.519 seconds
+
+   Ordered by: internal time
+   List reduced from 285 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      212    1.986    0.009    3.452    0.016 {built-in method posix.read}
+      193    1.434    0.007    1.434    0.007 {built-in method posix.write}
+       67    0.020    0.000    0.020    0.000 {built-in method posix.pipe}
+       32    0.011    0.000    0.011    0.000 {built-in method posix.readinto}
+      850    0.008    0.000    0.008    0.000 {method '_share_cuda_' of 'torch._C.StorageBase' objects}
+      850    0.007    0.000    0.027    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/multiprocessing/reductions.py:223(reduce_tensor)
+       32    0.007    0.000    0.007    0.000 {method 'recv' of '_socket.socket' objects}
+      869    0.007    0.000    3.462    0.004 {method 'poll' of 'select.poll' objects}
+       75    0.005    0.000    0.032    0.000 {method 'dump' of '_pickle.Pickler' objects}
+      850    0.002    0.000    0.005    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/_tensor.py:313(_typed_storage)
+      869    0.001    0.000    6.903    0.008 /usr/local/lib/python3.14/multiprocessing/connection.py:1151(wait)
+      850    0.001    0.000    0.003    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/multiprocessing/reductions.py:81(__setitem__)
+     1232    0.001    0.000    0.002    0.000 /usr/local/lib/python3.14/selectors.py:238(register)
+       75    0.001    0.000    0.001    0.000 /usr/local/lib/python3.14/multiprocessing/reduction.py:38(__init__)
+      850    0.001    0.000    0.001    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/storage.py:693(__new__)
+      850    0.001    0.000    0.001    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/storage.py:785(__init__)
+       11    0.001    0.000    0.032    0.003 /usr/local/lib/python3.14/multiprocessing/reduction.py:48(dumps)
+     1232    0.001    0.000    0.003    0.000 /usr/local/lib/python3.14/selectors.py:340(register)
+      848    0.001    0.000    0.007    0.000 /usr/local/lib/python3.14/multiprocessing/popen_forkserver.py:61(poll)
+     2088    0.001    0.000    0.001    0.000 {built-in method __new__ of type object at 0x62b856387120}
+      850    0.001    0.000    0.001    0.000 {method 'untyped_storage' of 'torch._C.TensorBase' objects}
+      869    0.000    0.000    0.001    0.000 /usr/local/lib/python3.14/selectors.py:336(__init__)
+      850    0.000    0.000    0.000    0.000 {method 'size' of 'torch._C.TensorBase' objects}
+      850    0.000    0.000    0.001    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/multiprocessing/reductions.py:49(__del__)
+     3195    0.000    0.000    0.000    0.000 {built-in method builtins.isinstance}
+      850    0.000    0.000    0.001    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/multiprocessing/reductions.py:33(__init__)
+       10    0.000    0.000    0.001    0.000 {built-in method _pickle.loads}
+       32    0.000    0.000    0.041    0.001 /usr/local/lib/python3.14/multiprocessing/forkserver.py:81(connect_to_new_process)
+     2558    0.000    0.000    0.000    0.000 {built-in method builtins.len}
+      850    0.000    0.000    0.009    0.000 /home/kbuntu/Documents/Github/BlobMaster/venv/lib/python3.14/site-packages/torch/storage.py:1444(_share_cuda_)
+
+
+
+
+Profile saved to: profile_w32_g10_c5.prof
+View with: python -m pstats profile_w32_g10_c5.prof
+
+================================================================================
+INSTRUMENTATION SUMMARY (run 8d8e114a)
+================================================================================
+Determinization:
+  calls=721 successes=721 attempts=721
+  avg_attempts_per_call=1.00 avg_attempts_per_success=1.00
+  avg_sample_ms=0.18 avg_validate_ms=0.00
+Node simulate_action:
+  calls=1950 avg_ms=0.270
+Batch evaluator (per-worker totals combined):
+  total_requests=21600 total_batches=722 avg_batch_size=29.9
+  min_batch=1 max_batch=30
+  total_infer_time_ms=2848.3 avg_infer_per_item_us=131.9
+Aggregate metrics saved to profile_8d8e114a_aggregate.json
+
+================================================================================
+PHASE 2: Manual Timing Profile (Compare Configs)
+================================================================================
+
+================================================================================
+Manual Timing Profile
+================================================================================
+
+Testing: Direct (no batching, threads)
+Thread worker 1 metrics saved to profile_c48c6df6_thread1_metrics.json
+Thread worker 0 metrics saved to profile_c48c6df6_thread0_metrics.json
+Thread worker 9 metrics saved to profile_c48c6df6_thread9_metrics.json
+Thread worker 3 metrics saved to profile_c48c6df6_thread3_metrics.json
+Thread worker 2 metrics saved to profile_c48c6df6_thread2_metrics.json
+Thread worker 5 metrics saved to profile_c48c6df6_thread5_metrics.json
+Thread worker 6 metrics saved to profile_c48c6df6_thread6_metrics.json
+Thread worker 0 metrics saved to profile_c48c6df6_thread0_metrics.json
+Thread worker 8 metrics saved to profile_c48c6df6_thread8_metrics.json
+Thread worker 1 metrics saved to profile_c48c6df6_thread1_metrics.json
+Thread worker 7 metrics saved to profile_c48c6df6_thread7_metrics.json
+Thread worker 4 metrics saved to profile_c48c6df6_thread4_metrics.json
+  Time: 25.08s
+  Games/min: 23.9
+  Examples: 240
+
+Testing: Batched (threads)
+Thread worker 1 metrics saved to profile_c48c6df6_thread1_metrics.json
+Thread worker 0 metrics saved to profile_c48c6df6_thread0_metrics.json
+Thread worker 6 metrics saved to profile_c48c6df6_thread6_metrics.json
+Thread worker 0 metrics saved to profile_c48c6df6_thread0_metrics.json
+Thread worker 9 metrics saved to profile_c48c6df6_thread9_metrics.json
+Thread worker 3 metrics saved to profile_c48c6df6_thread3_metrics.json
+Thread worker 2 metrics saved to profile_c48c6df6_thread2_metrics.json
+Thread worker 7 metrics saved to profile_c48c6df6_thread7_metrics.json
+Thread worker 8 metrics saved to profile_c48c6df6_thread8_metrics.json
+Thread worker 5 metrics saved to profile_c48c6df6_thread5_metrics.json
+Thread worker 4 metrics saved to profile_c48c6df6_thread4_metrics.json
+Thread worker 1 metrics saved to profile_c48c6df6_thread1_metrics.json
+  Time: 34.21s
+  Games/min: 17.5
+  Examples: 240
+  Avg batch size: 5.9
+
+Testing: Batched (processes)
+Worker 3 metrics saved to profile_c48c6df6_worker3_metrics.json
+Worker 1 metrics saved to profile_c48c6df6_worker1_metrics.json
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_c48c6df6_worker0_metrics.json
+Worker 4 metrics saved to profile_c48c6df6_worker4_metrics.json
+Worker 1 metrics saved to profile_c48c6df6_worker1_metrics.json
+Worker 5 metrics saved to profile_c48c6df6_worker5_metrics.json
+Worker 2 metrics saved to profile_c48c6df6_worker2_metrics.json
+Worker 9 metrics saved to profile_c48c6df6_worker9_metrics.json
+Worker 7 metrics saved to profile_c48c6df6_worker7_metrics.json
+Worker 8 metrics saved to profile_c48c6df6_worker8_metrics.json
+Worker 6 metrics saved to profile_c48c6df6_worker6_metrics.json
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_c48c6df6_worker0_metrics.json
+  Time: 21.18s
+  Games/min: 28.3
+  Examples: 240
+
+Testing: Sessions 1+2 Optimized (batched + parallel expansion)
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_c48c6df6_worker0_metrics.json
+Worker 1 metrics saved to profile_c48c6df6_worker1_metrics.json
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+Worker 0 metrics saved to profile_c48c6df6_worker0_metrics.json
+Worker 3 metrics saved to profile_c48c6df6_worker3_metrics.json
+Worker 8 metrics saved to profile_c48c6df6_worker8_metrics.json
+Worker 2 metrics saved to profile_c48c6df6_worker2_metrics.json
+Worker 4 metrics saved to profile_c48c6df6_worker4_metrics.json
+Worker 7 metrics saved to profile_c48c6df6_worker7_metrics.json
+Worker 9 metrics saved to profile_c48c6df6_worker9_metrics.json
+Worker 5 metrics saved to profile_c48c6df6_worker5_metrics.json
+Worker 6 metrics saved to profile_c48c6df6_worker6_metrics.json
+Worker 1 metrics saved to profile_c48c6df6_worker1_metrics.json
+  Time: 2.60s
+  Games/min: 230.9
+  Examples: 240
+
+================================================================================
+CONFIGURATION COMPARISON
+================================================================================
+
+Configuration                  Games/min       Speedup   
+------------------------------------------------------------
+Direct (no batching, threads)  23.9            1.00x
+Batched (threads)              17.5            0.73x
+Batched (processes)            28.3            1.18x
+Sessions 1+2 Optimized (batched + parallel expansion) 230.9           9.65x
+
+================================================================================
+INSTRUMENTATION SUMMARY (run c48c6df6)
+================================================================================
+Determinization:
+  calls=7367 successes=7367 attempts=7367
+  avg_attempts_per_call=1.00 avg_attempts_per_success=1.00
+  avg_sample_ms=0.27 avg_validate_ms=0.00
+Node simulate_action:
+  calls=424950 avg_ms=0.299
+Batch evaluator (per-worker totals combined):
+  total_requests=21600 total_batches=734 avg_batch_size=29.4
+  min_batch=1 max_batch=30
+  total_infer_time_ms=2657.0 avg_infer_per_item_us=123.0
+Aggregate metrics saved to profile_c48c6df6_aggregate.json
+
+================================================================================
+PHASE 3: Batch Evaluator Overhead
+================================================================================
+
+================================================================================
+Batch Evaluator Overhead Analysis
+================================================================================
+
+Test 1: Direct network calls (baseline)
+  1000 calls: 0.983s
+  Per call: 0.983ms
+  Calls/sec: 1017
+
+Test 2: Through BatchedEvaluator (single thread)
+  1000 calls: 11.366s
+  Per call: 11.366ms
+  Calls/sec: 88
+  Avg batch size: 1.0
+  Total batches: 1000
+
+  Overhead: 1055.7%
+
+Test 3: Multiple threads (4) through BatchedEvaluator
+  1000 calls (4 threads): 2.878s
+  Per call: 2.878ms
+  Calls/sec: 347
+  Avg batch size: 4.0
+  Total batches: 250
+
+  Speedup vs direct: 0.34x
+
+================================================================================
+Profiling complete!
+================================================================================
