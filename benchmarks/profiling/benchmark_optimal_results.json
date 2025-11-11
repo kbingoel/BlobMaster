@@ -1,0 +1,60 @@
+{
+  "timestamp": "2025-11-11T11:08:50.106388",
+  "num_games": 1000,
+  "elapsed_seconds": 66.46529603004456,
+  "games_per_minute": 902.7267398745652,
+  "seconds_per_game": 0.06646529603004456,
+  "total_examples": 24000,
+  "examples_per_game": 24.0,
+  "examples_per_minute": 21665.441756989563,
+  "warmup_games": 5,
+  "warmup_seconds": 2.948688507080078,
+  "training_estimate_days": 3.846371298034986,
+  "config": {
+    "workers": 32,
+    "num_determinizations": 3,
+    "simulations_per_determinization": 30,
+    "total_sims_per_move": 90,
+    "use_parallel_expansion": true,
+    "parallel_batch_size": 30,
+    "batch_size": 512,
+    "batch_timeout_ms": 10.0,
+    "cards_per_game": 5
+  },
+  "batch_evaluator_stats": {},
+  "mcts_variants": [
+    {
+      "mcts_config": "Light",
+      "num_determinizations": 2,
+      "simulations_per_det": 20,
+      "total_sims": 40,
+      "games": 200,
+      "elapsed": 13.017700433731079,
+      "games_per_minute": 921.8217964907194,
+      "training_days": 3.7666957273527424,
+      "examples": 4800
+    },
+    {
+      "mcts_config": "Medium",
+      "num_determinizations": 3,
+      "simulations_per_det": 30,
+      "total_sims": 90,
+      "games": 200,
+      "elapsed": 18.176886558532715,
+      "games_per_minute": 660.1790664951297,
+      "training_days": 5.259515786612476,
+      "examples": 4800
+    },
+    {
+      "mcts_config": "Heavy",
+      "num_determinizations": 5,
+      "simulations_per_det": 50,
+      "total_sims": 250,
+      "games": 200,
+      "elapsed": 44.890140533447266,
+      "games_per_minute": 267.31927896413913,
+      "training_days": 12.989045293242844,
+      "examples": 4800
+    }
+  ]
+}

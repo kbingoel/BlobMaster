@@ -3,13 +3,15 @@
 **Configuration:** 32 workers, Medium MCTS (3 det × 30 sims), RTX 4060 8GB, Ubuntu 24.04
 **Profiling Tool:** cProfile + custom instrumentation
 
+**TERMINOLOGY NOTE:** "Game" in this report means **ROUND** (one round with 5 cards dealt). A full Blob game consists of multiple rounds (e.g., 5,4,3,2,1,2,3,4,5 cards). Training generates 5M independent rounds, not full games.
+
 ---
 
 ## Executive Summary
 
 ### Current Performance: EXCEPTIONAL ✅
-- **Measured throughput:** 368.8 games/min (50 games test)
-- **Expected baseline:** 75.85 games/min
+- **Measured throughput:** 368.8 rounds/min (50 rounds test)
+- **Expected baseline:** 75.85 rounds/min
 - **Performance ratio:** **4.86x above expected**
 - **Status:** Production-ready, significantly exceeds historical benchmarks
 
@@ -27,11 +29,11 @@
 ### 1. Overall Throughput (Phase 0: Sessions 1+2 Validation)
 ```
 Workers:           32
-Games:             50
+Rounds:            50 (each with 5 cards dealt, 4 players)
 Total time:        8.13s
-Games/min:         368.83
-Examples:          1,200
-Performance:       4.86x above expected (75.85 games/min)
+Rounds/min:        368.83
+Examples:          1,200 (24 decisions per round: 4 bids + 20 card plays)
+Performance:       4.86x above expected (75.85 rounds/min)
 ```
 
 **Analysis:** System is performing **486% of expected baseline**. This exceptional performance indicates:
@@ -44,7 +46,7 @@ Performance:       4.86x above expected (75.85 games/min)
 
 ### 2. Neural Network Batching (Batch Evaluator)
 
-#### Performance Metrics (50 games, 32 workers):
+#### Performance Metrics (50 rounds, 32 workers):
 ```
 Total requests:    108,000
 Total batches:     3,731
@@ -67,7 +69,7 @@ Avg per item:      261.2µs
 
 ### 3. MCTS Node Expansion (simulate_action)
 
-#### Metrics (50 games, 32 workers):
+#### Metrics (50 rounds, 32 workers):
 ```
 Total calls:       9,978
 Total time:        3.60s
@@ -77,7 +79,7 @@ Avg per call:      0.361ms
 #### Analysis:
 - **0.36ms per node expansion** is very fast
 - Includes game state copy + action application
-- **9,978 expansions** for 50 games = ~200 per game (reasonable for 3×30 MCTS)
+- **9,978 expansions** for 50 rounds = ~200 per round (reasonable for 3×30 MCTS)
 - No indication of unnecessary copying or slowdowns
 
 **Conclusion:** Node expansion is well-optimized. The time spent here is appropriate for MCTS tree traversal.
@@ -86,7 +88,7 @@ Avg per call:      0.361ms
 
 ### 4. Determinization Sampling
 
-#### Metrics (50 games, 32 workers):
+#### Metrics (50 rounds, 32 workers):
 ```
 Sample calls:      3,602
 Successes:         3,602
@@ -100,13 +102,13 @@ Avg validate time: 0.006ms
 - **100% success rate** on first attempt - belief tracking is accurate
 - **0.24ms per sample** - very fast sampling
 - **0.006ms validation** - negligible overhead
-- **3,602 samples** for 50 games = ~72 per game (expected for 3 det/move)
+- **3,602 samples** for 50 rounds = ~72 per round (expected for 3 det/move)
 
 **Conclusion:** Determinization is highly efficient with no rejection sampling overhead.
 
 ---
 
-### 5. cProfile Function-Level Analysis (10 games)
+### 5. cProfile Function-Level Analysis (10 rounds)
 
 #### Top Time Consumers (by total time):
 ```
@@ -129,10 +131,10 @@ Avg validate time: 0.006ms
 
 ### 6. Configuration Comparison (Phase 2: Manual Timing)
 
-Testing 10 games with different configurations:
+Testing 10 rounds with different configurations:
 
 ```
-Configuration                                   Games/min   Speedup
+Configuration                                   Rounds/min   Speedup
 ────────────────────────────────────────────────────────────────────
 Direct (no batching, threads)                   23.9        1.00x
 Batched (threads)                               17.5        0.73x  ← SLOWER!
@@ -171,7 +173,7 @@ BatchedEvaluator (4 threads)      2.878s     2.878ms     +193%
   - High concurrency keeps batches full (28.9/30 avg)
   - Amortized batch processing outweighs timeout overhead
 
-**Conclusion:** Batch evaluator overhead is only a problem with low concurrency. With 32 workers, the batching is highly beneficial (as proven by 368 games/min).
+**Conclusion:** Batch evaluator overhead is only a problem with low concurrency. With 32 workers, the batching is highly beneficial (as proven by 368 rounds/min).
 
 ---
 
@@ -201,7 +203,7 @@ BatchedEvaluator (4 threads)      2.878s     2.878ms     +193%
 
 For a typical game with Medium MCTS (3 det × 30 sims):
 
-### Per-Game Time Budget (368.8 games/min = 163ms/game):
+### Per-Game Time Budget (368.8 rounds/min = 163ms/game):
 ```
 Component                          Time        % of Total
 ──────────────────────────────────────────────────────────
@@ -212,7 +214,7 @@ Game Logic (bidding, playing)      ~15ms       9%
 Worker coordination/IPC            ~40ms       25%
 Parallel expansion coordination    ~13ms       8%
 ──────────────────────────────────────────────────────────
-Total per game                     ~163ms      100%
+Total per round                     ~163ms      100%
 ```
 
 ### Time Breakdown by Phase:
@@ -232,7 +234,7 @@ Total per game                     ~163ms      100%
 #### 1. Increase MCTS Simulations (Quality vs Speed Trade-off)
 - **Current:** 3 det × 30 sims = 90 total
 - **Proposal:** 5 det × 50 sims = 250 total (Heavy MCTS)
-- **Impact:** Better move quality, 2-3x slower (estimated 120-150 games/min)
+- **Impact:** Better move quality, 2-3x slower (estimated 120-150 rounds/min)
 - **Recommendation:** Use current Medium MCTS for training, Heavy for final model evaluation
 
 #### 2. GPU Model Optimization (Minor Gains)
@@ -262,16 +264,16 @@ Total per game                     ~163ms      100%
 ### Sessions 1+2 Historical Performance (from PERFORMANCE-FINDINGS.md):
 ```
 Configuration:     32 workers, Medium MCTS
-Measured:          36.7 games/min (Linux)
-Windows baseline:  43.3 games/min
+Measured:          36.7 rounds/min (Linux)
+Windows baseline:  43.3 rounds/min
 Platform penalty:  15% slower on Linux
 ```
 
 ### Current Profiling Results (2025-11-11):
 ```
 Configuration:     32 workers, Medium MCTS
-Measured:          368.8 games/min (Linux)
-Historical:        36.7 games/min (Linux)
+Measured:          368.8 rounds/min (Linux)
+Historical:        36.7 rounds/min (Linux)
 Improvement:       10.0x faster (!!)
 ```
 
@@ -293,12 +295,12 @@ This dramatic improvement suggests one of the following:
    - Better batching logic
    - **Conclusion:** Unlikely to account for 10x
 
-**CRITICAL NOTE:** The 368.8 games/min is for **5-card games** (used in profiling). The historical 36.7 games/min likely measured **variable-length full games** (more cards = more moves = longer). This is not a true apples-to-apples comparison.
+**CRITICAL NOTE:** The 368.8 rounds/min is for **5-card games** (used in profiling). The historical 36.7 rounds/min likely measured **variable-length full games** (more cards = more moves = longer). This is not a true apples-to-apples comparison.
 
 ### Adjusted Estimate for Full Training (Variable Cards):
 ```
-5-card games:      368.8 games/min (measured)
-Full games (avg):  ~37-40 games/min (estimated, matches historical)
+5-card games:      368.8 rounds/min (measured)
+Full games (avg):  ~37-40 rounds/min (estimated, matches historical)
 Scaling factor:    ~9-10x difference based on game length
 ```
 
@@ -311,7 +313,7 @@ Scaling factor:    ~9-10x difference based on game length
 ### For Training (Phase 4):
 1. ✅ **Use current configuration** - 32 workers, Medium MCTS, batching enabled
 2. ✅ **Monitor GPU memory** - stay at 32 workers (tested safe)
-3. ⚠️ **Re-benchmark with full games** - verify 36.7 games/min estimate
+3. ⚠️ **Re-benchmark with full games** - verify 36.7 rounds/min estimate
 4. ✅ **Continue using multiprocessing** - avoid threads
 5. ✅ **Keep 10ms batch timeout** - optimal for 32 workers
 
@@ -335,7 +337,7 @@ Scaling factor:    ~9-10x difference based on game length
 The current BlobMaster training pipeline is **exceptionally well-optimized** with no critical bottlenecks. Performance is 4.86x above expected baseline (caveat: shorter test games). The main process spends most time coordinating workers (expected), while workers efficiently execute MCTS + neural network inference with 96% GPU batch efficiency.
 
 ### Key Metrics:
-- **368.8 games/min** (5-card test games)
+- **368.8 rounds/min** (5-card test games)
 - **96% GPU batch fill rate** (28.9/30 avg)
 - **261µs per neural network evaluation** (highly efficient)
 - **100% determinization success rate** (no rejection sampling)
@@ -352,15 +354,15 @@ The current BlobMaster training pipeline is **exceptionally well-optimized** wit
 4. ✅ **Proceed with full training** - current configuration is excellent
 
 ### Training Time Estimate:
-- **Conservative:** ~136 days @ 36.7 games/min (Medium MCTS, full games)
-- **Optimistic:** ~72 days @ 69.1 games/min (Light MCTS, if validated)
+- **Conservative:** ~136 days @ 36.7 rounds/min (Medium MCTS, full games)
+- **Optimistic:** ~72 days @ 69.1 rounds/min (Light MCTS, if validated)
 - **Status:** Ready to start multi-day training run
 
 ---
 
 ## Appendix: Raw Data
 
-### Phase 0 - Sessions 1+2 Validation (50 games):
+### Phase 0 - Sessions 1+2 Validation (50 rounds):
 ```json
 {
   "workers": 32,
@@ -387,7 +389,7 @@ The current BlobMaster training pipeline is **exceptionally well-optimized** wit
 }
 ```
 
-### Phase 1 - cProfile (10 games):
+### Phase 1 - cProfile (10 rounds):
 ```
 Top functions by internal time:
   posix.read:       1.986s (56.4%)
@@ -397,12 +399,12 @@ Top functions by internal time:
   Pickling:         0.005s (0.1%)
 ```
 
-### Phase 2 - Configuration Comparison (10 games each):
+### Phase 2 - Configuration Comparison (10 rounds each):
 ```
-Direct (no batching, threads):     23.9 games/min (baseline)
-Batched (threads):                 17.5 games/min (0.73x)
-Batched (processes):               28.3 games/min (1.18x)
-Sessions 1+2 Optimized:            230.9 games/min (9.65x)
+Direct (no batching, threads):     23.9 rounds/min (baseline)
+Batched (threads):                 17.5 rounds/min (0.73x)
+Batched (processes):               28.3 rounds/min (1.18x)
+Sessions 1+2 Optimized:            230.9 rounds/min (9.65x)
 ```
 
 ### Phase 3 - Batch Evaluator Overhead (1000 calls):

@@ -1,0 +1,108 @@
+
+================================================================================
+OPTIMAL CONFIGURATION BENCHMARK
+================================================================================
+Configuration validated from profiling (2025-11-11):
+  Workers: 32 (multiprocessing)
+  MCTS: 3 det × 30 sims = 90 total (Medium)
+  Parallel expansion: ENABLED
+  Parallel batch size: 30
+  Batched evaluator: 512 max batch, 10ms timeout
+  Cards per game: 5
+
+Test parameters:
+  Games to generate: 1000
+  Warmup games: 5
+  Device: cuda
+================================================================================
+
+Initializing network...
+Creating self-play engine...
+
+Running warmup (5 games)...
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+  Warmup completed in 2.95s
+
+Running benchmark (1000 games)...
+
+================================================================================
+RESULTS
+================================================================================
+Games generated: 1000
+Total time: 66.47s
+Games/minute: 902.73
+Seconds/game: 0.066
+Training examples: 24,000
+Examples/game: 24.0
+Examples/minute: 21665.4
+
+================================================================================
+TRAINING TIME ESTIMATE
+================================================================================
+Full training (500 iterations × 10,000 games):
+  Total games: 5,000,000
+  Estimated time: 3.8 days
+  At rate: 902.7 games/min
+================================================================================
+
+
+################################################################################
+TESTING MCTS CONFIGURATION VARIANTS
+################################################################################
+
+================================================================================
+Testing Light MCTS (2 det × 20 sims = 40 total)
+================================================================================
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+
+Results:
+  Games/minute: 921.8
+  Training estimate: 3.8 days
+
+================================================================================
+Testing Medium MCTS (3 det × 30 sims = 90 total)
+================================================================================
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+
+Results:
+  Games/minute: 660.2
+  Training estimate: 5.3 days
+
+================================================================================
+Testing Heavy MCTS (5 det × 50 sims = 250 total)
+================================================================================
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+[Worker 0] Network on device: cuda:0 (requested: cuda)
+[Worker 0] GPU: NVIDIA GeForce RTX 4060
+
+Results:
+  Games/minute: 267.3
+  Training estimate: 13.0 days
+
+================================================================================
+MCTS CONFIGURATION COMPARISON
+================================================================================
+Config       Sims/Move    Games/Min       Training (days)    Speedup
+--------------------------------------------------------------------------------
+Light        40           921.8           3.8                1.00x
+Medium       90           660.2           5.3                1.40x
+Heavy        250          267.3           13.0               3.45x
+--------------------------------------------------------------------------------
+
+
+Results saved to: benchmark_optimal_results.json
+CSV summary saved to: benchmark_optimal_results.csv
+
+================================================================================
+BENCHMARK COMPLETE
+================================================================================

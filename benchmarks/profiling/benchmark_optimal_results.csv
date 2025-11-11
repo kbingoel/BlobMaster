@@ -1,0 +1,2 @@
+timestamp,num_games,games_per_minute,seconds_per_game,total_examples,examples_per_game,training_estimate_days
+2025-11-11T11:08:50.106388,1000,902.7267398745652,0.06646529603004456,24000,24.0,3.846371298034986
