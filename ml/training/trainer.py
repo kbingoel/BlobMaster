@@ -497,7 +497,12 @@ class TrainingPipeline:
         self.metrics_history = []
         self.eval_frequency = config.get("eval_frequency", 5)  # Evaluate every N iterations
 
+        # Store training start date for checkpoint naming
+        self.training_start_date = datetime.now().strftime("%Y%m%d")
+        self.current_elo = self.best_model_elo  # Track current ELO for checkpoint naming
+
         print(f"Pipeline initialized:")
+        print(f"  - Training session started: {self.training_start_date}")
         print(f"  - Self-play workers: {config.get('num_workers', 16)}")
         print(f"  - Replay buffer capacity: {config.get('replay_buffer_capacity', 500_000):,}")
         print(f"  - Evaluation frequency: every {self.eval_frequency} iterations")
@@ -538,6 +543,17 @@ class TrainingPipeline:
             print(f"ITERATION {iteration + 1}/{num_iterations}")
             print(f"{'='*80}")
 
+            # Get MCTS params for this iteration (if config supports curriculum)
+            if hasattr(self.config, 'get_mcts_params'):
+                # NOTE: get_mcts_params() expects 1-indexed iteration (docstring),
+                # but Python loop is 0-indexed, so we pass iteration + 1
+                num_det, sims_per_det = self.config.get_mcts_params(iteration + 1)
+                print(f"MCTS curriculum: {num_det} determinizations × {sims_per_det} simulations")
+
+                # Update self-play engine config
+                self.selfplay_engine.num_determinizations = num_det
+                self.selfplay_engine.simulations_per_determinization = sims_per_det
+
             iteration_start_time = time.time()
 
             # Run single iteration
@@ -550,6 +566,10 @@ class TrainingPipeline:
 
                 # Log metrics
                 self._log_metrics(iteration, metrics)
+
+                # Distribution sanity logging (every 10 iterations)
+                if (iteration + 1) % 10 == 0 and 'distribution_stats' in metrics:
+                    self._log_distribution_sanity(metrics)
 
                 # Store metrics history
                 self.metrics_history.append({
@@ -596,6 +616,10 @@ class TrainingPipeline:
         selfplay_examples = self._selfplay_phase(iteration)
         metrics["num_selfplay_examples"] = len(selfplay_examples)
         metrics["replay_buffer_size"] = len(self.replay_buffer)
+
+        # Add distribution stats if available
+        if hasattr(self, 'last_distribution_stats') and self.last_distribution_stats is not None:
+            metrics["distribution_stats"] = self.last_distribution_stats
 
         # Phase 2: Training
         print(f"\n[2/4] Training Phase")
@@ -663,6 +687,14 @@ class TrainingPipeline:
         # Add examples to replay buffer
         self.replay_buffer.add_examples(examples)
         print(f"  - Replay buffer size: {len(self.replay_buffer):,}/{self.replay_buffer.capacity:,}")
+
+        # Collect distribution statistics (if decision-weighted sampling is enabled)
+        distribution_stats = None
+        if hasattr(self.config, 'use_decision_weighted_sampling') and self.config.get('use_decision_weighted_sampling'):
+            distribution_stats = self.selfplay_engine._collect_distribution_stats(examples)
+
+        # Store distribution stats for logging
+        self.last_distribution_stats = distribution_stats
 
         return examples
 
@@ -876,6 +908,57 @@ class TrainingPipeline:
             "model2_avg_score": match_results['model2_avg_score'],
         }
 
+    def _get_checkpoint_filename(
+        self,
+        iteration: int,
+        elo: Optional[int] = None,
+        is_permanent: bool = False
+    ) -> str:
+        """
+        Generate standardized checkpoint filename.
+
+        Args:
+            iteration: Current training iteration (0-indexed)
+            elo: Optional ELO rating (only for permanent checkpoints)
+            is_permanent: Whether this is a permanent checkpoint (every 5 iters)
+
+        Returns:
+            Filename following convention: YYYYMMDD-Blobmaster-v1-{params}-iter{XXX}[-elo{YYYY}].pth
+
+        Examples:
+            >>> self._get_checkpoint_filename(23, elo=None, is_permanent=False)
+            '20251115-Blobmaster-v1-32w-rounds-1x15-iter023.pth'
+
+            >>> self._get_checkpoint_filename(150, elo=1420, is_permanent=True)
+            '20251115-Blobmaster-v1-32w-rounds-3x35-iter150-elo1420.pth'
+        """
+        # Get MCTS params for this iteration (expects 1-indexed)
+        if hasattr(self.config, 'get_mcts_params'):
+            num_det, sims = self.config.get_mcts_params(iteration + 1)
+        else:
+            # Fallback to config defaults
+            num_det = self.config.get('num_determinizations', 3)
+            sims = self.config.get('simulations_per_determinization', 30)
+
+        # Build components
+        date = self.training_start_date
+        project = "Blobmaster"
+        version = "v1"
+        workers = f"{self.config.get('num_workers', 16)}w"
+        mode = self.config.get('training_on', 'rounds')  # 'rounds' or 'games'
+        mcts = f"{num_det}x{sims}"
+        iter_str = f"iter{iteration:03d}"  # Zero-padded to 3 digits
+
+        # Build filename
+        parts = [date, project, version, workers, mode, mcts, iter_str]
+
+        # Add ELO if provided (permanent checkpoints only)
+        if is_permanent and elo is not None:
+            parts.append(f"elo{elo}")
+
+        filename = "-".join(parts) + ".pth"
+        return filename
+
     def _checkpoint_phase(
         self,
         iteration: int,
@@ -888,13 +971,31 @@ class TrainingPipeline:
             iteration: Current iteration number
             metrics: Iteration metrics
         """
-        # Always save checkpoint at specified intervals
+        # Determine checkpoint type: permanent (every 5) or cache (others)
+        is_permanent = (iteration + 1) % 5 == 0
         should_save = (iteration + 1) % self.save_every_n_iterations == 0
 
         if should_save:
-            checkpoint_path = self.checkpoint_dir / f"checkpoint_iter_{iteration + 1}.pth"
+            # Get ELO for permanent checkpoints
+            elo = None
+            if is_permanent:
+                elo = int(self.current_elo) if hasattr(self, 'current_elo') else None
 
-            print(f"Saving checkpoint to {checkpoint_path.name}...")
+            # Generate standardized filename
+            filename = self._get_checkpoint_filename(iteration, elo, is_permanent)
+
+            # Determine save directory (permanent vs cache)
+            if is_permanent:
+                save_dir = self.checkpoint_dir / "permanent"
+                save_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                save_dir = self.checkpoint_dir / "cache"
+                save_dir.mkdir(parents=True, exist_ok=True)
+
+            checkpoint_path = save_dir / filename
+
+            checkpoint_type = "permanent" if is_permanent else "cache"
+            print(f"Saving {checkpoint_type} checkpoint to {filename}...")
             self.trainer.save_checkpoint(
                 str(checkpoint_path),
                 iteration=iteration,
@@ -902,11 +1003,12 @@ class TrainingPipeline:
             )
 
             # Also save replay buffer
-            buffer_path = self.checkpoint_dir / f"replay_buffer_iter_{iteration + 1}.pkl"
+            buffer_filename = filename.replace(".pth", "_buffer.pkl")
+            buffer_path = save_dir / buffer_filename
             self.replay_buffer.save(str(buffer_path))
 
-            print(f"  - Checkpoint saved: {checkpoint_path.name}")
-            print(f"  - Replay buffer saved: {buffer_path.name}")
+            print(f"  - Checkpoint saved: {checkpoint_path}")
+            print(f"  - Replay buffer saved: {buffer_path}")
 
         # Save best model only if promoted or if this is the first save
         should_save_best = (
@@ -915,7 +1017,17 @@ class TrainingPipeline:
         )
 
         if should_save_best:
-            best_model_path = self.checkpoint_dir / "best_model.pth"
+            # Update current ELO for checkpoint naming
+            if 'current_elo' in metrics:
+                self.current_elo = metrics['current_elo']
+
+            # Use standardized naming for best model too
+            best_filename = self._get_checkpoint_filename(
+                iteration,
+                elo=int(self.current_elo) if hasattr(self, 'current_elo') else None,
+                is_permanent=True  # Best model is always permanent
+            )
+            best_model_path = self.checkpoint_dir / f"best_{best_filename}"
             self.trainer.save_checkpoint(
                 str(best_model_path),
                 iteration=iteration,
@@ -973,6 +1085,61 @@ class TrainingPipeline:
         if "iteration_time_minutes" in metrics:
             print(f"Timing:")
             print(f"  - Total iteration time: {metrics['iteration_time_minutes']:.1f} minutes")
+
+        print(f"{'='*80}\n")
+
+    def _log_distribution_sanity(self, metrics: Dict[str, Any]):
+        """
+        Validate sampled distributions match targets.
+
+        Args:
+            metrics: Metrics dictionary containing distribution_stats
+        """
+        if 'distribution_stats' not in metrics:
+            return
+
+        stats = metrics['distribution_stats']
+
+        # Check player distribution
+        total_games = sum(stats['player_counts'].values())
+
+        # Require minimum sample size before validating distribution
+        MIN_SAMPLE_SIZE = 100  # Need at least 100 rounds for valid statistics
+        if total_games < MIN_SAMPLE_SIZE:
+            print(f"  Sample size too small ({total_games} < {MIN_SAMPLE_SIZE}), skipping distribution check")
+            return
+
+        print(f"\n{'='*80}")
+        print(f"DISTRIBUTION SANITY CHECK")
+        print(f"{'='*80}")
+
+        # Check player distribution (if config has player_distribution)
+        if hasattr(self.config, 'player_distribution'):
+            print(f"Player Distribution (n={total_games}):")
+            for num_players, target_pct in self.config.player_distribution.items():
+                actual_count = stats['player_counts'].get(num_players, 0)
+                actual_pct = actual_count / total_games if total_games > 0 else 0.0
+
+                print(
+                    f"  {num_players}p: {actual_pct:.1%} "
+                    f"(target {target_pct:.1%}, count={actual_count})"
+                )
+
+                # Assert within ±3% tolerance (only for sufficient sample size)
+                if abs(actual_pct - target_pct) > 0.03:
+                    print(
+                        f"  ⚠️  Distribution drift detected for {num_players}p: "
+                        f"{actual_pct:.1%} vs target {target_pct:.1%}"
+                    )
+
+        # Check card count distributions per (P, C) combination
+        if 'card_distributions' in stats:
+            print(f"\nCard Distribution:")
+            for (P, C), card_dist in stats['card_distributions'].items():
+                print(f"  {P}p/C={C}:")
+                for c, count in sorted(card_dist.items()):
+                    pct = count / total_games if total_games > 0 else 0.0
+                    print(f"    c={c}: {pct:.1%} (count={count})")
 
         print(f"{'='*80}\n")
 

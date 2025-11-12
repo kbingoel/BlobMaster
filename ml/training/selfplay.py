@@ -346,6 +346,10 @@ class SelfPlayWorker:
                     "player_position": player.position,
                     "game_id": game_id,
                     "move_number": move_number,
+                    # Metadata for distribution tracking
+                    "num_players": num_players,
+                    "cards_dealt": cards_to_deal,
+                    "start_cards": start_cards if (self.config and self.config.use_decision_weighted_sampling) else cards_to_deal,
                 }
             )
 
@@ -402,6 +406,10 @@ class SelfPlayWorker:
                     "player_position": player.position,
                     "game_id": game_id,
                     "move_number": move_number,
+                    # Metadata for distribution tracking
+                    "num_players": num_players,
+                    "cards_dealt": cards_to_deal,
+                    "start_cards": start_cards if (self.config and self.config.use_decision_weighted_sampling) else cards_to_deal,
                 }
             )
 
@@ -802,14 +810,68 @@ class SelfPlayEngine:
 
         if self.use_thread_pool:
             # Phase 3: ThreadPoolExecutor with shared BatchedEvaluator
-            return self._generate_games_threaded(
+            all_examples = self._generate_games_threaded(
                 num_games, num_players, cards_to_deal, progress_callback
             )
         else:
             # Phase 2: multiprocessing.Pool with per-worker BatchedEvaluator
-            return self._generate_games_multiprocess(
+            all_examples = self._generate_games_multiprocess(
                 num_games, num_players, cards_to_deal, progress_callback
             )
+
+        # Collect distribution statistics (if decision-weighted sampling is enabled)
+        # Note: This should be done by the TrainingPipeline when it processes examples
+        # For now, examples are returned as-is with metadata attached
+
+        return all_examples
+
+    def _collect_distribution_stats(self, examples: List[Dict]) -> Dict[str, Any]:
+        """
+        Collect player/card distribution statistics.
+
+        NOTE: Stats should be tracked per-round (not per-example) to avoid
+        inflating counts by decision density. Track unique game_ids instead.
+
+        Args:
+            examples: List of training examples with metadata
+
+        Returns:
+            Dictionary with distribution statistics
+        """
+        from collections import Counter
+
+        player_counts = Counter()
+        card_distributions = {}  # (P, C) -> Counter({c: count})
+        seen_game_ids = set()  # Track unique rounds to count once per round
+
+        for example in examples:
+            game_id = example.get('game_id')
+            if not game_id or game_id in seen_game_ids:
+                continue  # Skip if already counted this round
+
+            seen_game_ids.add(game_id)
+
+            # Extract from game metadata (stored in example)
+            num_players = example.get('num_players')
+            start_cards = example.get('start_cards')
+            cards_dealt = example.get('cards_dealt')
+
+            if num_players is not None:
+                player_counts[num_players] += 1
+
+            if num_players and start_cards and cards_dealt:
+                key = (num_players, start_cards)
+                if key not in card_distributions:
+                    card_distributions[key] = Counter()
+                card_distributions[key][cards_dealt] += 1
+
+        return {
+            'player_counts': dict(player_counts),
+            'card_distributions': {
+                (P, C): dict(dist)  # Use tuple keys (not string) for consistency
+                for (P, C), dist in card_distributions.items()
+            },
+        }
 
     def _generate_games_multiprocess(
         self,

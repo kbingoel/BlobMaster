@@ -98,6 +98,21 @@ def parse_args() -> argparse.Namespace:
         help='Number of self-play workers (overrides config)',
     )
 
+    # Training mode (Session 0)
+    parser.add_argument(
+        '--training-on',
+        type=str,
+        choices=['rounds', 'games'],
+        default='rounds',
+        help='Training mode: "rounds" (independent rounds, Phase 1) or '
+             '"games" (full multi-round games, Phase 2)'
+    )
+    parser.add_argument(
+        '--enable-curriculum',
+        action='store_true',
+        help='Enable MCTS curriculum (progressively increase search depth)'
+    )
+
     # Logging
     parser.add_argument(
         '--wandb',
@@ -352,6 +367,18 @@ def main():
 
     if args.save_every is not None:
         config.save_every_n_iterations = args.save_every
+
+    # Training mode and curriculum flags (Session 0)
+    config.training_on = args.training_on
+
+    # Enable MCTS curriculum if requested
+    if args.enable_curriculum:
+        print("MCTS curriculum enabled")
+        # Config already has mcts_schedule, just needs to be applied
+    else:
+        # Use fixed MCTS params (no curriculum)
+        print("Using fixed MCTS params (no curriculum)")
+        config.mcts_schedule = {}  # Empty schedule = use defaults
 
     if args.wandb:
         config.use_wandb = True
