@@ -210,6 +210,68 @@ class TestStateEncoder:
         phase_vector = encoder._encode_game_phase(game)
         assert phase_vector.tolist() == [0.0, 0.0, 1.0]
 
+    def test_game_context_encoding(self):
+        """Test game context encoding populates 29/54 dims correctly (Session 1)."""
+        from ml.training.selfplay import GameContext, generate_synthetic_context
+
+        encoder = StateEncoder()
+        game = BlobGame(num_players=5)
+        game.setup_round(5)
+
+        # Test 1: No context = all zeros
+        encoding_no_ctx = encoder.encode(game, player=game.players[0], game_context=None)
+        assert encoding_no_ctx.shape == (256,)
+        assert (encoding_no_ctx[202:256] == 0).all(), "Context dims should be zero when game_context=None"
+
+        # Test 2: With context = populated dims
+        context = generate_synthetic_context(5, 5, 7)
+        encoding_with_ctx = encoder.encode(game, player=game.players[0], game_context=context)
+        assert encoding_with_ctx.shape == (256,)
+
+        # Check that some context dims are non-zero
+        context_dims = encoding_with_ctx[202:256]
+        non_zero_count = (context_dims != 0).sum().item()
+        assert non_zero_count > 0, "Context features should be populated"
+
+        # Verify last 25 dims are reserved (zeros)
+        assert (encoding_with_ctx[231:256] == 0).all(), "Last 25 dims should be reserved"
+
+        # Test 3: Known values normalization
+        test_context = GameContext(
+            cumulative_scores=[50, 30, 20, 10, 0],
+            rounds_completed=5,
+            total_rounds=17,
+            previous_cards=[7, 6, 5, 4, 3],
+            num_players=5,
+            start_cards=7,
+            phase='descending'
+        )
+
+        encoding = encoder.encode(game, player=game.players[0], game_context=test_context)
+        context_features = encoding[202:231]
+
+        # Check score normalization (first 8 dims)
+        scores = context_features[0:8]
+        score_normalizer = 5 * (10 + 7)  # rounds_completed * (10 + start_cards) = 85
+        expected_score = 50 / 85  # ≈ 0.588
+        assert abs(scores[0].item() - expected_score) < 0.001
+
+        # Check round position (dims 8-12)
+        round_pos = context_features[8:12]
+        assert abs(round_pos[0].item() - (5/17)) < 0.001  # completed ratio
+        assert abs(round_pos[1].item() - (12/17)) < 0.001  # remaining ratio
+        assert abs(round_pos[3].item() - 0.0) < 0.001  # phase = descending
+
+        # Check previous cards (dims 12-27, normalized by start_cards)
+        prev_cards = context_features[12:27]
+        assert abs(prev_cards[0].item() - 1.0) < 0.001  # 7/7 = 1.0
+        assert abs(prev_cards[1].item() - (6/7)) < 0.001  # 6/7 ≈ 0.857
+
+        # Check game config (dims 27-29)
+        game_config = context_features[27:29]
+        assert abs(game_config[0].item() - (5/8)) < 0.001  # num_players/8
+        assert abs(game_config[1].item() - (7/8)) < 0.001  # start_cards/8
+
 
 class TestActionMasker:
     """Test suite for ActionMasker class."""

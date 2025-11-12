@@ -76,9 +76,12 @@ Card Index Mapping (0-51):
 
 import torch
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from ml.game.blob import BlobGame, Player, Card
 from ml.game.constants import SUITS, RANKS, RANK_VALUES, MAX_PLAYERS
+
+if TYPE_CHECKING:
+    from ml.training.selfplay import GameContext
 
 
 class StateEncoder:
@@ -98,13 +101,19 @@ class StateEncoder:
         self.card_dim = 52
         self.max_players = MAX_PLAYERS
 
-    def encode(self, game: BlobGame, player: Player) -> torch.Tensor:
+    def encode(
+        self,
+        game: BlobGame,
+        player: Player,
+        game_context: Optional["GameContext"] = None,
+    ) -> torch.Tensor:
         """
         Encode current game state from perspective of given player.
 
         Args:
             game: BlobGame instance
             player: Player whose perspective to encode
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             torch.Tensor of shape (256,) with normalized state features
@@ -166,8 +175,114 @@ class StateEncoder:
         state[offset:offset+16] = pos_vector
         offset += 16
 
-        # Remaining dimensions padded with zeros (for future features)
-        # offset should be 202, rest is zero-padded to 256 (54 dims spare)
+        # 12. Game Context Features (54 dims total: 29 used, 25 reserved)
+        # Session 1 implementation:
+        #   - Per-player cumulative scores (8 slots)
+        #   - Round position (4 slots)
+        #   - Previous round cards (15 slots)
+        #   - Game config (2 slots)
+        #   - Reserved for future (25 slots)
+        context_features = torch.zeros(54, dtype=torch.float32)
+
+        if game_context is not None:
+            ctx_offset = 0
+
+            # 1. Per-player cumulative scores (8 slots, normalized)
+            # Normalize by: rounds_completed × (10 + start_cards)
+            # IMPORTANT: No hard clamp at 1.0! Preserves signal when player far ahead
+            if game_context.rounds_completed > 0:
+                score_normalizer = game_context.rounds_completed * (
+                    10 + game_context.start_cards
+                )
+            else:
+                score_normalizer = 1.0  # Avoid division by zero
+
+            for i in range(min(len(game_context.cumulative_scores), 8)):
+                context_features[ctx_offset + i] = (
+                    game_context.cumulative_scores[i] / score_normalizer
+                )
+            ctx_offset += 8
+
+            # 2. Round position (4 slots)
+            # - rounds_completed / total_rounds
+            # - remaining_rounds / total_rounds
+            # - num_1card_rounds_remaining / num_players
+            # - phase: 0=descending, 0.5=in 1s, 1=ascending
+
+            # Rounds completed ratio
+            context_features[ctx_offset] = (
+                game_context.rounds_completed / game_context.total_rounds
+                if game_context.total_rounds > 0 else 0.0
+            )
+
+            # Remaining rounds ratio
+            remaining = game_context.total_rounds - game_context.rounds_completed
+            context_features[ctx_offset + 1] = (
+                remaining / game_context.total_rounds
+                if game_context.total_rounds > 0 else 1.0
+            )
+
+            # Number of 1-card rounds remaining (normalized by num_players)
+            # Full sequence: [C, C-1, ..., 1] + [1]*P + [2, 3, ..., C]
+            # Count how many 1s are left in the sequence
+            descending_len = game_context.start_cards
+            ones_start = descending_len
+            ones_end = ones_start + game_context.num_players
+
+            if game_context.rounds_completed < ones_start:
+                # Haven't reached 1-card rounds yet
+                ones_remaining = game_context.num_players
+            elif game_context.rounds_completed < ones_end:
+                # Currently in 1-card rounds
+                ones_remaining = ones_end - game_context.rounds_completed
+            else:
+                # Past all 1-card rounds
+                ones_remaining = 0
+
+            context_features[ctx_offset + 2] = (
+                ones_remaining / game_context.num_players
+                if game_context.num_players > 0 else 0.0
+            )
+
+            # Phase encoding: 0=descending, 0.5=in 1s, 1=ascending
+            phase_value = 0.0
+            if game_context.phase == 'descending':
+                phase_value = 0.0
+            elif game_context.phase == 'ones':
+                phase_value = 0.5
+            elif game_context.phase == 'ascending':
+                phase_value = 1.0
+            context_features[ctx_offset + 3] = phase_value
+
+            ctx_offset += 4
+
+            # 3. Previous round cards (15 slots, normalized by start_cards)
+            # Store MOST RECENT 15 rounds (truncate older, pad with 0 if <15)
+            # Normalize by start_cards for scaling consistency
+            prev_cards = game_context.previous_cards[-15:]  # Take last 15 rounds
+            for i, card_count in enumerate(prev_cards):
+                if i < 15:
+                    context_features[ctx_offset + i] = (
+                        card_count / game_context.start_cards
+                        if game_context.start_cards > 0 else 0.0
+                    )
+            ctx_offset += 15
+
+            # 4. Game config (2 slots)
+            # - num_players / 8 (max 8 players)
+            # - start_cards / 8 (max 8 starting cards in our configs)
+            context_features[ctx_offset] = game_context.num_players / 8.0
+            context_features[ctx_offset + 1] = game_context.start_cards / 8.0
+            ctx_offset += 2
+
+            # ctx_offset should now be 29 (8 + 4 + 15 + 2)
+            # Remaining 25 dims (29-54) are reserved for future use (zeros)
+
+        state[offset:offset+54] = context_features
+        offset += 54
+
+        # offset should now be 256 (202 base + 54 context)
+        assert offset == 256, f"Expected offset 256, got {offset}"
 
         return state
 

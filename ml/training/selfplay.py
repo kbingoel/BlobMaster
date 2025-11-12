@@ -46,12 +46,122 @@ import json
 import time as _time
 import multiprocessing as mp
 import concurrent.futures
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Tuple
+from dataclasses import dataclass
 
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
 from ml.game.blob import BlobGame, Card
 from ml.mcts.search import ImperfectInfoMCTS
+
+
+@dataclass
+class GameContext:
+    """Synthetic game context for independent rounds (Session 0)."""
+    cumulative_scores: List[int]
+    rounds_completed: int
+    total_rounds: int
+    previous_cards: List[int]
+    num_players: int
+    start_cards: int
+    phase: str  # 'descending', 'ones', 'ascending'
+
+
+# Precomputed decision weights (computed once at module load)
+# These weights represent the decision contribution of each card count
+# in actual full games, used for decision-weighted sampling
+DECISION_WEIGHTS = {
+    (5, 7): {1: 0.132, 2: 0.079, 3: 0.105, 4: 0.132, 5: 0.158, 6: 0.184, 7: 0.211},
+    (4, 8): {1: 0.091, 2: 0.061, 3: 0.073, 4: 0.091, 5: 0.110, 6: 0.128, 7: 0.146, 8: 0.300},
+    (4, 7): {1: 0.125, 2: 0.083, 3: 0.111, 4: 0.139, 5: 0.167, 6: 0.194, 7: 0.181},
+    (6, 7): {1: 0.130, 2: 0.078, 3: 0.104, 4: 0.130, 5: 0.156, 6: 0.182, 7: 0.220},
+}
+
+
+def generate_synthetic_context(
+    num_players: int, num_cards: int, start_cards: int
+) -> GameContext:
+    """
+    Create realistic early/mid/late game context for independent rounds.
+
+    Generates synthetic game context that mimics what would occur at various
+    points in a full multi-round game. This allows the network to learn
+    context-dependent strategy even when training on independent rounds.
+
+    Args:
+        num_players: Number of players (4, 5, or 6)
+        num_cards: Current round's card count (1 to start_cards)
+        start_cards: Starting card count / Maximum cards dealt (7 or 8)
+
+    Returns:
+        GameContext with synthetic scores, round position, and trajectory
+    """
+    # Sample game phase: 30% early, 40% mid, 30% late
+    phase_probs = [0.3, 0.4, 0.3]
+    phase_choice = np.random.choice(['early', 'mid', 'late'], p=phase_probs)
+
+    # Calculate total rounds for this (P, C) configuration
+    # Full game structure: C→(C-1)→...→1→[1×P]→2→...→(C-1)→C
+    # Example 5p/C=7: 7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7 = 17 rounds
+    total_rounds = 2 * start_cards - 1 + num_players
+
+    # Sample rounds_completed based on phase
+    if phase_choice == 'early':
+        # Early game: 0 to 1/3 of total rounds
+        rounds_done = np.random.randint(0, max(1, total_rounds // 3))
+    elif phase_choice == 'mid':
+        # Mid game: 1/3 to 2/3 of total rounds
+        rounds_done = np.random.randint(
+            total_rounds // 3, max(2, 2 * total_rounds // 3)
+        )
+    else:  # late
+        # Late game: 2/3 to total-1 rounds
+        rounds_done = np.random.randint(
+            2 * total_rounds // 3, max(3, total_rounds)
+        )
+
+    # Generate scores consistent with rounds_done and all-or-nothing scoring
+    # Max score per round = 10 + cards_dealt
+    # Average successful score per round ≈ 10 + (start_cards / 2) ≈ 14
+    # Generate scores with realistic variance
+    scores = []
+    for _ in range(num_players):
+        if rounds_done == 0:
+            scores.append(0)
+        else:
+            # Random score: 0 to (rounds_done × 17) with variance
+            # Some players do well, some do poorly
+            max_possible = rounds_done * (10 + start_cards)
+            score = np.random.randint(0, max(1, max_possible + 1))
+            scores.append(score)
+
+    # Build previous round sequence consistent with (P, C, rounds_done)
+    # Full sequence: [C, C-1, ..., 1] + [1]*P + [2, 3, ..., C]
+    descending = list(range(start_cards, 0, -1))
+    ones = [1] * num_players
+    ascending = list(range(2, start_cards + 1))
+    full_sequence = descending + ones + ascending
+
+    # Take the first rounds_done cards from the sequence
+    previous_cards = full_sequence[:rounds_done] if rounds_done > 0 else []
+
+    # Determine phase based on position in sequence
+    if rounds_done < len(descending):
+        phase = 'descending'
+    elif rounds_done < len(descending) + len(ones):
+        phase = 'ones'
+    else:
+        phase = 'ascending'
+
+    return GameContext(
+        cumulative_scores=scores,
+        rounds_completed=rounds_done,
+        total_rounds=total_rounds,
+        previous_cards=previous_cards,
+        num_players=num_players,
+        start_cards=start_cards,
+        phase=phase,
+    )
 
 
 class SelfPlayWorker:
@@ -80,6 +190,7 @@ class SelfPlayWorker:
         use_parallel_expansion: bool = False,
         parallel_batch_size: int = 10,
         must_have_suit_bias: float = 1.0,
+        config: Optional["TrainingConfig"] = None,
     ):
         """
         Initialize self-play worker.
@@ -108,6 +219,8 @@ class SelfPlayWorker:
                                 Recommended: 10 for 32 workers (32×10=320 batch size)
             must_have_suit_bias: Probability multiplier for must-have suits during determinization (default: 1.0)
                                 1.0 = no bias (maximum entropy), higher values = stronger preference
+            config: Optional TrainingConfig for hybrid training (Session 0)
+                   If provided, enables decision-weighted sampling
         """
         self.network = network
         self.encoder = encoder
@@ -121,6 +234,7 @@ class SelfPlayWorker:
         self.use_parallel_expansion = use_parallel_expansion
         self.parallel_batch_size = parallel_batch_size
         self.must_have_suit_bias = must_have_suit_bias
+        self.config = config
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -432,6 +546,58 @@ class SelfPlayWorker:
                 return 0.1  # Near-greedy
 
         return schedule
+
+    def sample_game_config(self) -> Tuple[int, int, int, Optional[GameContext]]:
+        """
+        Sample (num_players, start_cards, num_cards, context) using decision weights.
+
+        Uses decision-weighted sampling when config.use_decision_weighted_sampling is True,
+        otherwise falls back to fixed config values for backward compatibility.
+
+        Returns:
+            Tuple of (num_players, start_cards, num_cards, game_context or None)
+        """
+        # Fallback to fixed config if no config provided or sampling disabled
+        if self.config is None or not self.config.use_decision_weighted_sampling:
+            return (
+                self.config.num_players if self.config else 5,
+                self.config.cards_to_deal if self.config else 5,
+                self.config.cards_to_deal if self.config else 5,
+                None,
+            )
+
+        # 1. Sample player count
+        players = list(self.config.player_distribution.keys())
+        probs = [self.config.player_distribution[p] for p in players]
+        num_players = np.random.choice(players, p=probs)
+
+        # 2. Sample starting cards (conditional on P)
+        if num_players == 4:
+            start_cards = np.random.choice(
+                [7, 8],
+                p=[
+                    self.config.start_card_distribution_4p[7],
+                    self.config.start_card_distribution_4p[8],
+                ],
+            )
+        else:
+            start_cards = 7  # 5p/6p always C=7
+
+        # 3. Sample card count by decision weights
+        weights = DECISION_WEIGHTS.get((num_players, start_cards))
+        if weights is None:
+            # Fallback if combination not precomputed
+            num_cards = start_cards
+        else:
+            card_sizes = list(range(1, start_cards + 1))
+            probs = np.array([weights[c] for c in card_sizes])
+            probs = probs / probs.sum()  # Normalize to ensure sum = 1.0
+            num_cards = np.random.choice(card_sizes, p=probs)
+
+        # 4. Generate synthetic context (Session 1 implementation)
+        context = generate_synthetic_context(num_players, num_cards, start_cards)
+
+        return (num_players, start_cards, num_cards, context)
 
 
 class SelfPlayEngine:

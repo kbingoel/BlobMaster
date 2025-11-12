@@ -66,6 +66,57 @@ class TrainingConfig:
     num_players: int = 4
     cards_to_deal: int = 5
 
+    # Hybrid Training: Player distribution (Session 0)
+    player_distribution: dict = field(default_factory=lambda: {
+        4: 0.15,  # 15% - occasional
+        5: 0.70,  # 70% - YOUR STANDARD
+        6: 0.15,  # 15% - occasional
+    })
+
+    # Hybrid Training: 4p starting cards split (Session 0)
+    start_card_distribution_4p: dict = field(default_factory=lambda: {
+        7: 0.60,  # 60% - standard
+        8: 0.40,  # 40% - when fewer players
+    })
+
+    # Hybrid Training: Use decision-weighted sampling vs fixed (5p, 5c) (Session 0)
+    use_decision_weighted_sampling: bool = False  # Default to False for backward compatibility
+
+    # Hybrid Training: Training mode - controls what games_per_iteration counts (Session 0)
+    training_on: str = "rounds"  # "rounds" (Phase 1) or "games" (Phase 2)
+    # - "rounds": games_per_iteration counts independent rounds (~360 rounds/min)
+    # - "games": games_per_iteration counts full multi-round games (~73 games/min)
+
+    # Hybrid Training: MCTS curriculum schedule (Session 0)
+    # Maps iteration threshold -> (num_determinizations, simulations_per_determinization)
+    mcts_schedule: dict = field(default_factory=lambda: {
+        50: (1, 15),
+        150: (2, 25),
+        300: (3, 35),
+        450: (4, 45),
+        500: (5, 50),
+    })
+
+    def get_mcts_params(self, iteration: int) -> tuple:
+        """
+        Return (num_determinizations, simulations_per_det) for iteration.
+
+        Uses mcts_schedule to determine MCTS parameters based on training iteration.
+        Earlier iterations use lighter MCTS (faster, less accurate), later iterations
+        use heavier MCTS (slower, more accurate).
+
+        Args:
+            iteration: Current training iteration (1-indexed)
+
+        Returns:
+            Tuple of (num_determinizations, simulations_per_determinization)
+        """
+        for threshold, (det, sims) in sorted(self.mcts_schedule.items()):
+            if iteration <= threshold:
+                return (det, sims)
+        # Default to highest if beyond schedule
+        return (5, 50)
+
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert config to dictionary.
@@ -158,6 +209,11 @@ class TrainingConfig:
         if self.cards_to_deal <= 0:
             raise ValueError(
                 f"cards_to_deal must be positive, got {self.cards_to_deal}"
+            )
+
+        if self.training_on not in ('rounds', 'games'):
+            raise ValueError(
+                f"training_on must be 'rounds' or 'games', got {self.training_on}"
             )
 
         return True

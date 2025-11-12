@@ -32,6 +32,7 @@ class Arena:
         num_determinizations: int = 3,
         simulations_per_determinization: int = 50,
         device: str = 'cpu',
+        full_game_mode: bool = False,
     ):
         """
         Initialize arena for model tournaments.
@@ -42,12 +43,25 @@ class Arena:
             num_determinizations: Determinizations per MCTS search
             simulations_per_determinization: MCTS simulations per world
             device: Device to run models on ('cpu' or 'cuda')
+            full_game_mode: Enable full multi-round game evaluation (Session 4, not yet implemented)
+
+        Raises:
+            NotImplementedError: If full_game_mode=True (Session 4 feature)
         """
         self.encoder = encoder
         self.masker = masker
         self.num_determinizations = num_determinizations
         self.simulations_per_determinization = simulations_per_determinization
         self.device = device
+        self.full_game_mode = full_game_mode
+
+        # Session 0: Stub for full-game evaluation (Session 4 will implement)
+        if full_game_mode:
+            raise NotImplementedError(
+                "Full-game evaluation not yet implemented. "
+                "Session 4 will add P-conditional sequences and total-game scoring. "
+                "For now, use full_game_mode=False to evaluate on single rounds."
+            )
 
     def play_match(
         self,
