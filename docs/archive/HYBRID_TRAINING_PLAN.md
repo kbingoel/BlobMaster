@@ -1,4 +1,6 @@
-# Hybrid Training Plan - Implementation Guide
+# Hybrid Training Plan - Implementation Guide (Retired)
+
+> This document is now retired. Please use PROGRESSIVE_TRAINING_STRATEGY.md for the current, standalone training strategy (5 sessions, includes External Monitor & Checkpoint Management). The new plan supersedes Sessions 3–4 herein and consolidates all required background (terminology, distributions, acceptance criteria).
 
 **Goal**: Train Blob AI optimized for 5-player/7-card games using hybrid curriculum approach
 
