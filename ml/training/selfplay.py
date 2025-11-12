@@ -294,6 +294,13 @@ class SelfPlayWorker:
         if game_id is None:
             game_id = str(uuid.uuid4())
 
+        # Sample game configuration if decision-weighted sampling is enabled (Session 2)
+        # This overrides the method parameters with sampled (P, C, c, context)
+        if self.config and self.config.use_decision_weighted_sampling:
+            num_players, start_cards, cards_to_deal, game_context = self.sample_game_config()
+        else:
+            game_context = None  # No context for fixed configuration
+
         # Initialize game
         game = BlobGame(num_players=num_players)
 
@@ -312,14 +319,14 @@ class SelfPlayWorker:
             # Baseline: Use search() if batch_size is None
             if self.use_parallel_expansion:
                 action_probs = self.mcts.search_parallel(
-                    game, player, parallel_batch_size=self.parallel_batch_size
+                    game, player, parallel_batch_size=self.parallel_batch_size, game_context=game_context
                 )
             elif self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
-                    game, player, batch_size=self.batch_size
+                    game, player, batch_size=self.batch_size, game_context=game_context
                 )
             else:
-                action_probs = self.mcts.search(game, player)
+                action_probs = self.mcts.search(game, player, game_context=game_context)
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -328,7 +335,7 @@ class SelfPlayWorker:
             bid = self._select_action(action_probs, temperature)
 
             # Store training example (value will be filled in later)
-            state_tensor = self.encoder.encode(game, player)
+            state_tensor = self.encoder.encode(game, player, game_context)
             policy_vector = self._action_probs_to_vector(action_probs, is_bidding=True)
 
             examples.append(
@@ -355,14 +362,14 @@ class SelfPlayWorker:
             # Baseline: Use search() if batch_size is None
             if self.use_parallel_expansion:
                 action_probs = self.mcts.search_parallel(
-                    game, player, parallel_batch_size=self.parallel_batch_size
+                    game, player, parallel_batch_size=self.parallel_batch_size, game_context=game_context
                 )
             elif self.batch_size is not None:
                 action_probs = self.mcts.search_batched(
-                    game, player, batch_size=self.batch_size
+                    game, player, batch_size=self.batch_size, game_context=game_context
                 )
             else:
-                action_probs = self.mcts.search(game, player)
+                action_probs = self.mcts.search(game, player, game_context=game_context)
 
             # Get temperature for this move
             temperature = self.temperature_schedule(move_number)
@@ -382,7 +389,7 @@ class SelfPlayWorker:
                 card = legal_cards[0]
 
             # Store training example
-            state_tensor = self.encoder.encode(game, player)
+            state_tensor = self.encoder.encode(game, player, game_context)
             policy_vector = self._action_probs_to_vector(
                 action_probs, is_bidding=False
             )

@@ -134,6 +134,7 @@ class MCTS:
         self,
         game_state: BlobGame,
         player: Player,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run MCTS search from current game state.
@@ -145,6 +146,7 @@ class MCTS:
         Args:
             game_state: Current game state to search from
             player: Player whose turn it is (perspective for search)
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Dictionary mapping action index → probability
@@ -170,14 +172,14 @@ class MCTS:
 
         # Run simulations
         for _ in range(self.num_simulations):
-            self._simulate(root)
+            self._simulate(root, game_context)
 
         # Get action probabilities from visit counts
         action_probs = root.get_action_probabilities(self.temperature)
 
         return action_probs
 
-    def _simulate(self, node: MCTSNode) -> float:
+    def _simulate(self, node: MCTSNode, game_context: Optional["GameContext"] = None) -> float:
         """
         Run one MCTS simulation (all 4 phases).
 
@@ -206,7 +208,7 @@ class MCTS:
             value = self._get_terminal_value(current.game_state, current.player)
         else:
             # Expand node and evaluate with neural network
-            value = self._expand_and_evaluate(current)
+            value = self._expand_and_evaluate(current, game_context)
 
         # PHASE 4: BACKPROPAGATION
         # Update visit counts and values back to root
@@ -214,7 +216,7 @@ class MCTS:
 
         return value
 
-    def _expand_and_evaluate(self, node: MCTSNode) -> float:
+    def _expand_and_evaluate(self, node: MCTSNode, game_context: Optional["GameContext"] = None) -> float:
         """
         Expand leaf node and evaluate with neural network.
 
@@ -227,12 +229,13 @@ class MCTS:
 
         Args:
             node: Leaf node to expand
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Value prediction from neural network (normalized to [-1, 1])
         """
         # Encode current state to tensor
-        state_tensor = self.encoder.encode(node.game_state, node.player)
+        state_tensor = self.encoder.encode(node.game_state, node.player, game_context)
 
         # Get legal actions and mask for current game phase
         legal_actions, legal_mask = self._get_legal_actions_and_mask(
@@ -464,6 +467,7 @@ class MCTS:
         game_state: BlobGame,
         player: Player,
         batch_size: int = 8,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run MCTS with batched neural network inference and virtual losses.
@@ -479,6 +483,7 @@ class MCTS:
             batch_size: Number of leaf nodes to evaluate per batch (default: 8)
                        Larger = better GPU utilization but more memory
                        Recommended: 8-16 for training, 90 for self-play
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Action probabilities from visit counts
@@ -523,7 +528,7 @@ class MCTS:
 
             # Batch evaluate all collected leaves (single GPU call!)
             if leaf_nodes:
-                self._batch_expand_and_evaluate(leaf_nodes, use_virtual_loss=True)
+                self._batch_expand_and_evaluate(leaf_nodes, use_virtual_loss=True, game_context=game_context)
 
         # Get action probabilities from visit counts
         return root.get_action_probabilities(self.temperature)
@@ -533,6 +538,7 @@ class MCTS:
         game_state: BlobGame,
         player: Player,
         parallel_batch_size: int = 10,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run MCTS with GPU-batched parallel tree expansion.
@@ -562,6 +568,7 @@ class MCTS:
             parallel_batch_size: Number of leaves to expand per iteration (default: 10)
                                 Larger = larger cross-worker batches but more memory
                                 Recommended: 10 for optimal batch size (32×10=320)
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Action probabilities from visit counts
@@ -585,7 +592,7 @@ class MCTS:
         # Verify we have a shared evaluator for cross-worker batching
         if self.batch_evaluator is None and self.gpu_server_client is None:
             # Fall back to intra-game batching
-            return self.search_batched(game_state, player, batch_size=parallel_batch_size)
+            return self.search_batched(game_state, player, batch_size=parallel_batch_size, game_context=game_context)
 
         # Create root node
         root = MCTSNode(
@@ -603,16 +610,16 @@ class MCTS:
 
         # Run parallel expansion iterations
         for _ in range(num_iterations):
-            self._expand_parallel(root, parallel_batch_size)
+            self._expand_parallel(root, parallel_batch_size, game_context)
 
         # Handle remainder simulations
         if remainder > 0:
-            self._expand_parallel(root, remainder)
+            self._expand_parallel(root, remainder, game_context)
 
         # Get action probabilities from visit counts
         return root.get_action_probabilities(self.temperature)
 
-    def _expand_parallel(self, root: MCTSNode, batch_size: int) -> None:
+    def _expand_parallel(self, root: MCTSNode, batch_size: int, game_context: Optional["GameContext"] = None) -> None:
         """
         Expand multiple leaves in parallel using virtual loss.
 
@@ -655,7 +662,7 @@ class MCTS:
         # This calls batch_evaluator or gpu_server_client, which accumulates
         # requests from multiple workers and batches them into single GPU call
         if leaf_nodes:
-            self._batch_expand_and_evaluate(leaf_nodes, use_virtual_loss=True)
+            self._batch_expand_and_evaluate(leaf_nodes, use_virtual_loss=True, game_context=game_context)
 
     def _traverse_to_leaf(self, root: MCTSNode, use_virtual_loss: bool = False) -> Optional[MCTSNode]:
         """
@@ -695,7 +702,7 @@ class MCTS:
 
         return node
 
-    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode], use_virtual_loss: bool = False) -> None:
+    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode], use_virtual_loss: bool = False, game_context: Optional["GameContext"] = None) -> None:
         """
         Expand and evaluate multiple nodes in batch.
 
@@ -707,6 +714,7 @@ class MCTS:
         Args:
             nodes: List of leaf nodes to evaluate
             use_virtual_loss: If True, remove virtual losses after backpropagation
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Example:
             >>> leaves = [node1, node2, node3]
@@ -722,7 +730,7 @@ class MCTS:
         legal_actions_list = []
 
         for node in nodes:
-            state = self.encoder.encode(node.game_state, node.player)
+            state = self.encoder.encode(node.game_state, node.player, game_context)
             legal_actions, mask = self._get_legal_actions_and_mask(
                 node.game_state, node.player
             )
@@ -889,6 +897,7 @@ class ImperfectInfoMCTS:
         game_state: BlobGame,
         player: Player,
         belief: Optional["BeliefState"] = None,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run imperfect information MCTS search.
@@ -901,6 +910,7 @@ class ImperfectInfoMCTS:
             game_state: Current game state (with hidden hands)
             player: Player whose turn it is
             belief: Belief state (will be created if None)
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Dictionary mapping action → probability
@@ -928,7 +938,7 @@ class ImperfectInfoMCTS:
 
         if not determinizations:
             # Fall back to single MCTS on original state if sampling fails
-            return self.perfect_info_mcts.search(game_state, player)
+            return self.perfect_info_mcts.search(game_state, player, game_context)
 
         # Aggregate action counts across determinizations
         aggregated_counts: Dict[int, int] = {}
@@ -940,7 +950,7 @@ class ImperfectInfoMCTS:
             )
 
             # Run MCTS on this determinization
-            action_probs = self.perfect_info_mcts.search(det_game, player)
+            action_probs = self.perfect_info_mcts.search(det_game, player, game_context)
 
             # Accumulate visit counts (approximate from probabilities)
             for action, prob in action_probs.items():
@@ -953,7 +963,7 @@ class ImperfectInfoMCTS:
 
         if total_counts == 0:
             # No valid actions found, fall back
-            return self.perfect_info_mcts.search(game_state, player)
+            return self.perfect_info_mcts.search(game_state, player, game_context)
 
         action_probs = {
             action: count / total_counts
@@ -972,6 +982,7 @@ class ImperfectInfoMCTS:
         player: Player,
         batch_size: int = 8,
         belief: Optional["BeliefState"] = None,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run imperfect information MCTS with batched inference (Phase 1 + 2 + 3).
@@ -985,6 +996,7 @@ class ImperfectInfoMCTS:
             player: Player whose turn it is
             batch_size: Batch size for Phase 1 intra-game batching
             belief: Belief state (will be created if None)
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Action probabilities aggregated across determinizations
@@ -1006,7 +1018,7 @@ class ImperfectInfoMCTS:
 
         if not determinizations:
             # Fall back to single MCTS on original state if sampling fails
-            return self.perfect_info_mcts.search_batched(game_state, player, batch_size)
+            return self.perfect_info_mcts.search_batched(game_state, player, batch_size, game_context)
 
         # Aggregate action counts across determinizations
         aggregated_counts: Dict[int, int] = {}
@@ -1019,7 +1031,7 @@ class ImperfectInfoMCTS:
 
             # Run MCTS with Phase 1 batching on this determinization
             action_probs = self.perfect_info_mcts.search_batched(
-                det_game, player, batch_size
+                det_game, player, batch_size, game_context
             )
 
             # Accumulate visit counts (approximate from probabilities)
@@ -1033,7 +1045,7 @@ class ImperfectInfoMCTS:
 
         if total_counts == 0:
             # No valid actions found, fall back
-            return self.perfect_info_mcts.search_batched(game_state, player, batch_size)
+            return self.perfect_info_mcts.search_batched(game_state, player, batch_size, game_context)
 
         action_probs = {
             action: count / total_counts
@@ -1052,6 +1064,7 @@ class ImperfectInfoMCTS:
         player: Player,
         parallel_batch_size: int = 10,
         belief: Optional["BeliefState"] = None,
+        game_context: Optional["GameContext"] = None,
     ) -> Dict[int, float]:
         """
         Run imperfect information MCTS with GPU-batched parallel expansion.
@@ -1082,6 +1095,7 @@ class ImperfectInfoMCTS:
             parallel_batch_size: Number of leaves to expand per iteration (default: 10)
                                 Recommended: 10 for optimal cross-worker batching
             belief: Belief state (will be created if None)
+            game_context: Optional game context (scores, round index, etc.) for hybrid training
 
         Returns:
             Action probabilities aggregated across determinizations
@@ -1114,7 +1128,7 @@ class ImperfectInfoMCTS:
         # Verify we have a shared evaluator for cross-worker batching
         if self.batch_evaluator is None and self.gpu_server_client is None:
             # Fall back to intra-game batching
-            return self.search_batched(game_state, player, parallel_batch_size, belief)
+            return self.search_batched(game_state, player, parallel_batch_size, belief, game_context)
 
         # Create belief state if not provided
         if belief is None:
@@ -1131,7 +1145,7 @@ class ImperfectInfoMCTS:
         if not determinizations:
             # Fall back to single MCTS on original state if sampling fails
             return self.perfect_info_mcts.search_parallel(
-                game_state, player, parallel_batch_size
+                game_state, player, parallel_batch_size, game_context
             )
 
         # Aggregate action counts across determinizations
@@ -1148,7 +1162,7 @@ class ImperfectInfoMCTS:
             # parallel_batch_size leaves, and across all workers these get
             # batched together by the shared GPU server
             action_probs = self.perfect_info_mcts.search_parallel(
-                det_game, player, parallel_batch_size
+                det_game, player, parallel_batch_size, game_context
             )
 
             # Accumulate visit counts (approximate from probabilities)
@@ -1163,7 +1177,7 @@ class ImperfectInfoMCTS:
         if total_counts == 0:
             # No valid actions found, fall back
             return self.perfect_info_mcts.search_parallel(
-                game_state, player, parallel_batch_size
+                game_state, player, parallel_batch_size, game_context
             )
 
         action_probs = {
