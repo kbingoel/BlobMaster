@@ -15,15 +15,38 @@
 
 ---
 
+## Terminology
+
+**IMPORTANT:** This document uses specific terminology consistently:
+
+- **Round**: A single bidding + trick-taking cycle with a fixed number of cards dealt (e.g., one 5-card round)
+- **Game**: ALWAYS refers to a complete Blob game with the full sequence of rounds (e.g., 17 rounds for 5p/C=7)
+
+**Notation (P,C,c):**
+- **P** = Number of players (e.g., 4, 5, or 6 players)
+- **C** = Starting card count / Maximum cards dealt (e.g., C=7 or C=8)
+- **c** = Current round's card count (e.g., c=1, c=2, ... c=7)
+- Example: "5p/C=7" means 5 players starting with 7 cards, playing rounds: 7→6→5→4→3→2→1→1→1→1→1→2→3→4→5→6→7
+
+**Throughput Metrics:**
+- **rounds/min**: Independent single-round throughput (Phase 1: ~360 rounds/min with optimized MCTS curriculum)
+- **games/min**: Full multi-round game throughput (Phase 2: ~73 games/min, varies with MCTS settings)
+
+**Training Phases:**
+- **Phase 1**: Independent rounds with decision-weighted sampling and synthetic game context
+- **Phase 2**: Full multi-round game sequences with natural game context
+
+---
+
 ## Core Strategy
 
 ### The Problem
-- Current: Trains on fixed 5-card rounds only → catastrophic failure on 1-3 card rounds
+- Current: Trains on fixed 5-card rounds only → potentially catastrophic failure on 1-3 card rounds
 - Actual games vary by player count:
   - 5p/C=7: 7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7 (47% of rounds are 1c)
   - 4p/C=8: 8,7,6,5,4,3,2,1,1,1,1,2,3,4,5,6,7,8 (28% are 1c)
   - But decision points ≠ round counts: 7c has P×(7+1) decisions, 1c has P×(1+1)
-- All-or-nothing scoring: 1-card round = 11 pts max, 7-card round = 17 pts max (minimal difference)
+- All-or-nothing scoring: 1-card round = 11 pts max, 7-card round = 17 pts max (difference minimal compared to complexity increase)
 
 ### The Solution: Hybrid Curriculum with Decision-Weighted Sampling
 **Phase 1** (400-500 iter, ~4.6-5.8 days): Independent rounds + game context → fast foundation
@@ -60,7 +83,7 @@
 
 **Session 3 (4h)**: MCTS curriculum & CLI
 - Wire `config.get_mcts_params(iteration)` into `TrainingPipeline`
-- Add `--phase`, `--iterations` CLI args to `train.py`
+- Add `--training-on`, `--iterations` CLI args to `train.py`
 - Validate end-to-end pipeline with `--fast` mode
 
 **Session 4 (4h) - OPTIONAL**: Full games & evaluation
@@ -108,6 +131,12 @@ class TrainingConfig:
 
     # NEW: Use decision-weighted sampling vs fixed (5p, 5c)
     use_decision_weighted_sampling: bool = True
+
+    # NEW: Training mode - controls what games_per_iteration counts
+    # TODO: Add this parameter to ml/config.py
+    training_on: str = "rounds"  # "rounds" (Phase 1) or "games" (Phase 2)
+    # - "rounds": games_per_iteration counts independent rounds (~360 rounds/min)
+    # - "games": games_per_iteration counts full multi-round games (~73 games/min)
 
     # NEW: MCTS curriculum schedule (iteration → (det, sims))
     mcts_schedule: dict = field(default_factory=lambda: {
@@ -281,6 +310,28 @@ for i in [1, 50, 100, 250, 400, 500]:
     print(f'  Iter {i}: {det} det × {sims} sims')
 "
 
+# TODO: Verify training_on parameter validation
+python -c "
+from ml.config import TrainingConfig
+
+# Test default value
+config = TrainingConfig()
+assert config.training_on == 'rounds', f'Expected default \"rounds\", got {config.training_on}'
+print(f'Default training_on: {config.training_on} ✓')
+
+# Test valid values
+config.training_on = 'games'
+assert config.training_on == 'games'
+print(f'training_on=\"games\" accepted ✓')
+
+# TODO: Add validation in config that raises ValueError for invalid values
+# try:
+#     config.training_on = 'invalid'
+#     assert False, 'Should have raised ValueError'
+# except ValueError:
+#     print('Invalid training_on rejected ✓')
+"
+
 # Verify encoder accepts context parameter (returns zeros for now)
 python -c "
 from ml.network.encode import StateEncoder
@@ -299,6 +350,7 @@ print(f'Context dims [202:256]: all zeros = {(encoding[202:] == 0).all()} ✓')
 
 **Acceptance criteria**:
 - ✅ `TrainingConfig` has `player_distribution`, `start_card_distribution_4p`, `use_decision_weighted_sampling`
+- ✅ `TrainingConfig` has `training_on` parameter (default "rounds", accepts "rounds" or "games")
 - ✅ `SelfPlayWorker.sample_game_config()` returns (P, C, c, context) sampled by decision weights
 - ✅ Distribution tests pass: 70% 5p ±5%, 15% 4p ±5%, 15% 6p ±5% over 1000 samples
 - ✅ `StateEncoder.encode()` accepts optional `game_context` parameter
@@ -405,10 +457,16 @@ python -m pytest ml/network/test_network.py::TestStateEncoder::test_game_context
 
 **Prerequisite**: Session 0+1 complete - `sample_game_config()` and `generate_synthetic_context()` exist
 
+**Note on training_on parameter**: This session implements `training_on="rounds"` mode (Phase 1). Session 4 implements `training_on="games"` mode (Phase 2).
+
 **Files to modify**:
 - `ml/training/selfplay.py` - SelfPlayWorker.play_round() (call sample_game_config)
 - `ml/training/trainer.py` - Pass sampled config through pipeline
 - All encoder call sites - Pass `game_context` parameter
+
+**TODO**: When implementing, add conditional logic based on `config.training_on`:
+- `training_on="rounds"`: Use `play_round()` method (this session)
+- `training_on="games"`: Use `FullGameGenerator` (Session 4)
 
 **Wire sampling into training loop**:
 ```python
@@ -518,7 +576,9 @@ python -m pytest ml/training/test_training.py::TestSelfPlay::test_4p_start_cards
 
 **Files to modify**:
 - `ml/training/trainer.py` - Call `config.get_mcts_params(iteration)` to vary MCTS intensity
-- `ml/train.py` - Add `--phase`, `--iterations` CLI args
+- `ml/train.py` - Add `--training-on`, `--iterations` CLI args
+
+**TODO**: Update references to use `training_on` parameter instead of `--phase`
 
 **Wire MCTS curriculum into training loop**:
 ```python
@@ -537,6 +597,9 @@ class TrainingPipeline:
             self.config.simulations_per_determinization = sims_per_det
 
             # Run self-play with updated MCTS params
+            # TODO: Add conditional based on config.training_on:
+            #   - training_on="rounds": Generate independent rounds (games_per_iteration = rounds)
+            #   - training_on="games": Generate full multi-round games (games_per_iteration = games)
             games = self.self_play_engine.generate_games(self.config.games_per_iteration)
 
             # NEW: Distribution sanity logging (every 10 iterations)
@@ -563,14 +626,20 @@ class TrainingPipeline:
                 f"Player {p}: {actual_pct:.1%} vs target {target_pct:.1%}"
 ```
 
-**Add Phase 1/2 CLI args**:
+**Add training_on CLI arg**:
 ```python
 # In ml/train.py
+# TODO: Replace --phase with --training-on for clarity
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--phase', type=int, choices=[1, 2], default=1,
-                        help='Phase 1: independent rounds, Phase 2: full games')
+    parser.add_argument(
+        '--training-on',
+        type=str,
+        choices=['rounds', 'games'],
+        default='rounds',
+        help='Train on independent rounds (Phase 1) or full multi-round games (Phase 2)'
+    )
     parser.add_argument('--iterations', type=int, default=400,
                         help='Number of training iterations')
     parser.add_argument('--fast', action='store_true',
@@ -593,9 +662,9 @@ def main():
     # Load config
     config = get_production_config() if not args.fast else get_fast_config()
 
-    # Phase 2: Use full-game generation (Session 4 implements this)
-    if args.phase == 2:
-        config.use_full_game_mode = True  # Session 4 adds this flag
+    # Override training_on from CLI (Session 4 implements "games" mode)
+    if args.training_on:
+        config.training_on = args.training_on
 
     # Run training
     pipeline = TrainingPipeline(config)
@@ -605,23 +674,24 @@ def main():
 **Testing**:
 ```bash
 # Fast integration test (validates pipeline end-to-end)
-python ml/train.py --fast --phase 1 --iterations 5
+python ml/train.py --fast --training-on rounds --iterations 5
 ```
 
 **Acceptance**: 5-iteration test run completes successfully with varied card counts in logs
 
 ---
 
-### Session 4: Phase 2 Full Games & Evaluation (4 hours) [OPTIONAL]
+### Session 4: Full Games Mode (training_on="games") & Evaluation (4 hours) [OPTIONAL]
 
-**Goal**: Implement full-game generation and evaluation (stubbed in Session 0)
+**Goal**: Implement `training_on="games"` mode for full multi-round game generation and evaluation
 
-**Prerequisite**: Session 0-3 complete - Phase 1 training working
+**Prerequisite**: Session 0-3 complete - `training_on="rounds"` mode working
 
 **Files to modify**:
 - `ml/training/selfplay.py` - Implement `FullGameGenerator` class
 - `ml/evaluation/arena.py` - Implement `full_game_mode=True` (remove NotImplementedError)
-- `ml/config.py` - Add `use_full_game_mode` flag
+
+**TODO**: When `config.training_on="games"`, use `FullGameGenerator` instead of `play_round()`
 
 **Implementation** (P-conditional sequences):
 ```python
@@ -667,7 +737,7 @@ class FullGameGenerator:
 
 **Testing**:
 ```bash
-python ml/train.py --fast --phase 2 --iterations 2  # Test full game generation
+python ml/train.py --fast --training-on games --iterations 2  # Test full game generation
 ```
 
 **Acceptance**: Full games generated correctly with proper score accumulation
@@ -678,11 +748,12 @@ python ml/train.py --fast --phase 2 --iterations 2  # Test full game generation
 
 ### Phase 1: Independent Rounds + Context (REQUIRED)
 ```bash
-python ml/train.py --phase 1 --iterations 400
+python ml/train.py --training-on rounds --iterations 400
 ```
 - **Time**: ~4.6 days
 - **Output**: `models/checkpoints/phase1_best.pth`
 - **Expected ELO**: ~1400-1600 (solid play across all card counts)
+- **Note**: `--training-on rounds` means `games_per_iteration` counts individual rounds (~360 rounds/min)
 
 ### Evaluation Checkpoint
 Test model on full games using existing arena:
@@ -714,11 +785,12 @@ print(f'Context-aware: {results.shows_context_strategy}')
 
 ### Phase 2: Full Games (OPTIONAL)
 ```bash
-python ml/train.py --phase 2 --iterations 100 --resume models/checkpoints/phase1_best.pth
+python ml/train.py --training-on games --iterations 100 --resume models/checkpoints/phase1_best.pth
 ```
 - **Time**: ~10 days
 - **Output**: `models/checkpoints/phase2_best.pth`
 - **Expected ELO**: ~1700-1900 (near-optimal game score maximization)
+- **Note**: `--training-on games` means `games_per_iteration` counts full multi-round games (~73 games/min)
 
 ---
 
@@ -811,21 +883,21 @@ pip install -r ml/requirements.txt
 python -c "..."  # See Session 0 Testing section - verify sampling/schedule/encoder wiring
 python -m pytest ml/network/test_network.py  # After Session 1 - context features populated
 python -m pytest ml/training/test_training.py  # After Session 2 - distribution tests pass
-python ml/train.py --fast --phase 1 --iterations 5  # After Session 3 - end-to-end pipeline
+python ml/train.py --fast --training-on rounds --iterations 5  # After Session 3 - end-to-end pipeline
 
 # Full training (after all sessions)
-python ml/train.py --phase 1 --iterations 400  # Short Phase 1 (~4.6 days)
-python ml/train.py --phase 1 --iterations 500  # Long Phase 1 (~5.8 days)
+python ml/train.py --training-on rounds --iterations 400  # Short Phase 1 (~4.6 days)
+python ml/train.py --training-on rounds --iterations 500  # Long Phase 1 (~5.8 days)
 
 # Checkpoint evaluation (using extended arena.py)
 python -c "from ml.evaluation.arena import ModelArena; ..."  # See Evaluation section
 
 # Phase 2 (optional, only if Phase 1 evaluation shows need)
-python ml/train.py --phase 2 --iterations 100  # ~10 days
+python ml/train.py --training-on games --iterations 100  # ~10 days
 
-# Monitoring
-tensorboard --logdir=runs/  # If tensorboard installed
-tail -f logs/training.log  # Watch progress
+# Monitoring (External Monitor approach)
+python ml/monitor.py  # Live progress dashboard (press 'p' to pause, 'q' to quit)
+tail -f runs/training.log  # Alternative: watch raw logs
 ```
 
 ---
@@ -870,6 +942,500 @@ def compute_decision_weights(num_players, start_cards, iteration=0):
 
 ---
 
+## External Monitor & Checkpoint Management (Optional Enhancement)
+
+**Status**: Documentation only - not yet implemented
+
+**Goal**: Add external monitoring with live progress display and improve checkpoint management with iteration-boundary pause/resume capability. Core training works without this; it enhances operational visibility and checkpoint efficiency.
+
+**Approach**: External Monitor (two-process, file-based communication)
+- Training writes status.json for progress updates
+- Monitor reads status.json and displays live dashboard
+- Control signals via control.signal file for pause requests
+- No web server, no threading, no IPC complexity
+
+**Estimated Effort**: ~8 hours implementation
+
+---
+
+### A. Checkpoint Rotation & ELO (Permanent + Cache)
+
+**Problem**: Current implementation saves checkpoints every 10 iterations with no cleanup, leading to unbounded disk growth (~25-50GB for 500 iterations).
+
+**Solution**: Two-tier checkpoint system with automatic rotation.
+
+**Permanent Checkpoints** (iterations 5, 10, 15, 20, ...):
+- Path: `models/checkpoints/permanent/checkpoint_iter_{N}.pth`
+- Saved when `(iteration + 1) % 5 == 0`
+- **Filename convention**: 1-based (checkpoint_iter_5.pth, checkpoint_iter_10.pth, etc.)
+  - Internal iteration index is 0-based (0, 1, 2, ...)
+  - Example: internal iteration index 4 → filename checkpoint_iter_5.pth
+  - Example: internal iteration index 19 → filename checkpoint_iter_20.pth
+- Never deleted automatically
+- Triggers ELO evaluation
+- Contents: model + optimizer + scheduler state
+
+**Cached Checkpoints** (iterations 1, 2, 3, 4, 6, 7, 8, 9, ...):
+- Path: `models/checkpoints/cache/checkpoint_iter_{N}.pth`
+- Max 4 files at any time
+- **Pruning timing**: When saving a cache checkpoint, prune oldest immediately (FIFO behavior)
+  - Cache never exceeds 4 files, even between permanent saves
+- When permanent checkpoint created: clear entire cache
+- Contents: model + optimizer + scheduler state (same as permanent)
+
+**Replay Buffer Handling:**
+- Remove replay buffer persistence from `ml/training/trainer.py:906`
+- On resume: buffer starts empty and refills naturally during self-play
+- Code already handles missing buffer gracefully (verified in agent exploration)
+
+**Storage Efficiency:**
+- 500 iterations = 100 permanent + max 4 cache (~50GB total)
+  - **Note**: Estimate depends on model size (~4.9M parameters) and optimizer state
+  - Allow users to strip optimizer from older permanents later if disk becomes tight
+- vs current: 50 checkpoints saved every 10 iterations (unbounded growth)
+- More granular resume capability (every iteration vs every 10)
+- More frequent ELO tracking (every 5 vs every 10)
+
+---
+
+### B. Status File for Progress Tracking
+
+**File**: `models/checkpoints/status.json`
+
+**Purpose**: Real-time progress updates for external monitor
+
+**Fields**:
+```json
+{
+  "iteration": 42,
+  "phase": "selfplay",
+  "games_done": 2500,
+  "games_total": 10000,
+  "progress_pct": 25.0,
+  "started_at": "2025-11-12T14:00:00",
+  "elapsed_sec": 90,
+  "eta_sec": 270,
+  "status": "running",
+  "latest_permanent_iter": 40,
+  "latest_permanent_elo": 1245.0,
+  "elo_delta": 12.0,
+  "games_per_min": 36.7,
+  "buffer_warming": false
+}
+```
+
+**Update Cadence**:
+- On every phase transition (atomic write to .tmp then os.replace())
+- During self-play via progress callback (throttle to every 5-10 sec)
+- Before/after pause operations
+
+**StatusWriter class** (~40 lines in `ml/training/trainer.py`):
+- Atomic writes (write to .tmp, then os.replace() to status.json)
+  - **Pattern**: Write to `.json.tmp`, then use `os.replace()` (atomic within same filesystem)
+  - **Apply to all JSON files**: status.json, elo_history.json, metrics_history.json
+- Thread-safe updates from progress callbacks
+- Handles missing fields gracefully
+
+---
+
+### C. Control Signal for Pause/Resume
+
+**File**: `models/checkpoints/control.signal`
+
+**Format**: JSON with action command
+```json
+{"action": "pause"}
+```
+
+**Handling** (in `TrainingPipeline.run_training()`):
+- Check for control.signal at end of each iteration
+- If exists and contains `{"action": "pause"}`: delete file immediately and exit loop gracefully
+- Only act at iteration boundary (never mid-iteration)
+- Training saves checkpoint before exiting
+
+**Why Iteration-Boundary Only**:
+- No complex worker coordination required
+- No mid-iteration state persistence needed
+- Acceptable wait time: max ~4 minutes per iteration (Medium MCTS)
+- Clean checkpoint state
+
+---
+
+### D. External Monitor Script
+
+**File**: `ml/monitor.py` (~200 lines)
+
+**Dependencies**:
+- **Preferred**: `rich` library for beautiful terminal UI
+- **Fallback**: Plain text output if rich not installed
+
+**Data Sources** (file-based, no IPC):
+1. **Primary**: `models/checkpoints/status.json` (phase, progress, ETA)
+2. **Metrics**: `models/checkpoints/metrics_history.json` (last 5 iterations)
+3. **ELO**: `models/checkpoints/elo_history.json` (progression)
+4. **Logs**: Optional tail of `runs/training.log`
+   - **Note**: Many progress messages use `print()` (not logging module)
+   - `runs/training.log` will not contain print() output unless redirected
+   - Rely primarily on status.json and metrics_history.json for monitoring
+
+**Display Format** (live-updating, overwriting):
+```
+═══════════════════════════════════════════════════
+ BlobMaster Training Monitor
+═══════════════════════════════════════════════════
+ Status: Running | Iteration: 42/500 | Phase: selfplay
+ Progress: [████████████░░░░░░░░] 60% (6,000/10,000 games)
+ Elapsed: 1m 30s | ETA: 1m 00s
+
+ Latest Permanent: Iter 40 | ELO: 1,245 (+12 since iter 35)
+
+ Recent Metrics (last 5 iterations):
+   Iter 41: Loss=2.34 | Win Rate=0.56 | Time=2.1m
+   Iter 40: Loss=2.41 | Win Rate=0.54 | Time=2.3m (PROMOTED)
+   ...
+
+ Controls: [p]ause after iteration | [q]uit monitor
+═══════════════════════════════════════════════════
+```
+
+**Keyboard Controls** (non-blocking):
+- `p`: Write `{"action": "pause"}` to control.signal
+- `q`: Exit monitor (training continues)
+- Non-blocking input: Use `select`/`termios` (Unix) or `msvcrt` (Windows)
+- UI refreshes every 1 second regardless
+
+**Atomic Reads**:
+- Handle missing/partial files gracefully (retry next refresh)
+- Cache last valid state if file temporarily unavailable
+
+---
+
+### E. ELO Evaluation (Every 5th Iteration Only)
+
+**Current State**: ELO evaluation runs every 5 iterations (`eval_frequency=5` in config).
+
+**Change**: Evaluation only runs for **permanent checkpoints** (when checkpoint will be kept long-term).
+
+**Modify `ml/training/trainer.py._evaluation_phase()`:**
+```python
+def _evaluation_phase(self, iteration: int) -> dict:
+    """Run evaluation only on permanent checkpoint iterations."""
+    if (iteration + 1) % 5 != 0:
+        logger.info(f"Skipping evaluation (not a permanent checkpoint iteration)")
+        return {"eval_performed": False, "reason": "skipped_non_permanent"}
+
+    # Run evaluation arena, update ELO, check promotion
+    # ... existing evaluation logic ...
+```
+
+**ELO History:**
+- Only permanent checkpoints have ELO ratings
+- `models/checkpoints/elo_history.json` contains permanent checkpoint progression only
+- Monitor displays latest permanent ELO + delta from previous permanent
+- Cached checkpoints have no ELO (they're deleted within 5 iterations anyway)
+
+**Why This Works:**
+- Aligns ELO tracking with checkpoint retention policy
+- Reduces evaluation overhead (still every 5 iterations, just more explicit)
+- Cleaner metrics history (no ELO for transient checkpoints)
+
+---
+
+### F. Implementation Changes
+
+**New Files to Create:**
+
+1. **`ml/monitor.py`** (~200 lines)
+   - Main monitor script with rich UI or plain fallback
+   - File watching for status.json, metrics_history.json, elo_history.json
+   - Non-blocking keyboard input handler
+   - Control signal writer (on 'p' keypress)
+   - Auto-refresh loop (1 second intervals)
+
+**Files to Modify:**
+
+1. **`ml/training/trainer.py`** (TrainingPipeline class):
+
+   **Add StatusWriter class** (~40 lines):
+   ```python
+   class StatusWriter:
+       """Atomic status file writer for external monitoring."""
+       def __init__(self, checkpoint_dir: str):
+           self.status_path = Path(checkpoint_dir) / "status.json"
+
+       def update(self, **fields):
+           """Atomic write to status.json."""
+           # Write to temp file then atomic replace
+           tmp_path = self.status_path.with_suffix('.json.tmp')
+           with open(tmp_path, 'w') as f:
+               json.dump(fields, f, indent=2)
+           os.replace(tmp_path, self.status_path)
+   ```
+
+   **Modify `run_training()` method**:
+   - Add control signal check at end of each iteration
+   - Update status.json at phase boundaries
+   - Call `_check_pause_signal()` after checkpoint phase
+   - Exit loop gracefully if pause requested
+
+   **Add `_check_pause_signal()` method** (~15 lines):
+   - Read `control.signal` file
+   - If exists and valid JSON with `{"action": "pause"}`: delete and return True
+   - Handle missing/malformed files gracefully
+
+   **Update `_selfplay_phase()` method**:
+   - Enhance progress callback to update status.json every 5-10 sec
+   - Track `last_update` timestamp to throttle
+   - Update fields: games_done, progress_pct, eta_sec
+
+   **Update `_checkpoint_phase()` method**:
+   - Use (iteration+1) % 5 == 0 for permanent checkpoints
+   - Cache checkpoints for iterations not divisible by 5
+   - Prune oldest cache to keep ≤4 files
+   - Don't save replay buffer (remove line ~906)
+
+2. **`CLAUDE.md`** (Training section):
+   - Add External Monitor usage examples
+   - Document two-terminal workflow (tmux + monitor)
+
+3. **`HYBRID_TRAINING_PLAN.md`** (this file):
+   - Replace entire "Web Monitoring" section with External Monitor approach
+   - Update usage examples to show monitor.py
+   - Update testing section
+
+**No Changes Needed**:
+- `ml/training/selfplay.py` (workers unaffected by iteration-boundary pause)
+- `ml/game/blob.py`, `ml/mcts/`, `ml/network/` (core logic unchanged)
+- `ml/evaluation/arena.py` (evaluation logic unchanged)
+- `ml/train.py` (no Flask integration, no --web flag)
+
+---
+
+### G. Usage Examples
+
+**Start training in tmux:**
+```bash
+# Terminal 1: Start training
+tmux new -s blob_training
+python ml/train.py --iterations 500
+# Ctrl+B, D to detach
+```
+
+**Attach monitor anytime:**
+```bash
+# Terminal 2: Monitor progress
+python ml/monitor.py
+# Press 'p' to pause after current iteration
+# Press 'q' to exit monitor (training continues)
+```
+
+**Reconnect after SSH drop:**
+```bash
+# SSH dropped? Reconnect and attach to tmux
+tmux attach -t blob_training
+
+# Or just attach monitor to running training
+python ml/monitor.py  # Picks up status immediately
+```
+
+**Resume from paused state:**
+```bash
+# Training paused itself after seeing control signal
+# Simply restart with --resume
+python ml/train.py --iterations 500 --resume models/checkpoints/checkpoint_iter_42.pth
+# This resumes from internal iteration index 42 (the next iteration after file label 42)
+# Matches ml/training/trainer.py:980 resume logic
+```
+
+---
+
+### H. Implementation Order
+
+**Phase 1: Backend Infrastructure** (~4 hours)
+
+1. **StatusWriter class** (~1 hour)
+   - Create StatusWriter in trainer.py
+   - Implement atomic write logic
+   - Test with manual updates
+
+2. **Update TrainingPipeline** (~2 hours)
+   - Add status.json updates at phase boundaries
+   - Integrate progress callback throttling
+   - Add control signal checking
+   - Remove replay buffer save
+   - Test with --fast --iterations 5
+
+3. **Checkpoint rotation** (~1 hour)
+   - Implement (iteration+1) % 5 logic
+   - Add cache pruning
+   - Test with --fast --iterations 15
+
+**Phase 2: External Monitor** (~3 hours)
+
+4. **Monitor script MVP** (~2 hours)
+   - Create ml/monitor.py with plain text output
+   - Implement file watching (status.json, metrics_history.json)
+   - Add basic display loop (no rich yet)
+   - Test with running training
+
+5. **Rich UI enhancement** (~1 hour)
+   - Add rich library conditional import
+   - Implement fancy progress bars and panels
+   - Add keyboard input handling (p/q keys)
+   - Test pause/resume workflow
+
+**Phase 3: Documentation & Testing** (~1 hour)
+
+6. **Documentation updates**
+   - Update CLAUDE.md with monitor examples
+   - Update HYBRID_TRAINING_PLAN.md (this section)
+   - Add docstrings to monitor.py
+
+7. **Integration testing**
+   - Test 10-iteration run with monitor attached/detached
+   - Test pause at various points
+   - Test tmux detach/reattach workflow
+
+**Total Estimated Effort:** ~8 hours
+
+---
+
+### I. Testing Plan
+
+**Unit Tests**:
+1. **StatusWriter atomic writes**:
+   - Test that partial writes are never visible
+   - Test concurrent updates from multiple threads
+   - Test handling of missing directory
+
+2. **Control signal handling**:
+   - Test pause signal read and delete
+   - Test malformed JSON handling
+   - Test missing file handling
+
+**Integration Tests**:
+
+3. **Checkpoint rotation over 20 iterations:**
+   ```bash
+   python ml/train.py --fast --iterations 20
+   # Verify:
+   # - Internal iteration indices 4, 9, 14, 19 produce files checkpoint_iter_5.pth, 10, 15, 20 (permanent)
+   # - Filenames are 1-based while internal iteration is 0-based
+   # - Cache has max 4 files between permanent saves
+   # - No replay buffer files exist
+   ```
+
+4. **Monitor attachment/detachment:**
+   ```bash
+   # Terminal 1: Start training
+   python ml/train.py --iterations 100 &
+
+   # Terminal 2: Attach monitor
+   python ml/monitor.py
+   # Verify live updates
+
+   # Kill monitor (Ctrl+C)
+   # Restart monitor
+   python ml/monitor.py
+   # Verify reconnects and displays current state
+   ```
+
+5. **Pause/resume flow:**
+   ```bash
+   # Start training
+   python ml/train.py --iterations 100 &
+
+   # Attach monitor and press 'p' after iteration 5
+   python ml/monitor.py
+   # Verify: training completes iteration 5, then pauses
+
+   # Resume from checkpoint
+   python ml/train.py --iterations 100 --resume models/checkpoints/checkpoint_iter_6.pth
+   # Verify: continues from iteration 6
+   # Note: Resuming from checkpoint_iter_6.pth starts from internal iteration index 6
+   #       (i.e., the next iteration after file label 6)
+   ```
+
+6. **tmux workflow:**
+   ```bash
+   # Start in tmux
+   tmux new -s test
+   python ml/train.py --fast --iterations 10
+   # Detach: Ctrl+B, D
+
+   # Reattach and monitor
+   tmux attach -t test
+   python ml/monitor.py  # Should show progress
+   ```
+
+---
+
+### J. Success Criteria
+
+**Checkpoint System:**
+- ✅ Permanent checkpoints use (iteration+1) % 5 == 0
+- ✅ Filenames: checkpoint_iter_{iteration+1}.pth
+- ✅ Cache pruned to ≤4 files
+- ✅ No replay buffer files saved
+- ✅ ELO evaluation only on permanent checkpoints
+
+**Status File:**
+- ✅ status.json updated at all phase boundaries
+- ✅ Progress throttled to 5-10 sec during self-play
+- ✅ Atomic writes (no partial reads)
+- ✅ All required fields present and valid
+
+**Control Signals:**
+- ✅ Pause signal read and deleted immediately
+- ✅ Training completes current iteration before pausing
+- ✅ Checkpoint saved before pause
+- ✅ Graceful exit (no crashes)
+
+**External Monitor:**
+- ✅ Displays all metrics in real-time
+- ✅ Updates every 1 second
+- ✅ Handles missing files gracefully
+- ✅ Keyboard controls work (p/q)
+- ✅ Works with tmux detach/reattach
+- ✅ Can start/stop independently of training
+
+**Operational:**
+- ✅ Training works without monitor (status.json written but not required)
+- ✅ Monitor works with already-running training
+- ✅ SSH drop doesn't kill training
+- ✅ Resume from checkpoint continues correctly
+
+---
+
+### K. Advantages Over Web Interface
+
+**Simplicity:**
+- No Flask, no threading, no web server
+- File-based communication (OS-level atomic writes)
+- Independent processes (failure isolation)
+
+**Reconnectability:**
+- Attach monitor from any terminal
+- SSH drop ≠ training death
+- tmux-friendly workflow
+
+**Resource Efficiency:**
+- No web server overhead
+- No threading complexity in training process
+- Monitor uses negligible CPU when training running
+
+**Development:**
+- Monitor improvements don't require training changes
+- No API versioning concerns
+- Easier to debug (two separate processes)
+
+**Deployment:**
+- No port management
+- No firewall configuration
+- Works identically locally and over SSH
+
+---
+
 ## Green Light Criteria
 
 **After Session 0** (foundation complete):
@@ -893,14 +1459,14 @@ def compute_decision_weights(num_players, start_cards, iteration=0):
 
 **After Session 3** (curriculum & CLI complete):
 - ✅ `TrainingPipeline` varies MCTS params by iteration
-- ✅ `--phase 1 --iterations 5` completes successfully with varied (P,C,c) in logs
+- ✅ `--training-on rounds --iterations 5` completes successfully with varied (P,C,c) in logs
 - ✅ MCTS schedule applied correctly (verify logs show 1×15 early, increasing later)
 - **Phase 1 training ready! Can optionally proceed to Session 4**
 
 **After Session 4** (full games complete):
 - ✅ `FullGameGenerator` creates P-conditional sequences (5p: 17 rounds, 4p: 16-18)
 - ✅ `ModelArena(full_game_mode=True)` evaluates on total game scores
-- ✅ `--phase 2` training works, using full-game generation
+- ✅ `--training-on games` training works, using full-game generation
 - **Phase 2 training ready!**
 
 **Implementation-complete threshold**: Sessions 0-3 (16 hours)

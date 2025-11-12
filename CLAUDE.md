@@ -8,6 +8,22 @@ BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bid
 
 **Architecture**: Training and development happen on a Linux PC (Ubuntu 24.04) with RTX 4060 GPU + Python 3.14/PyTorch. Future inference deployment (Phase 7+) may use a Windows laptop with Intel iGPU + ONNX Runtime, or may be split into a separate repository. The production stack (when implemented) uses Bun (TypeScript backend), Svelte (frontend), and SQLite (database).
 
+## Terminology
+
+**IMPORTANT:** This project uses specific terminology to distinguish between training modes:
+
+- **Round**: A single bidding + trick-taking cycle with a fixed number of cards dealt (e.g., one 5-card round). A round consists of:
+  - Bidding phase: each player bids on tricks they'll win
+  - Card-playing phase: players take turns playing cards until all tricks are resolved
+
+- **Game**: ALWAYS refers to a complete Blob game consisting of the full sequence of rounds. For example:
+  - 5 players, C=7: 17 rounds in sequence (7→6→5→4→3→2→1→1→1→1→1→2→3→4→5→6→7)
+  - 4 players, C=8: 18 rounds in sequence (8→7→6→5→4→3→2→1→1→1→1→2→3→4→5→6→7→8)
+
+**Training Phases:**
+- **Phase 1 (Independent Rounds)**: Trains on individual rounds sampled independently, not full game sequences. Achieves ~360 rounds/min with optimized MCTS curriculum.
+- **Phase 2 (Full Games)**: Trains on complete multi-round game sequences. Achieves ~73 games/min depending on MCTS settings.
+
 ## Development Environment
 
 **IMPORTANT - Development Platform:**
@@ -355,6 +371,9 @@ python ml/train.py --workers 32 --device cuda
 ```
 
 **Current Performance** (Ubuntu 24.04 + RTX 4060, validated 2025-11-05):
+
+*Note: These metrics measure **games/min** (BlobGame instances). Phase 1 training can achieve higher throughput (~360 rounds/min) by playing independent rounds with optimized MCTS curriculum settings.*
+
 - Light MCTS (2 det × 20 sims): **69.1 games/min** ← **fastest option**
 - Medium MCTS (3 det × 30 sims): **36.7 games/min** ← **recommended for training**
 - Heavy MCTS (5 det × 50 sims): **16.0 games/min** ← **highest quality**
