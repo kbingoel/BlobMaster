@@ -6,7 +6,6 @@
 **Status**: Approved - Ready for implementation
 **Total Effort**: 23 hours core + 8 hours optional = 31 hours
 **Expected Training Time**: **~7-9 days Phase 1** (with linear curriculum) + ~35-40 days Phase 2 (optional)
-**Time Saved**: ~3-4 days in Phase 1 vs original 10-12 day estimate!
 
 ---
 
@@ -1905,11 +1904,11 @@ python ml/train.py \
 ```
 
 **Checkpoints of interest**:
-- Iteration 50: ~2,800 rounds/iter + MCTS bump (1×15 → 2×25 sims)
-- Iteration 150: ~4,400 rounds/iter + MCTS bump (2×25 → 3×35 sims)
-- Iteration 300: ~6,800 rounds/iter + MCTS bump (3×35 → 4×45 sims)
-- Iteration 450: ~9,200 rounds/iter + MCTS bump (4×45 → 5×50 sims)
-- Iteration 500: ~10,000 rounds/iter (final strength, 5×50 sims MCTS)
+- Iteration 50: 2,800 rounds/iter + MCTS bump (1×15 → 2×25 sims)
+- Iteration 150: 4,400 rounds/iter + MCTS bump (2×25 → 3×35 sims)
+- Iteration 300: 6,800 rounds/iter + MCTS bump (3×35 → 4×45 sims)
+- Iteration 450: 9,200 games/iter + MCTS bump (4×45 → 5×50 sims)
+- Iteration 500: 10,000 games/iter (final strength, 5×50 sims MCTS)
 
 ### Phase 1 Evaluation (after iteration 400-500)
 
@@ -2043,7 +2042,7 @@ python ml/train.py \
 
 ## Next Steps
 
-1. ✅ **Approve this plan** - Review and confirm approach
+1. ✅ **Approved this plan** - Review and confirm approach (20251112)
 2. 🔨 **Implement Session 0** - Complete missing baseline (4h)
 3. 🔨 **Implement Sessions 1-3** - Core training enhancements (11h, includes LR fix + curriculum)
 4. 🔨 **Implement Sessions 4-5** - Full-game infrastructure (8h)
