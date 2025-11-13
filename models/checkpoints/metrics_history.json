@@ -1,0 +1,21 @@
+[
+  {
+    "iteration": 0,
+    "timestamp": "2025-11-13T09:39:55.550478",
+    "num_selfplay_examples": 2000,
+    "replay_buffer_size": 2000,
+    "avg_total_loss": 4.082349119647857,
+    "avg_policy_loss": 3.926703533818645,
+    "avg_value_loss": 0.15564557140873325,
+    "avg_policy_accuracy": 3.8810483870967745,
+    "training_time_minutes": 0.010151239236195882,
+    "learning_rate": 0.0009999911173852617,
+    "eval_win_rate": 0.0,
+    "eval_games_played": 0,
+    "model_promoted": false,
+    "current_elo": 1000,
+    "elo_change": 0,
+    "eval_performed": false,
+    "iteration_time_minutes": 0.4566472133000692
+  }
+]

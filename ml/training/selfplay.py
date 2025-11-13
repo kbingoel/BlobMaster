@@ -803,6 +803,37 @@ class SelfPlayEngine:
                 # Each worker creates its own BatchedEvaluator in _worker_generate_games_static
                 self.batch_evaluator = None
 
+    def update_model(self, new_model: BlobNet):
+        """
+        Update the model used for self-play.
+
+        IMPORTANT: For multiprocessing mode, workers receive a static network_state
+        snapshot at creation (ml/training/selfplay.py:760). They won't see EMA
+        updates unless we refresh them. Three approaches:
+
+        1. Save EMA to disk, pass checkpoint path to workers (disk I/O overhead)
+        2. Recreate Pool each iteration with fresh network_state (pool overhead)
+        3. Use ThreadPoolExecutor instead (shares network automatically)
+
+        Current implementation uses approach #1 for multiprocessing compatibility.
+
+        Args:
+            new_model: Updated neural network (typically EMA model)
+        """
+        # Update internal reference (for threading mode)
+        self.network = new_model
+
+        # For multiprocessing: update network_state so next batch uses EMA
+        if not self.use_thread_pool:
+            self.network_state = new_model.state_dict()
+
+        # For thread pool mode: shared network is automatically updated
+        # (threads share same network instance)
+
+        # Update batch evaluator if it exists (thread pool mode)
+        if self.batch_evaluator is not None:
+            self.batch_evaluator.network = new_model
+
     def generate_games(
         self,
         num_games: int,
