@@ -219,6 +219,8 @@ class Arena:
         game = BlobGame(num_players=num_players)
 
         # Create MCTS agents for each player
+        # IMPORTANT: Disable exploration noise during evaluation (Session 3)
+        # Evaluation should be deterministic for fair comparison
         mcts_agents = {}
         for player_idx in range(num_players):
             model_idx = player_assignments[player_idx]
@@ -229,6 +231,8 @@ class Arena:
                 masker=self.masker,
                 num_determinizations=self.num_determinizations,
                 simulations_per_determinization=self.simulations_per_determinization,
+                exploration_noise_epsilon=0.0,  # NO NOISE in evaluation
+                exploration_noise_alpha=0.3,    # Unused when epsilon=0, but set for consistency
             )
 
         # Define callbacks for bidding and card playing

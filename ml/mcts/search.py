@@ -85,6 +85,8 @@ class MCTS:
         temperature: float = 1.0,
         batch_evaluator: Optional["BatchedEvaluator"] = None,
         gpu_server_client: Optional["GPUServerClient"] = None,
+        exploration_noise_epsilon: float = 0.0,
+        exploration_noise_alpha: float = 0.3,
     ):
         """
         Initialize MCTS search.
@@ -105,6 +107,11 @@ class MCTS:
                             If provided, uses centralized batching for better GPU utilization
             gpu_server_client: Optional GPUServerClient for multiprocessing GPU server
                               If provided, sends requests to centralized GPU server process
+            exploration_noise_epsilon: Weight of Dirichlet noise at root (default: 0.0)
+                                      0.0 = no noise, 0.25 = AlphaZero default for self-play
+                                      Only apply during self-play, not evaluation
+            exploration_noise_alpha: Dirichlet concentration parameter (default: 0.3)
+                                    Controls noise distribution shape (0.3 = AlphaZero default)
         """
         self.network = network
         self.encoder = encoder
@@ -114,6 +121,8 @@ class MCTS:
         self.temperature = temperature
         self.batch_evaluator = batch_evaluator
         self.gpu_server_client = gpu_server_client
+        self.exploration_noise_epsilon = exploration_noise_epsilon
+        self.exploration_noise_alpha = exploration_noise_alpha
 
         # Detect device from network parameters (if network is provided)
         if network is not None:
@@ -169,6 +178,38 @@ class MCTS:
             action_taken=None,
             prior_prob=0.0,
         )
+
+        # Expand root node and get initial action priors
+        if not self._is_terminal(game_state):
+            # Get legal actions and network policy
+            state_tensor = self.encoder.encode(game_state, player, game_context)
+            legal_actions, legal_mask = self._get_legal_actions_and_mask(game_state, player)
+
+            # Network evaluation for root
+            if self.gpu_server_client is not None:
+                policy, value = self.gpu_server_client.evaluate(state_tensor, legal_mask)
+            elif self.batch_evaluator is not None:
+                policy, value = self.batch_evaluator.evaluate(state_tensor, legal_mask)
+            else:
+                state_tensor = state_tensor.to(self.device)
+                legal_mask = legal_mask.to(self.device)
+                with torch.no_grad():
+                    policy, value = self.network(state_tensor, legal_mask)
+
+            # Convert policy to action probabilities
+            policy_np = policy.cpu().numpy()
+            action_probs = {action: float(policy_np[action]) for action in legal_actions}
+
+            # Apply Dirichlet noise at root (if enabled)
+            if self.exploration_noise_epsilon > 0:
+                action_probs = self._add_dirichlet_noise(
+                    action_probs,
+                    epsilon=self.exploration_noise_epsilon,
+                    alpha=self.exploration_noise_alpha,
+                )
+
+            # Expand root with (possibly noisy) action priors
+            root.expand(action_probs, legal_actions)
 
         # Run simulations
         for _ in range(self.num_simulations):
@@ -383,6 +424,58 @@ class MCTS:
         normalized_score = score / max_score
 
         return normalized_score
+
+    def _add_dirichlet_noise(
+        self,
+        action_probs: Dict[int, float],
+        epsilon: float,
+        alpha: float,
+    ) -> Dict[int, float]:
+        """
+        Add Dirichlet noise to action probabilities at root.
+
+        Applies the formula: P'(a) = (1-ε)·P(a) + ε·Dir(α)
+
+        This encourages exploration during self-play by adding randomness
+        to the root node's prior probabilities, helping the agent discover
+        diverse strategies.
+
+        Args:
+            action_probs: Prior policy probabilities {action_idx -> prob}
+            epsilon: Noise weight (0.25 = 25% noise, AlphaZero default)
+            alpha: Dirichlet concentration parameter (0.3 = AlphaZero default)
+                  Lower alpha = more concentrated noise (peakier)
+                  Higher alpha = more uniform noise
+
+        Returns:
+            Noisy action probabilities (same keys as input)
+
+        Example:
+            >>> prior_probs = {0: 0.5, 1: 0.3, 2: 0.2}
+            >>> noisy_probs = mcts._add_dirichlet_noise(prior_probs, 0.25, 0.3)
+            >>> # Result: slight perturbation of prior_probs
+        """
+        if epsilon == 0.0 or len(action_probs) == 0:
+            return action_probs  # No noise
+
+        # Get legal actions
+        actions = list(action_probs.keys())
+        probs = np.array([action_probs[a] for a in actions])
+        num_legal = len(actions)
+
+        # Sample Dirichlet noise for legal actions
+        noise = np.random.dirichlet([alpha] * num_legal)
+
+        # Apply noise: P'(a) = (1-ε)·P(a) + ε·Dir(α)
+        noisy_probs = (1 - epsilon) * probs + epsilon * noise
+
+        # Normalize to ensure sum = 1.0 (should already be close, but ensure numerical stability)
+        noisy_probs = noisy_probs / noisy_probs.sum()
+
+        # Convert back to dictionary
+        noisy_action_probs = {action: float(noisy_probs[i]) for i, action in enumerate(actions)}
+
+        return noisy_action_probs
 
     def search_with_tree_reuse(
         self,
@@ -835,6 +928,8 @@ class ImperfectInfoMCTS:
         batch_evaluator: Optional["BatchedEvaluator"] = None,
         gpu_server_client: Optional["GPUServerClient"] = None,
         must_have_suit_bias: float = 1.0,
+        exploration_noise_epsilon: float = 0.0,
+        exploration_noise_alpha: float = 0.3,
     ):
         """
         Initialize imperfect information MCTS.
@@ -856,6 +951,11 @@ class ImperfectInfoMCTS:
                               If provided, sends requests to centralized GPU server process
             must_have_suit_bias: Probability multiplier for must-have suits during determinization (default: 1.0)
                                 1.0 = no bias (maximum entropy), higher values = stronger preference
+            exploration_noise_epsilon: Weight of Dirichlet noise at root (default: 0.0)
+                                      0.0 = no noise, 0.25 = AlphaZero default for self-play
+                                      Only apply during self-play, not evaluation
+            exploration_noise_alpha: Dirichlet concentration parameter (default: 0.3)
+                                    Controls noise distribution shape (0.3 = AlphaZero default)
 
         Note:
             Total budget = num_determinizations × simulations_per_determinization
@@ -872,6 +972,8 @@ class ImperfectInfoMCTS:
         self.batch_evaluator = batch_evaluator
         self.gpu_server_client = gpu_server_client
         self.must_have_suit_bias = must_have_suit_bias
+        self.exploration_noise_epsilon = exploration_noise_epsilon
+        self.exploration_noise_alpha = exploration_noise_alpha
 
         # Import determinization components
         from ml.mcts.belief_tracker import BeliefState
@@ -890,6 +992,8 @@ class ImperfectInfoMCTS:
             temperature=temperature,
             batch_evaluator=batch_evaluator,
             gpu_server_client=gpu_server_client,
+            exploration_noise_epsilon=exploration_noise_epsilon,
+            exploration_noise_alpha=exploration_noise_alpha,
         )
 
     def search(
