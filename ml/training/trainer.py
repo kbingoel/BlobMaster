@@ -45,6 +45,10 @@ import time
 import copy
 import numpy as np
 from datetime import datetime
+import logging
+import shutil
+import glob
+import os
 
 from ml.network.model import BlobNet
 from ml.network.encode import StateEncoder, ActionMasker
@@ -52,6 +56,8 @@ from ml.training.replay_buffer import ReplayBuffer
 from ml.training.selfplay import SelfPlayEngine
 from ml.evaluation.arena import Arena
 from ml.evaluation.elo import ELOTracker
+
+logger = logging.getLogger(__name__)
 
 
 class NetworkTrainer:
@@ -390,6 +396,119 @@ class NetworkTrainer:
         self.scheduler.step()
 
 
+class StatusWriter:
+    """
+    Atomic status file writer for external monitoring.
+
+    Writes training status to JSON file with atomic updates
+    to prevent corruption from concurrent reads.
+    """
+
+    def __init__(self, status_file: str = "models/checkpoints/status.json"):
+        """
+        Args:
+            status_file: Path to status file (default: models/checkpoints/status.json)
+        """
+        self.status_file = Path(status_file)
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        self.start_time = time.time()
+
+    def update(
+        self,
+        iteration: int,
+        total_iterations: int,
+        metrics: Dict[str, Any],
+        config: Any
+    ):
+        """
+        Update status file with current training state.
+
+        Args:
+            iteration: Current iteration (0-indexed)
+            total_iterations: Total iterations planned
+            metrics: Metrics dict from iteration
+            config: Config dict or object
+
+        Note:
+            Iteration is 0-indexed internally but displayed as 1-indexed in status.
+        """
+        # Calculate progress (use 1-indexed for display)
+        display_iteration = iteration + 1
+        progress = display_iteration / total_iterations if total_iterations > 0 else 0.0
+
+        # Estimate ETA
+        elapsed = time.time() - self.start_time
+        if display_iteration > 0:
+            avg_iter_time = elapsed / display_iteration
+            remaining_iters = total_iterations - display_iteration
+            eta_seconds = avg_iter_time * remaining_iters
+            eta_hours = eta_seconds / 3600
+            eta_days = eta_hours / 24
+        else:
+            eta_hours = 0
+            eta_days = 0
+
+        # Get MCTS params for current iteration (with fallback)
+        mcts_str = "unknown"
+        try:
+            # Config can be dict or object
+            if isinstance(config, dict):
+                if 'num_determinizations' in config and 'simulations_per_determinization' in config:
+                    mcts_str = f"{config['num_determinizations']}×{config['simulations_per_determinization']}"
+            elif hasattr(config, 'get_mcts_params'):
+                num_det, sims = config.get_mcts_params(display_iteration)
+                mcts_str = f"{num_det}×{sims}"
+            elif hasattr(config, 'num_determinizations') and hasattr(config, 'simulations_per_determinization'):
+                mcts_str = f"{config.num_determinizations}×{config.simulations_per_determinization}"
+        except Exception as e:
+            logger.warning(f"Failed to get MCTS params: {e}")
+
+        # Get phase (with fallback)
+        if isinstance(config, dict):
+            phase = config.get('training_on', 'unknown')
+        else:
+            phase = getattr(config, 'training_on', 'unknown')
+
+        # Build status dict
+        status = {
+            'timestamp': time.time(),
+            'iteration': display_iteration,  # 1-indexed for display
+            'total_iterations': total_iterations,
+            'progress': progress,
+            'elapsed_hours': elapsed / 3600,
+            'eta_hours': eta_hours,
+            'eta_days': eta_days,
+            'phase': phase,
+            'mcts_config': mcts_str,
+            'elo': metrics.get('current_elo', None),
+            'elo_change': metrics.get('elo_change', None),
+            'learning_rate': metrics.get('learning_rate', None),
+            'loss': metrics.get('avg_total_loss', None),
+            'policy_loss': metrics.get('avg_policy_loss', None),
+            'value_loss': metrics.get('avg_value_loss', None),
+            'training_units_generated': metrics.get('training_units_generated', None),
+            'unit_type': metrics.get('unit_type', 'rounds'),
+            'pi_target_tau': metrics.get('pi_target_tau', None),
+        }
+
+        # Atomic write: write to temp file, then rename
+        tmp_file = self.status_file.with_suffix('.json.tmp')
+        try:
+            with open(tmp_file, 'w') as f:
+                json.dump(status, f, indent=2)
+
+            # Atomic rename (POSIX guarantees atomicity)
+            tmp_file.replace(self.status_file)
+        except Exception as e:
+            logger.error(f"Failed to write status file: {e}")
+            # Clean up temp file if it exists
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except:
+                    pass
+
+
 class TrainingPipeline:
     """
     Orchestrates the full AlphaZero training pipeline.
@@ -523,6 +642,13 @@ class TrainingPipeline:
         self.pi_target_tau_end = 0.7
         self.tau_anneal_iters = 200
 
+        # Status writer for external monitoring
+        self.status_writer = StatusWriter()
+        self.total_iterations = 0  # Set by run_training()
+
+        # Control signal file for pause/resume
+        self.control_signal_file = Path("models/checkpoints/control.signal")
+
         print(f"Pipeline initialized:")
         print(f"  - Training session started: {self.training_start_date}")
         print(f"  - Self-play workers: {config.get('num_workers', 16)}")
@@ -564,6 +690,51 @@ class TrainingPipeline:
                     online_param.data, alpha=1 - self.ema_decay
                 )
 
+    def _check_control_signal(self) -> str:
+        """
+        Check for control signals from external monitor.
+
+        Returns:
+            Control command string ('PAUSE', 'CONTINUE', or empty)
+        """
+        if not self.control_signal_file.exists():
+            return ''
+
+        try:
+            signal = self.control_signal_file.read_text().strip().upper()
+            return signal
+        except Exception as e:
+            logger.warning(f"Failed to read control signal: {e}")
+            return ''
+
+    def _clear_control_signal(self):
+        """Clear control signal file."""
+        if self.control_signal_file.exists():
+            try:
+                self.control_signal_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to clear control signal: {e}")
+
+    def _shutdown_workers(self):
+        """
+        Gracefully shutdown self-play workers.
+
+        Note:
+            Override this method based on your worker implementation.
+            This is a placeholder for proper cleanup.
+        """
+        if hasattr(self, 'selfplay_engine') and self.selfplay_engine is not None:
+            try:
+                logger.info("Shutting down self-play workers...")
+                # Assuming SelfPlayEngine has a shutdown method
+                if hasattr(self.selfplay_engine, 'shutdown'):
+                    self.selfplay_engine.shutdown()
+                else:
+                    # Fallback: just set flag if shutdown method doesn't exist
+                    logger.warning("SelfPlayEngine has no shutdown() method")
+            except Exception as e:
+                logger.error(f"Error shutting down workers: {e}")
+
     def run_training(
         self,
         num_iterations: int,
@@ -576,6 +747,12 @@ class TrainingPipeline:
             num_iterations: Number of training iterations to run
             resume_from: Optional checkpoint path to resume from
         """
+        # Set total iterations for status tracking
+        self.total_iterations = num_iterations
+
+        # Clear any stale control signals
+        self._clear_control_signal()
+
         # Resume from checkpoint if specified
         if resume_from:
             self._resume_from_checkpoint(resume_from)
@@ -592,66 +769,97 @@ class TrainingPipeline:
 
         # Main training loop
         start_iteration = self.current_iteration
-        for iteration in range(start_iteration, num_iterations):
-            self.current_iteration = iteration
-            print(f"\n{'='*80}")
-            print(f"ITERATION {iteration + 1}/{num_iterations}")
-            print(f"{'='*80}")
+        try:
+            for iteration in range(start_iteration, num_iterations):
+                # Check for pause request BEFORE starting iteration
+                signal = self._check_control_signal()
+                if signal == 'PAUSE':
+                    logger.info(
+                        f"Pause signal received at iteration {iteration} (displayed as {iteration + 1}). "
+                        f"Last checkpoint saved at iteration {iteration - 1}."
+                    )
+                    self._clear_control_signal()
+                    # Checkpoint already saved at end of previous iteration
+                    # Just cleanup and exit
+                    break
 
-            # Get MCTS params for this iteration (if config supports curriculum)
-            if hasattr(self.config, 'get_mcts_params'):
-                # NOTE: get_mcts_params() expects 1-indexed iteration (docstring),
-                # but Python loop is 0-indexed, so we pass iteration + 1
-                num_det, sims_per_det = self.config.get_mcts_params(iteration + 1)
-                print(f"MCTS curriculum: {num_det} determinizations × {sims_per_det} simulations")
+                self.current_iteration = iteration
+                print(f"\n{'='*80}")
+                print(f"ITERATION {iteration + 1}/{num_iterations}")
+                print(f"{'='*80}")
 
-                # Update self-play engine config
-                self.selfplay_engine.num_determinizations = num_det
-                self.selfplay_engine.simulations_per_determinization = sims_per_det
+                # Get MCTS params for this iteration (if config supports curriculum)
+                if hasattr(self.config, 'get_mcts_params'):
+                    # NOTE: get_mcts_params() expects 1-indexed iteration (docstring),
+                    # but Python loop is 0-indexed, so we pass iteration + 1
+                    num_det, sims_per_det = self.config.get_mcts_params(iteration + 1)
+                    print(f"MCTS curriculum: {num_det} determinizations × {sims_per_det} simulations")
 
-            iteration_start_time = time.time()
+                    # Update self-play engine config
+                    self.selfplay_engine.num_determinizations = num_det
+                    self.selfplay_engine.simulations_per_determinization = sims_per_det
 
-            # Run single iteration
-            try:
-                metrics = self.run_iteration(iteration)
+                iteration_start_time = time.time()
 
-                # Log iteration time
-                iteration_time = time.time() - iteration_start_time
-                metrics["iteration_time_minutes"] = iteration_time / 60.0
+                # Run single iteration
+                try:
+                    metrics = self.run_iteration(iteration)
 
-                # Log metrics
-                self._log_metrics(iteration, metrics)
+                    # Log iteration time
+                    iteration_time = time.time() - iteration_start_time
+                    metrics["iteration_time_minutes"] = iteration_time / 60.0
 
-                # Distribution sanity logging (every 10 iterations)
-                if (iteration + 1) % 10 == 0 and 'distribution_stats' in metrics:
-                    self._log_distribution_sanity(metrics)
+                    # Log metrics
+                    self._log_metrics(iteration, metrics)
 
-                # Store metrics history
-                self.metrics_history.append({
-                    "iteration": iteration,
-                    "timestamp": datetime.now().isoformat(),
-                    **metrics,
-                })
+                    # Distribution sanity logging (every 10 iterations)
+                    if (iteration + 1) % 10 == 0 and 'distribution_stats' in metrics:
+                        self._log_distribution_sanity(metrics)
 
-                print(f"\nIteration {iteration + 1} completed in {iteration_time / 60:.1f} minutes")
+                    # Store metrics history
+                    self.metrics_history.append({
+                        "iteration": iteration,
+                        "timestamp": datetime.now().isoformat(),
+                        **metrics,
+                    })
 
-            except Exception as e:
-                print(f"\nERROR in iteration {iteration + 1}: {e}")
-                # Save emergency checkpoint before raising
-                emergency_path = self.checkpoint_dir / f"emergency_iter_{iteration}.pth"
-                self._checkpoint_phase(iteration, {"error": str(e)})
-                print(f"Emergency checkpoint saved to {emergency_path}")
-                raise
+                    # Update status file (atomic write for external monitoring)
+                    self.status_writer.update(
+                        iteration=iteration,
+                        total_iterations=self.total_iterations,
+                        metrics=metrics,
+                        config=self.config
+                    )
 
-        print(f"\n{'='*80}")
-        print(f"Training Complete!")
-        print(f"{'='*80}")
-        print(f"Total iterations: {num_iterations}")
-        print(f"Best model: {self.best_model_path}")
-        print(f"Metrics history saved to: {self.checkpoint_dir / 'metrics_history.json'}")
+                    print(f"\nIteration {iteration + 1} completed in {iteration_time / 60:.1f} minutes")
 
-        # Shutdown self-play engine
-        self.selfplay_engine.shutdown()
+                except Exception as e:
+                    print(f"\nERROR in iteration {iteration + 1}: {e}")
+                    # Save emergency checkpoint before raising
+                    emergency_path = self.checkpoint_dir / f"emergency_iter_{iteration}.pth"
+                    self._checkpoint_phase(iteration, {"error": str(e)})
+                    print(f"Emergency checkpoint saved to {emergency_path}")
+                    raise
+
+            # Training completed normally or paused
+            if iteration == num_iterations - 1:
+                print(f"\n{'='*80}")
+                print(f"Training Complete!")
+                print(f"{'='*80}")
+                print(f"Total iterations: {num_iterations}")
+                print(f"Best model: {self.best_model_path}")
+                print(f"Metrics history saved to: {self.checkpoint_dir / 'metrics_history.json'}")
+            else:
+                print(f"\n{'='*80}")
+                print(f"Training Paused")
+                print(f"{'='*80}")
+                print(f"Completed iterations: {iteration}/{num_iterations}")
+                print(f"Resume with: --resume <checkpoint_path>")
+
+        finally:
+            # Always cleanup workers on exit (normal or exception)
+            logger.info("Cleaning up resources...")
+            self._shutdown_workers()
 
     def run_iteration(self, iteration: int) -> Dict[str, Any]:
         """
@@ -1062,6 +1270,127 @@ class TrainingPipeline:
         filename = "-".join(parts) + ".pth"
         return filename
 
+    def save_checkpoint_with_rotation(
+        self,
+        iteration: int,
+        metrics: Optional[dict] = None
+    ) -> str:
+        """
+        Save checkpoint with automatic rotation logic.
+
+        Args:
+            iteration: Current iteration (0-indexed)
+            metrics: Optional metrics dict (should contain 'current_elo' if available)
+
+        Returns:
+            Path to saved checkpoint
+
+        Note:
+            - Permanent checkpoints: iterations 4, 9, 14, ... (every 5th, 0-indexed)
+            - Cache checkpoints: all others (max 4 kept via FIFO rotation)
+            - Iteration is 0-indexed internally
+        """
+        # Determine if this is a permanent checkpoint (every 5th iteration)
+        # iteration 4, 9, 14, 19, ... → displayed as 5, 10, 15, 20, ...
+        is_permanent = (iteration + 1) % 5 == 0
+
+        # Get ELO if available (only for permanent checkpoints)
+        elo = None
+        if is_permanent and metrics and 'current_elo' in metrics:
+            try:
+                elo = int(metrics['current_elo'])
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid ELO value: {metrics['current_elo']}, skipping ELO in filename")
+                elo = None
+
+        # Generate filename using existing method
+        filename = self._get_checkpoint_filename(
+            iteration=iteration,
+            elo=elo,
+            is_permanent=is_permanent
+        )
+
+        # Determine directory
+        if is_permanent:
+            save_dir = Path("models/checkpoints/permanent")
+        else:
+            save_dir = Path("models/checkpoints/cache")
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        filepath = save_dir / filename
+
+        # Build checkpoint data
+        checkpoint_data = {
+            'iteration': iteration,  # 0-indexed
+            'model_state_dict': self.network.state_dict(),
+            'ema_model_state_dict': self.ema_model.state_dict(),
+            'optimizer_state_dict': self.trainer.optimizer.state_dict(),
+            'scheduler_state_dict': self.trainer.scheduler.state_dict(),
+            'replay_buffer': self.replay_buffer.get_state(),
+            'elo': elo,
+            'metrics': metrics,
+            'config': self.config,
+            'training_start_date': getattr(self, 'training_start_date', None),
+        }
+
+        # Save checkpoint with error handling
+        try:
+            # Check available disk space (require at least 2GB free)
+            stat = shutil.disk_usage(save_dir)
+            free_gb = stat.free / (1024**3)
+            if free_gb < 2.0:
+                logger.error(f"Low disk space: {free_gb:.1f}GB free. Checkpoint may fail.")
+
+            torch.save(checkpoint_data, filepath)
+
+            logger.info(
+                f"Saved {'permanent' if is_permanent else 'cache'} checkpoint: "
+                f"{filename} ({iteration+1}/{self.total_iterations if hasattr(self, 'total_iterations') else '?'})"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint {filepath}: {e}")
+            raise
+
+        # Rotate cache checkpoints if needed
+        if not is_permanent:
+            self._rotate_cache_checkpoints(max_keep=4)
+
+        return str(filepath)
+
+    def _rotate_cache_checkpoints(self, max_keep: int = 4):
+        """
+        Keep only the most recent N cache checkpoints, delete older ones.
+
+        Args:
+            max_keep: Maximum number of cache checkpoints to keep (default: 4)
+
+        Note:
+            Permanent checkpoints are never deleted by this method.
+        """
+        cache_dir = Path("models/checkpoints/cache")
+        if not cache_dir.exists():
+            return
+
+        # Get all cache checkpoint files
+        cache_files = sorted(
+            cache_dir.glob("*.pth"),
+            key=lambda p: p.stat().st_mtime  # Sort by modification time
+        )
+
+        # Delete oldest files if we exceed max_keep
+        num_to_delete = len(cache_files) - max_keep
+        if num_to_delete > 0:
+            for old_file in cache_files[:num_to_delete]:
+                try:
+                    file_size_mb = old_file.stat().st_size / (1024**2)
+                    logger.info(
+                        f"Rotating out old cache checkpoint: {old_file.name} "
+                        f"({file_size_mb:.1f}MB)"
+                    )
+                    old_file.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to delete old checkpoint {old_file}: {e}")
+
     def _checkpoint_phase(
         self,
         iteration: int,
@@ -1112,6 +1441,10 @@ class TrainingPipeline:
 
             print(f"  - Checkpoint saved: {checkpoint_path}")
             print(f"  - Replay buffer saved: {buffer_path}")
+
+            # Rotate cache checkpoints if this is a cache checkpoint
+            if not is_permanent:
+                self._rotate_cache_checkpoints(max_keep=4)
 
         # Save best model only if promoted or if this is the first save
         should_save_best = (
