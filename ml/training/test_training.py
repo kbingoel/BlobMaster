@@ -99,9 +99,11 @@ class TestSelfPlayWorker:
         # Generate a small game (4 players, 3 cards)
         examples = worker.generate_game(num_players=4, cards_to_deal=3)
 
-        # Should have examples (4 bids + 4*3 = 16 card plays)
+        # Should have examples
+        # With Session 1 zero-choice fast path: 4 bids + (4*3 - 4) plays
+        # (Last card for each player is skipped)
         assert len(examples) > 0
-        assert len(examples) == 4 + 12  # 4 bids + 12 card plays
+        assert len(examples) == 4 + 8  # 4 bids + 8 card plays (4 forced last-cards skipped)
 
         # Check each example has the right structure
         for example in examples:
@@ -356,8 +358,9 @@ class TestSelfPlayWorker:
             examples = worker.generate_game(num_players=4, cards_to_deal=cards)
 
             # Should have examples
-            # 4 bids + (4 players * cards cards) = 4 + 4*cards
-            expected_examples = 4 + (4 * cards)
+            # With Session 1 zero-choice fast path: 4 bids + (4*cards - 4) plays
+            # (Last card for each of 4 players is skipped)
+            expected_examples = 4 + (4 * (cards - 1))
             assert len(examples) == expected_examples
 
     def test_perfect_info_mode(self, network, encoder, masker):
@@ -375,6 +378,55 @@ class TestSelfPlayWorker:
 
         # Should still generate valid examples
         assert len(examples) > 0
+        for example in examples:
+            assert "state" in example
+            assert "policy" in example
+            assert "value" in example
+
+    def test_zero_choice_fast_path(self, worker):
+        """
+        Test Session 1: Zero-Choice Fast Path.
+
+        Verifies that forced last-card plays skip MCTS and training example creation.
+        Expected: ~14% of decisions are forced last-card plays (one per round per player).
+        """
+        # Generate a 7-card game (ensures forced last-cards)
+        # 5 players × 7 cards = 35 total cards played
+        # Expected: 5 bids + 35 plays = 40 total decisions
+        # Forced: 5 last-card plays (one per player)
+        # Expected stored: 5 bids + 30 plays (35 - 5 forced) = 35 examples
+        examples = worker.generate_game(num_players=5, cards_to_deal=7)
+
+        # Check that forced skip metadata is present
+        assert 'forced_skips' in examples[0], "First example should have forced_skips metadata"
+        assert 'total_decisions' in examples[0], "First example should have total_decisions metadata"
+        assert 'skip_rate' in examples[0], "First example should have skip_rate metadata"
+
+        forced_skips = examples[0]['forced_skips']
+        total_decisions = examples[0]['total_decisions']
+        skip_rate = examples[0]['skip_rate']
+
+        # Expected: 5 players × 1 forced last-card each = 5 forced skips
+        expected_forced_skips = 5
+        assert forced_skips == expected_forced_skips, \
+            f"Expected {expected_forced_skips} forced skips, got {forced_skips}"
+
+        # Expected: 5 bids + 35 plays = 40 total decisions
+        expected_total_decisions = 40
+        assert total_decisions == expected_total_decisions, \
+            f"Expected {expected_total_decisions} total decisions, got {total_decisions}"
+
+        # Expected: 35 stored examples (40 - 5 forced)
+        expected_stored_examples = 35
+        assert len(examples) == expected_stored_examples, \
+            f"Expected {expected_stored_examples} stored examples, got {len(examples)}"
+
+        # Expected skip rate: 5/40 = 0.125 (12.5%)
+        expected_skip_rate = 5 / 40
+        assert abs(skip_rate - expected_skip_rate) < 0.01, \
+            f"Expected skip rate ~{expected_skip_rate:.3f}, got {skip_rate:.3f}"
+
+        # Verify all examples are valid (should not include forced moves)
         for example in examples:
             assert "state" in example
             assert "policy" in example
@@ -498,9 +550,10 @@ class TestSelfPlayEngine:
         )
 
         # Should have examples from all games
-        # Each game: 4 bids + 12 card plays = 16 examples
-        # 4 games * 16 examples = 64 total
-        assert len(examples) == num_games * 16
+        # With Session 1 zero-choice fast path:
+        # Each game: 4 bids + (4*3 - 4) plays = 4 + 8 = 12 examples
+        # 4 games * 12 examples = 48 total
+        assert len(examples) == num_games * 12
 
         # Verify all examples are valid
         for example in examples:
@@ -522,9 +575,10 @@ class TestSelfPlayEngine:
             cards_to_deal=2,
         )
 
-        # Each game: 4 bids + 8 card plays = 12 examples
-        # 6 games * 12 examples = 72 total
-        assert len(examples) == 6 * 12
+        # With Session 1 zero-choice fast path:
+        # Each game: 4 bids + (4*2 - 4) plays = 4 + 4 = 8 examples
+        # 6 games * 8 examples = 48 total
+        assert len(examples) == 6 * 8
 
         # Check that examples come from both workers
         game_ids = set(ex["game_id"] for ex in examples)
@@ -590,7 +644,8 @@ class TestSelfPlayEngine:
         examples = future.result(timeout=60)  # 60 second timeout
 
         # Should have valid examples
-        assert len(examples) == 2 * 16  # 2 games * 16 examples each
+        # With Session 1 zero-choice fast path: 2 games * 12 examples each
+        assert len(examples) == 2 * 12  # 2 games * 12 examples each
 
         for example in examples:
             assert validate_training_example(example)
@@ -685,8 +740,8 @@ class TestSelfPlayEngine:
             cards_to_deal=2,
         )
 
-        # 5 games * 12 examples = 60 total
-        assert len(examples) == 5 * 12
+        # With Session 1 zero-choice fast path: 5 games * 8 examples = 40 total
+        assert len(examples) == 5 * 8
 
         # Verify all 5 games were generated
         game_ids = set(ex["game_id"] for ex in examples)
@@ -753,6 +808,51 @@ class TestSelfPlayEngine:
         # Should have valid examples
         assert len(examples1) > 0
         assert len(examples2) > 0
+
+        # Clean up
+        engine.shutdown()
+
+    def test_collect_forced_skip_stats(self, engine):
+        """
+        Test Session 1: Collect forced skip statistics.
+
+        Verifies that SelfPlayEngine.collect_forced_skip_stats correctly aggregates
+        forced skip metrics across multiple games.
+        """
+        # Generate multiple games with forced skips
+        examples = engine.generate_games(
+            num_games=3,
+            num_players=5,
+            cards_to_deal=7,
+        )
+
+        # Collect forced skip statistics
+        stats = engine.collect_forced_skip_stats(examples)
+
+        # Verify stats structure
+        assert 'total_forced_skips' in stats
+        assert 'total_decisions' in stats
+        assert 'avg_skip_rate' in stats
+        assert 'games_with_stats' in stats
+
+        # Expected: 3 games × 5 forced skips each = 15 total forced skips
+        expected_forced_skips = 3 * 5
+        assert stats['total_forced_skips'] == expected_forced_skips, \
+            f"Expected {expected_forced_skips} forced skips, got {stats['total_forced_skips']}"
+
+        # Expected: 3 games × 40 decisions each = 120 total decisions
+        expected_total_decisions = 3 * 40
+        assert stats['total_decisions'] == expected_total_decisions, \
+            f"Expected {expected_total_decisions} total decisions, got {stats['total_decisions']}"
+
+        # Expected skip rate: 15/120 = 0.125 (12.5%)
+        expected_skip_rate = 15 / 120
+        assert abs(stats['avg_skip_rate'] - expected_skip_rate) < 0.01, \
+            f"Expected skip rate ~{expected_skip_rate:.3f}, got {stats['avg_skip_rate']:.3f}"
+
+        # Expected: 3 games with stats
+        assert stats['games_with_stats'] == 3, \
+            f"Expected 3 games with stats, got {stats['games_with_stats']}"
 
         # Clean up
         engine.shutdown()

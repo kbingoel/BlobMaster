@@ -307,6 +307,7 @@ class SelfPlayWorker:
         # Storage for training examples
         examples = []
         move_number = 0
+        forced_skips = 0  # Track forced last-card plays (Session 1: Zero-Choice Fast Path)
 
         # Play the round using MCTS for all decisions
         def get_bid(player, hand, is_dealer, total_bids, cards_dealt):
@@ -358,7 +359,18 @@ class SelfPlayWorker:
 
         def get_card(player, legal_cards, trick):
             """Callback to get card to play using MCTS."""
-            nonlocal move_number
+            nonlocal move_number, forced_skips
+
+            # Session 1: Zero-Choice Fast Path
+            # Skip MCTS for forced last-card plays (player has only one card in hand)
+            # This saves ~14% of MCTS searches (every round ends with forced last-card)
+            # Note: Check hand size, not legal_cards length, to specifically catch last-card plays
+            # (not cases where player must follow suit but has only one card of that suit)
+            if len(player.hand) == 1:
+                forced_skips += 1
+                # Don't store training example for forced action
+                # Return the only card in hand (which must be the only legal card)
+                return legal_cards[0]
 
             # Run MCTS to get action probabilities
             # GPU-Batched: Use search_parallel() if use_parallel_expansion is True
@@ -430,6 +442,15 @@ class SelfPlayWorker:
                     break
 
         self._backpropagate_outcome(examples, final_scores)
+
+        # Add forced skip statistics as metadata to first example (Session 1)
+        # This allows aggregation at the iteration level
+        if examples:
+            total_decisions = len(examples) + forced_skips
+            skip_rate = forced_skips / total_decisions if total_decisions > 0 else 0.0
+            examples[0]["forced_skips"] = forced_skips
+            examples[0]["total_decisions"] = total_decisions
+            examples[0]["skip_rate"] = skip_rate
 
         return examples
 
@@ -871,6 +892,49 @@ class SelfPlayEngine:
                 (P, C): dict(dist)  # Use tuple keys (not string) for consistency
                 for (P, C), dist in card_distributions.items()
             },
+        }
+
+    def collect_forced_skip_stats(self, examples: List[Dict]) -> Dict[str, Any]:
+        """
+        Collect forced skip statistics (Session 1: Zero-Choice Fast Path).
+
+        Aggregates forced_skips, total_decisions, and skip_rate across all games.
+        Expects first example of each game to have forced_skips metadata.
+
+        Args:
+            examples: List of training examples with metadata
+
+        Returns:
+            Dictionary with forced skip statistics:
+                - total_forced_skips: Sum of forced skips across all games
+                - total_decisions: Sum of all decisions (stored + skipped)
+                - avg_skip_rate: Average skip rate across all games
+                - games_with_stats: Number of games that reported stats
+        """
+        total_forced_skips = 0
+        total_decisions = 0
+        games_with_stats = 0
+        seen_game_ids = set()
+
+        for example in examples:
+            game_id = example.get('game_id')
+            if not game_id or game_id in seen_game_ids:
+                continue  # Skip if already counted this game
+
+            # Check if this example has forced skip stats (only first example per game has it)
+            if 'forced_skips' in example:
+                seen_game_ids.add(game_id)
+                total_forced_skips += example.get('forced_skips', 0)
+                total_decisions += example.get('total_decisions', 0)
+                games_with_stats += 1
+
+        avg_skip_rate = total_forced_skips / total_decisions if total_decisions > 0 else 0.0
+
+        return {
+            'total_forced_skips': total_forced_skips,
+            'total_decisions': total_decisions,
+            'avg_skip_rate': avg_skip_rate,
+            'games_with_stats': games_with_stats,
         }
 
     def _generate_games_multiprocess(
