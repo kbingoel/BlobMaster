@@ -68,8 +68,8 @@ venv/Scripts/python.exe -m pytest --cov=ml ml/
 
 **Training**:
 ```bash
-# Start full training pipeline (136 days @ Medium MCTS or 72 days @ Light MCTS)
-venv/Scripts/python.exe ml/train.py --iterations 500
+# Start full training pipeline (~5 days with curriculum enabled)
+venv/Scripts/python.exe ml/train.py --iterations 500 --enable-curriculum
 
 # Fast test run (validates pipeline without long wait)
 venv/Scripts/python.exe ml/train.py --fast --iterations 5
@@ -389,10 +389,16 @@ python ml/train.py --workers 32 --device cuda
 
 **Hardware Limit Identified**: RTX 4060 8GB can support maximum **32 workers** (each worker uses ~150MB GPU memory, total ~5-6GB). Beyond 32 workers causes CUDA OOM errors.
 
-**Training Timeline** (500 iterations × 10,000 games each):
-- Light MCTS @ 69.1 games/min: **~72 days continuous training**
-- Medium MCTS @ 36.7 games/min: **~136 days continuous training**
-- Heavy MCTS @ 16.0 games/min: **~312 days continuous training**
+**Training Timeline**:
+
+*Phase 1 with curriculum* (recommended, 500 iterations with adaptive ramp):
+- **~5 days** total with MCTS curriculum (1×15 → 5×50) + linear unit ramp (2K → 10K)
+- Curriculum saves ~3-4 days vs fixed configuration
+
+*Phase 1 without curriculum* (fixed 10K rounds/iteration, for reference):
+- Light MCTS @ 69.1 games/min: ~72 days
+- Medium MCTS @ 36.7 games/min: ~136 days
+- Heavy MCTS @ 16.0 games/min: ~312 days
 
 **Key Findings**:
 - GPU server architecture (Phase 3.5) failed: 3-5x slower due to small batch sizes
@@ -408,11 +414,14 @@ python ml/train.py --workers 32 --device cuda
 
 Based on similar AlphaZero projects and validated benchmarks:
 
-- **Day 1** (ELO ~800): Random legal moves
-- **Day 3** (ELO ~1200): Learned basic trick-taking rules
-- **Day 7** (ELO ~1600): Strategic bidding and card counting
-- **~136 days total** on RTX 4060 for strong model (with Medium MCTS @ 36.7 games/min)
-- **~72 days total** if using Light MCTS (@ 69.1 games/min, slightly lower quality)
+**Phase 1 with curriculum** (recommended, ~5 days total):
+- **Day 1** (ELO ~800): Random legal moves, learning basic rules
+- **Day 3** (ELO ~1200): Consistent trick-taking, early bidding strategy
+- **Day 5** (ELO ~1400-1600): Strategic bidding, card counting, suit tracking
+
+**Phase 1 without curriculum** (fixed config, for reference):
+- ~72 days with Light MCTS (slightly lower quality)
+- ~136 days with Medium MCTS (higher quality)
 
 **Hardware Requirements**:
 - **Training** (Linux PC): RTX 4060 8GB GPU (supports max 32 workers), Ryzen 9 7950X 16-core, 128GB DDR5 RAM, 50GB+ storage

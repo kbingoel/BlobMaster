@@ -24,6 +24,7 @@ ray[default]>=2.8.0
 # Metrics and Logging
 tensorboard>=2.15.0
 wandb>=0.16.0
+rich>=13.0.0
 
 # Utilities
 tqdm>=4.66.0
