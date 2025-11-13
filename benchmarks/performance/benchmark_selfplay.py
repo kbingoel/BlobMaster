@@ -1,5 +1,5 @@
 """
-Benchmark self-play game generation performance.
+Benchmark self-play round generation performance (Phase 1: Independent Rounds).
 
 Tests different worker counts and MCTS configurations to find optimal settings
 for the AlphaZero training pipeline.
@@ -12,6 +12,8 @@ Usage:
 Output:
     - Console: Progress updates and results table
     - CSV: benchmark_selfplay_results.csv
+
+Note: This benchmarks Phase 1 (independent rounds), not Phase 2 (full games).
 """
 
 import argparse
@@ -161,7 +163,7 @@ class SelfPlayBenchmark:
                 elapsed = current_time - start_time
                 rate = count / elapsed if elapsed > 0 else 0
                 cpu_percent = psutil.cpu_percent(interval=None)
-                print(f"  Progress: {count}/{num_games} games ({rate:.1f} games/sec, CPU: {cpu_percent:.1f}%)")
+                print(f"  Progress: {count}/{num_games} rounds ({rate:.1f} rounds/sec, CPU: {cpu_percent:.1f}%)")
                 last_update_time[0] = current_time
 
         # Generate games and measure time
@@ -195,9 +197,9 @@ class SelfPlayBenchmark:
         cpu_percent_after = psutil.cpu_percent(interval=1.0)
         avg_cpu_percent = (cpu_percent_before + cpu_percent_after) / 2.0
 
-        # Calculate metrics
-        games_per_minute = (num_games / elapsed_time) * 60.0
-        seconds_per_game = elapsed_time / num_games
+        # Calculate metrics (Phase 1: Independent Rounds)
+        rounds_per_minute = (num_games / elapsed_time) * 60.0
+        seconds_per_round = elapsed_time / num_games
         examples_per_minute = (len(examples) / elapsed_time) * 60.0
 
         # Shutdown engine
@@ -210,18 +212,18 @@ class SelfPlayBenchmark:
             "num_determinizations": num_determinizations,
             "simulations_per_det": simulations_per_det,
             "total_sims_per_move": num_determinizations * simulations_per_det,
-            "num_games": num_games,
+            "num_rounds": num_games,
             "elapsed_time_sec": elapsed_time,
-            "games_per_minute": games_per_minute,
-            "seconds_per_game": seconds_per_game,
+            "rounds_per_minute": rounds_per_minute,
+            "seconds_per_round": seconds_per_round,
             "num_examples": len(examples),
             "examples_per_minute": examples_per_minute,
             "cpu_percent": avg_cpu_percent,
         }
 
         print(f"\nResults:")
-        print(f"  - Games/minute: {games_per_minute:.1f}")
-        print(f"  - Seconds/game: {seconds_per_game:.2f}")
+        print(f"  - Rounds/minute: {rounds_per_minute:.1f}")
+        print(f"  - Seconds/round: {seconds_per_round:.2f}")
         print(f"  - Training examples: {len(examples):,}")
         print(f"  - Examples/minute: {examples_per_minute:.1f}")
         print(f"  - CPU utilization: {avg_cpu_percent:.1f}%")
@@ -326,7 +328,7 @@ def print_results_table(results: List[Dict[str, Any]]):
         results: List of benchmark result dictionaries
     """
     print(f"\n\n{'='*80}")
-    print("BENCHMARK RESULTS SUMMARY")
+    print("BENCHMARK RESULTS SUMMARY (Phase 1: Independent Rounds)")
     print(f"{'='*80}\n")
 
     # Filter out results with errors
@@ -337,7 +339,7 @@ def print_results_table(results: List[Dict[str, Any]]):
         return
 
     # Print table header
-    print(f"{'Workers':<10} {'MCTS':<10} {'Sims/Move':<12} {'Games/Min':<12} {'Sec/Game':<12} {'CPU%':<8}")
+    print(f"{'Workers':<10} {'MCTS':<10} {'Sims/Move':<12} {'Rounds/Min':<12} {'Sec/Round':<12} {'CPU%':<8}")
     print("-" * 80)
 
     # Print rows
@@ -345,8 +347,8 @@ def print_results_table(results: List[Dict[str, Any]]):
         print(f"{r['num_workers']:<10} "
               f"{r['mcts_config']:<10} "
               f"{r['total_sims_per_move']:<12} "
-              f"{r['games_per_minute']:<12.1f} "
-              f"{r['seconds_per_game']:<12.2f} "
+              f"{r['rounds_per_minute']:<12.1f} "
+              f"{r['seconds_per_round']:<12.2f} "
               f"{r['cpu_percent']:<8.1f}")
 
     print("-" * 80)
@@ -357,9 +359,9 @@ def print_results_table(results: List[Dict[str, Any]]):
     # Find best worker count for medium MCTS
     medium_results = [r for r in valid_results if r['mcts_config'] == 'medium']
     if medium_results:
-        best_workers = max(medium_results, key=lambda x: x['games_per_minute'])
+        best_workers = max(medium_results, key=lambda x: x['rounds_per_minute'])
         print(f"  - Best worker count: {best_workers['num_workers']} "
-              f"({best_workers['games_per_minute']:.1f} games/min)")
+              f"({best_workers['rounds_per_minute']:.1f} rounds/min)")
 
     # Compare MCTS configs at best worker count
     if medium_results:
@@ -372,9 +374,9 @@ def print_results_table(results: List[Dict[str, Any]]):
             if r['mcts_config'] != 'light':
                 light = next((x for x in worker_results if x['mcts_config'] == 'light'), None)
                 if light:
-                    speedup = light['games_per_minute'] / r['games_per_minute']
+                    speedup = light['rounds_per_minute'] / r['rounds_per_minute']
 
-            print(f"    - {r['mcts_config']:<10}: {r['games_per_minute']:>6.1f} games/min "
+            print(f"    - {r['mcts_config']:<10}: {r['rounds_per_minute']:>6.1f} rounds/min "
                   f"({r['total_sims_per_move']:>3} sims/move, {speedup:.2f}x slower)")
 
     # Error summary
