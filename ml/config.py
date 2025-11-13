@@ -117,6 +117,39 @@ class TrainingConfig:
         # Default to highest if beyond schedule
         return (5, 50)
 
+    def get_training_units_per_iteration(self, iteration: int) -> int:
+        """
+        Adaptive training curriculum with linear ramp (saves ~3-4 days Phase 1 training).
+
+        Returns different units depending on training mode:
+        - Phase 1 (training_on='rounds'): Returns number of ROUNDS (independent rounds)
+        - Phase 2 (training_on='games'): Returns number of GAMES (full 17-round sequences)
+
+        Linear ramp from 2,000 → 10,000 over 500 iterations.
+        Smooth increase prevents sharp jumps that would interact with MCTS curriculum.
+
+        Args:
+            iteration: Current training iteration (0-indexed, so iter 0 = first iteration)
+
+        Returns:
+            Number of training units (rounds or games) for this iteration
+
+        Examples:
+            >>> config = TrainingConfig()
+            >>> config.get_training_units_per_iteration(0)    # First iteration
+            2000
+            >>> config.get_training_units_per_iteration(50)
+            2800
+            >>> config.get_training_units_per_iteration(250)
+            6000
+            >>> config.get_training_units_per_iteration(499)  # Last iteration
+            9984
+            >>> config.get_training_units_per_iteration(500)
+            10000  # Capped at max
+        """
+        # Linear ramp: +16 units per iteration, capped at 10,000
+        return min(2000 + (iteration * 16), 10000)
+
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert config to dictionary.

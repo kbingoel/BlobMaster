@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import json
 import time
+import copy
+import numpy as np
 from datetime import datetime
 
 from ml.network.model import BlobNet
@@ -103,12 +105,22 @@ class NetworkTrainer:
             weight_decay=weight_decay,
         )
 
-        # Initialize learning rate scheduler (StepLR: decay by 0.1 every 100 epochs)
-        self.scheduler = optim.lr_scheduler.StepLR(
+        # IMPROVEMENT: Replace StepLR with CosineAnnealingLR for smoother decay
+        # OLD CODE (works, but has abrupt jumps):
+        # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.1)
+        # ^ Steps per-iteration (not per-epoch), causing sharp drops at:
+        #   - Iteration 100: 0.001 → 0.0001 (sharp drop)
+        #   - Iteration 200: 0.0001 → 0.00001 (sharp drop)
+        #   These abrupt changes can cause training instability
+
+        # NEW: Cosine annealing (smooth, gradual decay)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            step_size=100,
-            gamma=0.1,
+            T_max=500,  # Total iterations (matches training plan)
+            eta_min=0.0001,  # Minimum LR (10x smaller than initial 0.001)
         )
+
+        print("Using CosineAnnealingLR scheduler (per-iteration, not per-epoch)")
 
         # Mixed precision scaler (for FP16 training)
         self.scaler = None
@@ -501,6 +513,16 @@ class TrainingPipeline:
         self.training_start_date = datetime.now().strftime("%Y%m%d")
         self.current_elo = self.best_model_elo  # Track current ELO for checkpoint naming
 
+        # NEW: EMA model (Session 2)
+        self.ema_model = copy.deepcopy(network)
+        self.ema_decay = 0.997  # Fixed value from MuZero
+        self.use_ema_for_selfplay = True
+
+        # NEW: Progressive target temperature schedule (Session 2)
+        self.pi_target_tau_start = 1.0
+        self.pi_target_tau_end = 0.7
+        self.tau_anneal_iters = 200
+
         print(f"Pipeline initialized:")
         print(f"  - Training session started: {self.training_start_date}")
         print(f"  - Self-play workers: {config.get('num_workers', 16)}")
@@ -508,6 +530,39 @@ class TrainingPipeline:
         print(f"  - Evaluation frequency: every {self.eval_frequency} iterations")
         print(f"  - Device: {self.device}")
         print(f"  - Checkpoint directory: {self.checkpoint_dir}")
+        print(f"  - EMA model: enabled (decay={self.ema_decay})")
+        print(f"  - Progressive target τ: {self.pi_target_tau_start} → {self.pi_target_tau_end} over {self.tau_anneal_iters} iterations")
+
+    def get_pi_target_tau(self, iteration: int) -> float:
+        """
+        Get policy target temperature for this iteration.
+
+        Args:
+            iteration: Current iteration (0-indexed)
+
+        Returns:
+            Temperature value (1.0 = uniform, lower = sharper)
+        """
+        if iteration >= self.tau_anneal_iters:
+            return self.pi_target_tau_end
+
+        # Linear anneal
+        progress = iteration / self.tau_anneal_iters
+        tau = self.pi_target_tau_start - progress * (
+            self.pi_target_tau_start - self.pi_target_tau_end
+        )
+        return tau
+
+    def update_ema_model(self):
+        """Update EMA model weights."""
+        with torch.no_grad():
+            for ema_param, online_param in zip(
+                self.ema_model.parameters(),
+                self.network.parameters()
+            ):
+                ema_param.data.mul_(self.ema_decay).add_(
+                    online_param.data, alpha=1 - self.ema_decay
+                )
 
     def run_training(
         self,
@@ -653,9 +708,23 @@ class TrainingPipeline:
         Returns:
             List of training examples from generated games
         """
-        num_games = self.config.get("games_per_iteration", 10_000)
+        # NEW: Use adaptive training curriculum (Session 2)
+        if hasattr(self.config, 'get_training_units_per_iteration'):
+            num_games = self.config.get_training_units_per_iteration(iteration)
+            unit_type = "rounds" if self.config.get('training_on', 'rounds') == 'rounds' else "games"
+            print(f"Generating {num_games:,} {unit_type} (adaptive curriculum: linear ramp)...")
+        else:
+            num_games = self.config.get("games_per_iteration", 10_000)
+            print(f"Generating {num_games:,} self-play games...")
 
-        print(f"Generating {num_games:,} self-play games...")
+        # NEW: Use EMA model for self-play (Session 2)
+        if self.use_ema_for_selfplay:
+            print(f"  - Using EMA model for self-play (stable policy)")
+            model_for_selfplay = self.ema_model
+            # Update self-play engine to use EMA model
+            if hasattr(self.selfplay_engine, 'update_model'):
+                self.selfplay_engine.update_model(model_for_selfplay)
+
         start_time = time.time()
 
         # Progress callback
@@ -684,7 +753,32 @@ class TrainingPipeline:
         print(f"  - Time: {elapsed_time / 60:.1f} minutes")
         print(f"  - Rate: {num_games / elapsed_time:.1f} games/sec")
 
-        # Add examples to replay buffer
+        # NEW: Apply progressive target sharpening (Session 2)
+        # Get policy target temperature for this iteration
+        tau = self.get_pi_target_tau(iteration)
+        print(f"  - Policy target τ = {tau:.3f}")
+
+        # Transform MCTS visit counts to policy targets with temperature
+        # NOTE: Tempering happens BEFORE adding to replay buffer
+        # IMPORTANT: MCTS returns untempered probabilities (temperature=1.0)
+        # We apply target sharpening here to control training signal
+        for example in examples:
+            visit_counts = example['policy']  # Raw visit counts from MCTS (untempered)
+
+            # Apply temperature: π_target ∝ N^(1/τ)
+            if tau != 1.0:
+                visit_counts_tempered = np.power(visit_counts, 1.0 / tau)
+            else:
+                visit_counts_tempered = visit_counts
+
+            # Normalize to probabilities and REPLACE policy field
+            total = visit_counts_tempered.sum()
+            if total > 0:
+                example['policy'] = visit_counts_tempered / total
+            else:
+                example['policy'] = visit_counts  # Fallback (shouldn't happen)
+
+        # Add tempered examples to replay buffer
         self.replay_buffer.add_examples(examples)
         print(f"  - Replay buffer size: {len(self.replay_buffer):,}/{self.replay_buffer.capacity:,}")
 
@@ -766,6 +860,12 @@ class TrainingPipeline:
         # Step learning rate scheduler
         self.trainer.step_scheduler()
 
+        # Get current learning rate after stepping
+        current_lr = self.trainer.get_learning_rate()
+
+        # NEW: Update EMA model (Session 2)
+        self.update_ema_model()
+
         elapsed_time = time.time() - start_time
 
         # Average metrics
@@ -775,11 +875,14 @@ class TrainingPipeline:
             "avg_value_loss": value_loss_sum / num_epochs,
             "avg_policy_accuracy": policy_accuracy_sum / num_epochs,
             "training_time_minutes": elapsed_time / 60.0,
+            "learning_rate": current_lr,  # NEW: Add learning rate to metrics
         }
 
         print(f"Training complete:")
         print(f"  - Avg total loss: {avg_metrics['avg_total_loss']:.4f}")
         print(f"  - Avg policy accuracy: {avg_metrics['avg_policy_accuracy']:.1f}%")
+        print(f"  - Learning rate: {current_lr:.6f}")
+        print(f"  - EMA model updated (decay={self.ema_decay})")
         print(f"  - Time: {elapsed_time / 60:.1f} minutes")
 
         return avg_metrics
