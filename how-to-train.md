@@ -7,8 +7,8 @@ Quick guide for running multi-day training with external monitoring.
 ### 1. Start Training
 
 ```bash
-# Full training run (7-9 days with Light MCTS, ~72 days with Medium MCTS)
-python ml/train.py --training-on rounds --iterations 500
+# Full training run (~5 days with curriculum enabled)
+python ml/train.py --training-on rounds --iterations 500 --enable-curriculum
 
 # Fast test (5 minutes)
 python ml/train.py --fast --iterations 10
@@ -104,10 +104,11 @@ rm models/checkpoints/permanent/[old-checkpoint].pth
 
 ### Phase 1: Independent Rounds (Current)
 ```bash
-python ml/train.py --training-on rounds --iterations 500
+python ml/train.py --training-on rounds --iterations 500 --enable-curriculum
 
-# Timeline: ~7-9 days (Light MCTS) or ~136 days (Medium MCTS)
-# Performance: ~360 rounds/min optimized
+# Timeline: ~5 days with curriculum (MCTS 1×15 → 5×50 + units 2K → 10K)
+# Without curriculum: ~72-136 days (depending on fixed MCTS config)
+# Performance: Variable with curriculum, ~310-1200 rounds/min depending on stage
 ```
 
 ### Phase 2: Full Games (Future)
@@ -202,10 +203,13 @@ models/checkpoints/
 
 ## Expected Training Progression
 
-**Day 1** (ELO ~800): Random legal moves
-**Day 3** (ELO ~1200): Basic trick-taking rules
-**Day 7** (ELO ~1600): Strategic bidding
-**~72-136 days**: Strong model (depending on MCTS config)
+**With curriculum** (~5 days total):
+- **Day 1** (ELO ~800): Random legal moves, learning basic rules
+- **Day 3** (ELO ~1200): Consistent trick-taking, early bidding strategy
+- **Day 5** (ELO ~1400-1600): Strategic bidding, card counting, suit tracking
+
+**Without curriculum** (fixed config, for reference):
+- ~72-136 days depending on MCTS configuration
 
 ---
 
