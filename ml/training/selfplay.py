@@ -191,6 +191,7 @@ class SelfPlayWorker:
         parallel_batch_size: int = 10,
         must_have_suit_bias: float = 1.0,
         config: Optional["TrainingConfig"] = None,
+        enable_exploration_noise: bool = True,
     ):
         """
         Initialize self-play worker.
@@ -221,6 +222,9 @@ class SelfPlayWorker:
                                 1.0 = no bias (maximum entropy), higher values = stronger preference
             config: Optional TrainingConfig for hybrid training (Session 0)
                    If provided, enables decision-weighted sampling
+            enable_exploration_noise: Add Dirichlet noise at root during self-play (default: True)
+                                     Uses AlphaZero defaults: epsilon=0.25, alpha=0.3
+                                     Set to False for evaluation/arena matches
         """
         self.network = network
         self.encoder = encoder
@@ -235,6 +239,7 @@ class SelfPlayWorker:
         self.parallel_batch_size = parallel_batch_size
         self.must_have_suit_bias = must_have_suit_bias
         self.config = config
+        self.enable_exploration_noise = enable_exploration_noise
 
         # Temperature schedule for exploration
         if temperature_schedule is None:
@@ -242,7 +247,12 @@ class SelfPlayWorker:
         else:
             self.temperature_schedule = temperature_schedule
 
-        # Create MCTS instance
+        # Create MCTS instance with exploration noise (Session 3)
+        # Use AlphaZero defaults: epsilon=0.25, alpha=0.3 for self-play
+        # Disable noise (epsilon=0.0) for evaluation
+        exploration_epsilon = 0.25 if enable_exploration_noise else 0.0
+        exploration_alpha = 0.30  # AlphaZero default
+
         if use_imperfect_info:
             self.mcts = ImperfectInfoMCTS(
                 network=network,
@@ -253,6 +263,8 @@ class SelfPlayWorker:
                 batch_evaluator=batch_evaluator,
                 gpu_server_client=gpu_server_client,
                 must_have_suit_bias=must_have_suit_bias,
+                exploration_noise_epsilon=exploration_epsilon,
+                exploration_noise_alpha=exploration_alpha,
             )
         else:
             # For testing or comparison, can use perfect info MCTS
@@ -266,6 +278,8 @@ class SelfPlayWorker:
                 num_simulations=total_sims,
                 batch_evaluator=batch_evaluator,
                 gpu_server_client=gpu_server_client,
+                exploration_noise_epsilon=exploration_epsilon,
+                exploration_noise_alpha=exploration_alpha,
             )
 
     def generate_game(
