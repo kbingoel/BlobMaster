@@ -2,6 +2,8 @@
 Visualization script for Session 1+2 validation benchmark results.
 
 Generates plots and summary statistics from the benchmark CSV output.
+
+Note: Supports both "games_per_minute" (legacy) and "rounds_per_minute" (Phase 1) columns.
 """
 
 import argparse
@@ -25,13 +27,21 @@ def load_results(csv_path: str) -> List[Dict]:
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Convert numeric fields
+            # Convert numeric fields (support both old and new column names)
             for key in ['workers', 'num_determinizations', 'simulations_per_determinization',
-                       'total_sims_per_move', 'games', 'parallel_batch_size', 'batch_timeout_ms',
-                       'elapsed_seconds', 'games_per_minute', 'seconds_per_game',
+                       'total_sims_per_move', 'games', 'rounds', 'num_rounds', 'parallel_batch_size', 'batch_timeout_ms',
+                       'elapsed_seconds', 'games_per_minute', 'rounds_per_minute',
+                       'seconds_per_game', 'seconds_per_round',
                        'total_examples', 'examples_per_minute']:
                 if key in row and row[key]:
                     row[key] = float(row[key])
+
+            # Normalize column names: use rounds_per_minute consistently
+            if 'rounds_per_minute' not in row and 'games_per_minute' in row:
+                row['rounds_per_minute'] = row['games_per_minute']
+            if 'seconds_per_round' not in row and 'seconds_per_game' in row:
+                row['seconds_per_round'] = row['seconds_per_game']
+
             # Convert boolean field
             if 'use_parallel_expansion' in row:
                 row['use_parallel_expansion'] = row['use_parallel_expansion'].lower() == 'true'
@@ -46,20 +56,20 @@ def plot_batch_size_sweep(results: List[Dict], output_path: str):
     if len(worker_counts) == 1:
         # Single worker count
         batch_sizes = sorted(set(r['parallel_batch_size'] for r in results))
-        games_per_min = [next(r['games_per_minute'] for r in results
+        rounds_per_min = [next(r['rounds_per_minute'] for r in results
                               if r['parallel_batch_size'] == bs)
                         for bs in batch_sizes]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(batch_sizes, games_per_min, 'o-', linewidth=2, markersize=8)
+        ax.plot(batch_sizes, rounds_per_min, 'o-', linewidth=2, markersize=8)
         ax.set_xlabel('Parallel Batch Size', fontsize=12)
-        ax.set_ylabel('Games per Minute', fontsize=12)
+        ax.set_ylabel('Rounds per Minute (Phase 1)', fontsize=12)
         ax.set_title(f'Parallel Batch Size Impact ({int(list(worker_counts)[0])} workers)',
                      fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3)
 
         # Mark optimal
-        best_idx = games_per_min.index(max(games_per_min))
+        best_idx = rounds_per_min.index(max(rounds_per_min))
         ax.axvline(batch_sizes[best_idx], color='red', linestyle='--', alpha=0.5,
                   label=f'Optimal: {batch_sizes[best_idx]}')
         ax.legend()
@@ -76,25 +86,25 @@ def plot_worker_scaling(results: List[Dict], output_path: str):
     batch_sizes = set(r['parallel_batch_size'] for r in results)
     if len(batch_sizes) == 1:
         workers = sorted(set(r['workers'] for r in results))
-        games_per_min = [next(r['games_per_minute'] for r in results
+        rounds_per_min = [next(r['rounds_per_minute'] for r in results
                              if r['workers'] == w)
                         for w in workers]
 
         # Calculate efficiency
-        baseline_throughput = games_per_min[0]
+        baseline_throughput = rounds_per_min[0]
         baseline_workers = workers[0]
-        speedups = [g / baseline_throughput for g in games_per_min]
+        speedups = [g / baseline_throughput for g in rounds_per_min]
         ideal_speedups = [w / baseline_workers for w in workers]
         efficiencies = [(s / i) * 100 for s, i in zip(speedups, ideal_speedups)]
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
         # Left: Throughput
-        ax1.plot(workers, games_per_min, 'o-', linewidth=2, markersize=8, label='Actual')
+        ax1.plot(workers, rounds_per_min, 'o-', linewidth=2, markersize=8, label='Actual')
         ax1.plot(workers, [baseline_throughput * w / baseline_workers for w in workers],
                 '--', alpha=0.5, label='Ideal Linear')
         ax1.set_xlabel('Number of Workers', fontsize=12)
-        ax1.set_ylabel('Games per Minute', fontsize=12)
+        ax1.set_ylabel('Rounds per Minute (Phase 1)', fontsize=12)
         ax1.set_title('Worker Scaling: Throughput', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
@@ -127,7 +137,7 @@ def plot_2d_heatmap(results: List[Dict], output_path: str):
             matching = [r for r in results
                        if r['workers'] == w and r['parallel_batch_size'] == bs]
             if matching:
-                matrix[i, j] = matching[0]['games_per_minute']
+                matrix[i, j] = matching[0]['rounds_per_minute']
 
     fig, ax = plt.subplots(figsize=(12, 8))
     im = ax.imshow(matrix, aspect='auto', cmap='RdYlGn', interpolation='nearest')
@@ -140,7 +150,7 @@ def plot_2d_heatmap(results: List[Dict], output_path: str):
 
     ax.set_xlabel('Parallel Batch Size', fontsize=12)
     ax.set_ylabel('Number of Workers', fontsize=12)
-    ax.set_title('Performance Heatmap: Workers × Batch Size',
+    ax.set_title('Performance Heatmap: Workers × Batch Size (Phase 1)',
                  fontsize=14, fontweight='bold')
 
     # Add values to cells
@@ -152,7 +162,7 @@ def plot_2d_heatmap(results: List[Dict], output_path: str):
 
     # Colorbar
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('Games per Minute', fontsize=11)
+    cbar.set_label('Rounds per Minute', fontsize=11)
 
     # Mark best configuration
     best_i, best_j = np.unravel_index(matrix.argmax(), matrix.shape)
@@ -175,7 +185,7 @@ def plot_mcts_comparison(results: List[Dict], output_path: str):
             mcts_configs.append((
                 config_name,
                 r['total_sims_per_move'],
-                r['games_per_minute']
+                r['rounds_per_minute']
             ))
 
     if not mcts_configs:
@@ -183,29 +193,29 @@ def plot_mcts_comparison(results: List[Dict], output_path: str):
 
     # Sort by sims per move
     mcts_configs.sort(key=lambda x: x[1])
-    names, sims, games_per_min = zip(*mcts_configs)
+    names, sims, rounds_per_min = zip(*mcts_configs)
 
-    # Calculate training time
-    GAMES_NEEDED = 500 * 10_000
-    training_days = [GAMES_NEEDED / (g * 60 * 24) for g in games_per_min]
+    # Calculate training time (Phase 1: Independent Rounds)
+    ROUNDS_NEEDED = 500 * 10_000
+    training_days = [ROUNDS_NEEDED / (g * 60 * 24) for g in rounds_per_min]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
     # Left: Throughput
     colors = ['green', 'orange', 'red']
-    ax1.bar(names, games_per_min, color=colors[:len(names)], alpha=0.7)
-    ax1.set_ylabel('Games per Minute', fontsize=12)
+    ax1.bar(names, rounds_per_min, color=colors[:len(names)], alpha=0.7)
+    ax1.set_ylabel('Rounds per Minute (Phase 1)', fontsize=12)
     ax1.set_title('MCTS Configuration: Throughput', fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3, axis='y')
 
     # Add values on bars
-    for i, (n, g) in enumerate(zip(names, games_per_min)):
+    for i, (n, g) in enumerate(zip(names, rounds_per_min)):
         ax1.text(i, g, f'{g:.1f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
 
     # Right: Training time
     ax2.bar(names, training_days, color=colors[:len(names)], alpha=0.7)
     ax2.set_ylabel('Training Time (days)', fontsize=12)
-    ax2.set_title('MCTS Configuration: Training Duration', fontsize=14, fontweight='bold')
+    ax2.set_title('MCTS Configuration: Training Duration (Phase 1)', fontsize=14, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='y')
 
     # Add values on bars
@@ -222,21 +232,22 @@ def generate_summary_report(results: List[Dict], output_path: str):
     """Generate text summary report."""
     with open(output_path, 'w') as f:
         f.write("="*80 + "\n")
-        f.write("SESSION 1+2 VALIDATION BENCHMARK - SUMMARY REPORT\n")
+        f.write("SESSION 1+2 VALIDATION BENCHMARK - SUMMARY REPORT (Phase 1)\n")
         f.write("="*80 + "\n\n")
 
         # Overall best
-        best = max(results, key=lambda r: r['games_per_minute'])
+        best = max(results, key=lambda r: r['rounds_per_minute'])
         f.write("BEST CONFIGURATION FOUND:\n")
         f.write("-"*80 + "\n")
         f.write(f"Workers: {int(best['workers'])}\n")
         f.write(f"Parallel batch size: {int(best['parallel_batch_size'])}\n")
         f.write(f"MCTS config: {best['num_determinizations']} det × {best['simulations_per_determinization']} sims\n")
-        f.write(f"Performance: {best['games_per_minute']:.1f} games/min\n")
-        f.write(f"Speedup vs baseline (36.7 g/min): {best['games_per_minute'] / 36.7:.2f}x\n")
+        f.write(f"Performance: {best['rounds_per_minute']:.1f} rounds/min\n")
+        f.write(f"Baseline (Medium MCTS, 2025-11-13): 741 rounds/min\n")
+        f.write(f"Speedup vs baseline: {best['rounds_per_minute'] / 741:.2f}x\n")
 
-        GAMES_NEEDED = 500 * 10_000
-        training_days = GAMES_NEEDED / (best['games_per_minute'] * 60 * 24)
+        ROUNDS_NEEDED = 500 * 10_000
+        training_days = ROUNDS_NEEDED / (best['rounds_per_minute'] * 60 * 24)
         f.write(f"Estimated training time: {training_days:.1f} days\n")
         f.write("\n")
 
@@ -246,12 +257,12 @@ def generate_summary_report(results: List[Dict], output_path: str):
             bs = r['parallel_batch_size']
             if bs not in batch_size_results:
                 batch_size_results[bs] = []
-            batch_size_results[bs].append(r['games_per_minute'])
+            batch_size_results[bs].append(r['rounds_per_minute'])
 
         if len(batch_size_results) > 1:
             f.write("PARALLEL BATCH SIZE ANALYSIS:\n")
             f.write("-"*80 + "\n")
-            f.write(f"{'Batch Size':<15} {'Avg Games/Min':<20} {'Max Games/Min':<20}\n")
+            f.write(f"{'Batch Size':<15} {'Avg Rounds/Min':<20} {'Max Rounds/Min':<20}\n")
             for bs in sorted(batch_size_results.keys()):
                 avg = np.mean(batch_size_results[bs])
                 max_val = max(batch_size_results[bs])
@@ -264,7 +275,7 @@ def generate_summary_report(results: List[Dict], output_path: str):
             w = r['workers']
             if w not in worker_results:
                 worker_results[w] = []
-            worker_results[w].append(r['games_per_minute'])
+            worker_results[w].append(r['rounds_per_minute'])
 
         if len(worker_results) > 1:
             f.write("WORKER SCALING ANALYSIS:\n")
@@ -273,7 +284,7 @@ def generate_summary_report(results: List[Dict], output_path: str):
             baseline_throughput = np.mean(worker_results[sorted_workers[0]])
             baseline_workers = sorted_workers[0]
 
-            f.write(f"{'Workers':<10} {'Avg G/Min':<12} {'Speedup':<10} {'Efficiency':<12}\n")
+            f.write(f"{'Workers':<10} {'Avg R/Min':<12} {'Speedup':<10} {'Efficiency':<12}\n")
             for w in sorted_workers:
                 avg = np.mean(worker_results[w])
                 speedup = avg / baseline_throughput
@@ -287,7 +298,7 @@ def generate_summary_report(results: List[Dict], output_path: str):
         if mcts_results:
             f.write("MCTS CONFIGURATION COMPARISON:\n")
             f.write("-"*80 + "\n")
-            f.write(f"{'Config':<12} {'Sims/Move':<12} {'Games/Min':<12} {'Training Days':<15}\n")
+            f.write(f"{'Config':<12} {'Sims/Move':<12} {'Rounds/Min':<12} {'Training Days':<15}\n")
 
             mcts_by_config = {}
             for r in mcts_results:
@@ -297,9 +308,9 @@ def generate_summary_report(results: List[Dict], output_path: str):
 
             for name in sorted(mcts_by_config.keys()):
                 r = mcts_by_config[name]
-                training_days = GAMES_NEEDED / (r['games_per_minute'] * 60 * 24)
+                training_days = ROUNDS_NEEDED / (r['rounds_per_minute'] * 60 * 24)
                 f.write(f"{name:<12} {int(r['total_sims_per_move']):<12} "
-                       f"{r['games_per_minute']:<12.1f} {training_days:<15.1f}\n")
+                       f"{r['rounds_per_minute']:<12.1f} {training_days:<15.1f}\n")
             f.write("\n")
 
         # Recommendations
@@ -308,16 +319,20 @@ def generate_summary_report(results: List[Dict], output_path: str):
         f.write(f"1. Use parallel_batch_size = {int(best['parallel_batch_size'])}\n")
         f.write(f"2. Use {int(best['workers'])} workers for optimal throughput\n")
 
-        speedup = best['games_per_minute'] / 36.7
-        if speedup >= 3.0:
-            f.write(f"3. ✅ Target achieved! {speedup:.2f}x speedup (≥3x goal)\n")
-            f.write("4. Sessions 3-5 optional but will provide additional gains\n")
-        elif speedup >= 2.0:
-            f.write(f"3. ⚠️ Good progress: {speedup:.2f}x speedup (target: 3x)\n")
-            f.write("4. Proceed with Sessions 3-5 to reach 3x target\n")
+        # Current baseline: 741 rounds/min (Medium MCTS, 2025-11-13)
+        speedup = best['rounds_per_minute'] / 741
+        if speedup >= 1.5:
+            f.write(f"3. ✅ Excellent! {speedup:.2f}x speedup vs baseline (741 r/min)\n")
+            f.write("4. Configuration validated and ready for production training\n")
+        elif speedup >= 1.2:
+            f.write(f"3. ✅ Good improvement: {speedup:.2f}x speedup vs baseline (741 r/min)\n")
+            f.write("4. Consider additional optimizations for further gains\n")
+        elif speedup >= 1.0:
+            f.write(f"3. ⚠️ Modest improvement: {speedup:.2f}x speedup vs baseline (741 r/min)\n")
+            f.write("4. Investigate configuration settings and hardware utilization\n")
         else:
-            f.write(f"3. ⚠️ Below expectations: {speedup:.2f}x speedup (target: 3x)\n")
-            f.write("4. Debug batch sizes and GPU utilization before Sessions 3-5\n")
+            f.write(f"3. ⚠️ Below baseline: {speedup:.2f}x vs 741 r/min\n")
+            f.write("4. Debug configuration - something may be wrong\n")
 
         f.write("\n")
         f.write("="*80 + "\n")

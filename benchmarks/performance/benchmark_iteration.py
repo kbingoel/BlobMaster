@@ -1,13 +1,16 @@
 """
-Benchmark full training iteration (self-play + training).
+Benchmark full training iteration (self-play + network training).
 
-Simulates one training iteration at 1/10th scale to project full-scale performance.
-This helps estimate the total training time for 500 iterations.
+Simulates one training iteration at reduced scale to project full-scale performance.
+This helps estimate the total training time for 500 iterations with adaptive curriculum.
+
+Note: This measures Phase 1 (independent rounds) self-play + network training epochs.
+The adaptive curriculum adjusts both MCTS depth and training units over iterations.
 
 Usage:
     python ml/benchmark_iteration.py
     python ml/benchmark_iteration.py --games 500 --epochs 5
-    python ml/benchmark_iteration.py --device cuda
+    python ml/benchmark_iteration.py --device cuda --iteration 250
 
 Output:
     - Console: Phase breakdown and projections
@@ -108,20 +111,20 @@ class IterationBenchmark:
         cards_to_deal: int = 5,
     ) -> Dict[str, Any]:
         """
-        Run self-play phase.
+        Run self-play phase (Phase 1: Independent Rounds).
 
         Args:
-            num_games: Number of games to generate
-            num_players: Players per game
+            num_games: Number of rounds to generate
+            num_players: Players per round
             cards_to_deal: Cards to deal per player
 
         Returns:
             Dictionary with self-play metrics
         """
         print(f"\n{'='*70}")
-        print("PHASE 1: SELF-PLAY")
+        print("PHASE 1: SELF-PLAY (Independent Rounds)")
         print(f"{'='*70}")
-        print(f"Generating {num_games:,} games ({num_players} players, {cards_to_deal} cards)")
+        print(f"Generating {num_games:,} rounds ({num_players} players, {cards_to_deal} cards)")
 
         # Progress tracking
         games_generated = [0]
@@ -133,7 +136,7 @@ class IterationBenchmark:
             if current_time - last_update_time[0] >= 10.0 or count == num_games:
                 elapsed = current_time - start_time
                 rate = count / elapsed if elapsed > 0 else 0
-                print(f"  Progress: {count:,}/{num_games:,} games ({rate:.1f} games/sec)")
+                print(f"  Progress: {count:,}/{num_games:,} rounds ({rate:.1f} rounds/sec)")
                 last_update_time[0] = current_time
 
         # Generate games
@@ -152,24 +155,24 @@ class IterationBenchmark:
         self.replay_buffer.add_examples(examples)
 
         # Calculate metrics
-        games_per_minute = (num_games / elapsed_time) * 60.0
-        seconds_per_game = elapsed_time / num_games
+        rounds_per_minute = (num_games / elapsed_time) * 60.0
+        seconds_per_round = elapsed_time / num_games
 
         metrics = {
-            "num_games": num_games,
+            "num_rounds": num_games,
             "num_examples": len(examples),
             "elapsed_time_sec": elapsed_time,
             "elapsed_time_min": elapsed_time / 60.0,
-            "games_per_minute": games_per_minute,
-            "seconds_per_game": seconds_per_game,
+            "rounds_per_minute": rounds_per_minute,
+            "seconds_per_round": seconds_per_round,
             "replay_buffer_size": len(self.replay_buffer),
         }
 
         print(f"\nSelf-Play Complete:")
-        print(f"  - Games generated: {num_games:,}")
+        print(f"  - Rounds generated: {num_games:,}")
         print(f"  - Training examples: {len(examples):,}")
         print(f"  - Time: {elapsed_time / 60:.1f} minutes")
-        print(f"  - Rate: {games_per_minute:.1f} games/min")
+        print(f"  - Rate: {rounds_per_minute:.1f} rounds/min")
         print(f"  - Replay buffer size: {len(self.replay_buffer):,}")
 
         return metrics
@@ -265,11 +268,11 @@ class IterationBenchmark:
         batch_size: int = 512,
     ) -> Dict[str, Any]:
         """
-        Run full iteration (self-play + training).
+        Run full iteration (self-play + network training).
 
         Args:
-            num_games: Number of games for self-play
-            num_epochs: Number of training epochs
+            num_games: Number of rounds for self-play (Phase 1: Independent Rounds)
+            num_epochs: Number of network training epochs
             batch_size: Training batch size
 
         Returns:
@@ -279,7 +282,7 @@ class IterationBenchmark:
         print("RUNNING FULL ITERATION BENCHMARK")
         print(f"{'#'*70}")
         print(f"Configuration:")
-        print(f"  - Games: {num_games:,}")
+        print(f"  - Rounds (self-play): {num_games:,}")
         print(f"  - Training epochs: {num_epochs}")
         print(f"  - Batch size: {batch_size}")
         print(f"{'#'*70}\n")
@@ -303,9 +306,9 @@ class IterationBenchmark:
         iteration_time = time.time() - iteration_start_time
 
         # Calculate projections for full-scale iteration
-        # Assume full iteration = 10,000 games
-        full_scale_games = 10_000
-        scale_factor = full_scale_games / num_games
+        # Assume full iteration = 10,000 rounds (adaptive curriculum may vary)
+        full_scale_rounds = 10_000
+        scale_factor = full_scale_rounds / num_games
 
         projected_selfplay_time = selfplay_metrics["elapsed_time_min"] * scale_factor
         projected_training_time = training_metrics["elapsed_time_min"]  # Same epochs
@@ -319,7 +322,7 @@ class IterationBenchmark:
         # Combine metrics
         results = {
             "configuration": {
-                "num_games": num_games,
+                "num_rounds": num_games,
                 "num_epochs": num_epochs,
                 "batch_size": batch_size,
                 "num_workers": self.num_workers,
@@ -337,7 +340,7 @@ class IterationBenchmark:
                 "training_percentage": (training_metrics["elapsed_time_min"] / (iteration_time / 60.0)) * 100.0,
             },
             "projections": {
-                "full_scale_games": full_scale_games,
+                "full_scale_rounds": full_scale_rounds,
                 "scale_factor": scale_factor,
                 "projected_selfplay_time_min": projected_selfplay_time,
                 "projected_training_time_min": projected_training_time,
@@ -374,7 +377,7 @@ class IterationBenchmark:
 
         # Projections
         proj = results['projections']
-        print(f"\nProjected Full-Scale Iteration (10,000 games):")
+        print(f"\nProjected Full-Scale Iteration (10,000 rounds):")
         print(f"  - Self-play: {proj['projected_selfplay_time_min']:.1f} minutes")
         print(f"  - Training: {proj['projected_training_time_min']:.1f} minutes")
         print(f"  - Total: {proj['projected_iteration_time_min']:.1f} minutes")
@@ -424,7 +427,7 @@ def main():
         "--games",
         type=int,
         default=500,
-        help="Games for self-play (default: 500 = 1/20th scale for quick screening)",
+        help="Rounds for self-play (default: 500 = 1/20th scale for quick screening)",
     )
     parser.add_argument(
         "--epochs",
@@ -467,9 +470,9 @@ def main():
 
     # Print benchmark plan
     print("\n" + "="*70)
-    print("ITERATION PERFORMANCE BENCHMARK")
+    print("ITERATION PERFORMANCE BENCHMARK (Phase 1: Independent Rounds)")
     print("="*70)
-    print(f"Games: {args.games:,} (1/10th scale)")
+    print(f"Rounds: {args.games:,} (reduced scale for quick testing)")
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size}")
     print(f"Workers: {args.workers}")
