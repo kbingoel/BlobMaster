@@ -1,682 +1,518 @@
 # BlobMaster
 
-An AI-powered assistant for the card game **Blob** using state-of-the-art reinforcement learning techniques. This project implements an AlphaZero-style neural network trained through self-play to master both bidding strategy and optimal card play.
+An AlphaZero-style reinforcement learning agent for the trick-taking card game **Blob**, trained through self-play with Monte Carlo Tree Search (MCTS) to master bidding strategy and card play.
 
-## Current Status
+**Current Status**: Phase 1 training infrastructure complete. Ready to train on independent rounds (~3.3-11 days). Phase 2 (full multi-round games) not yet implemented.
 
-**Phase 4 Complete** ✅ - Full training pipeline implemented with 93 passing tests. Ready to begin multi-day training runs.
+---
 
-- ✅ **Phase 1**: Core Game Engine (135 tests, 97% coverage)
-- ✅ **Phase 2**: MCTS + Neural Network (148 tests total)
-- ✅ **Phase 3**: Imperfect Information Handling (333 tests total)
-- ✅ **Phase 4**: Self-Play Training Pipeline (93 training tests)
-- 🔜 **Phase 5**: ONNX Export & Inference (Next)
-- 🔜 **Phase 6**: Backend API (Bun + TypeScript)
-- 🔜 **Phase 7**: Frontend UI (Svelte)
+## Terminology - READ THIS FIRST
 
-## Project Goals
+**CRITICAL**: This project uses specific terminology to distinguish training modes:
 
-1. **Learn modern ML/RL techniques** through a practical, scoped project
-2. **Implement AlphaZero-style architecture** with MCTS + neural network
-3. **Master imperfect information games** using determinization and belief tracking
-4. **Build end-to-end pipeline** from game rules → self-play training → production inference
-5. **Study emergent strategy** without human bias through pure self-play
-6. **Track learning progression** via ELO ratings across training generations
+- **Round**: A single deal with fixed cards (e.g., one 5-card bidding + trick-taking cycle). Phase 1 trains on independent rounds sampled randomly.
+  - **Performance metric**: rounds/min (310-1,049 rounds/min achieved on RTX 4060 8GB, varies by MCTS complexity)
+
+- **Game**: A complete Blob game consisting of a full sequence of rounds (e.g., 17 rounds for 5 players: 7→6→5→4→3→2→1→1→1→1→1→2→3→4→5→6→7). Phase 2 trains on complete game sequences.
+  - **Performance metric**: games/min (NOT YET IMPLEMENTED - full game training is Session 4-5 future work)
+
+**Note**: Older code and documentation may inconsistently use "game" to mean what we now define as "round". This document represents the current baseline terminology.
+
+---
+
+## Implementation Status
+
+### ✅ Complete
+
+**Phase 1-3: Core ML Infrastructure**
+- Game engine with 135 tests, 97% coverage ([ml/game/blob.py](ml/game/blob.py))
+- Neural network: Transformer architecture, ~4.9M parameters ([ml/network/model.py](ml/network/model.py))
+- MCTS with determinization for imperfect information ([ml/mcts/](ml/mcts/))
+- Belief tracking and suit elimination
+- 460 tests total across all components
+
+**Phase 4: Training Pipeline (Partial)**
+- Self-play engine with multiprocessing workers ([ml/training/selfplay.py](ml/training/selfplay.py))
+- Replay buffer with 500K capacity ([ml/training/replay_buffer.py](ml/training/replay_buffer.py))
+- Network training loop with Adam optimizer ([ml/training/trainer.py](ml/training/trainer.py))
+- ELO evaluation system ([ml/evaluation/](ml/evaluation/))
+- Main training script ([ml/train.py](ml/train.py))
+
+**Training Infrastructure Sessions (TRAINING-TODO.md)**
+- ✅ Session 0: MCTS curriculum integration & CLI flags
+- ✅ Session 1: Zero-choice fast path optimization
+- ✅ Session 2: Training stabilization & linear curriculum
+- ✅ Session 3: Exploration noise (Dirichlet α at root)
+- ✅ Session 6: External monitoring & checkpoint management
+
+### ❌ Not Implemented
+
+**Phase 4 Remaining (Sessions 4-5)** - ~8 hours of work:
+- Session 4: Full multi-round game evaluation infrastructure
+- Session 5: Full multi-round game training mode (Phase 2)
+
+**Phase 5-7: Production Deployment**
+- ONNX model export for inference
+- Bun/TypeScript backend API (directories exist, no code)
+- Svelte frontend UI (directories exist, no code)
+
+---
+
+## Training Readiness
+
+**Phase 1 (Independent Rounds)**: ✅ **READY NOW**
+- Train on randomly sampled single rounds
+- Performance: 310-1,049 rounds/min (32 workers, RTX 4060 8GB, Medium-Light MCTS)
+- Timeline: **~3.3-11 days** for 5M rounds (500 iterations × 10K each)
+- Command: `python ml/train.py --iterations 500 --training-on rounds`
+
+**Phase 2 (Full Game Sequences)**: ❌ **NOT READY**
+- Requires completing Sessions 4-5 (~8 hours implementation)
+- Would train on complete 17-round game sequences
+- Estimated: ~56-180 days when implemented (17 rounds per game)
+
+**Recommendation**: Start Phase 1 training now, implement Phase 2 later if multi-round strategy learning is needed.
+
+---
 
 ## Game Rules - Blob Variant
 
 ### Overview
-Blob is a trick-taking card game where players bid on the exact number of tricks they'll win, then play to meet their bid precisely.
+Blob is a trick-taking card game where players bid on the **exact** number of tricks they'll win, then play to meet their bid precisely. All-or-nothing scoring creates high-stakes decisions.
 
 ### Setup
 - **Players**: 3-8 players (variable per game)
 - **Deck**: Standard 52-card deck
-- **Rounds**: Variable cards dealt per round (typically starts with some cards, decreases, then as many 1-card rounds as there are players, then increases again to the same number of cards as in the first round)
-- **Trump**: Alternates between all four suits and then no suit. In no-trump rounds, the highest card in the led suit wins (no actual trump suit exists; the led suit functions similarly to trump for that trick only)
+- **Rounds**: Variable cards dealt (typically: 7→6→5→4→3→2→1→1→1...→2→3→4→5→6→7)
+- **Trump**: Rotates through all four suits, then no-trump rounds
 
 ### Bidding Phase
 - Players bid **sequentially** on how many tricks they expect to win
-- **Constraint**: The last bidder (dealer) cannot bid such that the total bids equal the number of cards dealt
-- This creates strategic tension: last position has information but a constraint (ending up "under" or "over")
+- **Last bidder constraint**: Dealer cannot bid such that total bids = cards dealt
+  - Creates strategic tension: last position has information but a constraint
 
 ### Playing Phase
-- Standard trick-taking rules:
+- Standard trick-taking:
   - Must follow suit if possible
   - Highest card in led suit wins (unless trump played)
   - Trump cards beat non-trump cards
-  - Winner of trick leads next trick (their lead card becomes trump)
+  - Winner of trick leads next trick
 
 ### Scoring
-- **Exact bids only**: Score = `(tricks_won == bid) ? (10 + bid) : 0`
+- **Exact bids only**: `score = (tricks_won == bid) ? (10 + bid) : 0`
 - Examples:
-  - Bid 2, won 2: **12 points**
-  - Bid 3, won 4: **0 points** (bust)
-  - Bid 0, won 0: **10 points** (risky but rewarding)
+  - Bid 2, won 2 tricks: **12 points**
+  - Bid 3, won 4 tricks: **0 points** (bust)
+  - Bid 0, won 0 tricks: **10 points** (risky but rewarding)
 
-This all-or-nothing scoring creates high-stakes decisions and rewards accurate self-assessment.
+This all-or-nothing scoring rewards accurate self-assessment and risk management.
 
-## Technical Approach
+---
 
-### Why AlphaZero-Style Architecture?
+## Performance Benchmarks
 
-For this project, we're using an **AlphaZero-inspired approach** rather than pure policy gradient methods (like PPO) because:
+**Platform**: Ubuntu 24.04, RTX 4060 8GB, Ryzen 9 7950X, 128GB RAM, Python 3.14
 
-1. **Sample efficiency**: MCTS + neural network converges faster than pure RL
-2. **Proven for card games**: Similar architectures dominate poker (Pluribus), bridge, and other imperfect information games
-3. **Interpretability**: MCTS tree can be visualized to understand AI reasoning
-4. **Handles imperfect information**: Determinization sampling works naturally with MCTS
-5. **Tree reuse**: Can retain computed nodes when game state updates incrementally
+### Phase 1 Training (Independent Rounds)
 
-### Architecture Components
+**Validated performance** from [benchmarks/BASELINE.md](benchmarks/BASELINE.md) (2025-11-13):
 
-#### 1. Game State Representation
+| Workers | MCTS Config | Det × Sims | Total Sims | **Rounds/Min** | **Training Timeline** (5M rounds) |
+|---------|-------------|------------|------------|----------------|-----------------------------------|
+| 32      | Light       | 2 × 20     | 40         | **1,049** 🏆   | **~3.3 days** (fastest)           |
+| 32      | Medium      | 3 × 30     | 90         | **741** ⭐     | **~4.7 days** (recommended)       |
+| 32      | Heavy       | 5 × 50     | 250        | **310**        | **~11 days** (highest quality)    |
 
-The AI needs to encode a **belief state** since opponent hands are hidden:
+**Annotations**:
+- 🏆 Light MCTS = fastest iteration, excellent quality-to-speed ratio
+- ⭐ Medium MCTS = **recommended balance** of speed and quality
+- Heavy MCTS = maximum quality, 3.4x slower than Light
 
-```
-State Vector (256 dimensions):
-├── My Hand (52-dim binary: which cards I hold)
-├── Cards Played This Trick (52-dim sequential)
-├── All Cards Played This Round (52-dim binary)
-├── Player Bids (8-dim, padded -1 for absent players)
-├── Player Tricks Won (8-dim, padded)
-├── My Bid (scalar, -1 if not yet bid)
-├── My Tricks Won (scalar)
-├── Round Metadata
-│   ├── Total cards this round
-│   ├── Current trick number
-│   ├── My position (relative to dealer)
-│   └── Number of active players
-├── Bidding Constraint (boolean: am I the last bidder?)
-└── Belief State (distribution over opponent possible hands)
-```
+**Important notes**:
+- Performance measured on **independent 5-card rounds** (Phase 1 training mode)
+- Hardware: Ubuntu 24.04, RTX 4060 8GB, Ryzen 9 7950X, 32 workers
+- **Hardware limit**: RTX 4060 8GB supports maximum **32 workers** (CUDA OOM beyond this)
+- Training estimates include **self-play only**; add 10-20% for network training overhead
+- See [benchmarks/BASELINE.md](benchmarks/BASELINE.md) for full methodology and raw data
 
-**Key Innovation**: Track **information sets** - when a player doesn't follow suit, we deduce they don't have that suit and update beliefs.
+### Profiling & Optimization
 
-#### 2. Neural Network Architecture
+For detailed performance analysis and bottleneck investigations:
+- [benchmarks/BASELINE.md](benchmarks/BASELINE.md) - Current validated baseline (2025-11-13)
+- [benchmarks/profiling/profiling-readme.md](benchmarks/profiling/profiling-readme.md) - How to run profiling tools
 
-**Lightweight Transformer** (~5-8M parameters for laptop inference):
+**Key optimization findings**:
+- Zero-choice fast path: Skips MCTS for forced last-card plays (~14% of decisions)
+- Parallel MCTS expansion: Batches 30 leaf evaluations per iteration
+- Determinization sampling: 100% success rate (no rejection sampling)
+- GPU batch efficiency: ~96% (29/30 avg batch size)
+- Neural network inference: ~261µs per evaluation
 
-```
-Input Encoder (256-dim)
-    ↓
-Positional Encoding (handle variable game state)
-    ↓
-4-6 Transformer Layers (multi-head attention)
-    ↓
-    ├── Policy Head: P(action | state) with legal action masking
-    │   ├── Bidding phase: Probability over valid bids [0, cards_dealt]
-    │   └── Playing phase: Probability over cards in hand
-    │
-    └── Value Head: Expected final score (normalized [-1, 1])
-```
+---
 
-**Design choices**:
-- **Transformer** over CNN: Better at modeling card relationships and variable-length states
-- **Small size**: Fast inference on Intel laptop CPU/iGPU (~50-100ms per evaluation)
-- **Dual-phase policy**: Network learns both bidding and card-play strategies
-- **Legal action masking**: Ensures network only considers valid moves
+## Quick Start
 
-#### 3. Monte Carlo Tree Search (MCTS)
+### Setup (Ubuntu Linux)
 
-MCTS provides lookahead planning using the neural network as a heuristic:
+```bash
+# Create virtual environment with Python 3.14
+python3.14 -m venv venv
+source venv/bin/activate
 
-```
-For each decision point:
-1. Sample 3-5 determinizations (possible opponent hand distributions)
-2. For each determinization:
-   - Run 200-400 MCTS simulations (training)
-   - Run 50-100 simulations (inference on laptop)
-3. Aggregate visit counts → action probabilities
-4. Select action (sample during training, argmax during play)
+# Install PyTorch with CUDA 12.4 support
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Install other dependencies
+pip install -r ml/requirements.txt
 ```
 
-**Tree Reuse**: After opponent moves, navigate to that child node and make it the new root, keeping the entire explored subtree.
+### Testing
 
-#### 4. Determinization for Imperfect Information
+```bash
+# Activate venv
+source venv/bin/activate
 
-Since we don't know opponent cards:
+# Run all tests (460 tests)
+python -m pytest ml/
 
-1. **Belief tracking**: Maintain probability distribution over possible opponent hands
-2. **Information set updates**: When player doesn't follow suit → eliminate that suit from their possible cards
-3. **Sampling**: Generate random opponent hands consistent with:
-   - Cards they've played
-   - Suits they've shown/not shown
-   - Number of cards they should have
-4. **Average across samples**: Run MCTS on each, aggregate results
+# Run specific test suites
+python -m pytest ml/game/test_blob.py          # Game engine (135 tests)
+python -m pytest ml/network/test_network.py    # Neural network
+python -m pytest ml/mcts/test_mcts.py          # MCTS
+python -m pytest ml/training/test_training.py  # Training pipeline (93 tests)
 
-#### 5. Self-Play Training Loop (AlphaZero)
-
-```
-Loop until convergence:
-    ├── Self-Play: Generate 10,000+ games using latest model + MCTS
-    │   ├── Run 16-32 parallel games (GPU-accelerated)
-    │   ├── Store (state, MCTS_policy, final_score) tuples
-    │   └── Use exploration noise for diversity
-    │
-    ├── Training: Update neural network
-    │   ├── Sample batches from replay buffer (last 500k positions)
-    │   ├── Loss = policy_loss + value_loss + L2_regularization
-    │   └── Train for N epochs on GPU
-    │
-    ├── Evaluation: Test new model vs. previous best
-    │   ├── Play 400 games (no exploration noise)
-    │   ├── Calculate ELO ratings
-    │   └── If new model wins >55%, promote to "best"
-    │
-    └── Checkpoint: Save model every iteration
+# Run with coverage
+python -m pytest --cov=ml ml/
 ```
 
-**Expected training time**: 3-7 days on RTX 4060 GPU (continuous self-play)
+### Training
 
-#### 6. ELO Tracking
+```bash
+# Phase 1: Train on independent rounds (READY NOW)
+python ml/train.py --iterations 500 --training-on rounds
 
-- Maintain a pool of historical model checkpoints
-- Periodically run round-robin tournaments
-- Calculate ELO ratings (start at 1000)
-- Expected progression:
-  - Day 1: ~800 (random play)
-  - Day 3: ~1200 (learned basic rules)
-  - Day 7: ~1600+ (strong strategic play)
+# Fast test run (validates pipeline, ~5 iterations in minutes)
+python ml/train.py --fast --iterations 5
 
-## Tech Stack
+# Resume from checkpoint
+python ml/train.py --iterations 500 --resume models/checkpoints/checkpoint_100.pth
 
-### Training Environment (Linux PC: Ubuntu 24.04, RTX 4060 8GB, Ryzen 9 7950X 16-core, 128GB DDR5)
+# Custom configuration
+python ml/train.py --config my_config.json --iterations 100
+```
 
-| Component | Technology | Justification |
-|-----------|------------|---------------|
-| **Platform** | Ubuntu Linux 24.04 | Native GPU support, better threading performance |
-| **ML Framework** | PyTorch 2.x (CUDA 12.9) | Best flexibility for custom RL, excellent GPU support |
-| **Game Engine** | Python 3.14 | Clean implementation of game rules, easy testing |
-| **MCTS** | Custom Python | ~200 lines, full control over determinization |
-| **Parallelization** | Python multiprocessing | 32 parallel self-play workers (proven optimal) |
-| **Metrics/Logging** | TensorBoard | Track ELO, loss curves, hyperparameters |
-| **Model Export** | ONNX | Cross-platform inference for future deployment |
+**Training parameters** (see [ml/config.py](ml/config.py)):
+- `--iterations`: Number of training iterations (default: 100)
+- `--training-on`: `rounds` (Phase 1) or `games` (Phase 2, not implemented)
+- `--workers`: Parallel self-play workers (default: 32, max: 32 for RTX 4060)
+- `--fast`: Use fast config for testing (fewer games, smaller MCTS)
+- `--resume`: Resume from checkpoint path
+- `--config`: Load config from JSON file
 
-### Production Environment (Future - Windows Laptop Deployment)
+### Code Quality
 
-**Note**: This is Phase 7+ work and may be split into a separate repository.
+```bash
+# Format code
+python -m black ml/
 
-| Component | Technology | Justification |
-|-----------|------------|---------------|
-| **Platform** | Windows (Intel i5-1135G7 iGPU, 16GB) | Deployment target (future) |
-| **Backend** | Bun (TypeScript) | Fast, single runtime, built-in SQLite, WebSocket support |
-| **Frontend** | Svelte + TypeScript | Lightweight, fast compilation, simple reactivity |
-| **Database** | SQLite | File-based (no browser storage issues), handles game history |
-| **Inference** | ONNX Runtime (OpenVINO) | Intel iGPU acceleration, 50-100ms latency target |
-| **Communication** | WebSockets | Real-time game state updates |
+# Lint
+python -m flake8 ml/
 
-### Why This Stack?
+# Type checking
+python -m mypy ml/
+```
 
-1. **Separation of concerns**: Heavy training (Linux PC/Python/GPU) separate from lightweight inference (future laptop/Bun/ONNX)
-2. **No Python in production**: Faster startup, easier deployment
-3. **File-based storage**: SQLite in repo directory (simple, portable)
-4. **Modern & maintainable**: Svelte + Bun are fast to develop and debug
-5. **GPU → CPU pipeline**: Train on powerful hardware, run anywhere via ONNX
+---
 
 ## Project Structure
 
 ```
-blobmaster/
-├── README.md                  # This file
-├── frontend/                  # Svelte UI
-│   ├── src/
-│   │   ├── lib/
-│   │   │   ├── components/    # GameBoard, Hand, BidSelector, etc.
-│   │   │   └── stores/        # Game state management
-│   │   ├── routes/            # SvelteKit pages
-│   │   └── app.html
-│   ├── package.json
-│   └── svelte.config.js
+BlobMaster/
+├── ml/                          # Python training code (active development)
+│   ├── game/                    # Core Blob game engine
+│   │   ├── blob.py              # Main game logic (135 tests)
+│   │   ├── constants.py         # Card ranks, suits, scoring
+│   │   └── test_blob.py
+│   ├── mcts/                    # Monte Carlo Tree Search
+│   │   ├── search.py            # MCTS with determinization
+│   │   ├── node.py              # MCTS node, UCB1 selection
+│   │   ├── belief_tracker.py   # Belief state tracking
+│   │   └── determinization.py  # Sampling opponent hands
+│   ├── network/                 # Neural network
+│   │   ├── model.py             # Transformer architecture (~4.9M params)
+│   │   └── encode.py            # State encoder (game → 256-dim tensor)
+│   ├── training/                # Self-play & training pipeline
+│   │   ├── selfplay.py          # Parallel self-play workers
+│   │   ├── replay_buffer.py    # Experience storage (500K capacity)
+│   │   └── trainer.py           # Training orchestration
+│   ├── evaluation/              # Model evaluation
+│   │   ├── arena.py             # Model tournaments
+│   │   └── elo.py               # ELO rating calculation
+│   ├── config.py                # Centralized configuration
+│   └── train.py                 # Main training entry point
 │
-├── backend/                   # Bun API server
-│   ├── src/
-│   │   ├── api/               # REST/WebSocket endpoints
-│   │   ├── inference/         # ONNX model loading & inference
-│   │   ├── game/              # TypeScript game state management
-│   │   └── db/                # SQLite queries
-│   ├── package.json
-│   └── tsconfig.json
+├── models/                      # Model checkpoints
+│   └── checkpoints/             # Training snapshots (.pth files)
 │
-├── ml/                        # Python training code
-│   ├── game/
-│   │   ├── blob.py            # Core game rules
-│   │   ├── state.py           # State representation
-│   │   └── actions.py         # Action space (bid/play)
-│   │
-│   ├── mcts/
-│   │   ├── node.py            # MCTS tree node
-│   │   ├── search.py          # MCTS algorithm
-│   │   └── determinization.py # Belief state sampling
-│   │
-│   ├── network/
-│   │   ├── model.py           # Transformer architecture
-│   │   ├── encode.py          # State → tensor encoding
-│   │   └── train.py           # Training loop
-│   │
-│   ├── training/
-│   │   ├── selfplay.py        # Parallel game generation
-│   │   ├── replay_buffer.py   # Experience storage
-│   │   └── trainer.py         # Main training orchestration
-│   │
-│   ├── evaluation/
-│   │   ├── arena.py           # Model vs. model tournaments
-│   │   ├── elo.py             # ELO calculation
-│   │   └── metrics.py         # Logging & visualization
-│   │
-│   ├── requirements.txt
-│   └── train.py               # Entry point for training
+├── docs/                        # Documentation
+│   ├── performance/             # Performance analysis
+│   ├── profiling/               # Profiling guides
+│   └── phases/                  # Phase completion summaries
 │
-├── models/                    # Saved model checkpoints
-│   ├── checkpoints/           # .pth files (PyTorch)
-│   ├── best_model.onnx        # Production model
-│   └── elo_history.json       # ELO progression data
+├── benchmarks/                  # Performance testing
+│   ├── profiling/               # Profiling scripts & results
+│   └── results/                 # Benchmark CSV data
 │
-├── data/
-│   ├── games.db               # SQLite: game history, user stats
-│   └── training_data/         # Self-play game records
+├── backend/                     # Bun/TypeScript API (planned, empty)
+├── frontend/                    # Svelte UI (planned, empty)
 │
-└── docs/
-    ├── training_log.md        # Training progress notes
-    └── architecture.md        # Detailed technical design
+├── README.md                    # Original README (outdated)
+├── NEW_README.md                # This file (current baseline)
+├── CLAUDE.md                    # Development guide for Claude Code
+└── TRAINING-TODO.md             # Remaining implementation work
 ```
 
-## Implementation Roadmap
+---
 
-### Phase 1: Core Game Engine ✅ COMPLETE
+## Roadmap
 
-**Goal**: Bulletproof game logic that handles all edge cases
+### Completed ✅
 
-- [x] Implement `game/blob.py`:
-  - Deck management, shuffling, dealing
-  - Bidding phase with last-player constraint
-  - Trick-taking logic (follow suit, trump, winner determination)
-  - Scoring (exact trick calculation)
-  - Support for 3-8 players, variable cards per round
-  - **Bonus**: Anti-cheat validation system
-  - **Bonus**: `copy()` and `apply_action()` methods for MCTS (Phase 2 prep)
+1. **Phase 1-3**: Core ML infrastructure
+   - Game engine, neural network, MCTS, imperfect information handling
+   - 460 tests, production-ready code
 
-- [x] Write comprehensive unit tests:
-  - Test all game rules independently
-  - Edge cases: 0-bid, last player constraint, suit elimination
-  - Multi-player scenarios (3, 4, 5, 8 players)
-  - **Result**: 135 tests, 97% coverage
+2. **Phase 4 (Partial)**: Training pipeline infrastructure
+   - Sessions 0-3, 6 complete
+   - Self-play, replay buffer, training loop, evaluation system
 
-- [ ] Build CLI version (SKIPPED - not needed):
-  - Use `play_round()` with callback functions instead
-  - CLI is optional and not required for AI training
+### In Progress 🔨
 
-**Deliverable**: Complete game engine with comprehensive tests and >95% code coverage
+**Phase 4 Completion** (~8 hours remaining):
+- Session 4: Full-game evaluation infrastructure (4 hours)
+- Session 5: Full-game training mode (4 hours)
 
-### Phase 2: MCTS + Neural Network ✅ COMPLETE
+See [TRAINING-TODO.md](TRAINING-TODO.md) for detailed implementation plan.
 
-**Goal**: Basic AI that can play legal moves and improve with training
+### Planned 🔜
 
-- [x] **Session 1-2 COMPLETE**: State Encoding & Neural Network
-  - State encoding: 256-dim tensor representation
-  - Transformer architecture (6 layers, 8 heads, ~4.9M params)
-  - Policy head (bidding + card play) with legal action masking
-  - Value head (score prediction)
-  - Training infrastructure (loss computation, checkpointing)
-  - **Result**: 34 tests, 96% coverage, 1.4ms inference time
+3. **Phase 5**: ONNX Export (after training)
+   - Convert PyTorch model → ONNX format
+   - Optimize for CPU/iGPU inference
+   - Target: <100ms inference latency
 
-- [x] **Session 3-5 COMPLETE**: Neural Network Architecture & Training
-  - Complete Transformer implementation
-  - Legal action masking for both bidding and playing
-  - Dual-head architecture (policy + value)
-  - Training infrastructure with loss functions
-  - **Performance**: 693 inferences/sec, 16x speedup with batching
+4. **Phase 6**: Backend API (Bun + TypeScript)
+   - REST/WebSocket endpoints
+   - ONNX Runtime integration
+   - SQLite database for game history
 
-- [x] **Session 6-8 COMPLETE**: MCTS Implementation
-  - MCTSNode with UCB1 selection
-  - Complete MCTS search algorithm integrated with neural network
-  - Tree reuse for efficiency (1.36x speedup)
-  - Batched inference (7.6x speedup)
-  - **Result**: 55 MCTS tests, all passing
+5. **Phase 7**: Frontend UI (Svelte)
+   - Playable web interface
+   - Real-time game state visualization
+   - AI move explanations
 
-- [x] **Session 9 COMPLETE**: Integration Testing & Validation
-  - End-to-end game playing with MCTS agents
-  - Performance benchmarks (all targets met)
-  - Quality validation (100% legal moves)
-  - System readiness for Phase 3
-  - **Result**: 14 integration tests, all passing
+---
 
-**Progress**: 9/9 sessions complete ✅ **PHASE 2 COMPLETE**
-**Total Tests**: 283 tests passing (135 game engine + 148 ML pipeline)
-**Deliverable**: ✅ AI plays valid games end-to-end with MCTS + Neural Network
+## Development Workflow
 
-### Phase 3: Imperfect Information Handling ✅ COMPLETE
+### When to Start Training
 
-**Goal**: Handle hidden opponent cards via determinization
+**Option A: Start Phase 1 Now** (recommended)
+- Train on independent rounds for **~3-11 days** (Light-Heavy MCTS)
+- Validate that training infrastructure works end-to-end
+- Get a trained model for bidding/card-play on single rounds
+- Implement Phase 2 later if needed
 
-**Status**: ✅ **COMPLETE** (14 hours, 7 sessions)
+**Option B: Complete Phase 2 First** (~8 hours implementation + 56-180 days training)
+- Implement Sessions 4-5 (full-game mode)
+- Train on complete 17-round game sequences
+- Learn multi-round strategy and score accumulation
+- Much longer timeline (17x slower per game)
 
-**Implementation:**
-- ✅ Belief tracking system ([mcts/belief_tracker.py](ml/mcts/belief_tracker.py)):
-  - Track which cards each player could have
-  - Update beliefs when players reveal suit information (suit elimination)
-  - Probabilistic belief distributions with Bayesian updates
-  - Entropy tracking for information gain measurement
+### Monitoring Training
 
-- ✅ Determinization sampling ([mcts/determinization.py](ml/mcts/determinization.py)):
-  - Sample consistent opponent hands from belief distributions
-  - Constraint satisfaction sampling with validation
-  - Diversity-focused sampling for multi-world coverage
-  - Performance: <10ms per sample
-
-- ✅ Imperfect info MCTS ([mcts/search.py](ml/mcts/search.py)):
-  - Multi-world MCTS (3-5 determinizations)
-  - Aggregate visit counts across sampled worlds
-  - Parallel evaluation support for performance
-  - Temperature-based action selection
-
-- ✅ Comprehensive validation:
-  - Suit elimination correctly filters possible cards
-  - Belief entropy decreases with information revelation
-  - Determinization consistency across samples
-  - Backward compatible with Phase 2 perfect info MCTS
-  - Performance targets met (<5ms belief state, <10ms sampling, <1000ms search)
-
-**Test Results:**
-- **87 new tests** for Phase 3 (belief tracking, determinization, imperfect info MCTS)
-- **Total Tests**: 367 tests passing (135 game engine + 148 ML pipeline + 84 imperfect info)
-- All performance benchmarks met
-- Memory usage within targets (<100KB)
-
-**Deliverable**: ✅ AI handles imperfect information correctly via determinization
-
-### Phase 4: Self-Play Training Pipeline ✅ COMPLETE
-
-**Goal**: Automated training loop generating strong models
-
-- [x] Build self-play engine (`training/selfplay.py`):
-  - Parallel game generation (16-32 workers) using multiprocessing
-  - MCTS with exploration noise via temperature-based sampling
-  - Store (state, policy, value) tuples for training
-  - **Result**: Efficient parallel game generation with configurable workers
-
-- [x] Implement replay buffer (`training/replay_buffer.py`):
-  - Circular buffer (500k positions default, configurable)
-  - Efficient random sampling for training batches
-  - Data augmentation support (placeholder for future)
-  - Save/load functionality for checkpoint resume
-  - **Result**: Memory-efficient storage with fast sampling
-
-- [x] Training loop (`training/trainer.py`):
-  - NetworkTrainer: batch loading, loss computation, optimization
-  - TrainingPipeline: orchestrates self-play → training → evaluation
-  - Adam optimizer with learning rate scheduling (StepLR)
-  - Gradient clipping for training stability
-  - Checkpoint saving and resume functionality
-  - **Result**: Complete end-to-end training pipeline
-
-- [x] Evaluation pipeline (`evaluation/arena.py`):
-  - Model vs. model tournaments with configurable games
-  - ELO calculation and tracking (`evaluation/elo.py`)
-  - Automated checkpoint promotion (>55% win rate threshold)
-  - ELO history persistence for visualization
-  - **Result**: Robust model comparison system
-
-- [x] Main training script (`train.py`):
-  - Command-line interface with config options
-  - Configuration system (`config.py`) with validation
-  - Logging setup (file + console output)
-  - Device auto-detection (CUDA/CPU)
-  - **Result**: Production-ready training entry point
-
-- [x] Comprehensive testing:
-  - 93 tests covering all training components
-  - Unit tests for self-play, replay buffer, training, evaluation
-  - Integration tests for full pipeline
-  - **Result**: High test coverage ensures reliability
-
-**Test Results:**
-- **93 new tests** for Phase 4 (self-play, replay buffer, training, evaluation)
-- **Total Tests**: 460 tests passing (135 game engine + 148 ML + 84 imperfect info + 93 training)
-- All integration tests passing
-- Performance validated: 36.7 games/min @ Medium MCTS (32 workers, RTX 4060)
-
-- [ ] **Run training**: 136 days on RTX 4060 (Medium MCTS) or 72 days (Light MCTS)
-
-**Deliverable**: Complete training system ready for multi-day training runs. Can execute:
 ```bash
-python ml/train.py --iterations 500
-python ml/train.py --fast --iterations 5  # Quick test
-python ml/train.py --config my_config.json --iterations 100
+# Check training logs
+tail -f logs/training_YYYYMMDD_HHMMSS.log
+
+# Monitor GPU usage
+watch -n 1 nvidia-smi
+
+# TensorBoard (if installed)
+tensorboard --logdir=runs/
 ```
 
-**Deliverable**: Trained model with ELO progression data
+### Expected Training Progression
 
-### Phase 5: ONNX Export & Inference
+Based on AlphaZero literature and similar projects:
 
-**Goal**: Fast inference on Intel laptop
+| Iteration | ELO  | Capability | Timeline (Medium MCTS) |
+|-----------|------|------------|------------------------|
+| 0         | ~800 | Random legal moves | Start |
+| ~50       | ~1000 | Basic trick-taking (follow suit) | ~0.5 days |
+| ~150      | ~1200 | Learned bidding/scoring relationship | ~1.4 days |
+| ~300      | ~1400 | Strategic bidding, card counting | ~2.8 days |
+| ~500      | ~1600+ | Advanced play (suit elimination, risk management) | **~4.7 days** |
 
-- [ ] Export model to ONNX:
-  - Convert PyTorch model → ONNX format
-  - Validate outputs match PyTorch
-  - Optimize for inference (operator fusion)
+**Timeline**: Iterations 0→500 in **~3.3-11 days** (Phase 1, Light-Heavy MCTS)
 
-- [ ] Test ONNX Runtime:
-  - CPU inference speed
-  - OpenVINO (Intel iGPU) acceleration
-  - Benchmark: should be <100ms per evaluation
+---
 
-**Deliverable**: `best_model.onnx` runs on laptop
+## Technical Architecture
 
-### Phase 6: Backend API
+### Why AlphaZero?
 
-**Goal**: Bun server that loads model and serves predictions
+- **Sample efficiency**: MCTS + neural network converges faster than pure policy gradients
+- **Proven for card games**: Similar architectures dominate poker (Pluribus), bridge
+- **Interpretability**: MCTS tree is visualizable to explain AI reasoning
+- **Tree reuse**: Retain computed nodes when game state updates
 
-- [ ] Setup Bun project (`backend/`):
-  - Initialize with TypeScript
-  - Install ONNX Runtime Node.js bindings
-  - Setup SQLite database
+### Network Architecture
 
-- [ ] Implement game logic in TypeScript:
-  - Port essential game rules from Python
-  - Game state management
-  - Move validation
+**Lightweight Transformer** (~4.9M parameters):
 
-- [ ] Build inference endpoint:
-  - Load ONNX model at startup
-  - API: `POST /predict` → { state } → { suggested_bid | suggested_card, confidence }
-  - Handle MCTS on server-side (or return NN policy directly)
+```
+Input: 256-dim state vector (hand, bids, tricks, belief state)
+  ↓
+Transformer (6 layers, 8 attention heads)
+  ↓
+  ├─→ Policy Head: P(action | state) with legal masking
+  │   ├─ Bidding: probabilities over valid bids [0, cards_dealt]
+  │   └─ Playing: probabilities over cards in hand
+  │
+  └─→ Value Head: Expected final score (normalized)
+```
 
-- [ ] WebSocket server:
-  - Real-time game state updates
-  - Multiplayer support (human + AI players)
+**Design choices**:
+- Transformer over CNN: better at card relationships, variable-length states
+- Small size: fast inference (~1.4ms on GPU)
+- Dual-phase policy: handles both bidding and card-play
 
-- [ ] Database schema:
-  - Games table (history)
-  - Users table (stats, ELO vs. AI)
-  - Moves table (for analysis)
+### MCTS with Determinization
 
-**Deliverable**: `bun run backend/src/index.ts` starts API server
+Handles imperfect information (hidden opponent cards):
 
-### Phase 7: Frontend UI
+1. **Belief tracking**: Maintain probability distribution over opponent hands
+2. **Sample determinizations**: Generate 2-5 possible worlds consistent with observations
+3. **Run MCTS**: 20-50 simulations per determinization (training uses more)
+4. **Aggregate**: Average visit counts across samples → action probabilities
 
-**Goal**: Playable web interface
+**Belief updates**: When player doesn't follow suit → eliminate that suit from their possible cards (100% success rate, no rejection sampling).
 
-- [ ] Setup Svelte project (`frontend/`):
-  - SvelteKit with TypeScript
-  - WebSocket client
-  - State management stores
+### Self-Play Training Loop
 
-- [ ] Build components:
-  - `GameBoard.svelte`: Full game view
-  - `Hand.svelte`: Your cards, clickable to play
-  - `BidSelector.svelte`: Choose bid with constraint warning
-  - `TrickHistory.svelte`: Show completed tricks
-  - `ScoreBoard.svelte`: Live scores, ELO
-  - `AIThinking.svelte`: Show what AI is considering (MCTS tree viz?)
+```
+Loop (500 iterations):
+  1. Self-Play: Generate 10,000 rounds with current model + MCTS
+     - 32 parallel workers (multiprocessing)
+     - Progressive MCTS curriculum (20 sims → 50 sims)
+     - Store (state, MCTS_policy, final_score) tuples
 
-- [ ] Game flow:
-  - Start new game (choose # players, AI players)
-  - Bidding phase → Playing phase → Scoring → Next round
-  - AI moves with animations
-  - Highlight legal moves
+  2. Training: Update neural network
+     - Sample batches from replay buffer (last 500K positions)
+     - Loss = policy_loss + value_loss + L2_regularization
+     - Adam optimizer with cosine annealing LR
 
-- [ ] Polish:
-  - Card graphics (or use Unicode card symbols)
-  - Smooth animations
-  - Responsive design
+  3. Evaluation: Test new model vs previous best
+     - 400 games, calculate ELO ratings
+     - Promote if new model wins >55%
 
-**Deliverable**: Full playable game in browser
+  4. Checkpoint: Save every iteration with standardized naming
+```
 
-## Training Configuration
+---
 
-### Hyperparameters (Starting Point)
+## Configuration System
+
+Training is controlled via [ml/config.py](ml/config.py):
 
 ```python
-# Network
-EMBEDDING_DIM = 256
-NUM_TRANSFORMER_LAYERS = 6
-NUM_HEADS = 8
-DROPOUT = 0.1
+from ml.config import get_production_config, get_fast_config
 
-# MCTS
-MCTS_SIMULATIONS_TRAINING = 300
-MCTS_SIMULATIONS_INFERENCE = 100
-CPUCT = 1.5  # Exploration constant
-DETERMINIZATIONS = 5
+# Production config (~72-136 days training)
+config = get_production_config()
 
-# Training
-BATCH_SIZE = 512
-LEARNING_RATE = 0.001
-WEIGHT_DECAY = 1e-4
-REPLAY_BUFFER_SIZE = 500_000
-SELF_PLAY_GAMES_PER_ITERATION = 10_000
-TRAINING_EPOCHS_PER_ITERATION = 10
+# Fast config (testing pipeline)
+config = get_fast_config()
 
-# Evaluation
-EVAL_GAMES = 400
-ELO_PROMOTION_THRESHOLD = 0.55  # 55% win rate to become new best
+# Custom config
+config = TrainingConfig(
+    num_workers=32,
+    games_per_iteration=10000,
+    batch_size=512,
+    learning_rate=0.001,
+    # ... see ml/config.py for all options
+)
 ```
 
-### Hardware Requirements
+**Key parameters**:
+- `num_workers`: Parallel self-play workers (default: 32, **max: 32 for RTX 4060 8GB**)
+- `games_per_iteration`: Rounds generated per iteration (default: 10,000)
+- `num_determinizations`: Worlds sampled for MCTS (Light: 2, Medium: 3, Heavy: 5)
+- `simulations_per_determinization`: MCTS sims per world (Light: 20, Medium: 30, Heavy: 50)
+- `replay_buffer_capacity`: Experience storage (default: 500,000)
+- `eval_games`: Games for model evaluation (default: 400)
+- `promotion_threshold`: Win rate to promote new model (default: 0.55)
+- `mcts_schedule`: Progressive curriculum (iteration → MCTS params, see config)
 
-**Training (Linux PC - Primary Development)**:
-- **Platform**: Ubuntu Linux 24.04
-- **CPU**: AMD Ryzen 9 7950X (16 cores)
-- **GPU**: NVIDIA RTX 4060 8GB
-- **RAM**: 128GB DDR5 (for 32 parallel self-play workers)
-- **Storage**: 50GB+ (model checkpoints, replay buffer)
-- **CUDA**: 12.9
-- **Python**: 3.14.0 (with GIL enabled)
-- **Time**: ~50 days continuous training (500 iterations, Medium MCTS config)
-
-**Inference (Future Deployment - Windows Laptop)**:
-- **Platform**: Windows (future work, may be separate repository)
-- **CPU**: Intel i5-1135G7 with iGPU
-- **RAM**: 16GB shared
-- **Storage**: 100MB (model + frontend assets)
-- **Latency**: <100ms per move evaluation target
-
-### Expected ELO Progression
-
-Based on similar projects (AlphaZero chess/Go, poker bots):
-
-```
-Iteration  |  ELO   |  Capability
------------|--------|------------------------------------------
-0          |  800   | Random legal moves
-10         |  1000  | Basic trick-taking (follow suit)
-50         |  1200  | Learned bidding/scoring relationship
-100        |  1400  | Strategic bidding, card counting
-200        |  1600  | Advanced play (suit elimination, bluffing)
-500+       | 1800+  | Superhuman (optimal against imperfect players)
-```
+---
 
 ## Research Questions
 
-Throughout this project, you'll explore:
+1. **Strategy convergence**: Do models converge to same optimal strategy, or create different "styles"?
+2. **Position value**: Is last bidder position advantageous (information) or disadvantageous (constraint)?
+3. **Risk management**: Conservative vs aggressive bidding - which emerges?
+4. **Belief accuracy**: How quickly can AI deduce opponent hands from suit information?
+5. **Transfer learning**: Can 4-player model adapt to 6-player games?
+6. **Exploitation**: Can AI exploit suboptimal human play patterns?
 
-1. **Strategy convergence**: Do all trained models converge to the same optimal strategy, or do initial conditions create different "styles"?
+---
 
-2. **Imperfect player exploitation**: How well does the AI adapt to suboptimal human play? (This is what you're most curious about!)
+## Common Issues
 
-3. **Position value**: Is last bidder position advantageous (information) or disadvantageous (constraint)?
+### CUDA Out of Memory
 
-4. **Risk/reward bidding**: Does AI learn conservative (safe bids) or aggressive (maximize points) strategies?
+**Problem**: Training crashes with `CUDA out of memory` error.
 
-5. **Belief state accuracy**: How quickly does the AI deduce opponent hands from suit information?
-
-6. **Transfer learning**: Can a model trained on 4-player games adapt to 6-player games?
-
-## Future Enhancements
-
-After the initial version is working:
-
-- **Explainability**: Visualize MCTS tree, show "why" AI made a bid/play
-- **Difficulty levels**: Reduce MCTS simulations or add noise for easier opponents
-- **Online play**: Multiplayer over internet
-- **Mobile app**: React Native or Flutter version
-- **Variants**: Support different Blob rule sets
-- **Meta-learning**: Train on multiple simultaneous games (different player counts)
-- **Human coaching**: "Tutor mode" that suggests moves and explains reasoning
-
-## Getting Started
-
-### Prerequisites
-
+**Solution**: RTX 4060 8GB supports maximum **32 workers**. Reduce workers:
 ```bash
-# Python environment (training)
-python --version  # 3.11+
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install -r ml/requirements.txt
-
-# Bun (backend/frontend)
-curl -fsSL https://bun.sh/install | bash
-bun --version  # 1.0+
+python ml/train.py --workers 16  # Safer, still fast (estimated ~400-500 rounds/min)
 ```
 
-### Quick Start
+### Slow Performance
 
-```bash
-# 1. Clone and setup
-git clone <your-repo>
-cd blobmaster
+**Problem**: Training is slower than benchmarks suggest.
 
-# 2. Test game engine
-cd ml
-python -m pytest game/test_blob.py  # Run all tests (135 tests, 97% coverage)
+**Solution**:
+1. Check GPU usage: `nvidia-smi` (should be >90% utilization)
+2. Verify CUDA is enabled: Check logs for `device: cuda:0`
+3. Use Light MCTS for faster iteration (1,049 rounds/min)
+4. Verify 32 workers are running: check process count
+5. See baseline benchmark: [benchmarks/BASELINE.md](benchmarks/BASELINE.md)
 
-# 3. Train model (start this and let it run)
-python train.py --iterations 500 --gpu 0
+### Outdated Documentation
 
-# 4. Monitor training (in another terminal)
-tensorboard --logdir=runs/
+**Problem**: README.md, CLAUDE.md, or other docs contradict this file.
 
-# 5. After training, export model
-python export_onnx.py --checkpoint models/checkpoints/best.pth
+**Solution**: **THIS FILE (NEW_README.md) IS THE SOURCE OF TRUTH** as of 2025-11-13. Other docs may contain outdated claims (e.g., "Phase 4 complete", "games/min" metrics for unimplemented features).
 
-# 6. Start backend
-cd ../backend
-bun install
-bun run dev  # Starts on http://localhost:3000
-
-# 7. Start frontend
-cd ../frontend
-bun install
-bun run dev  # Starts on http://localhost:5173
-```
-
-## Learning Resources
-
-To understand the techniques used:
-
-1. **AlphaZero Paper**: [Mastering Chess and Shogi by Self-Play](https://arxiv.org/abs/1712.01815)
-2. **Pluribus (Poker AI)**: [Superhuman AI for multiplayer poker](https://science.sciencemag.org/content/365/6456/885)
-3. **MCTS Survey**: [A Survey of Monte Carlo Tree Search Methods](https://ieeexplore.ieee.org/document/6145622)
-4. **Imperfect Information Games**: [Bayesian Opponent Modeling](https://papers.nips.cc/paper/2013/file/e2230b853516e7b05d79744fbd4c9c13-Paper.pdf)
-5. **Transformers**: [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+---
 
 ## License
 
-MIT License - feel free to learn from and extend this project!
+MIT License - Feel free to learn from and extend this project.
+
+---
 
 ## Acknowledgments
 
-- AlphaZero team at DeepMind for revolutionizing game AI
-- Pluribus team at Facebook AI for imperfect information techniques
-- The card game community for keeping Blob/Oh Hell alive!
+- AlphaZero team at DeepMind for game AI techniques
+- Pluribus team at Facebook AI for imperfect information methods
+- The Blob/Oh Hell card game community
+
+---
+
+**Last Updated**: 2025-11-13 (Performance benchmarks validated)
+**Project Version**: Phase 4 (Partial), Sessions 0-3 & 6 Complete
+**Training Status**: ✅ Ready for Phase 1 (independent rounds, **3.3-11 days**)
+**Benchmark Reference**: [benchmarks/BASELINE.md](benchmarks/BASELINE.md)
