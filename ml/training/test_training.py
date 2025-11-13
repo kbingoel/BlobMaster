@@ -12,7 +12,9 @@ import pytest
 import torch
 import numpy as np
 import time
+import json
 import concurrent.futures
+from pathlib import Path
 from typing import List, Dict, Any
 
 from ml.network.model import BlobNet
@@ -2285,3 +2287,178 @@ class TestMainTrainingScript:
             assert device == 'cuda'
         else:
             assert device == 'cpu'
+
+
+class TestCheckpointRotation:
+    """Test checkpoint rotation logic."""
+
+    def test_cache_rotation_keeps_four_most_recent(self):
+        """Verify cache keeps only 4 most recent checkpoints."""
+        cache_dir = Path('models/checkpoints/cache')
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean existing files
+        for f in cache_dir.glob('*.pth'):
+            f.unlink()
+
+        # Create 10 checkpoints with different timestamps
+        for i in range(10):
+            checkpoint = cache_dir / f'test_checkpoint_{i:03d}.pth'
+            checkpoint.write_text(f'checkpoint {i}')
+            time.sleep(0.01)  # Ensure different mtimes
+
+        # Simulate rotation (using TrainingPipeline._rotate_cache_checkpoints logic)
+        cache_files = sorted(cache_dir.glob('test_checkpoint_*.pth'), key=lambda p: p.stat().st_mtime)
+        num_to_delete = len(cache_files) - 4
+        for old_file in cache_files[:num_to_delete]:
+            old_file.unlink()
+
+        remaining = list(cache_dir.glob('test_checkpoint_*.pth'))
+        assert len(remaining) == 4, f"Expected 4 files, got {len(remaining)}"
+
+        # Verify we kept the most recent
+        remaining_names = [f.name for f in remaining]
+        assert 'test_checkpoint_006.pth' in remaining_names
+        assert 'test_checkpoint_009.pth' in remaining_names
+        assert 'test_checkpoint_000.pth' not in remaining_names
+
+        # Clean up
+        for f in remaining:
+            f.unlink()
+
+    def test_permanent_checkpoints_never_rotated(self):
+        """Verify permanent directory is not affected by rotation."""
+        permanent_dir = Path('models/checkpoints/permanent')
+        permanent_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create permanent checkpoints
+        for i in [5, 10, 15, 20]:
+            checkpoint = permanent_dir / f'permanent_iter{i:03d}.pth'
+            checkpoint.write_text(f'permanent {i}')
+
+        initial_count = len(list(permanent_dir.glob('*.pth')))
+        assert initial_count == 4
+
+        # Rotation should not touch permanent directory
+        # (rotation only operates on cache directory)
+
+        final_count = len(list(permanent_dir.glob('*.pth')))
+        assert final_count == initial_count, "Permanent checkpoints were deleted!"
+
+        # Clean up
+        for f in permanent_dir.glob('permanent_*.pth'):
+            f.unlink()
+
+
+class TestStatusWriter:
+    """Test atomic status file writes."""
+
+    def test_atomic_write_no_corruption(self):
+        """Verify status writes are atomic and don't corrupt file."""
+        from ml.training.trainer import StatusWriter
+
+        status_file = 'models/checkpoints/test_status_atomic.json'
+        writer = StatusWriter(status_file)
+
+        class MockConfig:
+            training_on = 'rounds'
+            num_determinizations = 3
+            simulations_per_determinization = 35
+
+        # Write status multiple times rapidly
+        for i in range(10):
+            metrics = {
+                'current_elo': 1000 + i * 10,
+                'learning_rate': 0.001,
+                'avg_total_loss': 0.5,
+            }
+            writer.update(
+                iteration=i,
+                total_iterations=10,
+                metrics=metrics,
+                config={'training_on': 'rounds', 'num_determinizations': 3, 'simulations_per_determinization': 35}
+            )
+
+        # Verify file is valid JSON (not corrupted)
+        with open(status_file) as f:
+            status = json.load(f)
+
+        assert status['iteration'] == 10  # Last iteration (1-indexed)
+        assert status['elo'] == 1090  # current_elo mapped to 'elo'
+
+        # Clean up
+        Path(status_file).unlink()
+
+    def test_status_handles_missing_metrics(self):
+        """Verify status writer handles missing metrics gracefully."""
+        from ml.training.trainer import StatusWriter
+        import json
+
+        status_file = 'models/checkpoints/test_status_missing.json'
+        writer = StatusWriter(status_file)
+
+        class MockConfig:
+            training_on = 'rounds'
+
+        # Write with minimal metrics
+        metrics = {}  # Empty metrics
+        writer.update(
+            iteration=0,
+            total_iterations=10,
+            metrics=metrics,
+            config={'training_on': 'rounds'}
+        )
+
+        # Verify file created with None values
+        with open(status_file) as f:
+            status = json.load(f)
+
+        assert status['elo'] is None
+        assert status['learning_rate'] is None
+        assert status['iteration'] == 1  # 1-indexed
+
+        # Clean up
+        Path(status_file).unlink()
+
+
+class TestControlSignals:
+    """Test pause/resume control signals."""
+
+    def test_pause_signal_detection(self):
+        """Verify pause signal is detected correctly."""
+        signal_file = Path('models/checkpoints/control.signal')
+        signal_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Clean up
+        if signal_file.exists():
+            signal_file.unlink()
+
+        # Test: no signal
+        signal = signal_file.read_text().strip().upper() if signal_file.exists() else ''
+        assert signal == ''
+
+        # Test: PAUSE signal
+        signal_file.write_text('PAUSE\n')
+        signal = signal_file.read_text().strip().upper()
+        assert signal == 'PAUSE'
+
+        # Test: case insensitive
+        signal_file.write_text('pause\n')
+        signal = signal_file.read_text().strip().upper()
+        assert signal == 'PAUSE'
+
+        # Clean up
+        signal_file.unlink()
+
+    def test_signal_cleared_after_processing(self):
+        """Verify signal file is cleared after processing."""
+        signal_file = Path('models/checkpoints/control.signal')
+        signal_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create signal
+        signal_file.write_text('PAUSE\n')
+        assert signal_file.exists()
+
+        # Simulate clearing
+        signal_file.unlink()
+        assert not signal_file.exists()

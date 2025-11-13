@@ -2,7 +2,7 @@
 
 An AlphaZero-style reinforcement learning agent for the trick-taking card game **Blob**, trained through self-play with Monte Carlo Tree Search (MCTS) to master bidding strategy and card play.
 
-**Current Status**: Phase 1 training infrastructure complete. Ready to train on independent rounds (~3.3-11 days). Phase 2 (full multi-round games) not yet implemented.
+**Current Status**: Phase 1 training infrastructure complete. Ready to train on independent rounds (~72-136 days). Phase 2 (full multi-round games) not yet implemented.
 
 ---
 
@@ -11,7 +11,7 @@ An AlphaZero-style reinforcement learning agent for the trick-taking card game *
 **CRITICAL**: This project uses specific terminology to distinguish training modes:
 
 - **Round**: A single deal with fixed cards (e.g., one 5-card bidding + trick-taking cycle). Phase 1 trains on independent rounds sampled randomly.
-  - **Performance metric**: rounds/min (310-1,049 rounds/min achieved on RTX 4060 8GB, varies by MCTS complexity)
+  - **Performance metric**: rounds/min (37-69 rounds/min achieved on RTX 4060, varies by MCTS complexity)
 
 - **Game**: A complete Blob game consisting of a full sequence of rounds (e.g., 17 rounds for 5 players: 7→6→5→4→3→2→1→1→1→1→1→2→3→4→5→6→7). Phase 2 trains on complete game sequences.
   - **Performance metric**: games/min (NOT YET IMPLEMENTED - full game training is Session 4-5 future work)
@@ -62,14 +62,14 @@ An AlphaZero-style reinforcement learning agent for the trick-taking card game *
 
 **Phase 1 (Independent Rounds)**: ✅ **READY NOW**
 - Train on randomly sampled single rounds
-- Performance: 310-1,049 rounds/min (32 workers, RTX 4060 8GB, Medium-Light MCTS)
-- Timeline: **~3.3-11 days** for 5M rounds (500 iterations × 10K each)
+- Performance: 37-69 rounds/min (32 workers, RTX 4060, Medium-Light MCTS)
+- Timeline: ~72-136 days for 5M rounds (500 iterations × 10K each)
 - Command: `python ml/train.py --iterations 500 --training-on rounds`
 
 **Phase 2 (Full Game Sequences)**: ❌ **NOT READY**
 - Requires completing Sessions 4-5 (~8 hours implementation)
 - Would train on complete 17-round game sequences
-- Estimated: ~56-180 days when implemented (17 rounds per game)
+- Estimated: ~35-40 days when implemented
 
 **Recommendation**: Start Phase 1 training now, implement Phase 2 later if multi-round strategy learning is needed.
 
@@ -115,38 +115,38 @@ This all-or-nothing scoring rewards accurate self-assessment and risk management
 
 ### Phase 1 Training (Independent Rounds)
 
-**Validated performance** from [benchmarks/BASELINE.md](benchmarks/BASELINE.md) (2025-11-13):
+Validated performance from [benchmarks/results/ubuntu-2025-11/BENCHMARK-SUMMARY.md](benchmarks/results/ubuntu-2025-11/BENCHMARK-SUMMARY.md):
 
-| Workers | MCTS Config | Det × Sims | Total Sims | **Rounds/Min** | **Training Timeline** (5M rounds) |
-|---------|-------------|------------|------------|----------------|-----------------------------------|
-| 32      | Light       | 2 × 20     | 40         | **1,049** 🏆   | **~3.3 days** (fastest)           |
-| 32      | Medium      | 3 × 30     | 90         | **741** ⭐     | **~4.7 days** (recommended)       |
-| 32      | Heavy       | 5 × 50     | 250        | **310**        | **~11 days** (highest quality)    |
+| Workers | MCTS Config | Sims/Move | Rounds/Min | Training Timeline (5M rounds) |
+|---------|-------------|-----------|------------|-------------------------------|
+| 32      | Light       | 40        | **69.1** 🏆 | **~72 days** (fastest)        |
+| 32      | Medium      | 90        | **36.7** ⭐  | **~136 days** (recommended)   |
+| 32      | Heavy       | 250       | 16.0        | ~312 days (highest quality)   |
+| 16      | Medium      | 90        | 26.6        | ~188 days (memory-safe)       |
 
 **Annotations**:
-- 🏆 Light MCTS = fastest iteration, excellent quality-to-speed ratio
-- ⭐ Medium MCTS = **recommended balance** of speed and quality
-- Heavy MCTS = maximum quality, 3.4x slower than Light
+- 🏆 Light MCTS = fastest iteration, good quality
+- ⭐ Medium MCTS = recommended balance of speed/quality
+- Heavy MCTS = research-grade quality, 4.3x slower than Light
 
-**Important notes**:
-- Performance measured on **independent 5-card rounds** (Phase 1 training mode)
-- Hardware: Ubuntu 24.04, RTX 4060 8GB, Ryzen 9 7950X, 32 workers
-- **Hardware limit**: RTX 4060 8GB supports maximum **32 workers** (CUDA OOM beyond this)
-- Training estimates include **self-play only**; add 10-20% for network training overhead
-- See [benchmarks/BASELINE.md](benchmarks/BASELINE.md) for full methodology and raw data
+**Note**: These are **rounds/min** (single deals), not games/min (multi-round sequences). Numbers reflect realistic training with variable round lengths (3-8 cards dealt).
+
+**Hardware Limit**: RTX 4060 8GB supports maximum **32 workers** before CUDA out-of-memory. 48+ workers fail with OOM errors.
+
+**Optimized Performance**: Profiling with fixed 5-card rounds shows ~369 rounds/min (10x faster than variable-length average), demonstrating that performance varies significantly by round complexity. See profiling docs for details.
 
 ### Profiling & Optimization
 
 For detailed performance analysis and bottleneck investigations:
-- [benchmarks/BASELINE.md](benchmarks/BASELINE.md) - Current validated baseline (2025-11-13)
+- [docs/profiling/PROFILING_ANALYSIS_2025-11-11.md](docs/profiling/PROFILING_ANALYSIS_2025-11-11.md) - Detailed analysis of 368 rounds/min on 5-card test
 - [benchmarks/profiling/profiling-readme.md](benchmarks/profiling/profiling-readme.md) - How to run profiling tools
 
-**Key optimization findings**:
-- Zero-choice fast path: Skips MCTS for forced last-card plays (~14% of decisions)
-- Parallel MCTS expansion: Batches 30 leaf evaluations per iteration
-- Determinization sampling: 100% success rate (no rejection sampling)
-- GPU batch efficiency: ~96% (29/30 avg batch size)
-- Neural network inference: ~261µs per evaluation
+**Key findings from profiling**:
+- 96% GPU batch efficiency (28.9/30 avg batch size)
+- 261µs per neural network inference
+- 100% determinization success rate (no rejection sampling)
+- Multiprocessing overhead is minimal and expected
+- Performance varies 5-10x based on round complexity (card count)
 
 ---
 
@@ -318,16 +318,16 @@ See [TRAINING-TODO.md](TRAINING-TODO.md) for detailed implementation plan.
 ### When to Start Training
 
 **Option A: Start Phase 1 Now** (recommended)
-- Train on independent rounds for **~3-11 days** (Light-Heavy MCTS)
+- Train on independent rounds for ~72-136 days (Light-Medium MCTS)
 - Validate that training infrastructure works end-to-end
 - Get a trained model for bidding/card-play on single rounds
 - Implement Phase 2 later if needed
 
-**Option B: Complete Phase 2 First** (~8 hours implementation + 56-180 days training)
+**Option B: Complete Phase 2 First** (~8 hours + 35-40 days)
 - Implement Sessions 4-5 (full-game mode)
 - Train on complete 17-round game sequences
 - Learn multi-round strategy and score accumulation
-- Much longer timeline (17x slower per game)
+- Longer timeline but potentially higher quality
 
 ### Monitoring Training
 
@@ -346,15 +346,15 @@ tensorboard --logdir=runs/
 
 Based on AlphaZero literature and similar projects:
 
-| Iteration | ELO  | Capability | Timeline (Medium MCTS) |
-|-----------|------|------------|------------------------|
-| 0         | ~800 | Random legal moves | Start |
-| ~50       | ~1000 | Basic trick-taking (follow suit) | ~0.5 days |
-| ~150      | ~1200 | Learned bidding/scoring relationship | ~1.4 days |
-| ~300      | ~1400 | Strategic bidding, card counting | ~2.8 days |
-| ~500      | ~1600+ | Advanced play (suit elimination, risk management) | **~4.7 days** |
+| Iteration | ELO  | Capability |
+|-----------|------|------------|
+| 0         | ~800 | Random legal moves |
+| ~50       | ~1000 | Basic trick-taking (follow suit) |
+| ~150      | ~1200 | Learned bidding/scoring relationship |
+| ~300      | ~1400 | Strategic bidding, card counting |
+| ~500      | ~1600+ | Advanced play (suit elimination, risk management) |
 
-**Timeline**: Iterations 0→500 in **~3.3-11 days** (Phase 1, Light-Heavy MCTS)
+**Timeline**: Iterations 0→500 in ~72-136 days (Phase 1, Light-Medium MCTS)
 
 ---
 
@@ -446,14 +446,14 @@ config = TrainingConfig(
 ```
 
 **Key parameters**:
-- `num_workers`: Parallel self-play workers (default: 32, **max: 32 for RTX 4060 8GB**)
+- `num_workers`: Parallel self-play workers (default: 32, max: 32 for RTX 4060)
 - `games_per_iteration`: Rounds generated per iteration (default: 10,000)
-- `num_determinizations`: Worlds sampled for MCTS (Light: 2, Medium: 3, Heavy: 5)
-- `simulations_per_determinization`: MCTS sims per world (Light: 20, Medium: 30, Heavy: 50)
+- `num_determinizations`: Worlds sampled for MCTS (default: 2-3)
+- `simulations_per_determinization`: MCTS sims per world (default: 20-50, progressive)
 - `replay_buffer_capacity`: Experience storage (default: 500,000)
 - `eval_games`: Games for model evaluation (default: 400)
 - `promotion_threshold`: Win rate to promote new model (default: 0.55)
-- `mcts_schedule`: Progressive curriculum (iteration → MCTS params, see config)
+- `mcts_schedule`: Progressive curriculum (iteration → MCTS params)
 
 ---
 
@@ -476,7 +476,7 @@ config = TrainingConfig(
 
 **Solution**: RTX 4060 8GB supports maximum **32 workers**. Reduce workers:
 ```bash
-python ml/train.py --workers 16  # Safer, still fast (estimated ~400-500 rounds/min)
+python ml/train.py --workers 16  # Safer, ~270 rounds/min
 ```
 
 ### Slow Performance
@@ -486,9 +486,8 @@ python ml/train.py --workers 16  # Safer, still fast (estimated ~400-500 rounds/
 **Solution**:
 1. Check GPU usage: `nvidia-smi` (should be >90% utilization)
 2. Verify CUDA is enabled: Check logs for `device: cuda:0`
-3. Use Light MCTS for faster iteration (1,049 rounds/min)
-4. Verify 32 workers are running: check process count
-5. See baseline benchmark: [benchmarks/BASELINE.md](benchmarks/BASELINE.md)
+3. Use Light MCTS for faster iteration: config has progressive curriculum
+4. See profiling guide: [docs/profiling/PROFILING_ANALYSIS_2025-11-11.md](docs/profiling/PROFILING_ANALYSIS_2025-11-11.md)
 
 ### Outdated Documentation
 
@@ -512,7 +511,6 @@ MIT License - Feel free to learn from and extend this project.
 
 ---
 
-**Last Updated**: 2025-11-13 (Performance benchmarks validated)
+**Last Updated**: 2025-11-13
 **Project Version**: Phase 4 (Partial), Sessions 0-3 & 6 Complete
-**Training Status**: ✅ Ready for Phase 1 (independent rounds, **3.3-11 days**)
-**Benchmark Reference**: [benchmarks/BASELINE.md](benchmarks/BASELINE.md)
+**Training Status**: Ready for Phase 1 (independent rounds)
