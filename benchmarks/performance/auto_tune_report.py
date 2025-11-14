@@ -2,19 +2,18 @@
 """
 Generate comprehensive report from auto-tune sweep results
 
-This script reads the SQLite database from auto_tune.py and generates:
+This script reads the JSON files from auto_tune.py and generates:
 - Markdown summary report with tables and recommendations
 - Plots for visualization (worker scaling, parameter sweeps, heatmaps)
 - Exportable config for ml/config.py
 
 Usage:
-    python auto_tune_report.py results/auto_tune_20251114_153000/auto_tune_results.db
-    python auto_tune_report.py results.db --output custom_report.md
+    python auto_tune_report.py results/auto_tune_20251114_153000
+    python auto_tune_report.py results/auto_tune_20251114_153000 --output custom_report.md
 """
 
 import argparse
 import json
-import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,67 +44,53 @@ class SweepConfig:
         return f"{self.workers}w × {self.parallel_batch_size}batch × {self.num_determinizations}×{self.simulations_per_det}"
 
 
-def load_results_from_db(db_path: str) -> Tuple[List[Dict], List[Dict]]:
-    """Load successful and failed results from database"""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def load_results_from_json(results_dir: str) -> Tuple[List[Dict], List[Dict]]:
+    """Load successful and failed results from JSON files"""
+    results_path = Path(results_dir)
 
-    # Successful results
-    cursor.execute("""
-        SELECT workers, parallel_batch_size, num_determinizations,
-               simulations_per_det, batch_timeout_ms, rounds_per_min,
-               variance, num_rounds, phase, elapsed_sec,
-               examples_per_round, cpu_percent, gpu_memory_mb
-        FROM experiments
-        WHERE success = 1 AND rounds_per_min IS NOT NULL
-        ORDER BY rounds_per_min DESC
-    """)
+    # Load experiments.json
+    experiments_file = results_path / "experiments.json"
+    if not experiments_file.exists():
+        print(f"ERROR: experiments.json not found in {results_dir}")
+        return [], []
+
+    with open(experiments_file, 'r') as f:
+        experiments = json.load(f)
 
     successful = []
-    for row in cursor.fetchall():
-        config = SweepConfig(
-            workers=row[0],
-            parallel_batch_size=row[1],
-            num_determinizations=row[2],
-            simulations_per_det=row[3],
-            batch_timeout_ms=row[4]
-        )
-        successful.append({
-            'config': config,
-            'rounds_per_min': row[5],
-            'variance': row[6] if row[6] is not None else 0.0,
-            'num_rounds': row[7],
-            'phase': row[8],
-            'elapsed_sec': row[9],
-            'examples_per_round': row[10],
-            'cpu_percent': row[11],
-            'gpu_memory_mb': row[12]
-        })
-
-    # Failed results
-    cursor.execute("""
-        SELECT workers, parallel_batch_size, num_determinizations,
-               simulations_per_det, batch_timeout_ms, error_msg, phase
-        FROM experiments
-        WHERE success = 0
-    """)
-
     failed = []
-    for row in cursor.fetchall():
-        config = SweepConfig(
-            workers=row[0],
-            parallel_batch_size=row[1],
-            num_determinizations=row[2],
-            simulations_per_det=row[3],
-            batch_timeout_ms=row[4]
-        )
-        failed.append({
-            'config': config,
-            'error': row[5],
-            'phase': row[6]
-        })
 
-    conn.close()
+    for exp in experiments:
+        config = SweepConfig(
+            workers=exp['workers'],
+            parallel_batch_size=exp['parallel_batch_size'],
+            num_determinizations=exp['num_determinizations'],
+            simulations_per_det=exp['simulations_per_det'],
+            batch_timeout_ms=exp.get('batch_timeout_ms', 10)
+        )
+
+        if exp['success'] and exp['rounds_per_min'] is not None:
+            successful.append({
+                'config': config,
+                'rounds_per_min': exp['rounds_per_min'],
+                'variance': exp.get('variance', 0.0),
+                'num_rounds': exp['num_rounds'],
+                'phase': exp['phase'],
+                'elapsed_sec': exp['elapsed_sec'],
+                'examples_per_round': exp.get('examples_per_round'),
+                'cpu_percent': exp.get('cpu_percent'),
+                'gpu_memory_mb': exp.get('gpu_memory_mb')
+            })
+        elif not exp['success']:
+            failed.append({
+                'config': config,
+                'error': exp.get('error_msg', 'Unknown error'),
+                'phase': exp['phase']
+            })
+
+    # Sort successful by rounds_per_min descending
+    successful.sort(key=lambda x: x['rounds_per_min'], reverse=True)
+
     return successful, failed
 
 
@@ -432,9 +417,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument('db_path', type=str, help='Path to auto_tune_results.db')
+    parser.add_argument('results_dir', type=str, help='Path to results directory (e.g., results/auto_tune_20251114_153000)')
     parser.add_argument('--output', type=str, default=None,
-                       help='Output markdown file (default: auto_tune_report.md in same dir as db)')
+                       help='Output markdown file (default: auto_tune_report.md in results dir)')
     parser.add_argument('--baseline', type=float, default=741.0,
                        help='Baseline performance for comparison (default: 741.0)')
     parser.add_argument('--no-plots', action='store_true',
@@ -442,21 +427,26 @@ def main():
 
     args = parser.parse_args()
 
-    # Check database exists
-    db_path = Path(args.db_path)
-    if not db_path.exists():
-        print(f"ERROR: Database not found: {db_path}")
+    # Check results directory exists
+    results_dir = Path(args.results_dir)
+    if not results_dir.exists():
+        print(f"ERROR: Results directory not found: {results_dir}")
+        return 1
+
+    experiments_file = results_dir / "experiments.json"
+    if not experiments_file.exists():
+        print(f"ERROR: experiments.json not found in {results_dir}")
         return 1
 
     # Setup output paths
-    output_dir = db_path.parent
+    output_dir = results_dir
     if args.output:
         report_path = args.output
     else:
         report_path = str(output_dir / 'auto_tune_report.md')
 
-    print(f"Loading results from: {db_path}")
-    successful, failed = load_results_from_db(str(db_path))
+    print(f"Loading results from: {results_dir}")
+    successful, failed = load_results_from_json(str(results_dir))
 
     print(f"Found {len(successful)} successful and {len(failed)} failed configurations")
 

@@ -16,14 +16,13 @@ Features:
 Usage:
     python benchmarks/performance/auto_tune.py
     python benchmarks/performance/auto_tune.py --time-budget 360
-    python benchmarks/performance/auto_tune.py --resume auto_tune_results.db
+    python benchmarks/performance/auto_tune.py --resume results/auto_tune_20251114_120000
     python benchmarks/performance/auto_tune.py --quick
 """
 
 import argparse
 import hashlib
 import json
-import sqlite3
 import sys
 import time
 import traceback
@@ -35,6 +34,8 @@ import os
 
 import torch
 import psutil
+
+# No longer using SQLite - using JSON files instead
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -76,63 +77,41 @@ class SweepConfig:
 
 
 # ============================================================================
-# Database and Checkpoint Management
+# JSON-based Checkpoint Management
 # ============================================================================
 
 class CheckpointManager:
-    """Manages SQLite database for results and checkpoints"""
+    """Manages JSON files for results and checkpoints"""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.conn = None
-        self._init_database()
+    def __init__(self, base_path: str):
+        # base_path is like "results/auto_tune_20251114/auto_tune_results.db"
+        # Convert to directory path
+        self.base_dir = Path(base_path).parent
+        self.experiments_file = self.base_dir / "experiments.json"
+        self.checkpoint_file = self.base_dir / "checkpoint.json"
 
-    def _init_database(self):
-        """Initialize database schema"""
-        self.conn = sqlite3.connect(self.db_path)
-        cursor = self.conn.cursor()
+        # Ensure directory exists
+        self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        # Experiments table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS experiments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                phase TEXT NOT NULL,
-                config_hash TEXT NOT NULL,
-                num_rounds INTEGER NOT NULL,
-                elapsed_sec REAL NOT NULL,
-                rounds_per_min REAL,
-                variance REAL,
-                success BOOLEAN NOT NULL,
-                error_msg TEXT,
+        # Load existing data or initialize
+        self.experiments = self._load_json(self.experiments_file, [])
+        self.checkpoint_data = self._load_json(self.checkpoint_file, None)
 
-                -- Configuration parameters
-                workers INTEGER,
-                parallel_batch_size INTEGER,
-                num_determinizations INTEGER,
-                simulations_per_det INTEGER,
-                batch_timeout_ms INTEGER,
+    def _load_json(self, path: Path, default):
+        """Load JSON file or return default if not exists"""
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Failed to load {path}: {e}")
+                return default
+        return default
 
-                -- Metrics
-                examples_per_round REAL,
-                cpu_percent REAL,
-                gpu_memory_mb REAL
-            )
-        """)
-
-        # Checkpoints table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                last_phase TEXT NOT NULL,
-                last_config TEXT NOT NULL,
-                current_best_config TEXT NOT NULL,
-                current_best_perf REAL NOT NULL,
-                timestamp TEXT NOT NULL
-            )
-        """)
-
-        self.conn.commit()
+    def _save_json(self, path: Path, data):
+        """Save data to JSON file"""
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
 
     def save_result(self, phase: str, config: SweepConfig, num_rounds: int,
                     elapsed_sec: float, rounds_per_min: Optional[float],
@@ -141,150 +120,110 @@ class CheckpointManager:
                     examples_per_round: Optional[float] = None,
                     cpu_percent: Optional[float] = None,
                     gpu_memory_mb: Optional[float] = None):
-        """Save experiment result to database"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO experiments (
-                timestamp, phase, config_hash, num_rounds, elapsed_sec,
-                rounds_per_min, variance, success, error_msg,
-                workers, parallel_batch_size, num_determinizations,
-                simulations_per_det, batch_timeout_ms,
-                examples_per_round, cpu_percent, gpu_memory_mb
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            datetime.now().isoformat(),
-            phase,
-            config.to_hash(),
-            num_rounds,
-            elapsed_sec,
-            rounds_per_min,
-            variance,
-            success,
-            error_msg,
-            config.workers,
-            config.parallel_batch_size,
-            config.num_determinizations,
-            config.simulations_per_det,
-            config.batch_timeout_ms,
-            examples_per_round,
-            cpu_percent,
-            gpu_memory_mb
-        ))
-        self.conn.commit()
+        """Save experiment result to JSON file"""
+        experiment = {
+            'timestamp': datetime.now().isoformat(),
+            'phase': phase,
+            'config_hash': config.to_hash(),
+            'num_rounds': num_rounds,
+            'elapsed_sec': elapsed_sec,
+            'rounds_per_min': rounds_per_min,
+            'variance': variance,
+            'success': success,
+            'error_msg': error_msg,
+            'workers': config.workers,
+            'parallel_batch_size': config.parallel_batch_size,
+            'num_determinizations': config.num_determinizations,
+            'simulations_per_det': config.simulations_per_det,
+            'batch_timeout_ms': config.batch_timeout_ms,
+            'examples_per_round': examples_per_round,
+            'cpu_percent': cpu_percent,
+            'gpu_memory_mb': gpu_memory_mb
+        }
+
+        self.experiments.append(experiment)
+        self._save_json(self.experiments_file, self.experiments)
 
     def save_checkpoint(self, phase: str, last_config: SweepConfig,
                        best_config: SweepConfig, best_perf: float):
         """Save checkpoint for resume capability"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO checkpoints (
-                id, last_phase, last_config, current_best_config,
-                current_best_perf, timestamp
-            ) VALUES (1, ?, ?, ?, ?, ?)
-        """, (
-            phase,
-            json.dumps(last_config.to_dict()),
-            json.dumps(best_config.to_dict()),
-            best_perf,
-            datetime.now().isoformat()
-        ))
-        self.conn.commit()
+        self.checkpoint_data = {
+            'last_phase': phase,
+            'last_config': last_config.to_dict(),
+            'current_best_config': best_config.to_dict(),
+            'current_best_perf': best_perf,
+            'timestamp': datetime.now().isoformat()
+        }
+        self._save_json(self.checkpoint_file, self.checkpoint_data)
 
     def load_checkpoint(self) -> Optional[Tuple[str, SweepConfig, SweepConfig, float]]:
         """Load last checkpoint if exists"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT last_phase, last_config, current_best_config, current_best_perf FROM checkpoints WHERE id = 1")
-        row = cursor.fetchone()
-
-        if row:
-            last_phase, last_config_json, best_config_json, best_perf = row
-            last_config = SweepConfig(**json.loads(last_config_json))
-            best_config = SweepConfig(**json.loads(best_config_json))
+        if self.checkpoint_data:
+            last_phase = self.checkpoint_data['last_phase']
+            last_config = SweepConfig(**self.checkpoint_data['last_config'])
+            best_config = SweepConfig(**self.checkpoint_data['current_best_config'])
+            best_perf = self.checkpoint_data['current_best_perf']
             return last_phase, last_config, best_config, best_perf
-
         return None
 
     def get_completed_configs(self, phase: Optional[str] = None) -> Set[str]:
         """Get hashes of completed configurations"""
-        cursor = self.conn.cursor()
-        if phase:
-            cursor.execute("SELECT DISTINCT config_hash FROM experiments WHERE phase = ? AND success = 1", (phase,))
-        else:
-            cursor.execute("SELECT DISTINCT config_hash FROM experiments WHERE success = 1")
-
-        return {row[0] for row in cursor.fetchall()}
+        hashes = set()
+        for exp in self.experiments:
+            if exp['success']:
+                if phase is None or exp['phase'] == phase:
+                    hashes.add(exp['config_hash'])
+        return hashes
 
     def get_successful_results(self, phase: Optional[str] = None) -> List[Dict]:
         """Get all successful experiment results"""
-        cursor = self.conn.cursor()
-        if phase:
-            cursor.execute("""
-                SELECT workers, parallel_batch_size, num_determinizations,
-                       simulations_per_det, batch_timeout_ms, rounds_per_min,
-                       variance, num_rounds
-                FROM experiments
-                WHERE phase = ? AND success = 1 AND rounds_per_min IS NOT NULL
-                ORDER BY rounds_per_min DESC
-            """, (phase,))
-        else:
-            cursor.execute("""
-                SELECT workers, parallel_batch_size, num_determinizations,
-                       simulations_per_det, batch_timeout_ms, rounds_per_min,
-                       variance, num_rounds
-                FROM experiments
-                WHERE success = 1 AND rounds_per_min IS NOT NULL
-                ORDER BY rounds_per_min DESC
-            """)
-
         results = []
-        for row in cursor.fetchall():
-            config = SweepConfig(
-                workers=row[0],
-                parallel_batch_size=row[1],
-                num_determinizations=row[2],
-                simulations_per_det=row[3],
-                batch_timeout_ms=row[4]
-            )
-            results.append({
-                'config': config,
-                'rounds_per_min': row[5],
-                'variance': row[6],
-                'num_rounds': row[7]
-            })
 
+        for exp in self.experiments:
+            if exp['success'] and exp['rounds_per_min'] is not None:
+                if phase is None or exp['phase'] == phase:
+                    config = SweepConfig(
+                        workers=exp['workers'],
+                        parallel_batch_size=exp['parallel_batch_size'],
+                        num_determinizations=exp['num_determinizations'],
+                        simulations_per_det=exp['simulations_per_det'],
+                        batch_timeout_ms=exp['batch_timeout_ms']
+                    )
+                    results.append({
+                        'config': config,
+                        'rounds_per_min': exp['rounds_per_min'],
+                        'variance': exp.get('variance', 0.0),
+                        'num_rounds': exp['num_rounds']
+                    })
+
+        # Sort by rounds_per_min descending
+        results.sort(key=lambda x: x['rounds_per_min'], reverse=True)
         return results
 
     def get_failed_results(self) -> List[Dict]:
         """Get all failed experiment results"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT workers, parallel_batch_size, num_determinizations,
-                   simulations_per_det, batch_timeout_ms, error_msg, phase
-            FROM experiments
-            WHERE success = 0
-        """)
-
         results = []
-        for row in cursor.fetchall():
-            config = SweepConfig(
-                workers=row[0],
-                parallel_batch_size=row[1],
-                num_determinizations=row[2],
-                simulations_per_det=row[3],
-                batch_timeout_ms=row[4]
-            )
-            results.append({
-                'config': config,
-                'error': row[5],
-                'phase': row[6]
-            })
+
+        for exp in self.experiments:
+            if not exp['success']:
+                config = SweepConfig(
+                    workers=exp['workers'],
+                    parallel_batch_size=exp['parallel_batch_size'],
+                    num_determinizations=exp['num_determinizations'],
+                    simulations_per_det=exp['simulations_per_det'],
+                    batch_timeout_ms=exp['batch_timeout_ms']
+                )
+                results.append({
+                    'config': config,
+                    'error': exp.get('error_msg', 'Unknown error'),
+                    'phase': exp['phase']
+                })
 
         return results
 
     def close(self):
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
+        """No-op for JSON-based manager (files are saved immediately)"""
+        pass
 
 
 # ============================================================================
@@ -343,12 +282,14 @@ def create_network(device: str) -> Tuple[BlobNet, StateEncoder, ActionMasker]:
     masker = ActionMasker()
 
     network = BlobNet(
-        input_dim=encoder.get_encoding_dim(),
-        max_actions=masker.get_max_actions(),
-        hidden_dim=256,
-        num_heads=4,
-        num_layers=4,
-        dropout=0.1
+        state_dim=encoder.state_dim,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.1,
+        max_bid=13,
+        max_cards=52
     ).to(device)
 
     # Initialize with random weights (not training, just benchmarking)
@@ -944,17 +885,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python auto_tune.py                           # Full sweep
-  python auto_tune.py --time-budget 360         # 6 hour time limit
-  python auto_tune.py --resume results.db       # Resume from checkpoint
-  python auto_tune.py --quick                   # Quick mode (reduced space)
+  python auto_tune.py                                        # Full sweep
+  python auto_tune.py --time-budget 360                      # 6 hour time limit
+  python auto_tune.py --resume results/auto_tune_20251114    # Resume from checkpoint
+  python auto_tune.py --quick                                # Quick mode (reduced space)
         """
     )
 
     parser.add_argument('--time-budget', type=int, default=None,
                        help='Maximum runtime in minutes (default: unlimited)')
     parser.add_argument('--resume', type=str, default=None,
-                       help='Resume from checkpoint database')
+                       help='Resume from checkpoint directory (e.g., results/auto_tune_20251114_120000)')
     parser.add_argument('--output', type=str, default=None,
                        help='Output directory (default: results/auto_tune_YYYYMMDD_HHMMSS/)')
     parser.add_argument('--quick', action='store_true',
@@ -975,12 +916,17 @@ Examples:
     # Setup output directory
     if args.output:
         output_dir = Path(args.output)
+    elif args.resume:
+        output_dir = Path(args.resume)
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_dir = Path(f'results/auto_tune_{timestamp}')
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = str(output_dir / 'auto_tune_results.db')
+
+    # For compatibility with CheckpointManager that expects a "db path"
+    # We pass a dummy path and let CheckpointManager use its parent directory
+    checkpoint_path = str(output_dir / 'auto_tune_results.db')
 
     # Check device availability
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -998,7 +944,7 @@ Examples:
     print()
 
     # Initialize checkpoint manager
-    checkpoint_mgr = CheckpointManager(db_path)
+    checkpoint_mgr = CheckpointManager(checkpoint_path)
     eta_estimator = ETAEstimator()
 
     # Define parameter space
@@ -1106,9 +1052,11 @@ Examples:
                 error = failure['error']
                 print(f"  - {config}: {error}")
 
-        print(f"\nResults saved to: {db_path}")
+        print(f"\nResults saved to: {output_dir}")
+        print(f"  - experiments.json: All experiment results")
+        print(f"  - checkpoint.json: Resume checkpoint")
         print(f"\nGenerate report with:")
-        print(f"  python benchmarks/performance/auto_tune_report.py {db_path}")
+        print(f"  python benchmarks/performance/auto_tune_report.py {output_dir}")
 
         checkpoint_mgr.close()
         return 0
@@ -1116,7 +1064,7 @@ Examples:
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
         print("Progress has been saved to checkpoint")
-        print(f"Resume with: python auto_tune.py --resume {db_path}")
+        print(f"Resume with: python auto_tune.py --resume {output_dir}")
         checkpoint_mgr.close()
         return 130
 
