@@ -2,19 +2,21 @@
 
 This directory contains benchmarking scripts for measuring and optimizing the BlobMaster training pipeline performance.
 
-## Current Baseline Performance (2025-11-13)
+## Current Baseline Performance (2025-11-14)
 
 **Hardware:** RTX 4060 8GB, Ryzen 9 7950X 16-core, 128GB DDR5, Ubuntu 24.04
 **Phase:** Phase 1 - Independent Rounds Training
-**Configuration:** 32 workers, parallel expansion enabled, parallel_batch_size=30
+**Configuration:** 32 workers, multiprocessing (use_thread_pool=False), parallel expansion enabled, parallel_batch_size=30, batch_size=512
 
 | MCTS Config | Determinizations × Simulations | Total Sims/Move | Rounds/Min | Training Time (5M rounds) |
 |-------------|-------------------------------|-----------------|------------|---------------------------|
-| **Light**   | 2 × 20                        | 40              | 1,049      | 3.3 days                  |
-| **Medium**  | 3 × 30                        | 90              | 741        | 4.7 days                  |
-| **Heavy**   | 5 × 50                        | 250             | 310        | 11.2 days                 |
+| **Light**   | 2 × 20                        | 40              | ~668       | ~5.2 days                 |
+| **Medium**  | 3 × 30                        | 90              | ~540-980*  | ~3.5-6.4 days             |
+| **Heavy**   | 5 × 50                        | 250             | ~250       | ~13.9 days                |
 
-**Recommended:** Medium MCTS (741 rounds/min) for best quality/speed balance.
+\* **Note:** Performance varies with test duration. Short tests (~200 rounds) achieve ~540 r/min, while longer tests (500+ rounds) achieve ~980 r/min due to warmup effects and batch efficiency. Auto-tune validation uses ~980 r/min baseline.
+
+**Recommended:** Medium MCTS (~540-980 rounds/min) for best quality/speed balance.
 
 ---
 
@@ -59,10 +61,10 @@ python benchmarks/performance/benchmark_optimal_config.py --games 100
 - CSV summary
 - Console: Rounds/min, training time estimates
 
-**Expected Results (±5%):**
-- Light: ~1,049 rounds/min
-- Medium: ~741 rounds/min
-- Heavy: ~310 rounds/min
+**Expected Results (varies by test duration):**
+- Light: ~668 rounds/min
+- Medium: ~540-980 rounds/min (short vs long tests)
+- Heavy: ~250 rounds/min
 
 ---
 
@@ -195,7 +197,7 @@ python benchmarks/performance/visualize_session1_results.py results.csv --output
 
 **Features:**
 - Backward compatible (accepts both "games_per_minute" and "rounds_per_minute" columns)
-- Automatic baseline comparison (741 rounds/min)
+- Automatic baseline comparison (980 rounds/min for Medium MCTS)
 - Scaling efficiency analysis
 
 ---
@@ -239,7 +241,7 @@ The auto-tune script performs intelligent parameter exploration in four phases:
 
 1. **Phase 1: Baseline Validation** (5-10 min)
    - Validates current optimal config (32w × 30batch × 3×30 MCTS)
-   - Confirms system performance (expected: ~741 rounds/min ±10%)
+   - Confirms system performance (expected: ~980 rounds/min ±10%)
    - Fails fast if baseline is significantly degraded
 
 2. **Phase 2: Individual Parameter Sweeps** (1-3 hours)
@@ -300,8 +302,8 @@ Phases: baseline,individual,interaction,final
 
 Phase 1/4: Baseline Validation
 Config: 32w × 30batch × 3×30 MCTS
-Expected: 741.0 r/min ±10%
-✓ Result: 745 r/min (+0.5% vs expected)
+Expected: 980.0 r/min ±10%
+✓ Result: 970 r/min (-1.0% vs expected)
 
 Phase 2/4: Individual Parameter Sweeps (parallel_batch_size)
   parallel_batch_size=40:
@@ -347,7 +349,7 @@ python benchmarks/performance/auto_tune_report.py auto_tune_results.db --baselin
 **Parameters:**
 - `db_path`: Path to auto_tune_results.db (required)
 - `--output PATH`: Output markdown file (default: auto_tune_report.md in same dir)
-- `--baseline FLOAT`: Baseline performance for comparison (default: 741.0)
+- `--baseline FLOAT`: Baseline performance for comparison (default: 980.0)
 - `--no-plots`: Skip plot generation
 
 **Output:**
@@ -421,7 +423,7 @@ python benchmarks/performance/benchmark_optimal_config.py \
   --test-mcts-variants \
   --output results/baseline_verification.json
 
-# Expected: 1,049/741/310 rounds/min (Light/Medium/Heavy) ±5%
+# Expected: 668/540-980/250 rounds/min (Light/Medium/Heavy)
 ```
 
 ### Worker Scaling Analysis
@@ -518,16 +520,52 @@ See `docs/performance/` for detailed historical analysis:
 
 ---
 
+## Troubleshooting
+
+### Low Performance (~30-80 rounds/min instead of ~980)
+
+**Symptom:** Benchmarks running 10-15x slower than expected baseline.
+
+**Root Cause:** Threading instead of multiprocessing due to Python's GIL (Global Interpreter Lock).
+
+**Solution:** Ensure `use_thread_pool=False` is set when creating `SelfPlayEngine`:
+
+```python
+engine = SelfPlayEngine(
+    network=network,
+    encoder=encoder,
+    masker=masker,
+    num_workers=32,
+    num_determinizations=3,
+    simulations_per_determinization=30,
+    device="cuda",
+    use_thread_pool=False,  # CRITICAL: Use multiprocessing, not threads!
+    use_parallel_expansion=True,
+    parallel_batch_size=30,
+)
+```
+
+**Why this happens:**
+- When `use_thread_pool` is not specified (None), the engine auto-selects based on device
+- For CUDA, it defaults to `True` (threading), which causes GIL contention
+- Threading with 32 workers results in ~75-80 r/min (GIL-limited)
+- Multiprocessing with 32 workers achieves ~980 r/min (full parallelism)
+
+**All active benchmark scripts have been updated to use multiprocessing by default.**
+
+---
+
 ## Contributing New Benchmarks
 
 When adding new benchmark scripts:
 
 1. **Use correct terminology:** rounds/min (Phase 1) vs games/min (Phase 2)
-2. **Support current config:** Import from `ml.config import TrainingConfig`
-3. **Standardize CLI:** Use argparse with --workers, --games, --device, --output
-4. **Include progress:** Use tqdm or progress callbacks for long-running benchmarks
-5. **Document expected results:** Add baseline numbers to this README
-6. **Handle errors gracefully:** CUDA OOM, missing files, invalid parameters
+2. **Always set `use_thread_pool=False`:** Ensure multiprocessing for proper performance
+3. **Support current config:** Import from `ml.config import TrainingConfig`
+4. **Standardize CLI:** Use argparse with --workers, --games, --device, --output
+5. **Include progress:** Use tqdm or progress callbacks for long-running benchmarks
+6. **Document expected results:** Add baseline numbers to this README
+7. **Handle errors gracefully:** CUDA OOM, missing files, invalid parameters
 
 ---
 
@@ -546,4 +584,4 @@ When adding new benchmark scripts:
 ---
 
 **Last Updated:** 2025-11-14
-**Baseline Validated:** 2025-11-13 (741 rounds/min, Medium MCTS, 32 workers)
+**Baseline Validated:** 2025-11-14 (~980 rounds/min for 500-round tests, Medium MCTS, 32 workers, multiprocessing enabled)
