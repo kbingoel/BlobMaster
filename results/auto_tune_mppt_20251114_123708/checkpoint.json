@@ -1,0 +1,20 @@
+{
+  "stage_num": 3,
+  "last_phase": "final",
+  "last_config": {
+    "workers": 32,
+    "parallel_batch_size": 35,
+    "num_determinizations": 3,
+    "simulations_per_det": 35,
+    "batch_timeout_ms": 9
+  },
+  "current_best_config": {
+    "workers": 32,
+    "parallel_batch_size": 35,
+    "num_determinizations": 3,
+    "simulations_per_det": 35,
+    "batch_timeout_ms": 9
+  },
+  "current_best_perf": 1029.5654095670795,
+  "timestamp": "2025-11-14T13:14:36.993948"
+}
