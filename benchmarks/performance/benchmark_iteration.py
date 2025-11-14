@@ -81,6 +81,7 @@ class IterationBenchmark:
             num_determinizations=num_determinizations,
             simulations_per_determinization=simulations_per_det,
             device=device,
+            use_thread_pool=False,  # Use multiprocessing, not threads (GIL bottleneck)
         )
 
         # Create replay buffer

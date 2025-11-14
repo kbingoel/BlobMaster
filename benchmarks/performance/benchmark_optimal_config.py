@@ -13,10 +13,10 @@ This benchmark uses the OPTIMAL settings from profiling analysis:
 - Batched evaluator: 512 max batch, 10ms timeout
 - 5 cards per game (matches training config)
 
-Expected performance (Phase 1 - Independent Rounds, validated 2025-11-13):
-  Light MCTS (2×20): ~1,049 rounds/min
-  Medium MCTS (3×30): ~741 rounds/min
-  Heavy MCTS (5×50): ~310 rounds/min
+Expected performance (Phase 1 - Independent Rounds, validated 2025-11-14):
+  Light MCTS (2×20): ~668 rounds/min
+  Medium MCTS (3×30): ~540-980 rounds/min (varies by test duration)
+  Heavy MCTS (5×50): ~250 rounds/min
 
 Usage:
     python benchmarks/performance/benchmark_optimal_config.py --games 1000

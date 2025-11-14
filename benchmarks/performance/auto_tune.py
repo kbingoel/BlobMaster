@@ -287,7 +287,7 @@ def create_network(device: str) -> Tuple[BlobNet, StateEncoder, ActionMasker]:
         num_layers=6,
         num_heads=8,
         feedforward_dim=1024,
-        dropout=0.1,
+        dropout=0.0,  # No dropout for inference/benchmarking
         max_bid=13,
         max_cards=52
     ).to(device)
@@ -344,8 +344,9 @@ def run_config_benchmark(
             simulations_per_determinization=config.simulations_per_det,
             device=device,
             use_batched_evaluator=True,
-            batch_size=256,
+            batch_size=512,
             batch_timeout_ms=config.batch_timeout_ms,
+            use_thread_pool=False,  # Use multiprocessing, not threads (GIL bottleneck)
             use_parallel_expansion=True,
             parallel_batch_size=config.parallel_batch_size
         )
@@ -973,7 +974,10 @@ Examples:
         simulations_per_det=30,
         batch_timeout_ms=10
     )
-    expected_baseline_perf = 741.0  # From validation 2025-11-13
+    # Expected baseline: ~980 r/min for 500-round tests (updated 2025-11-14)
+    # Validated with multiprocessing (use_thread_pool=False) + parallel expansion
+    # Previous value of 741 r/min was measured with threading (7x slower due to GIL)
+    expected_baseline_perf = 980.0
 
     # Parse phases
     phases_to_run = [p.strip() for p in args.phases.split(',')]
