@@ -200,6 +200,200 @@ python benchmarks/performance/visualize_session1_results.py results.csv --output
 
 ---
 
+### 6. auto_tune.py ⭐ INTELLIGENT PARAMETER SWEEP
+
+**Purpose:** Automatically find optimal training configuration through systematic parameter exploration.
+
+**Usage:**
+```bash
+# Full sweep (5-6 hours)
+python benchmarks/performance/auto_tune.py
+
+# Quick mode (reduced parameter space, ~75 minutes)
+python benchmarks/performance/auto_tune.py --quick
+
+# With time budget (6 hours max)
+python benchmarks/performance/auto_tune.py --time-budget 360
+
+# Resume from checkpoint
+python benchmarks/performance/auto_tune.py --resume results/auto_tune_20251114_153000/auto_tune_results.db
+
+# Run specific phases only
+python benchmarks/performance/auto_tune.py --phases baseline,individual
+```
+
+**Parameters:**
+- `--time-budget INT`: Maximum runtime in minutes (default: unlimited)
+- `--resume PATH`: Resume from checkpoint database
+- `--output DIR`: Output directory (default: results/auto_tune_YYYYMMDD_HHMMSS/)
+- `--quick`: Quick mode with reduced parameter space
+- `--phases STR`: Comma-separated list (baseline,individual,interaction,final)
+- `--verbose`: Verbose logging
+- `--baseline-tolerance FLOAT`: Baseline validation tolerance (default: 0.10 = ±10%)
+- `--early-stop-threshold FLOAT`: Performance threshold for early termination (default: 0.30)
+- `--device STR`: cuda or cpu (default: cuda)
+
+**What It Does:**
+
+The auto-tune script performs intelligent parameter exploration in four phases:
+
+1. **Phase 1: Baseline Validation** (5-10 min)
+   - Validates current optimal config (32w × 30batch × 3×30 MCTS)
+   - Confirms system performance (expected: ~741 rounds/min ±10%)
+   - Fails fast if baseline is significantly degraded
+
+2. **Phase 2: Individual Parameter Sweeps** (1-3 hours)
+   - One-at-a-time exploration of each parameter
+   - Order: workers → parallel_batch_size → num_determinizations → simulations_per_det
+   - Quick screening (100 rounds) with early termination for poor performers
+   - Extended validation (500 rounds) for promising configs (within 5% of best)
+
+3. **Phase 3: Interaction Exploration** (1-2 hours)
+   - Tests promising combinations from Phase 2
+   - Focuses on top 3 values per parameter
+   - Medium validation (500 rounds per config)
+
+4. **Phase 4: Final Validation** (30-60 min)
+   - Top 5 configs, extended runs (1000 rounds × 3 runs)
+   - Statistical validation with confidence intervals
+   - Variance analysis for stability testing
+
+**Parameter Space:**
+
+**Full mode:**
+- `workers`: [8, 16, 24, 32]
+- `parallel_batch_size`: [10, 20, 30, 40, 50]
+- `num_determinizations`: [2, 3, 4, 5]
+- `simulations_per_det`: [15, 20, 25, 30, 35, 40, 50]
+- `batch_timeout_ms`: [5, 10, 15, 20]
+
+**Quick mode:**
+- `workers`: [16, 24, 32]
+- `parallel_batch_size`: [20, 30, 40]
+- `num_determinizations`: [2, 3, 4]
+- `simulations_per_det`: [20, 30, 40]
+- `batch_timeout_ms`: [10]
+
+**Smart Features:**
+
+- **Early termination:** Skips configs >30% slower than current best
+- **Hardware-aware:** Respects known limits (max 32 workers for RTX 4060 8GB)
+- **Adaptive sampling:** More validation for promising configs, less for poor performers
+- **Checkpoint/resume:** Can resume after interruption (Ctrl+C saves progress)
+- **Error handling:** Handles CUDA OOM gracefully, continues sweep
+- **Progress tracking:** Real-time ETA based on actual runtime
+- **Statistical rigor:** Multiple runs for top candidates, variance analysis
+
+**Output:**
+
+- **SQLite database:** `auto_tune_results.db` with all results
+- **Checkpoint data:** Resume capability
+- **Console:** Real-time progress with ETA, current best, phase summary
+
+**Example Output:**
+```
+Auto-Tune Parameter Sweep
+=========================
+Output: results/auto_tune_20251114_153000
+Device: cuda
+Phases: baseline,individual,interaction,final
+
+Phase 1/4: Baseline Validation
+Config: 32w × 30batch × 3×30 MCTS
+Expected: 741.0 r/min ±10%
+✓ Result: 745 r/min (+0.5% vs expected)
+
+Phase 2/4: Individual Parameter Sweeps (parallel_batch_size)
+  parallel_batch_size=40:
+    ✓ 750 r/min (promising, validating with 500 rounds)
+    ★ NEW BEST: 812 r/min
+Current best: 32w × 40batch × 3×30 = 812 r/min
+
+...
+
+SWEEP COMPLETE
+Best configuration: 32w × 40batch × 3×30 MCTS
+Performance: 812 r/min
+Improvement: +9.6%
+```
+
+**Success Criteria:**
+- ✓ Runs unattended for 6+ hours without crashes
+- ✓ Finds config ≥10% better than baseline (>815 r/min)
+- ✓ Produces actionable report with clear recommendations
+- ✓ Results reproducible (same config → same perf ±5%)
+
+---
+
+### 7. auto_tune_report.py
+
+**Purpose:** Generate comprehensive report from auto-tune sweep results.
+
+**Usage:**
+```bash
+# Generate report from database
+python benchmarks/performance/auto_tune_report.py results/auto_tune_20251114_153000/auto_tune_results.db
+
+# Custom output path
+python benchmarks/performance/auto_tune_report.py auto_tune_results.db --output custom_report.md
+
+# Skip plots (faster)
+python benchmarks/performance/auto_tune_report.py auto_tune_results.db --no-plots
+
+# Custom baseline for comparison
+python benchmarks/performance/auto_tune_report.py auto_tune_results.db --baseline 750.0
+```
+
+**Parameters:**
+- `db_path`: Path to auto_tune_results.db (required)
+- `--output PATH`: Output markdown file (default: auto_tune_report.md in same dir)
+- `--baseline FLOAT`: Baseline performance for comparison (default: 741.0)
+- `--no-plots`: Skip plot generation
+
+**Output:**
+
+**Markdown report** (`auto_tune_report.md`):
+- Summary statistics (configs tested, best found, improvement)
+- Top 10 configurations table
+- Parameter analysis (best values for each parameter)
+- Failed configurations with error types
+- Key findings and recommendations
+- Exportable config for ml/config.py
+
+**Plots** (saved to `plots/` subdirectory):
+- `worker_scaling.png` - Worker count vs performance
+- `batch_size_sweep.png` - Parallel batch size impact
+- `mcts_heatmap.png` - Determinizations × Simulations heatmap
+- `top10_comparison.png` - Bar chart of top 10 configs
+- `variance_analysis.png` - Performance vs stability scatter plot
+
+**Example Report Snippet:**
+```markdown
+## Top 10 Configurations
+
+| Rank | Workers | Batch Size | Det × Sims | Total Sims | Rounds/Min | vs Baseline | Variance |
+|------|---------|------------|------------|------------|------------|-------------|----------|
+| 1    | 32      | 40         | 3×30       | 90         | 812        | +9.6%       | 2.1%     |
+| 2    | 32      | 50         | 3×25       | 75         | 798        | +7.7%       | 3.8%     |
+| 3    | 32      | 30         | 3×30       | 90         | 745        | baseline    | 1.9%     |
+
+## Key Findings
+- **parallel_batch_size**: Sweet spot at 40 (+9.6% over baseline)
+- **workers**: 32 remains optimal (24 shows 14% degradation)
+
+## Recommendations
+1. **Immediate**: Use 32w × 40batch × 3×30 (+9.6% speedup)
+2. **Investigate**: Test intermediate batch sizes (32-38) for fine-tuning
+```
+
+**Use Cases:**
+- Review auto-tune sweep results
+- Share findings with team
+- Export optimal config for production
+- Visualize parameter relationships
+
+---
+
 ## Archive
 
 The `archive/` directory contains retired benchmark scripts from earlier optimization sessions:
@@ -259,14 +453,30 @@ python benchmarks/performance/benchmark_iteration.py \
 cat results/iteration_timing.json | jq '.iteration_summary'
 ```
 
-### Parameter Sweep (Future Auto-Tune)
+### Automated Parameter Sweep
 
-The updated scripts are designed to support future automated parameter sweeping:
+Find optimal configuration automatically:
 
-1. Run `benchmark_selfplay.py` with various configurations
-2. Collect results in CSV
-3. Use `visualize_session1_results.py` to analyze
-4. Identify optimal settings
+```bash
+# Run auto-tune (5-6 hours, unattended)
+python benchmarks/performance/auto_tune.py --output results/auto_tune/
+
+# Quick mode for testing (~75 minutes)
+python benchmarks/performance/auto_tune.py --quick
+
+# Generate comprehensive report
+python benchmarks/performance/auto_tune_report.py results/auto_tune/auto_tune_results.db
+
+# View plots
+ls results/auto_tune/plots/
+```
+
+**What you get:**
+- Optimal configuration (tested across 50+ combinations)
+- Performance improvement quantification
+- Statistical validation with variance analysis
+- Exportable config for ml/config.py
+- Comprehensive plots and markdown report
 
 ---
 
@@ -323,13 +533,15 @@ When adding new benchmark scripts:
 
 ## Quick Reference
 
-| Script | Primary Use | Output | Duration (500 rounds) |
-|--------|-------------|--------|-----------------------|
-| benchmark_optimal_config.py | Baseline validation | JSON + CSV | ~40 sec (Medium) |
+| Script | Primary Use | Output | Duration |
+|--------|-------------|--------|----------|
+| benchmark_optimal_config.py | Baseline validation | JSON + CSV | ~40 sec (500 rounds) |
 | benchmark_selfplay.py | Worker scaling | CSV | ~5-60 sec per config |
 | benchmark_iteration.py | Full iteration timing | JSON | ~3-10 min |
 | benchmark_training.py | Network training | JSON | ~2-5 min |
 | visualize_session1_results.py | Plot generation | PNG + TXT | <10 sec |
+| **auto_tune.py** | **Automated optimization** | **SQLite DB** | **5-6 hours (full)** |
+| **auto_tune_report.py** | **Report from auto-tune** | **Markdown + Plots** | **<30 sec** |
 
 ---
 
