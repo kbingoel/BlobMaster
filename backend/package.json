@@ -1,0 +1,26 @@
+{
+  "name": "blobmaster-backend",
+  "version": "0.1.0",
+  "description": "BlobMaster backend server - AI card game inference and game management",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "test": "bun test",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.18.0",
+    "ws": "^8.18.0",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/bun": "latest",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
