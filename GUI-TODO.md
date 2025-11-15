@@ -5,6 +5,16 @@
 **Target Platform:** Windows Laptop (Inference/Production)
 **Dependencies:** Phase 5 ONNX Export Complete
 
+**IMPORTANT - Implementation Scope:**
+This document covers Phases 5-7 (ONNX export + GUI). However, note the following dependencies:
+
+- ✅ **Sections 6.1-6.3** (Project Setup, Game Engine Port, State Encoder) can be implemented **NOW** while away from Ubuntu training machine
+- ⚠️ **Sections 6.4-6.5** (ONNX Inference, MCTS) require trained model from Phase 1 (~3-5 days training)
+- ⚠️ **Full implementation requires Phase 2** (multi-round game support, Sessions 4-5, ~8 hours implementation)
+- 📖 **State Encoder:** See [docs/STATE_ENCODER_SPEC.md](../docs/STATE_ENCODER_SPEC.md) for complete 256-dimension specification
+
+**Recommendation:** Focus on 6.1-6.3 first, then wait for Phase 1 training completion + Phase 2 implementation before proceeding with full GUI.
+
 ---
 
 ## Table of Contents
@@ -1006,7 +1016,7 @@ export class BlobGame {
   /**
    * Get forbidden bid for dealer (bid that makes total = cards dealt)
    */
-  getForbiddenBid(currentTotalBids: number, cardsDeal: number): number | null {
+  getForbiddenBid(currentTotalBids: number, cardsDealt: number): number | null {
     const forbiddenBid = cardsDealt - currentTotalBids;
 
     if (forbiddenBid >= 0 && forbiddenBid <= cardsDealt) {
@@ -1420,8 +1430,9 @@ export class StateEncoder {
     offset += 3;
 
     // 11-12. Positional and Context Features (remaining dimensions)
-    // ... (implement remaining features to match Python exactly)
-    // For initial implementation, can pad with zeros
+    // IMPORTANT: See docs/STATE_ENCODER_SPEC.md for complete specification of all 256 dimensions
+    // Reference implementation: ml/network/encode.py
+    // Must match Python exactly - DO NOT pad with zeros, implement all features
 
     return state;
   }
