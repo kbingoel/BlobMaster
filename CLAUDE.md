@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bidding game) using AlphaZero-style reinforcement learning. The project implements a neural network trained through self-play with Monte Carlo Tree Search (MCTS) to master both bidding strategy and optimal card play in an imperfect information game.
 
-**Architecture**: Training and development happen on a Linux PC (Ubuntu 24.04) with RTX 4060 GPU + Python 3.14/PyTorch. Future inference deployment (Phase 7+) may use a Windows laptop with Intel iGPU + ONNX Runtime, or may be split into a separate repository. The production stack (when implemented) uses Bun (TypeScript backend), Svelte (frontend), and SQLite (database).
+**Architecture**: Training and development happen on a Linux PC (Ubuntu 24.04) with RTX 4060 GPU + Python 3.14/PyTorch. Future inference deployment (Phase 7+) will use a Windows laptop with Intel iGPU + ONNX Runtime. This is a **monorepo** containing both training (Python) and production (TypeScript) code. The production stack (when implemented) uses Bun (TypeScript backend), Svelte (frontend), and SQLite (database).
 
 ## Terminology
 
@@ -30,7 +30,7 @@ BlobMaster is an AI-powered assistant for the card game "Blob" (trick-taking bid
 - **Primary Development**: Ubuntu Linux 24.04 on Ryzen 9 7950X + RTX 4060 8GB
 - **Python Version**: Python 3.14.0 (with GIL enabled)
 - **Training Location**: All training happens on the Linux PC
-- **Future Deployment**: Windows laptop inference is Phase 7+ (future work, may be separate repo)
+- **Future Deployment**: Windows laptop inference is Phase 7+ (future work, will remain in this monorepo)
 
 ### Training Environment (Python)
 
