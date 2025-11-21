@@ -1,22 +1,23 @@
 {
-  "num_workers": 2,
-  "games_per_iteration": 100,
-  "num_determinizations": 2,
-  "simulations_per_determinization": 10,
+  "num_workers": 32,
+  "games_per_iteration": 10000,
+  "num_determinizations": 3,
+  "simulations_per_determinization": 30,
   "must_have_suit_bias": 1.0,
   "use_parallel_expansion": true,
   "parallel_batch_size": 30,
-  "replay_buffer_capacity": 10000,
-  "min_buffer_size": 1000,
-  "batch_size": 64,
-  "epochs_per_iteration": 2,
+  "batch_timeout_ms": 10.0,
+  "replay_buffer_capacity": 500000,
+  "min_buffer_size": 10000,
+  "batch_size": 512,
+  "epochs_per_iteration": 10,
   "learning_rate": 0.001,
   "weight_decay": 0.0001,
   "policy_loss_weight": 1.0,
   "value_loss_weight": 1.0,
-  "eval_games": 50,
-  "eval_determinizations": 2,
-  "eval_simulations": 10,
+  "eval_games": 400,
+  "eval_determinizations": 3,
+  "eval_simulations": 50,
   "promotion_threshold": 0.55,
   "embedding_dim": 256,
   "num_transformer_layers": 6,
@@ -25,7 +26,7 @@
   "device": "cuda",
   "use_mixed_precision": true,
   "checkpoint_dir": "models/checkpoints",
-  "save_every_n_iterations": 10,
+  "save_every_n_iterations": 5,
   "log_dir": "runs",
   "use_wandb": false,
   "wandb_project": "blobmaster",
@@ -43,5 +44,48 @@
   },
   "use_decision_weighted_sampling": false,
   "training_on": "rounds",
-  "mcts_schedule": {}
+  "mcts_schedule": {
+    "50": [
+      1,
+      15
+    ],
+    "150": [
+      2,
+      25
+    ],
+    "300": [
+      3,
+      35
+    ],
+    "450": [
+      4,
+      45
+    ],
+    "500": [
+      5,
+      50
+    ]
+  },
+  "batch_config_schedule": {
+    "50": [
+      30,
+      10
+    ],
+    "150": [
+      25,
+      10
+    ],
+    "300": [
+      40,
+      6
+    ],
+    "450": [
+      35,
+      7
+    ],
+    "500": [
+      35,
+      11
+    ]
+  }
 }

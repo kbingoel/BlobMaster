@@ -535,7 +535,7 @@ class TrainingPipeline:
         network: BlobNet,
         encoder: StateEncoder,
         masker: ActionMasker,
-        config: Dict[str, Any],
+        config,  # Can be TrainingConfig object or dict
     ):
         """
         Initialize training pipeline.
@@ -544,7 +544,7 @@ class TrainingPipeline:
             network: Neural network to train
             encoder: State encoder
             masker: Action masker
-            config: Training configuration dictionary with keys:
+            config: Training configuration (TrainingConfig object or dict) with keys:
                 - num_workers: Number of parallel self-play workers
                 - games_per_iteration: Games to generate per iteration
                 - num_determinizations: Determinizations for MCTS
@@ -564,10 +564,17 @@ class TrainingPipeline:
         self.masker = masker
         self.config = config
 
-        # Extract config values with defaults
-        self.checkpoint_dir = Path(config.get("checkpoint_dir", "models/checkpoints"))
-        self.save_every_n_iterations = config.get("save_every_n_iterations", 10)
-        self.device = config.get("device", "cuda")
+        # Extract config values with defaults (handle both dict and object)
+        def get_config_value(key, default):
+            """Get config value from dict or object."""
+            if isinstance(config, dict):
+                return config.get(key, default)
+            else:
+                return getattr(config, key, default)
+
+        self.checkpoint_dir = Path(get_config_value("checkpoint_dir", "models/checkpoints"))
+        self.save_every_n_iterations = get_config_value("save_every_n_iterations", 10)
+        self.device = get_config_value("device", "cuda")
 
         # Create checkpoint directory
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -580,24 +587,28 @@ class TrainingPipeline:
             network=network,
             encoder=encoder,
             masker=masker,
-            num_workers=config.get("num_workers", 16),
-            num_determinizations=config.get("num_determinizations", 3),
-            simulations_per_determinization=config.get(
+            num_workers=get_config_value("num_workers", 16),
+            num_determinizations=get_config_value("num_determinizations", 3),
+            simulations_per_determinization=get_config_value(
                 "simulations_per_determinization", 30
             ),
             device=self.device,
+            # MPPT auto-tuned batch configuration parameters
+            use_parallel_expansion=get_config_value("use_parallel_expansion", True),
+            parallel_batch_size=get_config_value("parallel_batch_size", 30),
+            batch_timeout_ms=get_config_value("batch_timeout_ms", 10.0),
         )
 
         # Replay buffer
         self.replay_buffer = ReplayBuffer(
-            capacity=config.get("replay_buffer_capacity", 500_000),
+            capacity=get_config_value("replay_buffer_capacity", 500_000),
         )
 
         # Network trainer
         self.trainer = NetworkTrainer(
             network=network,
-            learning_rate=config.get("learning_rate", 0.001),
-            weight_decay=config.get("weight_decay", 1e-4),
+            learning_rate=get_config_value("learning_rate", 0.001),
+            weight_decay=get_config_value("weight_decay", 1e-4),
             device=self.device,
         )
 
@@ -605,14 +616,14 @@ class TrainingPipeline:
         self.arena = Arena(
             encoder=encoder,
             masker=masker,
-            num_determinizations=config.get("eval_determinizations", 3),
-            simulations_per_determinization=config.get("eval_simulations", 50),
+            num_determinizations=get_config_value("eval_determinizations", 3),
+            simulations_per_determinization=get_config_value("eval_simulations", 50),
             device=self.device,
         )
 
         self.elo_tracker = ELOTracker(
-            initial_elo=config.get("initial_elo", 1000),
-            k_factor=config.get("elo_k_factor", 32),
+            initial_elo=get_config_value("initial_elo", 1000),
+            k_factor=get_config_value("elo_k_factor", 32),
         )
 
         # Load ELO history if it exists
@@ -624,9 +635,9 @@ class TrainingPipeline:
         # Training state
         self.current_iteration = 0
         self.best_model_path = None
-        self.best_model_elo = config.get("initial_elo", 1000)
+        self.best_model_elo = get_config_value("initial_elo", 1000)
         self.metrics_history = []
-        self.eval_frequency = config.get("eval_frequency", 5)  # Evaluate every N iterations
+        self.eval_frequency = get_config_value("eval_frequency", 5)  # Evaluate every N iterations
 
         # Store training start date for checkpoint naming
         self.training_start_date = datetime.now().strftime("%Y%m%d")
@@ -651,13 +662,31 @@ class TrainingPipeline:
 
         print(f"Pipeline initialized:")
         print(f"  - Training session started: {self.training_start_date}")
-        print(f"  - Self-play workers: {config.get('num_workers', 16)}")
-        print(f"  - Replay buffer capacity: {config.get('replay_buffer_capacity', 500_000):,}")
+        print(f"  - Self-play workers: {get_config_value('num_workers', 16)}")
+        print(f"  - Replay buffer capacity: {get_config_value('replay_buffer_capacity', 500_000):,}")
         print(f"  - Evaluation frequency: every {self.eval_frequency} iterations")
         print(f"  - Device: {self.device}")
         print(f"  - Checkpoint directory: {self.checkpoint_dir}")
         print(f"  - EMA model: enabled (decay={self.ema_decay})")
         print(f"  - Progressive target τ: {self.pi_target_tau_start} → {self.pi_target_tau_end} over {self.tau_anneal_iters} iterations")
+
+    def _get_config_value(self, key: str, default):
+        """
+        Get config value from dict or object.
+
+        Helper method to handle both TrainingConfig objects and legacy dicts.
+
+        Args:
+            key: Config key to retrieve
+            default: Default value if key not found
+
+        Returns:
+            Config value or default
+        """
+        if isinstance(self.config, dict):
+            return self.config.get(key, default)
+        else:
+            return getattr(self.config, key, default)
 
     def get_pi_target_tau(self, iteration: int) -> float:
         """
@@ -762,9 +791,9 @@ class TrainingPipeline:
         print(f"Starting AlphaZero Training Pipeline")
         print(f"{'='*80}")
         print(f"Total iterations: {num_iterations}")
-        print(f"Games per iteration: {self.config.get('games_per_iteration', 10_000):,}")
-        print(f"Epochs per iteration: {self.config.get('epochs_per_iteration', 10)}")
-        print(f"Batch size: {self.config.get('batch_size', 512)}")
+        print(f"Games per iteration: {self._get_config_value('games_per_iteration', 10_000):,}")
+        print(f"Epochs per iteration: {self._get_config_value('epochs_per_iteration', 10)}")
+        print(f"Batch size: {self._get_config_value('batch_size', 512)}")
         print(f"{'='*80}\n")
 
         # Main training loop
@@ -798,6 +827,20 @@ class TrainingPipeline:
                     # Update self-play engine config
                     self.selfplay_engine.num_determinizations = num_det
                     self.selfplay_engine.simulations_per_determinization = sims_per_det
+
+                # Get batch params for this iteration (if config supports curriculum)
+                if hasattr(self.config, 'get_batch_params'):
+                    batch_size, timeout_ms = self.config.get_batch_params(iteration + 1)
+                    print(f"Batch curriculum: parallel_batch_size={batch_size}, timeout={timeout_ms}ms")
+
+                    # Update self-play engine config
+                    self.selfplay_engine.parallel_batch_size = batch_size
+                    self.selfplay_engine.batch_timeout_ms = timeout_ms
+
+                    # CRITICAL: Also update BatchedEvaluator timeout if it exists
+                    # The evaluator stores timeout in seconds, so convert from milliseconds
+                    if hasattr(self.selfplay_engine, 'batch_evaluator') and self.selfplay_engine.batch_evaluator is not None:
+                        self.selfplay_engine.batch_evaluator.timeout_ms = timeout_ms / 1000.0
 
                 iteration_start_time = time.time()
 
@@ -889,7 +932,7 @@ class TrainingPipeline:
         print("-" * 40)
         training_metrics = self._training_phase(
             iteration,
-            num_epochs=self.config.get("epochs_per_iteration", 10),
+            num_epochs=self._get_config_value("epochs_per_iteration", 10),
         )
         metrics.update(training_metrics)
 
@@ -919,10 +962,10 @@ class TrainingPipeline:
         # NEW: Use adaptive training curriculum (Session 2)
         if hasattr(self.config, 'get_training_units_per_iteration'):
             num_games = self.config.get_training_units_per_iteration(iteration)
-            unit_type = "rounds" if self.config.get('training_on', 'rounds') == 'rounds' else "games"
+            unit_type = "rounds" if self._get_config_value('training_on', 'rounds') == 'rounds' else "games"
             print(f"Generating {num_games:,} {unit_type} (adaptive curriculum: linear ramp)...")
         else:
-            num_games = self.config.get("games_per_iteration", 10_000)
+            num_games = self._get_config_value("games_per_iteration", 10_000)
             print(f"Generating {num_games:,} self-play games...")
 
         # NEW: Use EMA model for self-play (Session 2)
@@ -992,7 +1035,7 @@ class TrainingPipeline:
 
         # Collect distribution statistics (if decision-weighted sampling is enabled)
         distribution_stats = None
-        if hasattr(self.config, 'use_decision_weighted_sampling') and self.config.get('use_decision_weighted_sampling'):
+        if hasattr(self.config, 'use_decision_weighted_sampling') and self._get_config_value('use_decision_weighted_sampling', False):
             distribution_stats = self.selfplay_engine._collect_distribution_stats(examples)
 
         # Store distribution stats for logging
@@ -1016,7 +1059,7 @@ class TrainingPipeline:
             Training metrics (avg over epochs)
         """
         # Check if buffer has enough data
-        min_buffer_size = self.config.get("min_buffer_size", 10_000)
+        min_buffer_size = self._get_config_value("min_buffer_size", 10_000)
         if len(self.replay_buffer) < min_buffer_size:
             print(f"Replay buffer too small ({len(self.replay_buffer)} < {min_buffer_size}), skipping training")
             return {
@@ -1026,7 +1069,7 @@ class TrainingPipeline:
                 "avg_policy_accuracy": 0.0,
             }
 
-        batch_size = self.config.get("batch_size", 512)
+        batch_size = self._get_config_value("batch_size", 512)
 
         print(f"Training for {num_epochs} epochs...")
         print(f"  - Batch size: {batch_size}")
@@ -1156,15 +1199,15 @@ class TrainingPipeline:
         best_model.load_state_dict(checkpoint['model_state_dict'])
 
         # Run arena match
-        num_eval_games = self.config.get("eval_games", 400)
+        num_eval_games = self._get_config_value("eval_games", 400)
         print(f"  - Playing {num_eval_games} evaluation games...")
 
         match_results = self.arena.play_match(
             model1=self.network,
             model2=best_model,
             num_games=num_eval_games,
-            num_players=self.config.get("num_players", 4),
-            cards_to_deal=self.config.get("cards_to_deal", 5),
+            num_players=self._get_config_value("num_players", 4),
+            cards_to_deal=self._get_config_value("cards_to_deal", 5),
             verbose=False,
         )
 
@@ -1183,15 +1226,15 @@ class TrainingPipeline:
             model_avg_score=match_results['model1_avg_score'],
             opponent_avg_score=match_results['model2_avg_score'],
             metadata={
-                'num_determinizations': self.config.get("eval_determinizations", 3),
-                'simulations_per_determinization': self.config.get("eval_simulations", 50),
+                'num_determinizations': self._get_config_value("eval_determinizations", 3),
+                'simulations_per_determinization': self._get_config_value("eval_simulations", 50),
             }
         )
 
         elo_change = new_elo - self.best_model_elo
 
         # Determine if model should be promoted
-        promotion_threshold = self.config.get("promotion_threshold", 0.55)
+        promotion_threshold = self._get_config_value("promotion_threshold", 0.55)
         should_promote = self.elo_tracker.should_promote_model(
             win_rate, promotion_threshold
         )
@@ -1248,15 +1291,15 @@ class TrainingPipeline:
             num_det, sims = self.config.get_mcts_params(iteration + 1)
         else:
             # Fallback to config defaults
-            num_det = self.config.get('num_determinizations', 3)
-            sims = self.config.get('simulations_per_determinization', 30)
+            num_det = self._get_config_value('num_determinizations', 3)
+            sims = self._get_config_value('simulations_per_determinization', 30)
 
         # Build components
         date = self.training_start_date
         project = "Blobmaster"
         version = "v1"
-        workers = f"{self.config.get('num_workers', 16)}w"
-        mode = self.config.get('training_on', 'rounds')  # 'rounds' or 'games'
+        workers = f"{self._get_config_value('num_workers', 16)}w"
+        mode = self._get_config_value('training_on', 'rounds')  # 'rounds' or 'games'
         mcts = f"{num_det}x{sims}"
         iter_str = f"iter{iteration:03d}"  # Zero-padded to 3 digits
 

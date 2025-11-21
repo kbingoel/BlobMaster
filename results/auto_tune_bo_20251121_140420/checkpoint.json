@@ -1,0 +1,14 @@
+{
+  "completed_stages": [
+    3
+  ],
+  "current_best_per_stage": {
+    "3": {
+      "parallel_batch_size": 43,
+      "batch_timeout_ms": 7,
+      "rounds_per_min": 790.7406593656236,
+      "improvement": "+47.0%"
+    }
+  },
+  "timestamp": "2025-11-21T14:10:07.581287"
+}

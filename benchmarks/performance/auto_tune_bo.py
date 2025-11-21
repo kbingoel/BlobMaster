@@ -22,13 +22,23 @@ Usage:
 import argparse
 import hashlib
 import json
-import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import torch
+import psutil
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from ml.network.model import BlobNet
+from ml.network.encode import StateEncoder, ActionMasker
+from ml.training.selfplay import SelfPlayEngine
 
 try:
     import optuna
@@ -75,79 +85,141 @@ BASELINE_WORKERS = 32
 BASELINE_BATCH_SIZE = 30
 BASELINE_TIMEOUT_MS = 10
 
-# Optuna search space bounds
-BATCH_SIZE_MIN = 5
-BATCH_SIZE_MAX = 100
-TIMEOUT_MS_MIN = 1
-TIMEOUT_MS_MAX = 50
+# Optuna search space bounds (narrowed from MPPT findings)
+BATCH_SIZE_MIN = 10   # Was 5 - too small wastes GPU
+BATCH_SIZE_MAX = 60   # Was 100 - MPPT never found optimal above 40
+TIMEOUT_MS_MIN = 3    # Was 1 - too aggressive for batching
+TIMEOUT_MS_MAX = 20   # Was 50 - MPPT never found optimal above 15
 
 # Default Optuna parameters
-DEFAULT_N_TRIALS = 15
-DEFAULT_N_STARTUP_TRIALS = 5  # Random trials before TPE kicks in
+DEFAULT_N_TRIALS = 25
+DEFAULT_N_STARTUP_TRIALS = 4  # 1 baseline + 3 smart seeds, then TPE takes over
 DEFAULT_ROUNDS_PER_TRIAL = 200
 DEFAULT_VALIDATION_ROUNDS = 200
 DEFAULT_VALIDATION_RUNS = 3
 
 
 # =============================================================================
+# Network Creation
+# =============================================================================
+
+def create_network(device: str) -> Tuple[BlobNet, StateEncoder, ActionMasker]:
+    """Create neural network with encoder and masker."""
+    encoder = StateEncoder()
+    masker = ActionMasker()
+
+    network = BlobNet(
+        state_dim=encoder.state_dim,
+        embedding_dim=256,
+        num_layers=6,
+        num_heads=8,
+        feedforward_dim=1024,
+        dropout=0.0,
+        max_bid=13,
+        max_cards=52
+    ).to(device)
+
+    network.eval()
+    return network, encoder, masker
+
+
+# =============================================================================
 # Benchmark Execution
 # =============================================================================
 
-def run_benchmark(config: BOConfig, num_rounds: int, verbose: bool = False) -> Optional[float]:
+def run_benchmark(
+    config: BOConfig,
+    num_rounds: int,
+    device: str = "cuda",
+    verbose: bool = False,
+    warmup_rounds: int = 5,
+    cards_to_deal: int = 5,
+    num_players: int = 4
+) -> Optional[float]:
     """
-    Run a benchmark with the given configuration.
+    Run inline benchmark using SelfPlayEngine (adapted from MPPT Gen2).
 
     Args:
         config: Configuration to test
         num_rounds: Number of rounds to run
+        device: Device for inference (cuda or cpu)
         verbose: Print detailed output
+        warmup_rounds: Warmup rounds before benchmark
+        cards_to_deal: Cards per player
+        num_players: Number of players
 
     Returns:
         Rounds per minute, or None if benchmark failed
     """
-    cmd = [
-        sys.executable,
-        "benchmarks/performance/benchmark_phase2_iteration.py",
-        "--workers", str(config.workers),
-        "--parallel-batch-size", str(config.parallel_batch_size),
-        "--num-determinizations", str(config.num_determinizations),
-        "--simulations-per-det", str(config.simulations_per_det),
-        "--batch-timeout-ms", str(config.batch_timeout_ms),
-        "--num-games", str(num_rounds),
-        "--device", "cuda",
-    ]
-
-    if verbose:
-        print(f"  Running: {' '.join(cmd)}")
-
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout
+        # Create network
+        network, encoder, masker = create_network(device)
+
+        # Create self-play engine
+        engine = SelfPlayEngine(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_workers=config.workers,
+            num_determinizations=config.num_determinizations,
+            simulations_per_determinization=config.simulations_per_det,
+            device=device,
+            use_batched_evaluator=True,
+            batch_size=512,
+            batch_timeout_ms=config.batch_timeout_ms,
+            use_thread_pool=False,
+            use_parallel_expansion=True,
+            parallel_batch_size=config.parallel_batch_size
         )
 
-        if result.returncode != 0:
-            print(f"  ERROR: Benchmark failed with return code {result.returncode}")
-            if verbose:
-                print(f"  STDERR: {result.stderr}")
-            return None
+        # Warmup
+        if verbose:
+            print(f"  Warming up ({warmup_rounds} rounds)...", end='', flush=True)
+        engine.generate_games(
+            num_games=warmup_rounds,
+            num_players=num_players,
+            cards_to_deal=cards_to_deal
+        )
+        torch.cuda.empty_cache()
+        if verbose:
+            print(" done")
 
-        # Parse output for rounds/min
-        for line in result.stdout.splitlines():
-            if "Games per minute:" in line:
-                games_per_min = float(line.split(":")[-1].strip())
-                return games_per_min
+        # Benchmark
+        if verbose:
+            print(f"  Benchmarking ({num_rounds} rounds)...", end='', flush=True)
+        start_time = time.time()
 
-        print(f"  ERROR: Could not parse rounds/min from output")
+        examples = engine.generate_games(
+            num_games=num_rounds,
+            num_players=num_players,
+            cards_to_deal=cards_to_deal
+        )
+
+        elapsed_sec = time.time() - start_time
+        rounds_per_min = (num_rounds / elapsed_sec) * 60
+
+        if verbose:
+            print(f" {rounds_per_min:.1f} r/min")
+
+        # Cleanup
+        engine.shutdown()
+        torch.cuda.empty_cache()
+        time.sleep(2)
+
+        return rounds_per_min
+
+    except torch.cuda.OutOfMemoryError as e:
+        error_msg = f"CUDA OOM: {str(e)}"
+        print(f"  ERROR: {error_msg}")
+        torch.cuda.empty_cache()
         return None
 
-    except subprocess.TimeoutExpired:
-        print(f"  ERROR: Benchmark timed out after 10 minutes")
-        return None
     except Exception as e:
-        print(f"  ERROR: Benchmark failed with exception: {e}")
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"  ERROR: {error_msg}")
+        if verbose:
+            traceback.print_exc()
+        torch.cuda.empty_cache()
         return None
 
 
@@ -155,7 +227,7 @@ def run_benchmark(config: BOConfig, num_rounds: int, verbose: bool = False) -> O
 # Optuna Optimization
 # =============================================================================
 
-def create_objective(stage_det: int, stage_sims: int, num_rounds: int, results_log: List[Dict]):
+def create_objective(stage_det: int, stage_sims: int, num_rounds: int, device: str, results_log: List[Dict]):
     """
     Create an Optuna objective function for a specific curriculum stage.
 
@@ -163,6 +235,7 @@ def create_objective(stage_det: int, stage_sims: int, num_rounds: int, results_l
         stage_det: Number of determinizations for this stage
         stage_sims: Simulations per determinization for this stage
         num_rounds: Number of rounds per trial
+        device: Device for inference (cuda or cpu)
         results_log: List to append trial results to
 
     Returns:
@@ -184,7 +257,7 @@ def create_objective(stage_det: int, stage_sims: int, num_rounds: int, results_l
         print(f"\n  Trial {trial.number}: batch_size={parallel_batch_size}, timeout={batch_timeout_ms}ms")
 
         # Run benchmark
-        rounds_per_min = run_benchmark(config, num_rounds, verbose=False)
+        rounds_per_min = run_benchmark(config, num_rounds, device=device, verbose=False)
 
         if rounds_per_min is None:
             # Failed trial - return very low value
@@ -195,13 +268,12 @@ def create_objective(stage_det: int, stage_sims: int, num_rounds: int, results_l
             print(f"    Result: {rounds_per_min:.1f} r/min")
             trial.set_user_attr("failed", False)
 
-        # Log result
+        # Log result (state will be added later from study.trials)
         results_log.append({
             "trial_number": trial.number,
             "parallel_batch_size": parallel_batch_size,
             "batch_timeout_ms": batch_timeout_ms,
             "rounds_per_min": rounds_per_min,
-            "state": trial.state.name,
         })
 
         return rounds_per_min
@@ -252,18 +324,27 @@ def optimize_stage(
         study_name=f"stage_{stage_num}",
     )
 
-    # Enqueue baseline as first trial
-    print(f"\nEnqueuing baseline: batch_size={BASELINE_BATCH_SIZE}, timeout={BASELINE_TIMEOUT_MS}ms")
-    study.enqueue_trial({
-        'parallel_batch_size': BASELINE_BATCH_SIZE,
-        'batch_timeout_ms': BASELINE_TIMEOUT_MS,
-    })
+    # Enqueue smart seed trials (known promising configs from domain knowledge)
+    print(f"\nEnqueuing 4 smart seed trials:")
+    seed_trials = [
+        (30, 10, "Baseline (center)"),
+        (40, 6, "MPPT Stage 3 winner (+41.8%)"),
+        (35, 7, "MPPT Stage 4 winner"),
+        (50, 5, "Large batch, short wait (exploration)"),
+    ]
+
+    for batch_size, timeout, desc in seed_trials:
+        print(f"  - ({batch_size}, {timeout}ms): {desc}")
+        study.enqueue_trial({
+            'parallel_batch_size': batch_size,
+            'batch_timeout_ms': timeout,
+        })
 
     # Results log for this stage
     results_log = []
 
     # Create objective function
-    objective = create_objective(stage_det, stage_sims, rounds_per_trial, results_log)
+    objective = create_objective(stage_det, stage_sims, rounds_per_trial, "cuda", results_log)
 
     # Run optimization
     start_time = time.time()
@@ -311,7 +392,7 @@ def optimize_stage(
     }
 
 
-def run_validation(config: BOConfig, num_rounds: int, num_runs: int) -> Dict:
+def run_validation(config: BOConfig, num_rounds: int, num_runs: int, device: str = "cuda") -> Dict:
     """
     Run validation trials for a configuration.
 
@@ -319,6 +400,7 @@ def run_validation(config: BOConfig, num_rounds: int, num_runs: int) -> Dict:
         config: Configuration to validate
         num_rounds: Rounds per validation run
         num_runs: Number of validation runs
+        device: Device for inference (cuda or cpu)
 
     Returns:
         Validation statistics
@@ -328,7 +410,7 @@ def run_validation(config: BOConfig, num_rounds: int, num_runs: int) -> Dict:
     results = []
     for i in range(num_runs):
         print(f"  Validation run {i+1}/{num_runs}...", end=" ")
-        perf = run_benchmark(config, num_rounds, verbose=False)
+        perf = run_benchmark(config, num_rounds, device=device, verbose=False)
         if perf is not None:
             results.append(perf)
             print(f"{perf:.1f} r/min")
@@ -425,7 +507,7 @@ def save_results(output_dir: Path, stage_results: Dict, validation_results: Dict
             "workers": BASELINE_WORKERS,
             "num_determinizations": stage_results["best_config"]["num_determinizations"],
             "simulations_per_det": stage_results["best_config"]["simulations_per_det"],
-            "optuna_state": trial["state"],
+            "optuna_state": "COMPLETE",  # All logged trials completed successfully
         })
 
     # Add validation runs
