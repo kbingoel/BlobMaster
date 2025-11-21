@@ -22,7 +22,8 @@ class TrainingConfig:
 
     # MCTS parallelization
     use_parallel_expansion: bool = True
-    parallel_batch_size: int = 30  # Optimal value from Session 2 tuning
+    parallel_batch_size: int = 42  # Default from BO Stage 3 (use get_batch_params for curriculum)
+    batch_timeout_ms: float = 9.0  # Batch collection timeout (BO-tuned, use get_batch_params for curriculum)
 
     # Replay buffer settings
     replay_buffer_capacity: int = 500_000
@@ -97,6 +98,17 @@ class TrainingConfig:
         500: (5, 50),
     })
 
+    # Bayesian Optimization (Optuna TPE) auto-tuned batch configuration (2025-11-21)
+    # Maps iteration threshold -> (parallel_batch_size, batch_timeout_ms)
+    # 25 trials per stage with TPE sampler found optimal configs for all stages
+    batch_config_schedule: dict = field(default_factory=lambda: {
+        50: (40, 6),    # Stage 1 (1×15): +6.4% speedup
+        150: (26, 3),   # Stage 2 (2×25): +2.1% speedup
+        300: (42, 9),   # Stage 3 (3×35): +40.8% speedup
+        450: (50, 8),   # Stage 4 (4×45): +45.3% speedup
+        500: (53, 9),   # Stage 5 (5×50): +48.7% speedup
+    })
+
     def get_mcts_params(self, iteration: int) -> tuple:
         """
         Return (num_determinizations, simulations_per_det) for iteration.
@@ -116,6 +128,36 @@ class TrainingConfig:
                 return (det, sims)
         # Default to highest if beyond schedule
         return (5, 50)
+
+    def get_batch_params(self, iteration: int) -> tuple:
+        """
+        Return (parallel_batch_size, batch_timeout_ms) for iteration.
+
+        Uses batch_config_schedule from Bayesian Optimization (Optuna TPE) auto-tuning.
+        These parameters control MCTS parallel expansion batching and timeout for GPU inference.
+
+        All stages show significant improvements (2-48%) over baseline with BO-tuned configs.
+
+        Args:
+            iteration: Current training iteration (1-indexed)
+
+        Returns:
+            Tuple of (parallel_batch_size, batch_timeout_ms)
+
+        Examples:
+            >>> config = TrainingConfig()
+            >>> config.get_batch_params(1)    # Stage 1
+            (40, 6)
+            >>> config.get_batch_params(300)  # Stage 3
+            (42, 9)
+            >>> config.get_batch_params(500)  # Stage 5
+            (53, 9)
+        """
+        for threshold, (batch_size, timeout_ms) in sorted(self.batch_config_schedule.items()):
+            if iteration <= threshold:
+                return (batch_size, timeout_ms)
+        # Default to Stage 5 optimal if beyond schedule
+        return (53, 9)
 
     def get_training_units_per_iteration(self, iteration: int) -> int:
         """

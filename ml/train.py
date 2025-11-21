@@ -310,7 +310,7 @@ def run_training_pipeline(
         network=network,
         encoder=encoder,
         masker=masker,
-        config=config.to_dict(),
+        config=config,  # Pass object (not dict) to enable curriculum methods
     )
     logger.info("Training pipeline initialized")
 

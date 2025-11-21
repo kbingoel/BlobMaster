@@ -1,0 +1,20 @@
+{
+  "timestamp": 1763130629.402047,
+  "iteration": 1,
+  "total_iterations": 500,
+  "progress": 0.002,
+  "elapsed_hours": 0.09470783299869961,
+  "eta_hours": 47.25920866635111,
+  "eta_days": 1.969133694431296,
+  "phase": "rounds",
+  "mcts_config": "1\u00d715",
+  "elo": 1000,
+  "elo_change": 0,
+  "learning_rate": 0.0009999911173852617,
+  "loss": 4.048251906113746,
+  "policy_loss": 3.889530970500066,
+  "value_loss": 0.1587209371993175,
+  "training_units_generated": null,
+  "unit_type": "rounds",
+  "pi_target_tau": null
+}
