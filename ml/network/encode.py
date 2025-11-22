@@ -595,8 +595,69 @@ class StateEncoder:
         else:
             pos_features[4] = 0.0
 
-        # Feature 5-15: Reserved for future positional features
-        # (e.g., distance to other players, relative scores, etc.)
+        # Feature 5: Trump count (normalized by 13.0)
+        trump_count = 0
+        if game.trump_suit is not None and player.hand:
+            trump_count = sum(1 for card in player.hand if card.suit == game.trump_suit)
+        pos_features[5] = trump_count / 13.0
+
+        # Features 6-9: Suit distribution (cards per suit, each normalized by 13.0)
+        # Order: ♠♥♣♦ (matching SUITS constant)
+        suit_counts = [0, 0, 0, 0]
+        if player.hand:
+            for card in player.hand:
+                suit_idx = SUITS.index(card.suit)
+                suit_counts[suit_idx] += 1
+
+        for i, count in enumerate(suit_counts):
+            pos_features[6 + i] = count / 13.0
+
+        # Features 10-13: High card indicators (Ace/King per suit)
+        # Encoding: 0.0 = neither, 0.5 = King only, 1.0 = Ace present
+        # Order: ♠♥♣♦ (matching SUITS constant)
+        high_card_indicators = [0.0, 0.0, 0.0, 0.0]
+        if player.hand:
+            for card in player.hand:
+                suit_idx = SUITS.index(card.suit)
+                if card.rank == "A":
+                    high_card_indicators[suit_idx] = 1.0
+                elif card.rank == "K" and high_card_indicators[suit_idx] < 1.0:
+                    # Only set to 0.5 if Ace hasn't been found
+                    high_card_indicators[suit_idx] = 0.5
+
+        for i, indicator in enumerate(high_card_indicators):
+            pos_features[10 + i] = indicator
+
+        # Feature 14: Trump strength (average rank of trump cards, normalized by 12.0)
+        # Returns 0.0 if no trump cards or no-trump round
+        trump_strength = 0.0
+        if game.trump_suit is not None and player.hand:
+            trump_cards = [card for card in player.hand if card.suit == game.trump_suit]
+            if trump_cards:
+                # RANK_VALUES maps ranks to 2-14, we want relative strength
+                # Normalize to [0, 1] by dividing by 12 (range is 14-2=12)
+                avg_rank = sum(RANK_VALUES[card.rank] for card in trump_cards) / len(trump_cards)
+                # Normalize: (avg_rank - 2) / 12 to get [0, 1] range
+                # But spec says normalize by 12.0 directly, so use avg_rank / 14.0 for [0, 1]
+                # Actually, re-reading spec: "normalized by 12.0" means divide by 12
+                # Since RANK_VALUES gives 2-14, and Ace=14 is highest
+                # Let's use: (avg_rank - 2) / 12.0 to map [2,14] -> [0,1]
+                trump_strength = (avg_rank - 2.0) / 12.0
+        pos_features[14] = trump_strength
+
+        # Feature 15: Dealer forbidden bid (normalized by cards_dealt)
+        # Returns -1.0 if not dealer or not in bidding phase
+        dealer_forbidden = -1.0
+        if player.position == game.dealer_position and game.game_phase == 'bidding':
+            # Calculate sum of other players' bids
+            current_total_bids = sum(
+                p.bid for p in game.players
+                if p.bid is not None and p.position != player.position
+            )
+            forbidden_bid = game.get_forbidden_bid(current_total_bids, cards_dealt)
+            if forbidden_bid is not None:
+                dealer_forbidden = forbidden_bid / cards_dealt if cards_dealt > 0 else 0.0
+        pos_features[15] = dealer_forbidden
 
         return pos_features
 

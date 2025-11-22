@@ -272,6 +272,273 @@ class TestStateEncoder:
         assert abs(game_config[0].item() - (5/8)) < 0.001  # num_players/8
         assert abs(game_config[1].item() - (7/8)) < 0.001  # start_cards/8
 
+    def test_trump_count(self):
+        """Test dimension 191: Trump count encoding."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Give player specific trump cards
+        player = game.players[0]
+        trump_suit = game.trump_suit
+
+        # Count actual trump cards in hand
+        actual_trump_count = sum(1 for card in player.hand if card.suit == trump_suit)
+
+        # Encode and check dimension 191
+        state = encoder.encode(game, player)
+        trump_count_encoded = state[191].item()
+        expected = actual_trump_count / 13.0
+
+        assert abs(trump_count_encoded - expected) < 1e-6
+        assert 0.0 <= trump_count_encoded <= 1.0
+
+    def test_trump_count_no_trump(self):
+        """Test dimension 191 returns 0.0 for no-trump rounds."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Set up game with no trump
+        game.setup_round(5)
+        game.trump_suit = None  # Force no-trump
+
+        player = game.players[0]
+        state = encoder.encode(game, player)
+
+        # Dimension 191 should be 0.0 for no-trump
+        assert state[191].item() == 0.0
+
+    def test_suit_distribution(self):
+        """Test dimensions 192-195: Suit distribution encoding."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        player = game.players[0]
+
+        # Count cards per suit manually
+        from ml.game.constants import SUITS
+        expected_counts = [0, 0, 0, 0]
+        for card in player.hand:
+            suit_idx = SUITS.index(card.suit)
+            expected_counts[suit_idx] += 1
+
+        # Encode and check dimensions 192-195
+        state = encoder.encode(game, player)
+        for i, expected_count in enumerate(expected_counts):
+            encoded_value = state[192 + i].item()
+            expected_value = expected_count / 13.0
+            assert abs(encoded_value - expected_value) < 1e-6
+            assert 0.0 <= encoded_value <= 1.0
+
+    def test_suit_distribution_void(self):
+        """Test dimensions 192-195 handle void suits (0 cards in suit)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Create player with only spades (void in other suits)
+        player = game.players[0]
+        player.hand = [
+            Card("2", "♠"), Card("3", "♠"), Card("4", "♠"),
+            Card("5", "♠"), Card("6", "♠")
+        ]
+
+        state = encoder.encode(game, player)
+
+        # Spades: 5 cards
+        assert abs(state[192].item() - (5/13.0)) < 1e-6
+        # Hearts, Clubs, Diamonds: void (0 cards)
+        assert state[193].item() == 0.0
+        assert state[194].item() == 0.0
+        assert state[195].item() == 0.0
+
+    def test_high_card_indicators_ace(self):
+        """Test dimensions 196-199: Ace encoding (value 1.0)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Give player Ace of Spades only
+        player = game.players[0]
+        player.hand = [Card("A", "♠")]
+
+        state = encoder.encode(game, player)
+
+        # Spades: Ace present = 1.0
+        assert state[196].item() == 1.0
+        # Other suits: no high cards = 0.0
+        assert state[197].item() == 0.0
+        assert state[198].item() == 0.0
+        assert state[199].item() == 0.0
+
+    def test_high_card_indicators_king_only(self):
+        """Test dimensions 196-199: King only encoding (value 0.5)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Give player King of Hearts only
+        player = game.players[0]
+        player.hand = [Card("K", "♥")]
+
+        state = encoder.encode(game, player)
+
+        # Hearts: King only = 0.5
+        assert state[197].item() == 0.5
+        # Other suits: no high cards = 0.0
+        assert state[196].item() == 0.0
+        assert state[198].item() == 0.0
+        assert state[199].item() == 0.0
+
+    def test_high_card_indicators_both_ace_and_king(self):
+        """Test dimensions 196-199: Both Ace and King (value 1.0 for Ace)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Give player both Ace and King of Clubs
+        player = game.players[0]
+        player.hand = [Card("A", "♣"), Card("K", "♣")]
+
+        state = encoder.encode(game, player)
+
+        # Clubs: Ace present = 1.0 (King presence implied)
+        assert state[198].item() == 1.0
+
+    def test_high_card_indicators_none(self):
+        """Test dimensions 196-199: No Aces or Kings (all 0.0)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Give player only low cards
+        player = game.players[0]
+        player.hand = [Card("2", "♠"), Card("3", "♥"), Card("4", "♣")]
+
+        state = encoder.encode(game, player)
+
+        # All suits: no Aces or Kings = 0.0
+        assert state[196].item() == 0.0
+        assert state[197].item() == 0.0
+        assert state[198].item() == 0.0
+        assert state[199].item() == 0.0
+
+    def test_trump_strength(self):
+        """Test dimension 200: Trump strength (average rank)."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+
+        # Set up game with known trump
+        game.setup_round(5)
+        trump_suit = game.trump_suit
+
+        # Give player specific trump cards with known ranks
+        from ml.game.constants import RANK_VALUES
+        player = game.players[0]
+        # Create trump cards: Ace (14) and King (13)
+        player.hand = [Card("A", trump_suit), Card("K", trump_suit)]
+
+        state = encoder.encode(game, player)
+
+        # Calculate expected: avg((14+13)/2) = 13.5, normalized: (13.5-2)/12 = 0.958
+        avg_rank = (14 + 13) / 2  # 13.5
+        expected = (avg_rank - 2.0) / 12.0
+
+        assert abs(state[200].item() - expected) < 1e-6
+        assert 0.0 <= state[200].item() <= 1.0
+
+    def test_trump_strength_no_trump_cards(self):
+        """Test dimension 200 returns 0.0 when no trump cards in hand."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        trump_suit = game.trump_suit
+        player = game.players[0]
+
+        # Give player cards that are NOT trump
+        other_suits = ["♠", "♥", "♣", "♦"]
+        other_suits.remove(trump_suit)
+        player.hand = [Card("A", other_suits[0]), Card("K", other_suits[1])]
+
+        state = encoder.encode(game, player)
+
+        # No trump cards = 0.0
+        assert state[200].item() == 0.0
+
+    def test_trump_strength_no_trump_round(self):
+        """Test dimension 200 returns 0.0 for no-trump rounds."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+        game.trump_suit = None  # Force no-trump
+
+        player = game.players[0]
+        player.hand = [Card("A", "♠"), Card("K", "♠")]
+
+        state = encoder.encode(game, player)
+
+        # No trump round = 0.0
+        assert state[200].item() == 0.0
+
+    def test_dealer_forbidden_bid(self):
+        """Test dimension 201: Dealer forbidden bid encoding."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+
+        # Set dealer and put game in bidding phase
+        dealer_pos = game.dealer_position
+        dealer = game.players[dealer_pos]
+        game.game_phase = 'bidding'
+
+        # Set specific bids for non-dealer players
+        # We want total of other bids = 2, so forbidden = 5 - 2 = 3
+        bids_to_assign = [0, 1, 1]  # Total = 2
+        bid_idx = 0
+
+        for player in game.players:
+            if player.position != dealer_pos:
+                player.bid = bids_to_assign[bid_idx]
+                bid_idx += 1
+            else:
+                player.bid = None  # Dealer hasn't bid yet
+
+        state = encoder.encode(game, dealer)
+
+        # Forbidden bid = 5 - 2 = 3, normalized = 3/5 = 0.6
+        forbidden_bid_encoded = state[201].item()
+        expected = 3.0 / 5.0  # 0.6
+
+        assert abs(forbidden_bid_encoded - expected) < 1e-6
+
+    def test_dealer_forbidden_bid_not_dealer(self):
+        """Test dimension 201 returns -1.0 for non-dealer players."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+        game.game_phase = 'bidding'
+
+        # Get a non-dealer player
+        dealer_pos = game.dealer_position
+        non_dealer = game.players[(dealer_pos + 1) % 4]
+
+        state = encoder.encode(game, non_dealer)
+
+        # Non-dealer = -1.0
+        assert state[201].item() == -1.0
+
+    def test_dealer_forbidden_bid_not_bidding_phase(self):
+        """Test dimension 201 returns -1.0 during non-bidding phases."""
+        encoder = StateEncoder()
+        game = BlobGame(num_players=4)
+        game.setup_round(5)
+        game.game_phase = 'playing'  # Not bidding
+
+        dealer_pos = game.dealer_position
+        dealer = game.players[dealer_pos]
+
+        state = encoder.encode(game, dealer)
+
+        # Not bidding phase = -1.0
+        assert state[201].item() == -1.0
+
 
 class TestActionMasker:
     """Test suite for ActionMasker class."""
