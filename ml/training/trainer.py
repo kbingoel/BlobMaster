@@ -1196,7 +1196,7 @@ class TrainingPipeline:
         ).to(self.device)
 
         checkpoint = torch.load(self.best_model_path, map_location=self.device)
-        best_model.load_state_dict(checkpoint['model_state_dict'])
+        best_model.load_state_dict(checkpoint['network_state_dict'])
 
         # Run arena match
         num_eval_games = self._get_config_value("eval_games", 400)

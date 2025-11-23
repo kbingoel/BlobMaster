@@ -309,21 +309,26 @@ def get_fast_config() -> TrainingConfig:
     """
     Get a fast training config for testing/debugging.
 
+    Uses BO-optimized batch parameters from Stage 1 (1×15) for maximum throughput
+    with light MCTS settings.
+
     Returns:
         TrainingConfig with reduced computational requirements
     """
     return TrainingConfig(
-        num_workers=2,
-        games_per_iteration=100,
-        num_determinizations=2,
-        simulations_per_determinization=10,
-        replay_buffer_capacity=10_000,
+        num_workers=32,
+        games_per_iteration=100,  # 100 games for quick testing
+        num_determinizations=1,
+        simulations_per_determinization=15,
+        parallel_batch_size=40,  # BO-optimized from Stage 1 (1×15): +6.4% speedup
+        batch_timeout_ms=6,      # BO-optimized from Stage 1: best throughput (1643 r/min)
+        replay_buffer_capacity=10_000,  # Max examples stored (across multiple iterations)
         min_buffer_size=1_000,
-        batch_size=64,
+        batch_size=64,  # Training batch size (gradient updates, not MCTS batching)
         epochs_per_iteration=2,
         eval_games=50,
-        eval_determinizations=2,
-        eval_simulations=10,
+        eval_determinizations=1,
+        eval_simulations=15,
     )
 
 
