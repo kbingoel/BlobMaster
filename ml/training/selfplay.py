@@ -295,6 +295,10 @@ class SelfPlayWorker:
         examples at each decision point. Final outcomes are back-propagated to
         all examples after the game completes.
 
+        Behavior depends on config.training_on:
+        - "rounds" (Phase 1): Generate independent single-round game with synthetic context
+        - "games" (Phase 2): Generate full multi-round game sequence with real context
+
         Args:
             num_players: Number of players in the game (3-8)
             cards_to_deal: Cards to deal per player (1-13)
@@ -308,6 +312,22 @@ class SelfPlayWorker:
         if game_id is None:
             game_id = str(uuid.uuid4())
 
+        # Check training mode: "rounds" (Phase 1) vs "games" (Phase 2)
+        if self.config and self.config.training_on == "games":
+            # Phase 2: Generate full multi-round game sequence
+            # Sample player count and starting cards if decision-weighted sampling is enabled
+            if self.config.use_decision_weighted_sampling:
+                num_players, start_cards, _, _ = self.sample_game_config()
+            else:
+                start_cards = cards_to_deal  # Use provided cards_to_deal as starting cards
+
+            return self._generate_full_game_sequence(
+                num_players=num_players,
+                start_cards=start_cards,
+                game_id=game_id,
+            )
+
+        # Phase 1: Generate independent single round (existing logic)
         # Sample game configuration if decision-weighted sampling is enabled (Session 2)
         # This overrides the method parameters with sampled (P, C, c, context)
         if self.config and self.config.use_decision_weighted_sampling:
@@ -648,6 +668,300 @@ class SelfPlayWorker:
         context = generate_synthetic_context(num_players, num_cards, start_cards)
 
         return (num_players, start_cards, num_cards, context)
+
+    @staticmethod
+    def _generate_round_sequence(num_players: int, start_cards: int) -> List[int]:
+        """
+        Generate the full sequence of rounds for a complete Blob game.
+
+        A full game follows the pattern: C→(C-1)→...→1→[1×P]→2→...→(C-1)→C
+        where C is the starting card count and P is the number of players.
+
+        Examples:
+            - 5 players, C=7: [7,6,5,4,3,2,1, 1,1,1,1,1, 2,3,4,5,6,7] = 17 rounds
+            - 4 players, C=8: [8,7,6,5,4,3,2,1, 1,1,1,1, 2,3,4,5,6,7,8] = 18 rounds
+            - 4 players, C=7: [7,6,5,4,3,2,1, 1,1,1,1, 2,3,4,5,6,7] = 16 rounds
+
+        Args:
+            num_players: Number of players (3-8)
+            start_cards: Starting card count (1-13)
+
+        Returns:
+            List of card counts for each round in sequence
+        """
+        descending = list(range(start_cards, 0, -1))  # C → 1
+        ones = [1] * num_players  # P × 1-card rounds
+        ascending = list(range(2, start_cards + 1))  # 2 → C
+        return descending + ones + ascending
+
+    @staticmethod
+    def _get_phase(rounds_completed: int, num_players: int, start_cards: int) -> str:
+        """
+        Determine which phase of the game a round belongs to.
+
+        Phases:
+            - 'descending': C → 1 (start_cards rounds)
+            - 'ones': 1×P (num_players rounds)
+            - 'ascending': 2 → C (start_cards - 1 rounds)
+
+        Args:
+            rounds_completed: Number of rounds already completed (0-indexed)
+            num_players: Number of players
+            start_cards: Starting card count
+
+        Returns:
+            Phase string: 'descending', 'ones', or 'ascending'
+        """
+        descending_end = start_cards
+        ones_end = descending_end + num_players
+
+        if rounds_completed < descending_end:
+            return 'descending'
+        elif rounds_completed < ones_end:
+            return 'ones'
+        else:
+            return 'ascending'
+
+    def _generate_full_game_sequence(
+        self,
+        num_players: int,
+        start_cards: int,
+        game_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate a complete multi-round game sequence (Phase 2 training mode).
+
+        Plays a full game following the pattern: C→...→1→[1×P]→2→...→C
+        Tracks cumulative scores across rounds and backpropagates the **total game score**
+        to all training examples (not individual round scores).
+
+        Args:
+            num_players: Number of players (3-8)
+            start_cards: Starting card count (1-13)
+            game_id: Unique game identifier
+
+        Returns:
+            List of training examples from all rounds with backpropagated total game scores
+        """
+        # Generate the full round sequence
+        round_sequence = self._generate_round_sequence(num_players, start_cards)
+        total_rounds = len(round_sequence)
+
+        # Initialize game state
+        game = BlobGame(num_players=num_players)
+        cumulative_scores = [0] * num_players  # Track scores across rounds
+        all_examples = []
+        total_forced_skips = 0
+        move_number = 0
+
+        # Play each round in sequence
+        for round_idx, num_cards in enumerate(round_sequence):
+            # Build real game context for this round
+            phase = self._get_phase(round_idx, num_players, start_cards)
+            game_context = GameContext(
+                cumulative_scores=cumulative_scores.copy(),  # Copy to avoid mutation
+                rounds_completed=round_idx,
+                total_rounds=total_rounds,
+                previous_cards=round_sequence[:round_idx],  # Cards from previous rounds
+                num_players=num_players,
+                start_cards=start_cards,
+                phase=phase,
+            )
+
+            # Play this round
+            round_examples, round_scores, forced_skips = self._play_single_round_with_context(
+                game=game,
+                num_cards=num_cards,
+                game_context=game_context,
+                game_id=game_id,
+                move_number_offset=move_number,
+            )
+
+            # Update cumulative scores
+            for player_pos in range(num_players):
+                cumulative_scores[player_pos] += round_scores.get(player_pos, 0)
+
+            # Accumulate examples and statistics
+            all_examples.extend(round_examples)
+            total_forced_skips += forced_skips
+            move_number += len(round_examples) + forced_skips
+
+        # Backpropagate TOTAL GAME SCORE to all examples
+        # This is the key difference from Phase 1 (which uses round scores)
+        max_possible_score = total_rounds * (10 + start_cards)
+        for example in all_examples:
+            player_position = example["player_position"]
+            total_score = cumulative_scores[player_position]
+
+            # Normalize total game score to [-1, 1] range
+            # 0 -> -1.0, max_possible -> 1.0
+            normalized_value = (total_score / max_possible_score) * 2.0 - 1.0
+            example["value"] = float(normalized_value)
+
+        # Add forced skip statistics to first example (for aggregation)
+        if all_examples:
+            total_decisions = len(all_examples) + total_forced_skips
+            skip_rate = total_forced_skips / total_decisions if total_decisions > 0 else 0.0
+            all_examples[0]["forced_skips"] = total_forced_skips
+            all_examples[0]["total_decisions"] = total_decisions
+            all_examples[0]["skip_rate"] = skip_rate
+
+        return all_examples
+
+    def _play_single_round_with_context(
+        self,
+        game: BlobGame,
+        num_cards: int,
+        game_context: GameContext,
+        game_id: str,
+        move_number_offset: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[int, int], int]:
+        """
+        Play a single round within a full game sequence with real game context.
+
+        This method is similar to generate_game() but:
+        1. Takes a pre-existing game instance (to maintain cumulative scores)
+        2. Takes real game context (not synthetic)
+        3. Returns examples without backpropagating outcomes (value=None)
+        4. Returns round scores separately for later backpropagation
+
+        Args:
+            game: BlobGame instance to play round on
+            num_cards: Cards to deal this round
+            game_context: Real game context (cumulative scores, rounds completed, etc.)
+            game_id: Unique game identifier
+            move_number_offset: Move number offset for this round (cumulative across rounds)
+
+        Returns:
+            Tuple of:
+                - List of training examples (value=None, will be filled later)
+                - Dict of round scores {player_position: round_score}
+                - Number of forced skips this round
+        """
+        examples = []
+        move_number = move_number_offset
+        forced_skips = 0
+
+        # Play the round using MCTS for all decisions
+        def get_bid(player, hand, is_dealer, total_bids, cards_dealt):
+            """Callback to get bid using MCTS."""
+            nonlocal move_number
+
+            # Run MCTS to get action probabilities
+            if self.use_parallel_expansion:
+                action_probs = self.mcts.search_parallel(
+                    game, player, parallel_batch_size=self.parallel_batch_size, game_context=game_context
+                )
+            elif self.batch_size is not None:
+                action_probs = self.mcts.search_batched(
+                    game, player, batch_size=self.batch_size, game_context=game_context
+                )
+            else:
+                action_probs = self.mcts.search(game, player, game_context=game_context)
+
+            # Get temperature for this move
+            temperature = self.temperature_schedule(move_number)
+
+            # Select action with temperature
+            bid = self._select_action(action_probs, temperature)
+
+            # Store training example (value will be filled in later)
+            state_tensor = self.encoder.encode(game, player, game_context)
+            policy_vector = self._action_probs_to_vector(action_probs, is_bidding=True)
+
+            examples.append(
+                {
+                    "state": state_tensor.cpu().numpy(),
+                    "policy": policy_vector,
+                    "value": None,  # Will be back-propagated with total game score
+                    "player_position": player.position,
+                    "game_id": game_id,
+                    "move_number": move_number,
+                    # Metadata for distribution tracking
+                    "num_players": game_context.num_players,
+                    "cards_dealt": num_cards,
+                    "start_cards": game_context.start_cards,
+                }
+            )
+
+            move_number += 1
+            return bid
+
+        def get_card(player, legal_cards, trick):
+            """Callback to get card to play using MCTS."""
+            nonlocal move_number, forced_skips
+
+            # Zero-Choice Fast Path: Skip MCTS for forced last-card plays
+            if len(player.hand) == 1:
+                forced_skips += 1
+                return legal_cards[0]
+
+            # Run MCTS to get action probabilities
+            if self.use_parallel_expansion:
+                action_probs = self.mcts.search_parallel(
+                    game, player, parallel_batch_size=self.parallel_batch_size, game_context=game_context
+                )
+            elif self.batch_size is not None:
+                action_probs = self.mcts.search_batched(
+                    game, player, batch_size=self.batch_size, game_context=game_context
+                )
+            else:
+                action_probs = self.mcts.search(game, player, game_context=game_context)
+
+            # Get temperature for this move
+            temperature = self.temperature_schedule(move_number)
+
+            # Select action with temperature
+            card_idx = self._select_action(action_probs, temperature)
+
+            # Find the card in legal_cards that matches the selected index
+            card = None
+            for legal_card in legal_cards:
+                if self.encoder._card_to_index(legal_card) == card_idx:
+                    card = legal_card
+                    break
+
+            # Fallback to first legal card if MCTS selected an illegal card
+            if card is None:
+                card = legal_cards[0]
+
+            # Store training example
+            state_tensor = self.encoder.encode(game, player, game_context)
+            policy_vector = self._action_probs_to_vector(
+                action_probs, is_bidding=False
+            )
+
+            examples.append(
+                {
+                    "state": state_tensor.cpu().numpy(),
+                    "policy": policy_vector,
+                    "value": None,  # Will be back-propagated with total game score
+                    "player_position": player.position,
+                    "game_id": game_id,
+                    "move_number": move_number,
+                    # Metadata for distribution tracking
+                    "num_players": game_context.num_players,
+                    "cards_dealt": num_cards,
+                    "start_cards": game_context.start_cards,
+                }
+            )
+
+            move_number += 1
+            return card
+
+        # Play the round
+        result = game.play_round(num_cards, get_bid, get_card)
+
+        # Extract round scores from result
+        round_scores = {}
+        for player_result in result["player_scores"]:
+            # Find the player by name to get their position
+            for player in game.players:
+                if player.name == player_result["name"]:
+                    round_scores[player.position] = player_result["round_score"]
+                    break
+
+        return examples, round_scores, forced_skips
 
 
 class SelfPlayEngine:
