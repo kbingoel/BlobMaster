@@ -916,12 +916,21 @@ class TrainingPipeline:
         """
         metrics = {}
 
+        # Show training mode (rounds vs games)
+        training_mode = self._get_config_value('training_on', 'rounds')
+        print(f"Training mode: {training_mode}")
+
         # Phase 1: Self-play
         print(f"\n[1/4] Self-Play Phase")
         print("-" * 40)
         selfplay_examples = self._selfplay_phase(iteration)
         metrics["num_selfplay_examples"] = len(selfplay_examples)
         metrics["replay_buffer_size"] = len(self.replay_buffer)
+        metrics["training_mode"] = training_mode
+
+        # Add selfplay metrics (unit type, count)
+        if hasattr(self, 'last_selfplay_metrics') and self.last_selfplay_metrics is not None:
+            metrics.update(self.last_selfplay_metrics)
 
         # Add distribution stats if available
         if hasattr(self, 'last_distribution_stats') and self.last_distribution_stats is not None:
@@ -999,10 +1008,32 @@ class TrainingPipeline:
         elapsed_time = time.time() - start_time
 
         print(f"Self-play complete:")
-        print(f"  - Games generated: {num_games:,}")
+        print(f"  - {unit_type.capitalize()} generated: {num_games:,}")
         print(f"  - Training examples: {len(examples):,}")
         print(f"  - Time: {elapsed_time / 60:.1f} minutes")
-        print(f"  - Rate: {num_games / elapsed_time:.1f} games/sec")
+        print(f"  - Rate: {num_games / elapsed_time:.1f} {unit_type}/sec")
+
+        # Add game-specific statistics for Phase 2 (full games mode)
+        if unit_type == "games":
+            # Calculate average rounds per game from examples
+            # Each game has metadata in its first example
+            unique_games = set()
+            total_rounds = 0
+            for ex in examples:
+                game_id = ex.get('game_id')
+                if game_id not in unique_games:
+                    unique_games.add(game_id)
+                    # Infer rounds from game context if available
+                    # For 5p/C=7: 17 rounds, for 4p/C=8: 18 rounds
+                    num_players = ex.get('num_players', 5)
+                    start_cards = ex.get('start_cards', 7)
+                    rounds_in_game = 2 * start_cards - 1 + num_players
+                    total_rounds += rounds_in_game
+
+            if len(unique_games) > 0:
+                avg_rounds = total_rounds / len(unique_games)
+                print(f"  - Average rounds per game: {avg_rounds:.1f}")
+                print(f"  - Total rounds played: {total_rounds:,}")
 
         # NEW: Apply progressive target sharpening (Session 2)
         # Get policy target temperature for this iteration
@@ -1040,6 +1071,13 @@ class TrainingPipeline:
 
         # Store distribution stats for logging
         self.last_distribution_stats = distribution_stats
+
+        # Store training unit type and count in iteration metrics
+        # These will be added to metrics in run_iteration()
+        self.last_selfplay_metrics = {
+            'training_units_generated': num_games,
+            'unit_type': unit_type,
+        }
 
         return examples
 

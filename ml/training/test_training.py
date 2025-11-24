@@ -483,6 +483,191 @@ def validate_training_example(example: Dict[str, Any]) -> bool:
     return True
 
 
+class TestFullGameMode:
+    """Tests for Session 5: Full-Game Training Mode (Phase 2)."""
+
+    @pytest.fixture
+    def network(self):
+        """Create a small neural network for testing."""
+        return BlobNet(
+            state_dim=256,
+            embedding_dim=128,
+            num_layers=2,
+            num_heads=4,
+            feedforward_dim=256,
+            dropout=0.1,
+        )
+
+    @pytest.fixture
+    def encoder(self):
+        """Create state encoder."""
+        return StateEncoder()
+
+    @pytest.fixture
+    def masker(self):
+        """Create action masker."""
+        return ActionMasker()
+
+    @pytest.fixture
+    def config_games_mode(self):
+        """Create config for games mode."""
+        from ml.config import TrainingConfig
+        config = TrainingConfig()
+        config.training_on = "games"
+        config.use_decision_weighted_sampling = False
+        return config
+
+    @pytest.fixture
+    def worker_games_mode(self, network, encoder, masker, config_games_mode):
+        """Create self-play worker in games mode."""
+        return SelfPlayWorker(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=2,
+            simulations_per_determinization=10,
+            use_imperfect_info=True,
+            config=config_games_mode,
+        )
+
+    def test_generate_round_sequence(self):
+        """Test round sequence generation."""
+        # 5 players, C=7: Total = 2*7 - 1 + 5 = 18 rounds
+        sequence = SelfPlayWorker._generate_round_sequence(5, 7)
+        assert len(sequence) == 18  # 7 descending + 5 ones + 6 ascending
+        assert sequence[0] == 7  # Starts with start_cards
+        assert sequence[7:12] == [1, 1, 1, 1, 1]  # Five 1-card rounds
+        assert sequence[-1] == 7  # Ends with start_cards
+
+        # 4 players, C=8: Total = 2*8 - 1 + 4 = 19 rounds
+        sequence = SelfPlayWorker._generate_round_sequence(4, 8)
+        assert len(sequence) == 19
+        assert sequence[0] == 8
+        assert sequence[-1] == 8
+
+        # 4 players, C=7: Total = 2*7 - 1 + 4 = 17 rounds
+        sequence = SelfPlayWorker._generate_round_sequence(4, 7)
+        assert len(sequence) == 17
+
+    def test_get_phase(self):
+        """Test phase detection."""
+        # 5 players, C=7: descending (0-6), ones (7-11), ascending (12-16)
+        assert SelfPlayWorker._get_phase(0, 5, 7) == 'descending'
+        assert SelfPlayWorker._get_phase(6, 5, 7) == 'descending'
+        assert SelfPlayWorker._get_phase(7, 5, 7) == 'ones'
+        assert SelfPlayWorker._get_phase(11, 5, 7) == 'ones'
+        assert SelfPlayWorker._get_phase(12, 5, 7) == 'ascending'
+        assert SelfPlayWorker._get_phase(16, 5, 7) == 'ascending'
+
+    def test_full_game_generation(self, worker_games_mode):
+        """Test generating a full multi-round game sequence."""
+        examples = worker_games_mode.generate_game(
+            num_players=4,
+            cards_to_deal=7,  # This is start_cards in games mode
+            game_id="test_full_game",
+        )
+
+        # Should have examples from all rounds
+        assert len(examples) > 0
+
+        # All examples should have same game_id
+        game_ids = set(ex["game_id"] for ex in examples)
+        assert len(game_ids) == 1
+        assert "test_full_game" in list(game_ids)[0]
+
+        # Values should be backpropagated (not None)
+        for example in examples:
+            assert example["value"] is not None
+            assert -1.0 <= example["value"] <= 1.0
+
+        # Move numbers should be monotonically increasing (can have gaps due to forced skips)
+        move_numbers = [ex["move_number"] for ex in examples]
+        assert move_numbers[0] == 0
+        for i in range(1, len(move_numbers)):
+            assert move_numbers[i] > move_numbers[i - 1], "Move numbers should be increasing"
+
+    def test_full_game_value_normalization(self, worker_games_mode):
+        """Test that total game scores are properly normalized."""
+        examples = worker_games_mode.generate_game(
+            num_players=4,
+            cards_to_deal=7,
+            game_id="test_normalization",
+        )
+
+        # Check that all players' values are normalized
+        player_values = {}
+        for ex in examples:
+            pos = ex["player_position"]
+            if pos not in player_values:
+                player_values[pos] = []
+            player_values[pos].append(ex["value"])
+
+        # All examples from same player should have same value (total game score)
+        for pos, values in player_values.items():
+            assert len(set(values)) == 1, f"Player {pos} has inconsistent values"
+
+        # Values should be in valid range
+        for pos, values in player_values.items():
+            value = values[0]
+            assert -1.0 <= value <= 1.0
+
+    def test_full_game_metadata(self, worker_games_mode):
+        """Test that full game examples have correct metadata."""
+        examples = worker_games_mode.generate_game(
+            num_players=5,
+            cards_to_deal=7,
+            game_id="test_metadata",
+        )
+
+        # Check metadata fields
+        for ex in examples:
+            assert "num_players" in ex
+            assert "cards_dealt" in ex
+            assert "start_cards" in ex
+            assert ex["num_players"] == 5
+            assert ex["start_cards"] == 7
+
+    def test_games_mode_dispatcher(self, network, encoder, masker):
+        """Test that config.training_on='games' triggers full-game generation."""
+        from ml.config import TrainingConfig
+
+        # Config with games mode
+        config_games = TrainingConfig()
+        config_games.training_on = "games"
+        config_games.use_decision_weighted_sampling = False
+
+        worker_games = SelfPlayWorker(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=2,
+            simulations_per_determinization=10,
+            config=config_games,
+        )
+
+        examples_games = worker_games.generate_game(num_players=4, cards_to_deal=7)
+
+        # Config with rounds mode
+        config_rounds = TrainingConfig()
+        config_rounds.training_on = "rounds"
+        config_rounds.use_decision_weighted_sampling = False
+
+        worker_rounds = SelfPlayWorker(
+            network=network,
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=2,
+            simulations_per_determinization=10,
+            config=config_rounds,
+        )
+
+        examples_rounds = worker_rounds.generate_game(num_players=4, cards_to_deal=7)
+
+        # Games mode should generate significantly more examples (17 rounds vs 1 round)
+        # Expect at least 5x more examples (accounting for forced skips)
+        assert len(examples_games) > len(examples_rounds) * 5
+
+
 class TestSelfPlayEngine:
     """Tests for SelfPlayEngine class for parallel game generation."""
 
