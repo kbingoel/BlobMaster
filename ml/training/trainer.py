@@ -358,7 +358,7 @@ class NetworkTrainer:
         Returns:
             Dictionary with checkpoint metadata (iteration, metrics, etc.)
         """
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
         # Restore network and optimizer state
         self.network.load_state_dict(checkpoint["network_state_dict"])
@@ -593,6 +593,9 @@ class TrainingPipeline:
                 "simulations_per_determinization", 30
             ),
             device=self.device,
+            # Force multiprocessing.Pool (Phase 2) - threading is GIL-bound
+            # and causes single-core execution despite 32 workers
+            use_thread_pool=False,
             # MPPT auto-tuned batch configuration parameters
             use_parallel_expansion=get_config_value("use_parallel_expansion", True),
             parallel_batch_size=get_config_value("parallel_batch_size", 30),
@@ -1234,8 +1237,16 @@ class TrainingPipeline:
             dropout=self.network.dropout,
         ).to(self.device)
 
-        checkpoint = torch.load(self.best_model_path, map_location=self.device)
+        checkpoint = torch.load(self.best_model_path, map_location=self.device, weights_only=False)
         best_model.load_state_dict(checkpoint['network_state_dict'])
+
+        # Update arena MCTS params to match current curriculum stage
+        # (avoids 3×50 eval when training uses 1×15)
+        if hasattr(self.config, 'get_mcts_params'):
+            eval_det, eval_sims = self.config.get_mcts_params(iteration + 1)
+            self.arena.num_determinizations = eval_det
+            self.arena.simulations_per_determinization = eval_sims
+            print(f"  - Eval MCTS: {eval_det}×{eval_sims} (matches curriculum stage)")
 
         # Run arena match
         num_eval_games = self._get_config_value("eval_games", 400)

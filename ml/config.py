@@ -39,6 +39,7 @@ class TrainingConfig:
 
     # Evaluation settings
     eval_games: int = 400
+    eval_frequency: int = 50
     eval_determinizations: int = 3
     eval_simulations: int = 50
     promotion_threshold: float = 0.55
@@ -55,7 +56,7 @@ class TrainingConfig:
 
     # Checkpointing
     checkpoint_dir: str = 'models/checkpoints'
-    save_every_n_iterations: int = 10
+    save_every_n_iterations: int = 1
 
     # Logging
     log_dir: str = 'runs'
