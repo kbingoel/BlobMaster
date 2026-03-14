@@ -1,37 +1,50 @@
 # BlobMaster: Rust Rewrite Migration Plan
 
 **Date**: 2026-03-14
-**Source**: Python/PyTorch AlphaZero implementation (Phases 1-4)
+**Source**: Python/PyTorch AlphaZero implementation (Phases 1-4, now archived)
 **Target**: Clean-sheet Rust rewrite
+**Status**: Repository cleaned. All original Python code deleted; reference copies live in `legacy/`.
 
 ---
 
 ## 1. What We're Porting
 
-A complete AlphaZero-style reinforcement learning system for the card game "Blob" (trick-taking with bidding). The Python implementation is correct and well-tested (460 tests, 97% game engine coverage) but fundamentally bottlenecked by Python's per-operation overhead for MCTS tree search and game simulation.
+A complete AlphaZero-style reinforcement learning system for the card game "Blob" (trick-taking with bidding). The Python implementation was correct and well-tested (460 tests, 97% game engine coverage) but fundamentally bottlenecked by Python's per-operation overhead for MCTS tree search and game simulation. The original source is gone from the repo — `legacy/` is the sole reference.
 
 **Core components to rewrite in Rust:**
 
-| Component | Python Source | Lines | Tests | Purpose |
-|-----------|-------------|-------|-------|---------|
-| Game Engine | `blob.py`, `constants.py` | ~1,900 | 135 | Blob rules, card/deck/trick/game logic |
-| State Encoder | `encode.py` | 754 | in test_network | Game state → 256-dim tensor |
-| Neural Network | `model.py` | 509 | in test_network | BlobNet Transformer (dual-head) |
-| MCTS Core | `node.py`, `search.py` | ~1,200 | in test_mcts | Tree search with UCB1 selection |
-| Belief Tracker | `belief_tracker.py` | ~600 | in test_mcts | Opponent hand probability tracking |
-| Determinization | `determinization.py` | ~700 | dedicated | Sampling consistent opponent hands |
-| Self-Play | `selfplay.py` | ~1,200 | 93 | Parallel game generation for training |
-| Replay Buffer | `replay_buffer.py` | ~400 | in test_training | Experience storage & sampling |
-| Trainer | `trainer.py` | ~600 | in test_training | Network training loop |
-| Evaluation | `arena.py`, `elo.py` | ~1,100 | dedicated | Model tournaments & ELO tracking |
-| Config | `config.py` | 344 | — | Training hyperparameters |
-| CLI | `train.py` | ~400 | — | Entry point, checkpointing |
+| Component | Legacy Reference | Lines | Tests | Purpose |
+|-----------|-----------------|-------|-------|---------|
+| Game Engine | `legacy/game-engine/blob.py`, `constants.py` | ~1,900 | 135 | Blob rules, card/deck/trick/game logic |
+| State Encoder | `legacy/neural-network/encode.py` | 754 | in test_network | Game state → 256-dim tensor |
+| Neural Network | `legacy/neural-network/model.py` | 509 | in test_network | BlobNet Transformer (dual-head) |
+| MCTS Core | `legacy/mcts/node.py`, `search.py` | ~1,200 | in test_mcts | Tree search with UCB1 selection |
+| Belief Tracker | `legacy/mcts/belief_tracker.py` | ~600 | in test_mcts | Opponent hand probability tracking |
+| Determinization | `legacy/mcts/determinization.py` | ~700 | dedicated | Sampling consistent opponent hands |
+| Self-Play | `legacy/training/selfplay.py` | ~1,200 | 93 | Parallel game generation for training |
+| Replay Buffer | `legacy/training/replay_buffer.py` | ~400 | in test_training | Experience storage & sampling |
+| Trainer | `legacy/training/trainer.py` | ~600 | in test_training | Network training loop |
+| Evaluation | `legacy/evaluation/arena.py`, `elo.py` | ~1,100 | dedicated | Model tournaments & ELO tracking |
+| Config | `legacy/config/config.py` | 344 | — | Training hyperparameters |
+| CLI | `legacy/config/train.py` | ~400 | — | Entry point, checkpointing |
 
 ---
 
-## 2. Legacy Folder Structure
+## 2. Repository Structure
 
-All reference files have been copied to `legacy/` organized by component:
+The repository has been cleaned to contain only the migration plan and legacy references. All original Python source, model checkpoints, benchmarks, docs, backend/frontend stubs, and virtual environment have been deleted. Git history preserves everything if restoration is needed.
+
+```
+BlobMaster/
+├── .git/                  # Full history — `git checkout HEAD~1` restores everything
+├── .gitignore
+├── README.md              # Project overview and direction
+├── conclusion.md          # Python project post-mortem
+├── prepare-migration.md   # This file
+└── legacy/                # Organized archive of Python reference code (read-only)
+```
+
+### Legacy Folder (reference only — do not modify)
 
 ```
 legacy/
@@ -149,7 +162,7 @@ struct BlobState {
 - **Init**: Xavier uniform for all linear layers, zeros for biases
 
 ### 4.2 State Encoding (256 dimensions)
-Full spec in `legacy/specs/STATE_ENCODER_SPEC.md`. Summary:
+Full spec in [legacy/specs/STATE_ENCODER_SPEC.md](legacy/specs/STATE_ENCODER_SPEC.md). Summary:
 
 | Offset | Dims | Feature |
 |--------|------|---------|
@@ -399,18 +412,23 @@ Python used 32 multiprocessing workers with full process isolation. In Rust:
 
 ---
 
-## 11. Files NOT Ported (and why)
+## 11. Files Deleted from Repo (and why)
 
-| File/Artifact | Reason |
-|---------------|--------|
-| Model checkpoints (`.pth`) | Learned nothing (uniform policy). No weights to transfer. |
-| Replay buffer saves | Training data from random play. No value. |
-| `gpu_server.py` | Abandoned architecture (3-5x slower than multiprocessing) |
-| `batch_evaluator.py` | Python-specific batching workaround. Rust won't need it. |
+Everything outside `legacy/` has been removed. Key items not preserved in `legacy/` either:
+
+| Deleted Item | Reason |
+|--------------|--------|
+| Model checkpoints (`.pth`, 6x 59MB) | Learned nothing (uniform policy). No weights to transfer. |
+| Replay buffer saves (651MB) | Training data from random play. No value. |
+| `gpu_server.py`, `batch_evaluator.py` | Abandoned/Python-specific architectures. |
 | `dashboard.py`, `monitor.py` | Python monitoring tools. Rewrite with `tracing`. |
-| `benchmarks/` | Python-specific benchmarks. Invalid for Rust. |
-| Backend (`backend/`) | Phase 6 stubs only. Will be Rust-native or kept as TS. |
-| Frontend (`frontend/`) | Phase 7 stubs only. Svelte stays as-is. |
+| `benchmarks/` (13 scripts, 30+ CSVs) | Python-specific benchmarks. Invalid for Rust. |
+| `backend/` (Bun/TS stubs) | Phase 6 placeholder. Decision deferred. |
+| `frontend/` (Svelte stubs) | Phase 7 placeholder. Decision deferred. |
+| `venv/` | Python virtual environment. |
+| `archive/` (9 session reports, debug scripts) | Historical only. Key findings captured in `conclusion.md`. |
+
+All recoverable via `git checkout HEAD~1` if needed.
 
 ---
 
@@ -435,7 +453,7 @@ The most important outcome: **5x100 MCTS in Rust will be faster than 1x15 in Pyt
 Before considering the port complete, verify:
 
 - [ ] All 135 game engine tests pass (ported from `test_blob.py`)
-- [ ] State encoder produces identical 256-dim vectors for the same game state (cross-validate with Python)
+- [ ] State encoder produces identical 256-dim vectors for the same game state (cross-validate against legacy spec)
 - [ ] MCTS with 5x100 sims produces non-uniform visit distributions (top action >2x average)
 - [ ] Self-play generates valid training examples (state/policy/value shapes correct)
 - [ ] Replay buffer samples are uniformly distributed
