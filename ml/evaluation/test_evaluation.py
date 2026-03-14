@@ -452,3 +452,189 @@ class TestEvaluationIntegration:
         assert len(tracker.history) == 5
         stats = tracker.get_statistics()
         assert stats['num_evaluations'] == 5
+
+
+class TestFullGameEvaluation:
+    """Tests for full-game evaluation (Session 4)."""
+
+    def test_full_game_mode_initialization(self, encoder, masker):
+        """Test Arena can be initialized with full_game_mode=True."""
+        arena = Arena(
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=2,
+            simulations_per_determinization=10,
+            device='cpu',
+            full_game_mode=True,
+        )
+
+        assert arena.full_game_mode is True
+
+    def test_generate_round_sequence_5p7c(self, arena):
+        """Test round sequence generation for 5p/7c."""
+        sequence = arena._generate_round_sequence(num_players=5, start_cards=7)
+
+        # Expected: [7,6,5,4,3,2, 1,1,1,1,1, 2,3,4,5,6,7]
+        expected = [7, 6, 5, 4, 3, 2] + [1] * 5 + [2, 3, 4, 5, 6, 7]
+        assert sequence == expected
+        assert len(sequence) == 17  # 6 descending + 5 ones + 6 ascending
+
+    def test_generate_round_sequence_4p8c(self, arena):
+        """Test round sequence generation for 4p/8c."""
+        sequence = arena._generate_round_sequence(num_players=4, start_cards=8)
+
+        # Expected: [8,7,6,5,4,3,2, 1,1,1,1, 2,3,4,5,6,7,8]
+        expected = [8, 7, 6, 5, 4, 3, 2] + [1] * 4 + [2, 3, 4, 5, 6, 7, 8]
+        assert sequence == expected
+        assert len(sequence) == 18  # 7 descending + 4 ones + 7 ascending
+
+    def test_generate_round_sequence_4p7c(self, arena):
+        """Test round sequence generation for 4p/7c."""
+        sequence = arena._generate_round_sequence(num_players=4, start_cards=7)
+
+        # Expected: [7,6,5,4,3,2, 1,1,1,1, 2,3,4,5,6,7]
+        expected = [7, 6, 5, 4, 3, 2] + [1] * 4 + [2, 3, 4, 5, 6, 7]
+        assert sequence == expected
+        assert len(sequence) == 16  # 6 descending + 4 ones + 6 ascending
+
+    def test_get_phase_descending(self, arena):
+        """Test phase determination for descending phase."""
+        sequence = [7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7]
+
+        # First few rounds should be descending
+        assert arena._get_phase(0, sequence) == 'descending'
+        assert arena._get_phase(1, sequence) == 'descending'
+        assert arena._get_phase(4, sequence) == 'descending'
+        assert arena._get_phase(6, sequence) == 'descending'  # Last of descending (first 1, from 2->1)
+
+    def test_get_phase_ones(self, arena):
+        """Test phase determination for ones phase."""
+        sequence = [7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7]
+
+        # Middle rounds should be ones
+        # Note: Index 6 (first 1) is 'descending' because it came from 2 (2->1)
+        # Ones phase starts at index 7 where prev=1, current=1
+        assert arena._get_phase(7, sequence) == 'ones'
+        assert arena._get_phase(8, sequence) == 'ones'
+        assert arena._get_phase(9, sequence) == 'ones'  # Within ones phase
+        # Note: Index 10 (last 1 before ascending) is classified as 'ascending'
+        # because next round increases - this is the transition point
+
+    def test_get_phase_ascending(self, arena):
+        """Test phase determination for ascending phase."""
+        sequence = [7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 2, 3, 4, 5, 6, 7]
+
+        # Final rounds should be ascending
+        assert arena._get_phase(11, sequence) == 'ascending'
+        assert arena._get_phase(12, sequence) == 'ascending'
+        assert arena._get_phase(16, sequence) == 'ascending'  # Last round
+
+    def test_sample_full_game_configs(self, arena):
+        """Test sampling (P, C) configurations."""
+        configs = arena._sample_full_game_configs(num_sequences=100)
+
+        assert len(configs) == 100
+
+        # Check all configs are valid
+        for num_players, start_cards in configs:
+            assert num_players in [4, 5, 6]
+            if num_players == 4:
+                assert start_cards in [7, 8]
+            else:
+                assert start_cards == 7
+
+        # Check distribution approximately matches expectations
+        # 4p: 15%, 5p: 70%, 6p: 15%
+        player_counts = [p for p, c in configs]
+        count_4p = player_counts.count(4)
+        count_5p = player_counts.count(5)
+        count_6p = player_counts.count(6)
+
+        # Allow for randomness (rough checks)
+        assert count_4p > 5  # Should be around 15
+        assert count_5p > 50  # Should be around 70
+        assert count_6p > 5  # Should be around 15
+
+    def test_full_game_evaluation(self, encoder, masker, small_network):
+        """Test end-to-end full-game evaluation."""
+        # Create full-game arena
+        arena = Arena(
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=1,  # Very light for speed
+            simulations_per_determinization=5,
+            device='cpu',
+            full_game_mode=True,
+        )
+
+        model1 = small_network
+        model2 = small_network
+
+        # Play 2 full-game sequences (fast test)
+        results = arena.play_match(
+            model1=model1,
+            model2=model2,
+            num_games=2,  # Just 2 full games
+            verbose=False,
+        )
+
+        # Check result structure
+        assert 'model1_wins' in results
+        assert 'model2_wins' in results
+        assert 'draws' in results
+        assert 'model1_avg_score' in results
+        assert 'model2_avg_score' in results
+        assert 'model1_total_score' in results
+        assert 'model2_total_score' in results
+        assert 'win_rate' in results
+        assert 'games_played' in results
+
+        # Check values are reasonable
+        assert results['games_played'] == 2
+        assert results['model1_wins'] + results['model2_wins'] + results['draws'] == 2
+        assert 0.0 <= results['win_rate'] <= 1.0
+
+        # Scores should be higher than single-round scores (cumulative over ~17 rounds)
+        # Typical single-round score: 0-15, full-game score: 50-200+
+        assert results['model1_avg_score'] > 20
+        assert results['model2_avg_score'] > 20
+
+    def test_full_game_elo_tracking(self, encoder, masker, small_network):
+        """Test ELO tracking with full-game evaluation."""
+        # Create full-game arena
+        arena = Arena(
+            encoder=encoder,
+            masker=masker,
+            num_determinizations=1,
+            simulations_per_determinization=5,
+            device='cpu',
+            full_game_mode=True,
+        )
+
+        tracker = ELOTracker(initial_elo=1000)
+        model = small_network
+
+        # Play full-game match
+        results = arena.play_match(
+            model1=model,
+            model2=model,
+            num_games=2,
+            verbose=False,
+        )
+
+        # Update ELO
+        current_elo = tracker.get_current_elo()
+        new_elo = tracker.add_match_result(
+            iteration=1,
+            model_elo=current_elo,
+            opponent_elo=current_elo,
+            win_rate=results['win_rate'],
+            games_played=results['games_played'],
+            model_avg_score=results['model1_avg_score'],
+            opponent_avg_score=results['model2_avg_score'],
+        )
+
+        # Check ELO tracking works
+        assert isinstance(new_elo, (int, float))
+        assert len(tracker.history) == 1
+        assert tracker.history[0]['games_played'] == 2

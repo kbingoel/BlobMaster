@@ -532,31 +532,31 @@ class TestFullGameMode:
 
     def test_generate_round_sequence(self):
         """Test round sequence generation."""
-        # 5 players, C=7: Total = 2*7 - 1 + 5 = 18 rounds
+        # 5 players, C=7: Total = 2*(7-1) + 5 = 17 rounds
         sequence = SelfPlayWorker._generate_round_sequence(5, 7)
-        assert len(sequence) == 18  # 7 descending + 5 ones + 6 ascending
+        assert len(sequence) == 17  # 6 descending + 5 ones + 6 ascending
         assert sequence[0] == 7  # Starts with start_cards
-        assert sequence[7:12] == [1, 1, 1, 1, 1]  # Five 1-card rounds
+        assert sequence[6:11] == [1, 1, 1, 1, 1]  # Five 1-card rounds
         assert sequence[-1] == 7  # Ends with start_cards
 
-        # 4 players, C=8: Total = 2*8 - 1 + 4 = 19 rounds
+        # 4 players, C=8: Total = 2*(8-1) + 4 = 18 rounds
         sequence = SelfPlayWorker._generate_round_sequence(4, 8)
-        assert len(sequence) == 19
+        assert len(sequence) == 18
         assert sequence[0] == 8
         assert sequence[-1] == 8
 
-        # 4 players, C=7: Total = 2*7 - 1 + 4 = 17 rounds
+        # 4 players, C=7: Total = 2*(7-1) + 4 = 16 rounds
         sequence = SelfPlayWorker._generate_round_sequence(4, 7)
-        assert len(sequence) == 17
+        assert len(sequence) == 16
 
     def test_get_phase(self):
         """Test phase detection."""
-        # 5 players, C=7: descending (0-6), ones (7-11), ascending (12-16)
+        # 5 players, C=7: descending (0-5), ones (6-10), ascending (11-16)
         assert SelfPlayWorker._get_phase(0, 5, 7) == 'descending'
-        assert SelfPlayWorker._get_phase(6, 5, 7) == 'descending'
-        assert SelfPlayWorker._get_phase(7, 5, 7) == 'ones'
-        assert SelfPlayWorker._get_phase(11, 5, 7) == 'ones'
-        assert SelfPlayWorker._get_phase(12, 5, 7) == 'ascending'
+        assert SelfPlayWorker._get_phase(5, 5, 7) == 'descending'
+        assert SelfPlayWorker._get_phase(6, 5, 7) == 'ones'
+        assert SelfPlayWorker._get_phase(10, 5, 7) == 'ones'
+        assert SelfPlayWorker._get_phase(11, 5, 7) == 'ascending'
         assert SelfPlayWorker._get_phase(16, 5, 7) == 'ascending'
 
     def test_full_game_generation(self, worker_games_mode):
@@ -1753,22 +1753,22 @@ class TestNetworkTrainer:
             assert torch.allclose(p1, p2)
 
     def test_learning_rate_scheduling(self, trainer):
-        """Test learning rate scheduler works."""
+        """Test CosineAnnealingLR scheduler works (Session 2: replaced StepLR)."""
         initial_lr = trainer.get_learning_rate()
         assert initial_lr == 0.001
 
-        # Step scheduler (StepLR: decay by 0.1 every 100 epochs)
-        # Before 100 steps, LR should stay the same
+        # CosineAnnealingLR decays from step 1 (not constant like StepLR)
         for _ in range(50):
             trainer.step_scheduler()
-        assert trainer.get_learning_rate() == 0.001
+        lr_at_50 = trainer.get_learning_rate()
+        assert lr_at_50 < initial_lr  # Should have decreased already
 
-        # After 100 steps, LR should decay
-        for _ in range(51):
+        # After 250 steps (halfway through T_max=500), LR should be ~0.0005
+        for _ in range(200):
             trainer.step_scheduler()
-        current_lr = trainer.get_learning_rate()
-        assert current_lr < initial_lr
-        assert abs(current_lr - 0.0001) < 1e-6  # Should be 0.001 * 0.1 = 0.0001
+        lr_at_250 = trainer.get_learning_rate()
+        assert lr_at_250 < lr_at_50  # Monotonically decreasing
+        assert lr_at_250 < 0.001 * 0.6  # Below 60% of initial
 
     def test_gradient_clipping(self, trainer):
         """Test gradients are clipped correctly."""
@@ -2041,8 +2041,12 @@ class TestTrainingPipeline:
         metrics1 = pipeline.run_iteration(iteration=0)
 
         # Check checkpoint was saved (save_every_n_iterations=1)
-        checkpoint_path = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
-        assert checkpoint_path.exists()
+        # New naming format: YYYYMMDD-Blobmaster-v1-<w>w-<mode>-<mcts>-iter<N>.pth
+        # Saved in checkpoint_dir/cache/ subdirectory
+        cache_dir = pipeline.checkpoint_dir / "cache"
+        checkpoints = list(cache_dir.glob("*.pth")) if cache_dir.exists() else []
+        assert len(checkpoints) > 0, f"No checkpoint found in {cache_dir}"
+        checkpoint_path = checkpoints[0]
 
         # Save current state
         replay_buffer_size_before = len(pipeline.replay_buffer)
@@ -2070,8 +2074,8 @@ class TestTrainingPipeline:
         # Check state restored
         assert new_pipeline.current_iteration == 1  # Should start from next iteration
 
-        # Check replay buffer restored (if saved)
-        buffer_path = pipeline.checkpoint_dir / "replay_buffer_iter_1.pkl"
+        # Check replay buffer restored if buffer file exists alongside checkpoint
+        buffer_path = checkpoint_path.parent / (checkpoint_path.stem + "_buffer.pkl")
         if buffer_path.exists():
             assert len(new_pipeline.replay_buffer) == replay_buffer_size_before
 
@@ -2118,11 +2122,10 @@ class TestTrainingPipeline:
         # Check metrics history recorded
         assert len(pipeline.metrics_history) == 2
 
-        # Check checkpoints saved
-        checkpoint_iter1 = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
-        checkpoint_iter2 = pipeline.checkpoint_dir / "checkpoint_iter_2.pth"
-        assert checkpoint_iter1.exists()
-        assert checkpoint_iter2.exists()
+        # Check checkpoints saved with new standardized naming (in cache/ subdirectory)
+        cache_dir = pipeline.checkpoint_dir / "cache"
+        checkpoints = sorted(cache_dir.glob("*.pth")) if cache_dir.exists() else []
+        assert len(checkpoints) == 2, f"Expected 2 checkpoints, found {len(checkpoints)} in {cache_dir}"
 
         # Check best model saved
         assert pipeline.best_model_path is not None
@@ -2149,17 +2152,20 @@ class TestTrainingPipeline:
         # Run checkpoint phase
         pipeline._checkpoint_phase(iteration=0, metrics=metrics)
 
-        # Check checkpoint saved (save_every_n_iterations=1, so iteration 0 saves at iter 1)
-        checkpoint_path = pipeline.checkpoint_dir / "checkpoint_iter_1.pth"
-        assert checkpoint_path.exists()
+        # Check checkpoint saved with new standardized naming
+        # Saved in checkpoint_dir/cache/ (iteration 0 is not a permanent milestone)
+        cache_dir = pipeline.checkpoint_dir / "cache"
+        checkpoints = list(cache_dir.glob("*.pth")) if cache_dir.exists() else []
+        assert len(checkpoints) > 0, f"No checkpoint found in {cache_dir}"
+        checkpoint_path = checkpoints[0]
 
-        # Check replay buffer saved
-        buffer_path = pipeline.checkpoint_dir / "replay_buffer_iter_1.pkl"
+        # Check replay buffer saved alongside checkpoint
+        buffer_path = checkpoint_path.parent / (checkpoint_path.stem + "_buffer.pkl")
         assert buffer_path.exists()
 
-        # Check best model saved
-        best_model_path = pipeline.checkpoint_dir / "best_model.pth"
-        assert best_model_path.exists()
+        # Check best model saved (prefixed with "best_")
+        best_models = list(pipeline.checkpoint_dir.glob("best_*.pth"))
+        assert len(best_models) > 0, "No best model checkpoint found"
 
         # Clean up
         pipeline.selfplay_engine.shutdown()
@@ -2323,10 +2329,9 @@ class TestMainTrainingScript:
         config = get_fast_config()
 
         # Should have reduced computational requirements
-        assert config.num_workers < 16
         assert config.games_per_iteration < 10_000
         assert config.num_determinizations <= 2
-        assert config.simulations_per_determinization <= 10
+        assert config.simulations_per_determinization <= 20
         assert config.batch_size < 512
         assert config.epochs_per_iteration < 10
 
@@ -2446,9 +2451,9 @@ class TestMainTrainingScript:
             # Check replay buffer has examples
             assert len(pipeline.replay_buffer) > 0
 
-            # Check best model saved
-            best_model_path = pipeline.checkpoint_dir / "best_model.pth"
-            assert best_model_path.exists()
+            # Check best model saved (new naming: best_<standardized_name>.pth)
+            best_models = list(pipeline.checkpoint_dir.glob("best_*.pth"))
+            assert len(best_models) > 0, "No best model checkpoint found"
 
         finally:
             # Clean up

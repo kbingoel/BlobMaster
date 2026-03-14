@@ -975,6 +975,7 @@ class TrainingPipeline:
             print(f"Generating {num_games:,} {unit_type} (adaptive curriculum: linear ramp)...")
         else:
             num_games = self._get_config_value("games_per_iteration", 10_000)
+            unit_type = "games"
             print(f"Generating {num_games:,} self-play games...")
 
         # NEW: Use EMA model for self-play (Session 2)
@@ -1673,8 +1674,12 @@ class TrainingPipeline:
         metadata = self.trainer.load_checkpoint(checkpoint_path)
         self.current_iteration = metadata["iteration"] + 1  # Start from next iteration
 
-        # Try to load replay buffer
-        buffer_path = Path(checkpoint_path).parent / f"replay_buffer_iter_{metadata['iteration'] + 1}.pkl"
+        # Try to load replay buffer (new naming: <checkpoint_stem>_buffer.pkl)
+        cp = Path(checkpoint_path)
+        buffer_path = cp.parent / (cp.stem + "_buffer.pkl")
+        if not buffer_path.exists():
+            # Fallback: old naming convention
+            buffer_path = cp.parent / f"replay_buffer_iter_{metadata['iteration'] + 1}.pkl"
         if buffer_path.exists():
             print(f"Loading replay buffer from {buffer_path.name}...")
             self.replay_buffer.load(str(buffer_path))
