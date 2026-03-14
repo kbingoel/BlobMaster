@@ -674,13 +674,13 @@ class SelfPlayWorker:
         """
         Generate the full sequence of rounds for a complete Blob game.
 
-        A full game follows the pattern: C→(C-1)→...→1→[1×P]→2→...→(C-1)→C
+        A full game follows the pattern: C→(C-1)→...→2→[1×P]→2→...→(C-1)→C
         where C is the starting card count and P is the number of players.
 
         Examples:
-            - 5 players, C=7: [7,6,5,4,3,2,1, 1,1,1,1,1, 2,3,4,5,6,7] = 17 rounds
-            - 4 players, C=8: [8,7,6,5,4,3,2,1, 1,1,1,1, 2,3,4,5,6,7,8] = 18 rounds
-            - 4 players, C=7: [7,6,5,4,3,2,1, 1,1,1,1, 2,3,4,5,6,7] = 16 rounds
+            - 5 players, C=7: [7,6,5,4,3,2, 1,1,1,1,1, 2,3,4,5,6,7] = 17 rounds
+            - 4 players, C=8: [8,7,6,5,4,3,2, 1,1,1,1, 2,3,4,5,6,7,8] = 18 rounds
+            - 4 players, C=7: [7,6,5,4,3,2, 1,1,1,1, 2,3,4,5,6,7] = 16 rounds
 
         Args:
             num_players: Number of players (3-8)
@@ -689,7 +689,7 @@ class SelfPlayWorker:
         Returns:
             List of card counts for each round in sequence
         """
-        descending = list(range(start_cards, 0, -1))  # C → 1
+        descending = list(range(start_cards, 1, -1))  # C → 2
         ones = [1] * num_players  # P × 1-card rounds
         ascending = list(range(2, start_cards + 1))  # 2 → C
         return descending + ones + ascending
@@ -700,7 +700,7 @@ class SelfPlayWorker:
         Determine which phase of the game a round belongs to.
 
         Phases:
-            - 'descending': C → 1 (start_cards rounds)
+            - 'descending': C → 2 (start_cards - 1 rounds)
             - 'ones': 1×P (num_players rounds)
             - 'ascending': 2 → C (start_cards - 1 rounds)
 
@@ -712,7 +712,7 @@ class SelfPlayWorker:
         Returns:
             Phase string: 'descending', 'ones', or 'ascending'
         """
-        descending_end = start_cards
+        descending_end = start_cards - 1
         ones_end = descending_end + num_players
 
         if rounds_completed < descending_end:

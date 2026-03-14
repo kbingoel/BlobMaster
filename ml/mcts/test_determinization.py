@@ -1620,7 +1620,7 @@ class TestParallelSearchOptimization:
             constraints.cannot_have_suits = {'♠', '♥', '♣', '♦'}
 
         # Should fall back to perfect info MCTS
-        action_probs = mcts.search_parallel(game, player, belief)
+        action_probs = mcts.search_parallel(game, player, belief=belief)
         assert len(action_probs) > 0
 
 
