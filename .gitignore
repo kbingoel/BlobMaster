@@ -21,3 +21,8 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Model artifacts (large binary files - do not commit)
+*.pth
+*.pkl
+*.onnx

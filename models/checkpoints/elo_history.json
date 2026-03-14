@@ -1,0 +1,102 @@
+{
+  "initial_elo": 1000,
+  "k_factor": 32,
+  "history": [
+    {
+      "iteration": 4,
+      "model_elo_before": 1000,
+      "model_elo_after": 988,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1012,
+      "win_rate": 0.12,
+      "games_played": 400,
+      "model_avg_score": 1.53,
+      "opponent_avg_score": 1.5575,
+      "elo_change": -12,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    },
+    {
+      "iteration": 9,
+      "model_elo_before": 1000,
+      "model_elo_after": 991,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1009,
+      "win_rate": 0.22,
+      "games_played": 400,
+      "model_avg_score": 3.1125,
+      "opponent_avg_score": 1.2666666666666666,
+      "elo_change": -9,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    },
+    {
+      "iteration": 14,
+      "model_elo_before": 1000,
+      "model_elo_after": 987,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1013,
+      "win_rate": 0.09,
+      "games_played": 400,
+      "model_avg_score": 1.3675,
+      "opponent_avg_score": 1.5858333333333332,
+      "elo_change": -13,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    },
+    {
+      "iteration": 19,
+      "model_elo_before": 1000,
+      "model_elo_after": 986,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1014,
+      "win_rate": 0.0475,
+      "games_played": 400,
+      "model_avg_score": 0.65,
+      "opponent_avg_score": 1.655833333333333,
+      "elo_change": -14,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    },
+    {
+      "iteration": 24,
+      "model_elo_before": 1000,
+      "model_elo_after": 990,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1010,
+      "win_rate": 0.1775,
+      "games_played": 400,
+      "model_avg_score": 2.5425,
+      "opponent_avg_score": 1.7525,
+      "elo_change": -10,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    },
+    {
+      "iteration": 24,
+      "model_elo_before": 1000,
+      "model_elo_after": 988,
+      "opponent_elo_before": 1000,
+      "opponent_elo_after": 1012,
+      "win_rate": 0.14,
+      "games_played": 400,
+      "model_avg_score": 2.06,
+      "opponent_avg_score": 1.343333333333333,
+      "elo_change": -12,
+      "metadata": {
+        "num_determinizations": 3,
+        "simulations_per_determinization": 50
+      }
+    }
+  ]
+}
