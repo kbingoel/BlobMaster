@@ -6,6 +6,9 @@
 
 ---
 
+Given your deep understanding of the game, critically propose improvements to this plan, as we will use it to derive a outline document that guides us in working out these ideas into code. Question the choice of embeddings, input token dimensions, etc. You can agree with the choices if you think they are genuinely good.
+You can always refer to the rules of the game as outlined in prepare-migration.md line 102-130.
+
 ## 1. Game Dynamics and Information Flow
 
 ### 1.1 Progressive Information Revelation
@@ -22,9 +25,9 @@ Consider a concrete 5-player, 7-card round with hearts as trump:
 
 A single off-suit play (Player 3 plays a diamond when spades were led) creates a constraint that persists for the entire round: Player 3 has zero spades. This eliminates roughly 25% of possible hand distributions for that opponent in one observation.
 
-**After tricks 3-4** — Card counting becomes powerful. 20 cards observed + 3-4 in hand = 23-24 known cards.Combined with suit void constraints accumulated over 4 tricks, opponent hands are often narrowed to a handful of possibilities. At this stage, an expert player transitions from probabilistic reasoning to near-deterministic deduction.
+**After tricks 3-4** — Card counting becomes powerful. 20 cards observed + 3-4 in hand = 23-24 known cards. Combined with suit void constraints accumulated over 4 tricks, the distribution of opponent hands narrows considerably. However, 17 cards remain unseen — distributed across opponent hands and, critically, the 17 undealt cards that will never appear in this round. An unplayed card could be in any opponent's hand or simply absent from the game entirely. This ambiguity places a hard ceiling on deductive certainty even with strong constraint propagation.
 
-**After tricks 5-6** —  With accumulated void constraints, you may know most opponent's remaining cards. The game becomes purely tactical: given known hands, find the play sequence that fulfills your bid.
+**After tricks 5-6** — Void constraints and card counting reduce the uncertainty significantly, but the undealt cards continue to impose fundamental limits. When Player 3 hasn't played a spade, you know they're either void or holding spades — but you cannot determine which without further evidence. The game becomes more tactical as possibilities narrow, but rarely reaches the point of fully known opponent hands.
 
 ### 1.2 The Information Gradient
 
@@ -35,7 +38,7 @@ This progression creates an **information gradient**: the value of different rea
 | Bidding | Hand-strength estimation | My cards, trump suit, position, others' bids |
 | Tricks 1-2 | Probabilistic hand ranging | Which cards played, who led, who followed |
 | Tricks 3-4 | Constraint propagation | Suit voids, card counting, bid progress |
-| Tricks 5-7 | Deterministic deduction | Near-complete opponent hand knowledge |
+| Tricks 5-7 | Constrained probabilistic reasoning | Narrowed hand distributions, persistent uncertainty from undealt cards |
 
 The optimal network must handle all four stages with a single architecture. This means it must process the *entire history of play* — not just the current trick — because the accumulated evidence from earlier tricks is what enables the constraint propagation and deduction in later tricks.
 
@@ -233,16 +236,17 @@ Each card played in the current round becomes one token, ordered by play time.
 | `was_lead` | 1 | 1.0 if this was the first card played in the trick |
 | `followed_suit` | 1 | 1.0 if card suit matches the led suit, 0.0 if off-suit |
 | `is_trump_play` | 1 | 1.0 if this card is a trump card |
-| `won_trick` | 1 | 1.0 if this card won the trick, 0.0 otherwise, -1.0 if trick is incomplete |
+| `trick_complete` | 1 | 1.0 if the trick this card belongs to is complete, 0.0 if in progress |
+| `won_trick` | 1 | 1.0 if this card won the trick, 0.0 otherwise (meaningful only when `trick_complete = 1.0`) |
 | `is_current_trick` | 1 | 1.0 if this card belongs to the trick currently being played |
 
-**Input dimension**: 16 + 8 + 16 + 7 = **47** → `Linear(47 → d_model)`
+**Input dimension**: 16 + 8 + 16 + 8 = **48** → `Linear(48 → d_model)`
 
 **Notes**:
 - Rank and suit embeddings are **shared** with hand card tokens. This is critical — the same learned representation of "Ace of Spades" is used whether the card is in your hand or on the table. The model learns card identity once.
 - Player embeddings encode relative position (relative to the current player, not absolute seat number). Player 0 is always "me," Player 1 is "left of me," etc. This ensures the model learns position-relative strategy.
 - `followed_suit` is the key feature for suit void detection. When `followed_suit = 0.0` and `was_lead = 0.0`, the player couldn't follow suit — revealing a void.
-- Cards in the current (incomplete) trick have `won_trick = -1.0` to distinguish from completed tricks. The `is_current_trick` flag provides additional disambiguation.
+- `trick_complete` and `won_trick` are split into separate features to avoid overloading a single feature with status and outcome semantics. The previous design used -1.0 as a sentinel for "in progress," which conflates "unknown" with "negative outcome." Splitting provides cleaner gradients — the network learns completion status and win/loss independently.
 
 #### Player State Tokens (3-8 per state, public information)
 
@@ -260,12 +264,17 @@ Each player in the game becomes one token.
 | `relative_position` | 1 | Position relative to me / `num_players` → [0, 1) |
 | `cumulative_score` | 1 | Total game score (multi-round) / `(rounds_completed × (10 + start_cards))`, 0.0 if single-round or no rounds completed |
 | `cards_in_hand` | 1 | Number of cards remaining in hand / `cards_dealt` → [0, 1] |
+| `void_spades` | 1 | 1.0 if this player has shown void in spades (played off-suit when spades were led), 0.0 otherwise |
+| `void_hearts` | 1 | 1.0 if this player has shown void in hearts |
+| `void_clubs` | 1 | 1.0 if this player has shown void in clubs |
+| `void_diamonds` | 1 | 1.0 if this player has shown void in diamonds |
 
-**Input dimension**: 16 + 9 = **25** → `Linear(25 → d_model)`
+**Input dimension**: 16 + 13 = **29** → `Linear(29 → d_model)`
 
 **Notes**:
 - `tricks_needed` provides a direct urgency signal. A value > `tricks_remaining / cards_dealt` means the player's bid is in jeopardy or already impossible.
 - `bid_status` gives the network an immediate signal about whether a player is still "live" (actively trying to meet their bid) or "done" (already met or busted). This is the most important feature for opponent modeling during the playing phase.
+- **Suit void flags** are precomputed at encoding time by scanning played card records for off-suit plays (cards where `was_lead = 0` and `followed_suit = 0`). Void detection is the single most informative event in trick-taking games (section 2.2), and providing it as a direct feature saves the network from expensive multi-hop attention. The network can still learn nuanced near-void reasoning through attention over played cards — the binary flags bootstrap the critical hard constraint.
 
 #### Context Token (1 per state, public information)
 
@@ -330,11 +339,11 @@ Sharing ensures that the model learns a single coherent representation of each r
 | Parameter | Value | Rationale |
 |---|---|---|
 | `d_model` | 128 | Each attention head gets 16 dims — sufficient to encode suit (4 values), rank (13 values), and player (8 values) comparisons. The structured entity input provides strong inductive bias, so width beyond 128 yields diminishing returns. |
-| `num_layers` | 8 | Supports 4-5 step reasoning chains (e.g., "Player 3 showed void in hearts" → "they might have trumps" → "my heart lead is risky" → "lead clubs instead"). 6 layers is the minimum for multi-hop inference over game history; 8 provides headroom for deeper strategic reasoning. |
+| `num_layers` | 8 | Supports 4-5 step reasoning chains (e.g., "Player 3 showed void in hearts" → "they might have trumps" → "my heart lead is risky" → "lead clubs instead"). 6 layers is the minimum for multi-hop inference over game history; 8 provides headroom for deeper strategic reasoning. Worth benchmarking against 6 layers at equivalent training compute — if 6 matches, the freed ~400K parameters could be reallocated to wider `d_model`. |
 | `num_heads` | 8 | 16 dims per head. Eight heads accommodate the distinct attention patterns needed: suit matching, rank comparison, player grouping, temporal proximity, trump tracking, bid comparison, lead/follow distinction, and global aggregation. |
 | `ffn_dim` | 512 | 4× expansion ratio (standard). The FFN layers learn nonlinear feature combinations within each token — e.g., "high rank + trump suit + opponent showed void = very strong card." |
 | `dropout` | 0.1 | Applied in attention weights and FFN. Provides regularization against overfitting on the 500K replay buffer. |
-| `activation` | ReLU | Consistent with the tch-rs/libtorch standard. GeLU is a valid alternative but ReLU is simpler and empirically equivalent at this model scale. |
+| `activation` | GeLU | Modern default for Transformers (BERT, GPT-2+, ViT). Provides smoother gradients near zero compared to ReLU, marginally improving training dynamics at small model scales. Supported in tch-rs via `Tensor::gelu`. |
 | `normalization` | Pre-norm | LayerNorm applied before attention and FFN (not after). Pre-norm provides more stable gradients in deeper networks (8 layers) and is the modern default. |
 
 #### Attention Masking
@@ -351,33 +360,60 @@ Standard padding mask: tokens beyond the actual sequence length (padded to max l
 
 ### 4.5 Output Heads
 
-Both heads read from the CLS token representation after the final Transformer layer.
+The policy and value heads use different readout strategies. The policy head uses **phase-specific readout** — separate mechanisms for bidding and playing — while the value head reads from the CLS token.
 
-#### Policy Head
+#### Playing Policy Head (Entity-Based Readout)
+
+During the playing phase, each hand card token produces a scalar "play this card" score through a shared MLP. Softmax over these scores yields play probabilities.
 
 ```
-CLS_repr (128)
-  → Linear(128 → 128)
-  → ReLU
-  → Dropout(0.1)
-  → Linear(128 → 52)
-  → apply action mask (illegal actions → -inf)
-  → Softmax
-  → action probabilities (52)
+Each hand card token (128 dims)
+  → Linear(128 → 32)
+  → GeLU
+  → Linear(32 → 1)
+  → scalar score
+
+Stack scores for all hand cards → Softmax → play probabilities
 ```
 
-**Action space** (unchanged from legacy):
-- **Bidding phase**: Actions 0-13 represent bid values. Actions 14-51 masked.
-- **Playing phase**: Actions 0-51 represent card indices (`suit_index × 13 + rank_index`). Cards not in hand or illegal to play are masked.
+This is architecturally native to the entity structure: after 8 layers of attention, each hand card's representation already encodes its relationship to played cards (is my card still highest?), player states (are opponents competing for tricks?), and the game context (trump suit, trick count). Asking "should this card be played?" directly from that representation is the natural readout.
 
-The CLS token aggregates information from all entity tokens through 8 layers of attention. By the final layer, it has attended to hand cards (what I can play), played cards (what's happened), player states (how everyone's bid is progressing), and context (trump, phase, round). This aggregated representation is sufficient to produce well-informed action probabilities over the unified 52-dim action space.
+**Advantages over a unified 52-dim output**:
+- **No wasted capacity**: Only cards in hand produce scores — no parameters dedicated to always-masked positions
+- **Parameter efficient**: ~4K params vs ~23K for a CLS → 52-dim head
+- **Generalization**: The scoring MLP is shared across all cards and hand sizes. The same weights evaluate any card in any position
 
-#### Value Head
+**MCTS integration**: During MCTS, the playing head returns a probability distribution over hand card indices (0 to `hand_size - 1`). The MCTS engine maps these back to card indices (`suit_index × 13 + rank_index`) using the known hand composition. Visit count distributions for training targets use the same hand-card-index space.
+
+#### Bidding Policy Head (CLS-Based Readout)
+
+During the bidding phase, the CLS token feeds a dedicated bidding head.
 
 ```
 CLS_repr (128)
   → Linear(128 → 64)
-  → ReLU
+  → GeLU
+  → Dropout(0.1)
+  → Linear(64 → 14)
+  → apply bid mask (illegal bids → -inf)
+  → Softmax
+  → bid probabilities (14)
+```
+
+**Bid action space**: Actions 0-13 represent bid values 0 through 13. Illegal bids are masked:
+- Bids > `cards_dealt` are always masked
+- If the dealer constraint is active (total bids cannot equal `cards_dealt`), the forbidden bid value is additionally masked
+
+**Why separate heads**: Bidding and playing are fundamentally different decision types — "choose a number" vs. "choose a card." A unified 52-dim head forces output positions 0-13 to serve dual roles (bid values AND card indices ♠2-♠A), coupled only by the game_phase signal. This coupling means playing-phase gradients corrupt bidding weights at positions 0-13, and vice versa. Separate heads eliminate this gradient interference entirely.
+
+**On bidding-playing alignment**: Separating the heads prevents gradient interference but does not inherently prevent "optimistic bidding" — a bidding head that is too aggressive early in training. The mechanism that keeps bidding honest is the **value head**: during MCTS for bidding, each candidate bid leads to simulated play. If the value head accurately predicts "I bid 5 with a weak hand → score 0," MCTS will down-weight aggressive bids regardless of the bidding policy's prior. The training loop self-corrects: optimistic bids → failing games → low value targets → corrected value estimates → realistic MCTS bid targets next iteration. This is why value head accuracy (well-defined target, proper loss weighting) is critical — it is the mechanism that aligns bidding ambition with playing capability.
+
+#### Value Head (CLS-Based Readout)
+
+```
+CLS_repr (128)
+  → Linear(128 → 64)
+  → GeLU
   → Dropout(0.1)
   → Linear(64 → 1)
   → Tanh
@@ -386,14 +422,28 @@ CLS_repr (128)
 
 The value represents the expected game outcome for the current player. Tanh bounds the output to [-1, 1], where 1 represents the best possible outcome and -1 the worst.
 
-### 4.6 Loss Function
+**Value target definition**: The training target for the value head is the **z-scored cumulative score** at game end:
 
-Unchanged from the legacy specification:
+```
+target = clip((my_score - mean_score) / max(std_score, ε), -1, 1)
+```
 
-- **Policy loss**: Cross-entropy with masking: `-sum(target × log(pred + 1e-8))`, averaged over batch
-- **Value loss**: MSE between predicted and actual game outcome
-- **Combined**: `policy_loss + value_loss` (equal weighting)
-- **Optimizer**: Adam (`lr=0.001`, `weight_decay=1e-4`)
+where `my_score` is the current player's final game score, `mean_score` and `std_score` are computed across all players in the game, and `ε` prevents division by zero (e.g., when all players score 0).
+
+This target is preferred over alternatives:
+- **Win/loss (+1/-1)**: Too coarse — a player who lost by 1 point after 17 rounds gets the same signal as one who scored 0. Wastes information in a multi-round game.
+- **Raw score**: Unbounded and varies with game length. Poor normalization makes training unstable.
+- **Rank-based**: Insensitive to margin of victory. A 2-point win and a 50-point win produce the same target.
+
+Z-scored score captures both relative standing and magnitude of advantage, providing richer gradients for MCTS value estimation. When all players score identically (std = 0), the target is 0.0 for all players, correctly reflecting no differentiation.
+
+### 4.6 Loss Function and Training Configuration
+
+- **Policy loss**: Cross-entropy with masking: `-sum(target × log(pred + 1e-8))`, averaged over batch. During bidding, the target is the MCTS visit distribution over bid actions (14-dim). During playing, the target is the MCTS visit distribution mapped to hand card indices.
+- **Value loss**: MSE between predicted and actual z-scored game outcome (see value target definition in 4.5)
+- **Combined**: `policy_loss + c_value × value_loss`, where `c_value = 2.0`. Policy loss (cross-entropy over ~5-10 legal actions, typical range 0.5-2.5) naturally dominates value loss (MSE over [-1, 1], typical range 0.01-0.25) at equal weighting, starving the value head of learning signal. A coefficient of 2.0 approximately balances gradient magnitudes. This is tunable — monitor both loss curves and adjust if one plateaus while the other continues improving.
+- **Optimizer**: AdamW (`lr=3e-4`, `β₁=0.9`, `β₂=0.999`, `weight_decay=1e-4`)
+- **Learning rate schedule**: Linear warmup over the first 1,000 training batches from 0 to `3e-4`, followed by cosine annealing to `1e-5` over the remaining training budget. Warmup prevents early instability when embeddings are near-random. Cosine annealing provides smooth convergence without hard learning rate drops.
 - **Gradient clipping**: `max_norm=1.0`
 
 ### 4.7 Parameter Budget
@@ -409,8 +459,8 @@ Unchanged from the legacy specification:
 | CLS token | 128 | 1 × 128 |
 | **Input projections** | | |
 | Hand card projection | 3,968 | (30 + 1) × 128 |
-| Played card projection | 6,144 | (47 + 1) × 128 |
-| Player state projection | 3,328 | (25 + 1) × 128 |
+| Played card projection | 6,272 | (48 + 1) × 128 |
+| Player state projection | 3,840 | (29 + 1) × 128 |
 | Context projection | 1,792 | (13 + 1) × 128 |
 | **Transformer (×8 layers)** | | |
 | Self-attention (Q, K, V, O) | 66,048 | 4 × (128 × 128 + 128) per layer |
@@ -419,12 +469,13 @@ Unchanged from the legacy specification:
 | Per-layer total | 198,144 | |
 | 8 layers total | **1,585,152** | |
 | **Output heads** | | |
-| Policy head | 23,220 | (128 × 128 + 128) + (128 × 52 + 52) |
+| Playing head (entity-based) | 4,161 | (128 × 32 + 32) + (32 × 1 + 1) |
+| Bidding head | 9,166 | (128 × 64 + 64) + (64 × 14 + 14) |
 | Value head | 8,321 | (128 × 64 + 64) + (64 × 1 + 1) |
 | | | |
-| **Total** | **~1.64M** | |
+| **Total** | **~1.63M** | |
 
-At 1.64M parameters, this model is **3× smaller** than the legacy 4.9M Transformer while being far more expressive — every parameter is doing useful work on structured entity relationships rather than computing degenerate self-attention over a single token.
+At 1.63M parameters, this model is **3× smaller** than the legacy 4.9M Transformer while being far more expressive — every parameter is doing useful work on structured entity relationships rather than computing degenerate self-attention over a single token. The entity-based playing head is more parameter-efficient than a unified 52-dim head (4K vs 23K), while the separate bidding head adds only 9K parameters for clean gradient separation.
 
 ### 4.8 Inference Performance
 
@@ -613,16 +664,20 @@ The CLS token attends to all entity tokens to build a global game representation
 | Property | Value |
 |---|---|
 | Architecture | Structured Entity Transformer |
-| Parameters | ~1.64M |
+| Parameters | ~1.63M |
 | d_model | 128 |
 | Layers | 8 |
 | Attention heads | 8 (16 dims/head) |
 | FFN dimension | 512 |
+| Activation | GeLU |
 | Token types | 5 (hand card, played card, player state, context, CLS) |
 | Typical token count | 20-40 |
 | Max token count | 57 |
-| Policy output | 52-dim (unified bid + card action space) |
-| Value output | Scalar ∈ [-1, 1] |
+| Policy output (playing) | Entity-based per-card scoring via shared MLP |
+| Policy output (bidding) | 14-dim CLS-based head |
+| Value output | Scalar ∈ [-1, 1] (z-scored cumulative score) |
+| Value loss weight | 2.0× |
+| Learning rate | 3e-4 with linear warmup + cosine annealing |
 | Inference (CPU, ONNX) | ~0.15ms average |
 | Training framework | tch-rs (libtorch) for GPU training |
 | Inference framework | ort (ONNX Runtime) for CPU inference during MCTS |
