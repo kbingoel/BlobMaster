@@ -2,6 +2,44 @@
 
 AlphaZero-style AI for the card game "Blob" (trick-taking with bidding, 3-8 players).
 
+## Vocabulary
+
+| Term | Meaning |
+|---|---|
+| **Game** | A complete session from first deal to final scores. For 5 players: 17 rounds, ~680 decisions. |
+| **Round** | One deal-bid-play-score cycle at a fixed card count (e.g., "the 7-card round"). Each round has one bidding phase followed by tricks. |
+| **Trick** | One cycle where each player plays a card; the highest card (respecting suit/trump rules) wins. A round of N cards has N tricks. |
+| **Bid** | A player's declaration of exactly how many tricks they expect to win this round. |
+| **Play** | A single card played into a trick by one player. |
+| **Decision point** | Any moment the network must choose: either a bid or a play. ~40 per round. |
+
+## Game Rules Reference
+
+### Card System
+- **Deck**: Standard 52 cards (4 suits x 13 ranks)
+- **Suits**: Spades(♠), Hearts(♥), Clubs(♣), Diamonds(♦)
+- **Ranks**: 2,3,4,5,6,7,8,9,10,J,Q,K,A (values 2-14)
+- **Card index**: `suit_index * 13 + rank_index` (0-51): ♠2=0, ♠A=12, ♥2=13, ..., ♦A=51
+
+### Round Structure
+- **Players**: 3-8
+- **Cards per round**: descends from C to 1, stays at 1 for N rounds, ascends back to C. `C = 52 / num_players` (integer division). Example (5 players, C=10): `[10,9,8,7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7,8,9,10]` — 23 rounds
+- **Trump rotation**: ♠→♥→♣→♦→None→♠→... (cycles every 5 rounds)
+
+### Bidding Phase
+- Players bid sequentially (left of dealer first)
+- Bid = exact number of tricks you expect to win (0 to cards_dealt)
+- **Dealer constraint**: Dealer cannot bid such that total_bids == cards_dealt (forces at least one player to miss)
+
+### Playing Phase (Trick-Taking)
+- Must follow led suit if able; if void, may play any card (including trump)
+- Trick winner: highest trump if any trump played, otherwise highest card of led suit
+- Trick winner leads the next trick
+
+### Scoring
+- `score = (tricks_won == bid) ? (10 + bid) : 0`
+- All-or-nothing: exact bid required for points. Cumulative across all rounds.
+
 ## Status: Rust Rewrite — Architecture Finalized
 
 The original Python/PyTorch implementation (Phases 1-4) has been **concluded and archived**. It produced a correct, well-tested game engine and training pipeline, but Python's per-operation overhead made MCTS too slow to generate useful learning signal. The model never learned. Full post-mortem in [conclusion.md](conclusion.md).
@@ -60,7 +98,7 @@ Precomputing key derived features (void flags, `is_highest_in_suit`, `cards_abov
 
 ### Inference Performance
 
-At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX Runtime). With 5 determinizations × 100 MCTS simulations per move, one full game takes ~3s of neural network time. At 32 rayon threads on the 7950X: **~640 games/minute**, comfortably within the 2,000–10,000 games/iteration training target.
+At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX Runtime). With 5 determinizations × 100 MCTS simulations per move, one round (~40 decisions) takes ~3s of neural network time. At 32 rayon threads on the 7950X: **~640 rounds/minute**, supporting the 2,000 rounds/iteration training target (~3 minutes of self-play per iteration).
 
 ## Porting Order
 
@@ -69,13 +107,42 @@ At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX
 3. **Structured Entity Transformer** — as specified in [architecture.md](architecture.md)
 4. **MCTS** — Arena-allocated tree search with belief tracking and determinization
 5. **Training Pipeline** — Self-play (`rayon`), contiguous replay buffer, training loop
-6. **Evaluation + CLI** — Arena tournaments, ELO tracking, `clap` CLI
+6. **Evaluation + CLI** — Model comparison, strength tracking, `clap` CLI
+7. **ONNX + Fine-Tuning** — ONNX export for fast inference, player-count-specific fine-tuned models
 
 **Key fixes over Python version:**
 - MCTS starts at 5×100 sims/move — enough signal to actually learn
 - Strong policy prior breaks the vicious cycle: weak prior → uniform MCTS targets → weaker prior
-- Replay buffer as contiguous tensors, not 500K Python dicts across a 650MB heap
-- Full iteration in ~30–45s vs ~5 min; 500 iterations in ~4–6h vs ~44h
+- Replay buffer stores raw `BlobState` (~410 bytes), re-encodes on the fly — not 500K Python dicts across a 650MB heap
+- Diagnostic-driven adaptive training replaces fixed schedules — every iteration is monitored and tuned
+- Full iteration in ~3–5 min (32 threads) vs ~5 min (Python, single-threaded bottleneck)
+
+## Training Strategy
+
+### Player Distribution & Fine-Tuning
+
+Base model trains on mixed player counts: **n=4 (10%), n=5 (60%), n=6 (25%), n=7 (5%)**. The Structured Entity Transformer handles variable player counts natively via its token design — more players simply means more player state and played card tokens.
+
+After base model training, **player-specific fine-tuned models** are produced for each count (n=3 through n=8), prioritizing n=5. Fine-tuning is cheap: the transformer layers already encode card fundamentals, suit reasoning, and void detection generically — fine-tuning adjusts output heads and final layers to count-specific dynamics.
+
+### Training Optimization
+
+Given limited hardware (single RTX 4060), every wasted evaluation is expensive. Training is driven by diagnostic metrics, not fixed schedules. Key metrics logged every iteration:
+
+| Metric | What it tells you | Action if wrong |
+|---|---|---|
+| **MCTS visit entropy** | Is MCTS producing non-random targets? Low = good signal. | If high (≈ log(n_legal)), increase sim budget |
+| **Top-1 visit share** | Fraction of visits on best action. Should be >0.3. | If ≈ 1/n_legal, sim budget insufficient |
+| **Policy-MCTS KL divergence** | How much the network disagrees with MCTS. Should drop over time. | If stuck high, LR or architecture issue |
+| **Policy loss** (bid/play separate) | Should drop below ln(avg_legal) ≈ 1.95 within ~10 iterations. | If flat, check MCTS signal quality |
+| **Value prediction variance** | Is the value head producing diverse outputs? | If all ≈ 0, check z-scoring targets |
+| **Bid accuracy (top-1)** | % network top bid matches MCTS top bid. Interpretable. | Plateau = capacity or signal issue |
+| **Win rate vs checkpoint N-20** | Is training still improving? More telling than vs random. | If flat, training has stalled |
+| **Bid success rate** | % of rounds where model hits bid exactly. Domain-specific strength. | Direct measure of play quality |
+| **Per-layer gradient norms** | Are all transformer layers learning? | Vanishing = architecture problem |
+| **Loss improvement per eval** | Δloss / num_nn_evaluations. Training efficiency. | If flat, wasting compute |
+
+These metrics enable **adaptive training**: simulation budget adjusts based on visit entropy, epochs per iteration adjust based on loss improvement rate, and buffer size adjusts based on effective sample rate.
 
 ## Hardware
 
