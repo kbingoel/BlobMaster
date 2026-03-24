@@ -6,12 +6,12 @@ AlphaZero-style AI for the card game "Blob" (trick-taking with bidding, 3-8 play
 
 | Term | Meaning |
 |---|---|
-| **Game** | A complete session from first deal to final scores. For 5 players: 17 rounds, ~680 decisions. |
+| **Game** | A complete session from first deal to final scores. For 5 players, 7 cards: 17 rounds, ~380 decisions. For 5 players, 8 cards: 19 rounds, ~470 decisions. |
 | **Round** | One deal-bid-play-score cycle at a fixed card count (e.g., "the 7-card round"). Each round has one bidding phase followed by tricks. |
 | **Trick** | One cycle where each player plays a card; the highest card (respecting suit/trump rules) wins. A round of N cards has N tricks. |
 | **Bid** | A player's declaration of exactly how many tricks they expect to win this round. |
 | **Play** | A single card played into a trick by one player. |
-| **Decision point** | Any moment the network must choose: either a bid or a play. ~40 per round. |
+| **Decision point** | Any moment the network must choose: either a bid or a play. Decisions per round = `num_players × (cards_dealt + 1)`. |
 
 ## Game Rules Reference
 
@@ -23,7 +23,7 @@ AlphaZero-style AI for the card game "Blob" (trick-taking with bidding, 3-8 play
 
 ### Round Structure
 - **Players**: 3-8
-- **Cards per round**: descends from C to 1, stays at 1 for N rounds, ascends back to C. `C = 52 / num_players` (integer division). Example (5 players, C=10): `[10,9,8,7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7,8,9,10]` — 23 rounds
+- **Cards per round (C)**: a game parameter, typically 7 or 8. Constrained by `num_players × C ≤ 52`. Descends from C to 1, stays at 1 for N rounds (N = num_players), ascends back to C. Total rounds = `2C + num_players - 2`. Example (5 players, C=7): `[7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7]` — 17 rounds. Example (5 players, C=8): `[8,7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7,8]` — 19 rounds
 - **Trump rotation**: ♠→♥→♣→♦→None→♠→... (cycles every 5 rounds)
 
 ### Bidding Phase
@@ -50,8 +50,8 @@ The Rust rewrite is in progress. The neural network architecture has been fully 
 
 ```
 README.md              ← You are here
+development-plan.md    ← Complete Rust development plan (architecture + implementation)
 conclusion.md          ← Why Python failed, what to do differently
-architecture.md        ← Structured Entity Transformer specification (current)
 prepare-migration.md   ← Rust rewrite plan (game engine, MCTS, training pipeline)
 legacy/                ← Archived Python reference code
 ```
@@ -66,7 +66,7 @@ The legacy BlobNet was a 6-layer Transformer over a flat 256-dim state vector (~
 
 | Token | Count | What it encodes |
 |---|---|---|
-| Hand card | 1–13 | Rank, suit, trump status, relative strength, suit counts |
+| Hand card | 1–8 | Rank, suit, trump status, relative strength, suit counts |
 | Played card | 0–48 | Rank, suit, player, trick number, lead/follow, win status |
 | Player state | 3–8 | Bid, tricks won, bid status, suit voids, position |
 | Context | 1 | Trump suit, cards dealt, trick progress, game phase |
@@ -98,13 +98,13 @@ Precomputing key derived features (void flags, `is_highest_in_suit`, `cards_abov
 
 ### Inference Performance
 
-At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX Runtime). With 5 determinizations × 100 MCTS simulations per move, one round (~40 decisions) takes ~3s of neural network time. At 32 rayon threads on the 7950X: **~640 rounds/minute**, supporting the 2,000 rounds/iteration training target (~3 minutes of self-play per iteration).
+At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX Runtime). With 5 determinizations × 100 MCTS simulations per move, one 7-card round (~40 decisions) takes ~3s of neural network time. At 32 rayon threads on the 7950X: **~640 rounds/minute** for 7-card rounds, supporting ~3 minutes of self-play per iteration (~177 games, ~80K training examples).
 
 ## Porting Order
 
 1. **Game Engine** — Blob rules, bitwise card representation (`u64` bitmasks, ~50ns state copy), trick history log (`TrickRecord` struct)
 2. **Entity Encoder** — `BlobState` → variable-length token sequence
-3. **Structured Entity Transformer** — as specified in [architecture.md](architecture.md)
+3. **Structured Entity Transformer** — as specified in [development-plan.md](development-plan.md) Section 3
 4. **MCTS** — Arena-allocated tree search with belief tracking and determinization
 5. **Training Pipeline** — Self-play (`rayon`), contiguous replay buffer, training loop
 6. **Evaluation + CLI** — Model comparison, strength tracking, `clap` CLI
@@ -121,7 +121,11 @@ At a typical 35-token sequence: ~57M MACs per forward pass, ~0.15ms on CPU (ONNX
 
 ### Player Distribution & Fine-Tuning
 
-Base model trains on mixed player counts: **n=4 (10%), n=5 (60%), n=6 (25%), n=7 (5%)**. The Structured Entity Transformer handles variable player counts natively via its token design — more players simply means more player state and played card tokens.
+Base model trains on mixed configurations:
+- **Player count**: n=4 (10%), n=5 (60%), n=6 (25%), n=7 (5%)
+- **Cards dealt**: C=7 (40%), C=8 (60%), constrained by `n × C ≤ 52` (forces C=7 for n=7)
+
+The Structured Entity Transformer handles variable player counts and hand sizes natively via its token design — more players simply means more player state and played card tokens.
 
 After base model training, **player-specific fine-tuned models** are produced for each count (n=3 through n=8), prioritizing n=5. Fine-tuning is cheap: the transformer layers already encode card fundamentals, suit reasoning, and void detection generically — fine-tuning adjusts output heads and final layers to count-specific dynamics.
 

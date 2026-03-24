@@ -10,7 +10,7 @@ The Rust rewrite has not started yet. This repository currently contains only pl
 
 Read these before making architectural decisions:
 
-- **[architecture.md](architecture.md)** — The finalized neural network specification (Structured Entity Transformer). This supersedes the legacy BlobNet described in `prepare-migration.md`. Use `architecture.md` as the authoritative source for all network design decisions.
+- **[development-plan.md](development-plan.md)** — The authoritative development plan. Contains the complete Structured Entity Transformer specification (Sections 2–3), MCTS design (Section 4), training pipeline (Sections 5–7), and evaluation/deployment (Sections 6–8). Use this as the single source of truth for all design decisions.
 - **[prepare-migration.md](prepare-migration.md)** — Rust rewrite plan: game rules (§3), MCTS algorithm (§5), training pipeline (§6), crate recommendations (§10), verification checklist (§13).
 - **[legacy/](legacy/)** — Archived Python source. Read-only reference. Never modify.
 
@@ -21,8 +21,8 @@ The system is an AlphaZero-style MCTS+neural-network pipeline for a trick-taking
 ### Data Flow
 
 ```
-BlobState (stack, ~200 bytes)
-  → Entity Encoder → variable-length token sequence (~14–56 tokens)
+BlobState (stack, ~410 bytes)
+  → Entity Encoder → variable-length token sequence (~14–58 tokens)
   → Structured Entity Transformer (1.63M params)
   → Playing head (hand card tokens → per-card scores → softmax)
   → Bidding head (CLS token → 14-dim softmax)
@@ -31,10 +31,10 @@ BlobState (stack, ~200 bytes)
 
 ### Key Architectural Decisions
 
-**BlobState** must be extended from the minimal struct in `prepare-migration.md §3.6` to include a `trick_history: [TrickRecord; 13]` field — the entity encoder requires the full ordered log of who played what card in which trick (see `architecture.md §5.1`).
+**BlobState** must be extended from the minimal struct in `prepare-migration.md §3.6` to include a `trick_history: [TrickRecord; 13]` field — the entity encoder requires the full ordered log of who played what card in which trick (see `development-plan.md` Session 2).
 
 **Entity encoder** transforms `BlobState` into five token types:
-- Hand cards (1–13), Played cards (0–48), Player states (3–8), Context (1), CLS (1)
+- Hand cards (1–8), Played cards (0–48), Player states (3–8), Context (1), CLS (1)
 - Rank/suit embeddings are **shared** between hand and played card tokens
 - Player embeddings are **shared** between played cards and player state tokens
 - Played card tokens receive additional chronological embeddings (52×128 table)
@@ -56,11 +56,11 @@ Card index = `suit_index * 13 + rank_index`. Suits: ♠=0, ♥=1, ♣=2, ♦=3. 
 ## Porting Order
 
 1. Game engine (`blob.py` → Rust) — port all 135 tests from `legacy/game-engine/test_blob.py`
-2. Entity encoder (`architecture.md §4–5`) — replaces `legacy/neural-network/encode.py`
-3. Structured Entity Transformer (`architecture.md §4.3–4.6`) — replaces `legacy/neural-network/model.py`
-4. MCTS with belief tracking and determinization (`prepare-migration.md §5`)
-5. Training pipeline: self-play, replay buffer, trainer (`prepare-migration.md §6`)
-6. Evaluation + CLI: arena, ELO, `clap` (`prepare-migration.md §7`)
+2. Entity encoder (`development-plan.md` Section 2) — replaces `legacy/neural-network/encode.py`
+3. Structured Entity Transformer (`development-plan.md` Section 3) — replaces `legacy/neural-network/model.py`
+4. MCTS with belief tracking and determinization (`development-plan.md` Section 4)
+5. Training pipeline: self-play, replay buffer, trainer (`development-plan.md` Section 5)
+6. Evaluation + CLI: strength tracking, `clap` (`development-plan.md` Section 6)
 
 ## Crate Choices
 
@@ -71,7 +71,7 @@ Card index = `suit_index * 13 + rank_index`. Suits: ♠=0, ♥=1, ♣=2, ♦=3. 
 Before considering a phase complete:
 - Game engine: all 135 ported tests pass; state copy benchmarks at ~50ns
 - MCTS: with 5×100 sims, top action has >2× average visit count (non-uniform signal)
-- Training: policy loss drops below `ln(avg_legal_actions)` within 10 iterations; ELO exceeds 1000 within 20 iterations
+- Training: policy loss drops below `ln(avg_legal_actions)` within 10 iterations; win rate vs random > 55% within 20 iterations
 - Performance: full iteration (self-play + training) completes in <60 seconds; 32-thread self-play >80% scaling efficiency
 
 ## Hardware Target
