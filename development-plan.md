@@ -29,7 +29,7 @@ Set up the Rust workspace structure and implement the low-level card representat
 Implement the game initialization, dealing logic, and the complete bidding phase.
 
 - Trump rotation: `[Spades, Hearts, Clubs, Diamonds, NoTrump]` cycling every 5 rounds — store as `u8` (0–4)
-- Round structure: symmetric pattern — descends from C to 1, stays at 1 for N rounds, ascends back to C. `C = 52 / num_players` (integer division). Number of "stay at 1" rounds = `num_players`
+- Round structure: symmetric pattern — descends from C to 1, stays at 1 for N rounds, ascends back to C. C is a game parameter (typically 7 or 8), constrained by `num_players × C ≤ 52`. Number of "stay at 1" rounds = `num_players`. Total rounds = `2C + num_players - 2`
 - Dealing: shuffle deck (Fisher-Yates with `rand_xoshiro::Xoshiro256PlusPlus` for speed), distribute `cards_dealt` cards per player as `u64` bitmasks
 - Bidding rules: each player bids 0..=cards_dealt. **Dealer restriction**: dealer's bid cannot make total bids equal cards_dealt (forces at least one player to miss). Validate this constraint
 - `fn legal_bids(state: &BlobState) -> u16` — bitmask over values 0..=13, with forbidden value cleared for dealer. Max 14 possible bids fits in u16. Avoids heap allocation (unlike Vec)
@@ -54,11 +54,11 @@ Implement the playing phase with full trick-taking rules and the all-or-nothing 
 
 Wire up the complete multi-round game and add comprehensive testing including property-based tests.
 
-- `fn new_game(num_players: u8) -> BlobState` — initializes first round (cards_dealt = 52 / num_players)
+- `fn new_game(num_players: u8, cards_dealt: u8) -> BlobState` — initializes first round. Validate `num_players × cards_dealt ≤ 52`
 - `fn advance_round(state: &mut BlobState)` — reset trick state, clear `played_this_round`, advance dealer, rotate trump, adjust cards_dealt per symmetric round structure, accumulate scores into `cumulative_scores`
 - Full game loop: deal → bid → play tricks → score → next round, until all rounds complete
 - `fn is_game_over(state: &BlobState) -> bool` — true when last round scored
-- `fn total_rounds(num_players: u8) -> u8` — compute total rounds for a given player count
+- `fn total_rounds(num_players: u8, start_cards: u8) -> u8` — `2 * start_cards + num_players - 2`. E.g., 5P7C → `2*7+5-2 = 17`, 5P8C → `2*8+5-2 = 19`
 - Add `proptest` for property-based testing: random games always terminate, card conservation (52 cards never lost/duplicated), tricks_won always sums to cards_dealt, no player can play a card not in their hand
 - Port remaining ~50 tests from Python's `test_blob.py`
 - **Gate check**: all 135 ported tests pass, `BlobState` copy benchmarked, legal move gen benchmarked
@@ -145,7 +145,7 @@ Implement the 8-layer pre-norm Transformer with multi-head self-attention.
 - FFN: `Linear(128, 512) → GeLU → Dropout(0.1) → Linear(512, 128) → Dropout(0.1)`
 - LayerNorm: `eps=1e-5`, learnable affine parameters
 - Stack 8 identical layers with independent parameters
-- Parameter count check: each layer = `4 * 128² (QKV+O) + 2 * 128*512 (FFN) + 4*128 (LN affine)` ≈ 198K × 8 = ~1,585K. Verify matches architecture.md
+- Parameter count check: each layer = `4 * 128² (QKV+O) + 2 * 128*512 (FFN) + 4*128 (LN affine)` ≈ 198K × 8 = ~1,585K
 - Test: gradient flow — run random forward+backward, verify no NaN/zero gradients in any layer
 - Note: `torch.compile` is Python-only (TorchDynamo). Not available through tch-rs. JIT tracing via `CModule` is possible but defer to Section 8 optimization
 
@@ -180,7 +180,7 @@ Implement the combined loss, AdamW optimizer, learning rate schedule, and a sing
   - Since training generates full games (Section 5.2), cumulative scores have rich variance (e.g., 60–180 range for 5P7C). Z-scoring produces well-distributed targets that use the tanh range effectively. Track value target distribution to verify
 - **Combined loss**: `policy_loss + 2.0 * value_loss` — the 2.0 coefficient balances gradient magnitudes since policy loss is typically larger
 - **Optimizer**: AdamW with β₁=0.9, β₂=0.999, weight_decay=1e-4
-- **LR schedule**: linear warmup 0→3e-4 over 1,000 batches, then cosine annealing to 1e-5 (matching architecture.md §4.6). The 3e-4 peak is the standard for AdamW with 1.63M params; 1e-3 risks instability at this scale
+- **LR schedule**: linear warmup 0→3e-4 over 1,000 batches, then cosine annealing to 1e-5. The 3e-4 peak is the standard for AdamW with 1.63M params; 1e-3 risks instability at this scale
 - **Gradient clipping**: `clip_grad_norm_(params, max_norm=1.0)`
 - Implement `fn train_step(model, batch) -> (policy_loss, value_loss, total_loss)` — forward, compute loss, backward, clip, step
 - Handle variable sequence lengths in batch: pad features, create masks, pass through model
@@ -192,9 +192,13 @@ Implement the combined loss, AdamW optimizer, learning rate schedule, and a sing
 Set up the ONNX export pipeline and inference path early — ONNX Runtime is required for self-play (Section 5) and is the only inference path for the Windows deployment target.
 
 - **Why early**: the inference machine (Intel i5-1135G7, Iris Xe iGPU) has no CUDA GPU. ONNX Runtime is the only viable inference backend, not an optimization — it's on the critical path. Additionally, ONNX CPU inference (~0.15ms/eval) is ~3× faster than `tch` CPU (~0.5ms), making it essential for self-play throughput (40M+ evaluations per iteration)
-- **Export**: trace the `tch` model with dummy input → save as ONNX. Handle dynamic sequence length via dynamic axes
+- **Export via Python bridge**: `tch-rs` has no native ONNX export. The export workflow is:
+  1. Save model weights from Rust via `VarStore::save("model.pt")`
+  2. Run a small Python script (~20 lines) that loads weights into an equivalent PyTorch model definition and calls `torch.onnx.export()` with dynamic axes
+  3. This script is a build artifact in `scripts/export_onnx.py`, run once per iteration after training
   - Input: `features: [batch, max_seq, feat_dim]`, `token_types: [batch, max_seq]`, `attention_mask: [batch, max_seq]`
   - Outputs: `bid_policy: [batch, 14]`, `play_scores: [batch, max_hand]`, `value: [batch, 1]`
+  - The Python model definition must mirror the Rust `tch` model exactly — keep both in sync. Changes to the network require updating both
 - **ONNX Runtime inference** (`ort` crate in `blob-engine` or shared crate, NOT `blob-nn`):
   - Load exported model, create session with `CpuExecutionProvider`
   - Configure `intra_op_num_threads=1` for per-rayon-thread sessions (each thread gets its own session, no contention)
@@ -214,15 +218,16 @@ Implement the MCTS node structure with arena allocation and the selection phase.
 
 - Arena allocation for cache-friendly traversal:
   ```
-  MctsNode { visit_count: u32, value_sums: [f32; 8], prior: f32, action: u8, children: SmallVec<[u32; 8]> }
+  MctsNode { visit_count: u32, value_sums: [f32; 8], value_counts: [u32; 8], prior: f32, action: u8, children: SmallVec<[u32; 8]> }
   MctsArena { nodes: Vec<MctsNode>, root_player: u8 }
   ```
-  - **Per-player value storage**: each node stores value estimates for all player seats, not a single scalar. This correctly models multiplayer dynamics — players who have "blobbed" (busted their bid) become spoilers with different objectives, and multiple players can score in the same round. A two-player zero-sum sign-flip would be wrong here
+  - **Per-player value storage**: each node stores value estimates and visit counts for all player seats, not a single scalar. This correctly models multiplayer dynamics — players who have "blobbed" (busted their bid) become spoilers with different objectives, and multiple players can score in the same round. A two-player zero-sum sign-flip would be wrong here
+  - **Why per-player visit counts**: the neural network evaluates leaves from the current player's perspective. In a 5-player game, only ~1/5 of leaf evaluations produce a value for any given player. Using a global `visit_count` as denominator would dilute Q-values non-uniformly across children (depending on which player-turns their subtrees lead to), biasing UCB1 selection. Per-player `value_counts` ensures correct averaging
   - Node index 0 = root. Children stored as indices into `nodes` vec
   - Allocate new node: `arena.nodes.push(node); return arena.nodes.len() - 1`
-  - Pre-allocate `Vec::with_capacity(10_000)` per search to avoid reallocation. Per-player values add ~28 bytes/node (7 extra f32s vs single f32), so 10K nodes ≈ 280KB extra — negligible
+  - Pre-allocate `Vec::with_capacity(10_000)` per search to avoid reallocation. Per-player values and counts add ~60 bytes/node (7 extra f32s + 7 extra u32s vs single f32/u32), so 10K nodes ≈ 600KB extra — negligible
 - UCB1 selection: `Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N_child)`
-  - `Q = value_sums[acting_player] / visit_count` — use the **acting player's** value at each node during selection. This ensures each player's moves are selected to maximize their own expected outcome
+  - `Q = value_sums[acting_player] / value_counts[acting_player]` — use the **acting player's** value divided by that player's specific visit count. This ensures each player's Q estimate is a proper average, not diluted by visits where other players were evaluated. When `value_counts[acting_player] == 0`, default to `Q = 0` (neutral prior), which is quickly corrected as simulations accumulate
   - `P = prior` (from neural network policy)
   - `c_puct = 1.5` (exploration constant, tune later)
   - Select child with highest UCB1 score
@@ -240,9 +245,9 @@ Implement the remaining MCTS phases and the full simulation loop.
   - Define trait: `trait Evaluator { fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32); }`
 - **Backpropagation — per-player values for multiplayer**:
   - Blob is multiplayer (3-8 players), not two-player adversarial. Each player independently maximizes their own score. There is no zero-sum relationship to exploit — multiple players can score in the same round, and "blobbed" players become spoilers with shifted objectives (disrupting others)
-  - **Design**: the neural network evaluates the leaf state from `state.current_player`'s perspective, returning a single value `v`. During backpropagation, store this value in `value_sums[current_player]` at every node on the path. Over many simulations, each node accumulates value estimates from multiple players' perspectives as different players act at different tree depths
-  - At each node on the path: `visit_count += 1`, `value_sums[leaf_current_player] += v`
-  - During selection (Session 4.1), UCB1 uses `Q = value_sums[acting_player] / visit_count` — each player's moves are evaluated from their own perspective. Nodes where the acting player has never been evaluated default to `Q = 0` (neutral prior), which is quickly corrected as simulations accumulate
+  - **Design**: the neural network evaluates the leaf state from `state.current_player`'s perspective, returning a single value `v`. During backpropagation, store this value in `value_sums[leaf_current_player]` and increment `value_counts[leaf_current_player]` at every node on the path. Over many simulations, each node accumulates value estimates from multiple players' perspectives as different players act at different tree depths
+  - At each node on the path: `visit_count += 1`, `value_sums[leaf_current_player] += v`, `value_counts[leaf_current_player] += 1`
+  - During selection (Session 4.1), UCB1 uses `Q = value_sums[acting_player] / value_counts[acting_player]` — each player's Q is averaged only over simulations that actually evaluated that player, preventing dilution bias. `N_child` in the exploration term still uses the global `visit_count` (total visits through that child)
 - **Search loop**: for `num_simulations` iterations: select → expand (if leaf) → evaluate → backpropagate
 - After search: action probabilities = `visit_count[child] / total_visits` for each child of root
 - **Temperature**: during training, use temperature τ to sharpen/flatten: `prob_i = visit_i^(1/τ) / sum(visit_j^(1/τ))`. τ=1.0 early in game (exploration), τ→0 late (exploitation)
@@ -305,7 +310,7 @@ Implement the replay buffer storing raw game states with circular FIFO semantics
   ```
   - Policy stored as sparse `(action_index, probability)` pairs:
     - **Bidding**: action_index = bid value (0–13), up to 14 entries
-    - **Playing**: action_index = hand card position (0 to hand_size-1), matching the entity-based playing head's output space (architecture.md §4.5). NOT card indices 0–51
+    - **Playing**: action_index = hand card position (0 to hand_size-1), matching the entity-based playing head's output space (Session 3.3). NOT card indices 0–51
   - `SmallVec<[(u8, f32); 14]>` avoids heap allocation for most examples (≤14 legal actions fits inline)
 - **Batch construction**: separate bid and play examples into two sub-batches by `GamePhase`
   - Bid sub-batch: reconstruct dense `[f32; 14]` policy tensor
@@ -321,17 +326,17 @@ Implement the replay buffer storing raw game states with circular FIFO semantics
 Implement the self-play engine that generates training examples from complete games using MCTS.
 
 - **Training unit is the full game, not individual rounds**. Training on full games allows the value head to learn from cumulative game outcomes — the actual objective. Round-scoped z-scoring would produce bimodal targets (0 or 10+bid) with poor gradient signal, and would not reward consistent performance across an entire game
-- **Compute budget**: a 5P7C game = 17 rounds × ~40 decisions = ~680 decisions. At 5×100 MCTS = 500 evals/decision → ~340K neural evals per game. At 0.15ms/eval (ONNX): ~51s single-threaded, ~1.6s with 32 threads. To generate ~80K training examples: ~118 games × 680 decisions ≈ 80K. At 1.6s/game = **~3 minutes of self-play** — comparable to the previous round-based estimate
+- **Compute budget**: a 5P7C game = 17 rounds, ~380 decisions (5 players × sum of (cards_dealt + 1) per round). A 5P8C game = 19 rounds, ~470 decisions. Weighted average across the player/card distribution: ~453 decisions/game. At 5×100 MCTS = 500 evals/decision → ~226K neural evals per average game. At 0.15ms/eval (ONNX): ~34s single-threaded, ~1.1s with 32 threads. To generate ~80K training examples: ~177 games × 453 decisions ≈ 80K. At 1.1s/game = **~3 minutes of self-play**
 - For each decision point in a game: encode state → MCTS search → record `(state, mcts_policy, _)` — value filled in after game ends
 - **After game completes**: compute z-scored value from cumulative game scores for each player: `v_i = clip((cumulative_score_i - mean) / max(std, ε), -1, 1)`. Backfill this value into **all** examples from that player's perspective across all rounds
-  - Cumulative game scores have rich variance (e.g., 60–180 range for 5P7C), producing well-distributed value targets that use the tanh range effectively
+  - Cumulative game scores have rich variance (e.g., 40–130 range for 5P7C), producing well-distributed value targets that use the tanh range effectively
   - Handle edge case: if all players score identically (std=0), set all values to 0.0
 - **Training example**: `(BlobState, sparse_policy, f32, GamePhase)` — sparse policy has nonzero entries only for legal actions, sums to 1.0
   - For bidding: up to 14 entries (bid values 0–13)
   - For playing: entries are hand card position indices (0 to hand_size-1), matching the entity-based playing head's output space. The MCTS engine maps card indices back to hand positions using the known hand composition
 - **Player count distribution**: n=4 (10%), n=5 (60%), n=6 (25%), n=7 (5%). Each game is played at a single player count, sampled per this distribution. Priority is n=5 for target use case; broader distribution builds a more general base model for fine-tuning
-- **Cards-dealt configuration**: for each player count, use the standard maximum `C = 52 / num_players`. Games always start from the full round structure (e.g., 5P10C = 23 rounds, 4P13C = 27 rounds)
-- Generate N games per iteration, collecting all decision-point examples. ~680 decisions per 5P7C game → ~118 games = ~80K examples per iteration
+- **Cards-dealt distribution**: C=7 (40%), C=8 (60%), constrained by `num_players × C ≤ 52`. For n=7, C is forced to 7 (since 7×8=56 > 52). Games always start from the full round structure (e.g., 5P7C = 17 rounds, 5P8C = 19 rounds, 6P8C = 19 rounds)
+- Generate N games per iteration, collecting all decision-point examples. ~453 avg decisions/game → ~177 games = ~80K examples per iteration
 - Test: generate 5 complete games, verify all examples have valid policies (sum to ~1.0, nonzero entries only at legal actions), values in [-1, 1], and value targets are consistent within each game (same player gets same value across all their examples in a game)
 
 ### Session 5.3 — Rayon parallelization and self-play engine
@@ -366,7 +371,7 @@ Wire up the complete training iteration with all diagnostic metrics from the sta
   - Separate bidding and playing examples in the batch (they use different output heads)
   - Or: process all through transformer, then dispatch to appropriate head per example
 - **Epochs per iteration**: start at 10, but make adaptive — stop early if loss improvement per epoch drops below threshold (some iterations converge in 5, others need 15)
-- **LR schedule**: linear warmup (0→3e-4 over 1,000 global batches) + cosine annealing to 1e-5 (matching architecture.md). Track global batch count across iterations
+- **LR schedule**: linear warmup (0→3e-4 over 1,000 global batches) + cosine annealing to 1e-5. Track global batch count across iterations
 - **Per-iteration diagnostic metrics** (logged to structured JSON via `tracing`):
   - **Signal quality**: mean MCTS visit entropy, mean top-1 visit share (from self-play MctsResults)
   - **Learning progress**: policy_loss (separate bid/play), value_loss, combined_loss, learning_rate
@@ -376,7 +381,10 @@ Wire up the complete training iteration with all diagnostic metrics from the sta
   - **Play accuracy (top-1)**: same for card plays
   - **Policy-MCTS KL divergence**: KL(MCTS_target || network_policy), averaged over batch. Should decrease over training
   - **Loss improvement per evaluation**: Δ(policy_loss) / num_nn_evaluations_this_iteration. Direct measure of compute efficiency
-- **Checkpoint**: `{model.pt, optimizer.pt, buffer.bin, metrics.json}` per iteration. Keep last 5 checkpoints, delete older
+- **Checkpoint strategy**: save `{model.pt, optimizer.pt, buffer.bin, metrics.json}` per iteration, but manage retention to save storage:
+  - **Evaluated checkpoints** (every 5 iterations): kept permanently. These are the comparison anchors (see Session 6.1)
+  - **Rolling checkpoint**: always keep the most recent non-evaluated iteration, so training can be paused/resumed without losing more than one iteration of progress. Delete the previous rolling checkpoint once the next iteration completes
+  - Example at iteration 102: keep evaluated checkpoints at 5, 10, 15, ..., 100, plus the rolling checkpoint at 102. Iteration 101's checkpoint was deleted when 102 completed
 - **Resume**: detect existing checkpoint on startup, load and continue from last iteration
 - **Gate check**: policy loss drops below `ln(avg_legal_actions)` ≈ `ln(7)` ≈ 1.95 within 10 iterations. If not, something is wrong with the learning signal
 
@@ -388,19 +396,20 @@ Wire up the complete training iteration with all diagnostic metrics from the sta
 
 Implement the model comparison system for tracking training progress. No ELO — use direct metrics.
 
-- **Checkpoint comparison**: every K=10 iterations, play current model vs checkpoint from 20 iterations ago
-  - Each model controls exactly **one seat** per game. Remaining seats filled by a fixed baseline (random or heuristic). This avoids the multi-seat coordination bias of putting one model in multiple seats
-  - Play 50 full games with fair seat rotation. Track:
-    - **Win rate** (higher cumulative game score more often): primary comparison metric
+- **Evaluation cadence**: every 5 iterations, play current model vs the checkpoint from 20 iterations ago (= 4 evaluations back). This saves ~95% of evaluation compute vs evaluating every iteration while providing statistically reliable comparisons across meaningful training intervals
+  - Example: eval at iter 5 vs random/heuristic baseline (no prior checkpoint yet), eval at iter 10 vs iter 5, ..., eval at iter 25 vs iter 5, eval at iter 30 vs iter 10, eval at iter 50 vs iter 30
+  - Every iteration is checkpointed (see Session 5.4), but only evaluation-iteration checkpoints are kept permanently
+- **Evaluation games**: play **200 full games** per evaluation with fair seat rotation. Each model controls exactly **one seat** per game. Remaining seats filled by a fixed baseline (random or heuristic). This avoids the multi-seat coordination bias of putting one model in multiple seats. Track:
+    - **Win rate** (higher cumulative game score more often): primary comparison metric. 200 games gives a 95% CI of ~±7% — sufficient to detect a 55% true win rate reliably
     - **Score differential**: mean(model_A_cumulative - model_B_cumulative) per game. More granular than binary win
     - **Bid success rate**: % of rounds across all games where model hits bid exactly. Domain-specific strength measure
   - Win rate with 95% confidence interval (binomial). Need >55% to declare improvement
 - **Strength tracking over time** (replaces ELO):
-  - CSV log per iteration: `iteration, win_rate_vs_prev, bid_success_rate, score_differential, policy_loss, value_loss, visit_entropy, kl_divergence`
-  - Plot curves: the slope of win_rate_vs_prev tells you whether training is accelerating, steady, or stalling
+  - CSV log per evaluation: `iteration, win_rate_vs_N20, bid_success_rate, score_differential, policy_loss, value_loss, visit_entropy, kl_divergence`
+  - Plot curves: the slope of win_rate tells you whether training is accelerating, steady, or stalling
   - **Bid success rate** is the single most interpretable domain metric — a strong Blob player bids accurately
 - **Heuristic baseline** (valuable intermediate benchmark): simple rule-based player — bid = count of (aces + kings in trump suit + aces in non-trump), play highest legal card if winning else lowest. Win rate vs heuristic measures absolute progress beyond random
-- **Promotion logic**: if current model's bid success rate exceeds best model's by >2% over 50 games, promote as new best. Self-play uses best model for training stability
+- **Promotion logic**: if current model's bid success rate exceeds best model's by >2% over 200 games, promote as new best. Self-play uses best model for training stability
 - Test: run comparison with two random models — verify ~50% win rate within statistical noise
 
 ### Session 6.2 — CLI, configuration, and logging
@@ -415,8 +424,8 @@ Build the command-line interface for running training, evaluation, and analysis.
 - **Configuration**: `TrainingConfig` struct with serde, loadable from TOML file or CLI args. CLI args override file values
   - MCTS params: `determinizations`, `simulations_per_det`, `c_puct`, `temperature`, `temp_threshold`
   - Training params: `lr_peak`, `lr_min`, `weight_decay`, `batch_size`, `max_epochs_per_iter`, `buffer_capacity`
-  - Self-play params: `num_games`, `num_threads`, `player_distribution: [f32; 4]` (for n=4,5,6,7)
-  - Eval params: `eval_rounds`, `eval_interval`, `promotion_threshold`
+  - Self-play params: `num_games`, `num_threads`, `player_distribution: [f32; 4]` (for n=4,5,6,7), `cards_dealt_distribution: [f32; 2]` (for C=7,8)
+  - Eval params: `eval_games: 200`, `eval_interval: 5`, `eval_lookback: 20`, `promotion_threshold`
 - **Logging**: `tracing` with structured fields. Log levels: INFO for iteration summaries, DEBUG for per-batch metrics, TRACE for per-round details
   - Output to both terminal (pretty) and file (JSON lines) via `tracing-subscriber` layers
   - Key metrics per iteration: games_generated, examples_added, policy_loss_bid, policy_loss_play, value_loss, bid_accuracy, visit_entropy, kl_divergence, games_per_sec, inference_ms_avg
@@ -434,7 +443,7 @@ Profile end-to-end performance, fix bottlenecks, and verify all completion gates
   - MCTS 100 sims (with ONNX eval): target <20ms
   - Full move (5 det × 100 sims): target <100ms
   - Single full game self-play (5P7C, 17 rounds): target <30s neural time
-- **Full iteration benchmark**: self-play (~118 games) + training (10 epochs) — target <5 minutes total with 32 threads
+- **Full iteration benchmark**: self-play (~177 games) + training (10 epochs) — target <5 minutes total with 32 threads
 - **Memory profiling**: track peak RSS during 32-thread self-play. Verify no memory leaks over 100 iterations
 - **Numerical stability**: run 50 training iterations, verify no NaN/Inf in loss, gradients, or model outputs. Check value head stays in [-1, 1] range
 - **Gate checklist verification**:
