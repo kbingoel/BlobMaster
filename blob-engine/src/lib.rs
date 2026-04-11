@@ -8,12 +8,15 @@
 //! (`round`, `dealing`, `bidding` modules).
 //!
 //! Session 1.3 adds trick-taking and per-round scoring (`playing` module):
-//! `legal_plays`, `apply_play`, and `score_round`. The full multi-round game
-//! loop lands in Session 1.4.
+//! `legal_plays`, `apply_play`, and `score_round`.
+//!
+//! Session 1.4 wires the per-phase primitives into the full multi-round game
+//! loop (`game` module): `new_game`, `advance_round`, and `is_game_over`.
 
 pub mod bidding;
 pub mod card;
 pub mod dealing;
+pub mod game;
 pub mod hand;
 pub mod playing;
 pub mod round;
@@ -22,6 +25,7 @@ pub mod state;
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
 pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};
+pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
 pub use playing::{apply_play, legal_plays, score_round};
 pub use round::{

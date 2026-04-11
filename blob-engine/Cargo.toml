@@ -10,3 +10,6 @@ rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

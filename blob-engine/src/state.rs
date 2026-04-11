@@ -14,12 +14,18 @@ pub const MIN_PLAYERS: usize = 3;
 pub const MAX_PLAYERS: usize = 8;
 
 /// Game phase discriminant. `u8` repr so `BlobState` can hold it directly.
+///
+/// `Complete` is set by `advance_round` after the final round of a game has
+/// been scored. There's nothing left to do in the `Complete` state — `MCTS`
+/// and the encoder treat it as a terminal sink, and `is_game_over` is the
+/// canonical query.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GamePhase {
     Bidding = 0,
     Playing = 1,
     Scoring = 2,
+    Complete = 3,
 }
 
 impl GamePhase {
@@ -29,6 +35,7 @@ impl GamePhase {
             0 => Some(GamePhase::Bidding),
             1 => Some(GamePhase::Playing),
             2 => Some(GamePhase::Scoring),
+            3 => Some(GamePhase::Complete),
             _ => None,
         }
     }
@@ -75,6 +82,14 @@ pub struct BlobState {
     pub dealer: u8,
     pub num_players: u8,
     pub cards_dealt: u8,
+    /// Cards dealt in the very first round of this game. Combined with
+    /// `num_players`, this fully determines the round structure (see
+    /// `crate::round::round_structure`) and the total round count.
+    pub start_cards: u8,
+    /// 0-indexed round counter. Used to derive `cards_dealt` and `trump_suit`
+    /// for the current round, and to detect game-over (`round_idx + 1 ==
+    /// total_rounds(start_cards, num_players)` after the last round is scored).
+    pub round_idx: u8,
     /// Stored as `GamePhase as u8`.
     pub game_phase: u8,
 
@@ -107,6 +122,8 @@ impl BlobState {
             dealer: 0,
             num_players: 0,
             cards_dealt: 0,
+            start_cards: 0,
+            round_idx: 0,
             game_phase: GamePhase::Bidding as u8,
             trick_leader: 0,
             trick_play_order: [0; MAX_PLAYERS],
