@@ -55,7 +55,7 @@ Card index = `suit_index * 13 + rank_index`. Suits: ♠=0, ♥=1, ♣=2, ♦=3. 
 
 ## Porting Order
 
-1. Game engine (`blob.py` → Rust) — port all 135 tests from `legacy/game-engine/test_blob.py`
+1. Game engine (`blob.py` → Rust) — port all 143 tests from `legacy/game-engine/test_blob.py`. **Note**: the legacy `generate_round_structure` has an off-by-one (produces `2C + num_players − 1` rounds instead of the correct `2C + num_players − 2`). The Rust port uses the correct formula; any ported test asserting round counts or round-index→cards-dealt mappings must be adjusted. See `development-plan.md` Session 1.2 for details
 2. Entity encoder (`development-plan.md` Section 2) — replaces `legacy/neural-network/encode.py`
 3. Structured Entity Transformer (`development-plan.md` Section 3) — replaces `legacy/neural-network/model.py`
 4. MCTS with belief tracking and determinization (`development-plan.md` Section 4)
@@ -69,7 +69,7 @@ Card index = `suit_index * 13 + rank_index`. Suits: ♠=0, ♥=1, ♣=2, ♦=3. 
 ## Verification Gates
 
 Before considering a phase complete:
-- Game engine: all 135 ported tests pass; state copy benchmarks at ~50ns
+- Game engine: all 143 ported tests pass (adjusted for round-structure correction); `BlobState` copy benchmarks at ~100ns (~410 B across ~6 cache lines)
 - MCTS: with 5×100 sims, top action has >2× average visit count (non-uniform signal)
 - Training: policy loss drops below `ln(avg_legal_actions)` within 10 iterations; win rate vs random > 55% within 20 iterations
 - Performance: full iteration (self-play + training) completes in <60 seconds; 32-thread self-play >80% scaling efficiency

@@ -11,17 +11,21 @@ Set up the Rust workspace structure and implement the low-level card representat
 - `cargo init --name blobmaster` with workspace members: `blob-engine`, `blob-nn`, `blob-bin`
   - Start lean — 3 crates: engine (game + encoder + MCTS), nn (model + training), bin (CLI + eval). Split further only when boundaries stabilize
   - Additional crates (encoder, mcts, eval) can be extracted later without breaking APIs
+  - **Crate constraints**: `blob-engine` is cross-platform and must **never** depend on `tch` (libtorch) — only `ort` and pure-Rust crates. `tch` lives exclusively in `blob-nn` (training on Linux). This keeps the inference binary buildable on the Windows deployment target (Section 3.5)
 - Add shared dependencies in workspace `Cargo.toml`: `serde`, `rand`, `rand_xoshiro`, `smallvec`, `tracing`
-- Implement card encoding: `card_index = suit * 13 + rank` (Suits: ♠=0 ♥=1 ♣=2 ♦=3, Ranks: 2=0 through A=12)
+- Implement card encoding: `card_index = suit * 13 + rank` (Suits: ♠=0 ♥=1 ♣=2 ♦=3, Ranks: 2=0 through A=12). Hard cap on `cards_dealt`: **C ≤ 13**. This is never a binding constraint in training (distribution is C∈{7,8}, n∈{4,5,6,7}, max 8 tricks/round), but keeping the cap explicit lets all fixed-size arrays below use 13 as their upper bound
 - Implement `u64` bitmask operations: `hand.add(card)`, `hand.remove(card)`, `hand.contains(card)`, `hand.count()`, `hand.iter()`, `hand.cards_of_suit(suit)`
 - Use `u64` bit manipulation: bit N = card N present. `popcount` for count, `trailing_zeros` for iteration, mask `& (0x1FFF << (suit*13))` for suit extraction
-- Define `TrickRecord { cards: [(u8, u8); 8], num_played: u8, winner: u8, suit_led: u8 }` — stack-allocated, no heap
+- Define `GamePhase` enum (`#[repr(u8)]`): `Bidding = 0`, `Playing = 1`, `Scoring = 2`. `BlobState.game_phase` stores one of these. Section 2.3's context-token `game_phase one-hot(2)` one-hots over {Bidding, Playing} (Scoring states are never encoded for network input); Section 3.3's phase dispatch reads this field to pick which head to run
+- Define `TrickRecord { cards: [(u8, u8); 8], num_played: u8, winner: u8, suit_led: u8 }` — stack-allocated, no heap. **Tuple convention**: `cards[i] = (player, card)`, ordered by play sequence (index 0 = first player to act in the trick, i.e. the leader). `num_played` equals `num_players` for every completed record, kept for validation/invariant checks
 - Define `BlobState` struct (~410 bytes):
   - `hands: [u64; 8]`, `played_this_round: u64` (maintained incrementally — needed by encoder for `cards_above_remaining`, `is_highest_in_suit`)
-  - `bids: [u8; 8]`, `tricks_won: [u8; 8]`, `trump_suit: u8`, `current_player: u8`, `dealer: u8`, `num_players: u8`, `cards_dealt: u8`, `game_phase: u8`
+  - `bids: [u8; 8]`, `tricks_won: [u8; 8]`, `trump_suit: u8`, `current_player: u8`, `dealer: u8`, `num_players: u8`, `cards_dealt: u8`, `game_phase: u8` (`GamePhase` repr)
   - `trick_leader: u8`, `trick_play_order: [u8; 8]`, `trick_cards_played: u8`
-  - `trick_history: [TrickRecord; 13]`, `tricks_completed: u8`
+    - **`trick_play_order` stores card indices** (not players) in play order for the in-progress trick. Slot `i` holds the card played by player `(trick_leader + i) % num_players`. This keeps the field 8 bytes instead of 16 and avoids redundancy, since `trick_leader` is already in state. Player derivation is O(1) for the encoder (Section 2.2 iterates the current trick alongside `trick_history`)
+  - `trick_history: [TrickRecord; 13]`, `tricks_completed: u8` — 13 is the hard max given C ≤ 13 cap above; training distributions never exceed 8 tricks/round
   - `cumulative_scores: [u16; 8]` (multi-round tracking, needed by player state tokens)
+- **RNG ownership**: the shuffling/determinization RNG (`Xoshiro256PlusPlus`) is **not** a field of `BlobState` — it is passed in explicitly to `new_game`, `advance_round`, and any dealing helper. This preserves `BlobState: Copy` (required for zero-cost cloning in MCTS) and matches Section 5.3's per-thread seeding strategy for self-play determinism
 - Write unit tests for all bitmask ops; benchmark `BlobState` copy (target: ~100ns via `memcpy` of stack struct — 410 bytes across ~6 cache lines)
 
 ### Session 1.2 — Dealing, bidding phase, and trump rotation
@@ -29,12 +33,20 @@ Set up the Rust workspace structure and implement the low-level card representat
 Implement the game initialization, dealing logic, and the complete bidding phase.
 
 - Trump rotation: `[Spades, Hearts, Clubs, Diamonds, NoTrump]` cycling every 5 rounds — store as `u8` (0–4)
-- Round structure: symmetric pattern — descends from C to 1, stays at 1 for N rounds, ascends back to C. C is a game parameter (typically 7 or 8), constrained by `num_players × C ≤ 52`. Number of "stay at 1" rounds = `num_players`. Total rounds = `2C + num_players - 2`
+- Round structure: symmetric pattern — `[C, C−1, …, 2, 1, 1, …, 1, 2, …, C−1, C]`. Built from three segments:
+  - Descending: `C, C−1, …, 2` — `C − 1` rounds
+  - One-card plateau: `1` repeated `num_players` times — `num_players` rounds (this is the total count of 1-card rounds in the game)
+  - Ascending: `2, 3, …, C` — `C − 1` rounds
+  - **Total rounds** = `(C − 1) + num_players + (C − 1) = 2C + num_players − 2`
+  - Example (5 players, C=7): `[7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7]` — 17 rounds (5 one-card rounds in the plateau)
+  - Example (5 players, C=8): `[8,7,6,5,4,3,2,1,1,1,1,1,2,3,4,5,6,7,8]` — 19 rounds
+  - C is a game parameter (typically 7 or 8), constrained by `num_players × C ≤ 52` and by the engine's hard cap `C ≤ 13` (Session 1.1)
+  - ⚠ **Legacy discrepancy**: `legacy/game-engine/constants.py::generate_round_structure` produces `2C + num_players − 1` rounds — it concatenates `range(C, 0, -1)` (which already ends in 1) with `[1] * num_players`, yielding one extra 1-card round. The Rust port must use the formula above, which matches the game as actually played and the README example. Any legacy tests that assert round count or round-index-to-cards-dealt mappings need to be adjusted when ported (Session 1.4's gate)
 - Dealing: shuffle deck (Fisher-Yates with `rand_xoshiro::Xoshiro256PlusPlus` for speed), distribute `cards_dealt` cards per player as `u64` bitmasks
 - Bidding rules: each player bids 0..=cards_dealt. **Dealer restriction**: dealer's bid cannot make total bids equal cards_dealt (forces at least one player to miss). Validate this constraint
 - `fn legal_bids(state: &BlobState) -> u16` — bitmask over values 0..=13, with forbidden value cleared for dealer. Max 14 possible bids fits in u16. Avoids heap allocation (unlike Vec)
 - `fn apply_bid(state: &mut BlobState, bid: u8)` — set `bids[current_player]`, advance player, transition to playing phase when all have bid
-- Port relevant tests from Python's `test_blob.py` (bidding group: ~25 tests)
+- Port relevant tests from Python's `test_blob.py` (bidding group: ~25 tests out of 143 total)
 - Edge case: 1-card rounds where bid can only be 0 or 1, and dealer constraint may force bid=0
 
 ### Session 1.3 — Trick-taking, suit following, and scoring
@@ -48,7 +60,7 @@ Implement the playing phase with full trick-taking rules and the all-or-nothing 
 - When trick completes: increment `tricks_won[winner]`, set `trick_leader = winner`, `current_player = winner`, increment `tricks_completed`
 - When all tricks done (tricks_completed == cards_dealt): transition to scoring phase
 - Scoring: `score[i] = if tricks_won[i] == bids[i] { 10 + bids[i] } else { 0 }` — all-or-nothing
-- Port trick-taking tests (~60 tests from Python), including edge cases: void suits, trump overrides, NoTrump rounds
+- Port trick-taking tests (~60 tests from Python's 143 total), including edge cases: void suits, trump overrides, NoTrump rounds
 
 ### Session 1.4 — Full game loop, round sequencing, and property tests
 
@@ -60,8 +72,8 @@ Wire up the complete multi-round game and add comprehensive testing including pr
 - `fn is_game_over(state: &BlobState) -> bool` — true when last round scored
 - `fn total_rounds(num_players: u8, start_cards: u8) -> u8` — `2 * start_cards + num_players - 2`. E.g., 5P7C → `2*7+5-2 = 17`, 5P8C → `2*8+5-2 = 19`
 - Add `proptest` for property-based testing: random games always terminate, card conservation (52 cards never lost/duplicated), tricks_won always sums to cards_dealt, no player can play a card not in their hand
-- Port remaining ~50 tests from Python's `test_blob.py`
-- **Gate check**: all 135 ported tests pass, `BlobState` copy benchmarked, legal move gen benchmarked
+- Port remaining ~58 tests from Python's `test_blob.py` (143 total across all three sessions). Some tests will need adjustment: any test asserting round counts must use the corrected `2C + num_players − 2` formula, not the legacy Python value
+- **Gate check**: all ported tests from `test_blob.py` pass (143 total, adjusted for the round-structure correction), `BlobState` copy benchmarked, legal move gen benchmarked
 - `#[derive(Clone, Copy)]` on `BlobState` — ~410 bytes, copy is just memcpy
 
 ---
@@ -447,7 +459,7 @@ Profile end-to-end performance, fix bottlenecks, and verify all completion gates
 - **Memory profiling**: track peak RSS during 32-thread self-play. Verify no memory leaks over 100 iterations
 - **Numerical stability**: run 50 training iterations, verify no NaN/Inf in loss, gradients, or model outputs. Check value head stays in [-1, 1] range
 - **Gate checklist verification**:
-  - [ ] All 135 game engine tests pass
+  - [ ] All ported game engine tests pass (143 from `test_blob.py`, adjusted for the round-structure correction)
   - [ ] MCTS 5×100 → top1_visit_share > 2/num_legal_actions (non-uniform signal)
   - [ ] Policy loss < ln(7) ≈ 1.95 within 10 iterations
   - [ ] Win rate vs random > 55% within 20 iterations

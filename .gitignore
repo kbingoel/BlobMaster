@@ -22,7 +22,20 @@ build/
 .DS_Store
 Thumbs.db
 
+# Rust / Cargo
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
 # Model artifacts (large binary files - do not commit)
 *.pth
 *.pkl
 *.onnx
+*.safetensors

@@ -1,0 +1,13 @@
+[package]
+name = "blob-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blobmaster"
+path = "src/main.rs"
+
+[dependencies]
+blob-engine = { path = "../blob-engine" }
+tracing = { workspace = true }
