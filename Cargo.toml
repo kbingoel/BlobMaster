@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "blob-engine",
+    "blob-nn",
+    "blob-bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+rand_xoshiro = "0.6"
+smallvec = { version = "1", features = ["serde", "union"] }
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,10 @@
+[package]
+name = "blob-nn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blob-engine = { path = "../blob-engine" }
+serde = { workspace = true }
+tracing = { workspace = true }
