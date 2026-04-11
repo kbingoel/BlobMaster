@@ -80,16 +80,17 @@ Wire up the complete multi-round game and add comprehensive testing including pr
 
 ## Section 2: Entity Encoder (3 sessions, ~9h)
 
-### Session 2.1 — Shared embeddings and hand card tokens
+### Session 2.1 — Feature layout and hand card tokens
 
-Implement the shared embedding tables and the hand card token encoder.
+Establish the raw one-hot feature layout and implement the hand card token encoder.
 
-- Shared embedding tables (learned parameters, but for encoding we produce raw features — embeddings are in the neural network): rank one-hot (16-dim, 13 values + 3 padding), suit one-hot (8-dim, 4 values + 4 padding), player one-hot (16-dim, 8 values + 8 padding)
-- Decision: encoder produces **raw feature vectors** per token; the neural network's input projection layers convert to d_model=128. Encoder is pure Rust, no ML dependency
+- **Raw one-hot features, no learned embedding tables in the encoder**: rank is encoded as a 16-dim one-hot (13 values + 3 padding slots so the layout is uniform across token types), suit as 8-dim (4 + 4 padding), player as 16-dim (8 + 8 padding). The 1s sit at the appropriate index, every other slot is 0.0
+- Decision: encoder produces **raw feature vectors** per token; the neural network's per-token-type input projection (`Linear(30,128)` for hand cards, `Linear(48,128)` for played, etc., per Session 3.1) absorbs the rank/suit/player columns into its weight matrix. There is no shared embedding table — each token type has its own projection. Encoder is pure Rust, no ML dependency
 - Hand card token (30 dims): rank(16) + suit(8) + is_trump(1) + suit_count_in_hand(1) + is_highest_in_suit(1) + is_lowest_in_suit(1) + cards_above_remaining(1) + cards_below_remaining(1)
 - "Remaining" means not in own hand and not yet played — uses `played_this_round` bitmask from `BlobState`. `cards_above_remaining(card)` = popcount of cards in same suit with higher rank, not in hand, not in `played_this_round`
 - `is_highest_in_suit` / `is_lowest_in_suit`: among cards of that suit remaining in the game (hand + unplayed), is this card the extreme?
 - Output: `Vec<[f32; 30]>` with 1–13 entries (one per card in hand)
+- **Hand emit order is the canonical action order**: hand cards are emitted in ascending card-index order, i.e. exactly the order of `Hand::iter()` (which uses `trailing_zeros` over the `u64` bitmask). This is the same order the playing head's per-position scores will be interpreted in (Session 3.3), and the same order the MCTS-to-policy mapping uses (Session 5.2). Do not reorder by suit, rank, trumpness, or anything else
 - Test: construct known game states, verify feature values exactly match expected. Especially test derived features (highest/lowest, remaining counts) after several tricks played
 
 ### Session 2.2 — Played card tokens and player state tokens
@@ -100,26 +101,43 @@ Implement the chronologically-ordered played card tokens and per-player state to
 - Iterate `trick_history[0..tricks_completed]` plus current trick's `trick_play_order` — emit tokens in strict chronological order
 - `followed_suit`: card suit == trick's led suit. Critical signal: `followed_suit=0 && was_lead=0` reveals a **suit void** for that player
 - `won_trick`: only set for the card that won a completed trick (highest trump, or highest of led suit)
-- Chronological position index (0–47) stored alongside each token — the neural net adds a learned chronological embedding from a 52×128 table
+- Chronological position index (0–51) stored alongside each token — the neural net adds a learned chronological embedding from a 52×128 table (Session 3.1). The maximum is 51, hit only by the final play of a 4P×13C round (52 plays total); 5–7 player training distributions stay well under that
 - **Player state token** (29 dims): player(16) + bid(1) + tricks_won(1) + tricks_needed(1) + bid_status(1) + is_dealer(1) + is_me(1) + relative_position(1) + cumulative_score(1) + cards_in_hand(1) + void_spades(1) + void_hearts(1) + void_clubs(1) + void_diamonds(1)
 - `bid_status`: encode as -1 (busted, tricks_won > bid), 0 (live, tricks_won <= bid and tricks_remaining sufficient), +1 (met, tricks_won == bid)
 - `void_*` flags: precomputed from played card history — scan all played cards where `followed_suit=0 && was_lead=0`, mark that player as void in the led suit. **Single most informative signal** for belief tracking
 - `relative_position`: `(player_idx - current_player) % num_players`, normalized to [0,1]
 - `is_me`: 1.0 for the player whose perspective this encoding represents
-- `cumulative_score`: read from `BlobState.cumulative_scores`, normalized by max possible score
+- `cumulative_score`: read from `BlobState.cumulative_scores`, normalized as `score as f32 / (total_rounds(start_cards, num_players) as f32 * (10.0 + start_cards as f32))`. The denominator is the theoretical ceiling — every round perfectly bid at the maximum card count of that game — so the feature stays in `[0, 1]`. Pin this exact divisor so the value head and the player-state token agree on scale
 
 ### Session 2.3 — Context token, CLS, sequence assembly, and validation
 
 Build the context token, CLS token placeholder, assemble the full variable-length sequence, and validate with internal consistency tests.
 
 - **Context token** (13 dims): trump_suit one-hot(5, includes NoTrump) + cards_dealt(1, normalized) + current_trick(1, normalized) + tricks_remaining(1) + num_players(1, normalized) + round_number(1, normalized) + game_phase one-hot(2) + bidding_constraint_active(1)
+- `round_number` normalization: `state.round_idx as f32 / total_rounds(state.start_cards, state.num_players) as f32`. Uses `start_cards` from `BlobState` (added in Session 1.1) so the divisor is exact for whatever round structure this game was initialized with
 - `bidding_constraint_active`: 1.0 only during bidding phase when current player is dealer and constraint applies
+- **Game-phase one-hot covers only `{Bidding, Playing}`**: the encoder is never legitimately called from `Scoring` (engine auto-transitions through it inside `advance_round`) or `Complete` (terminal sink, MCTS doesn't search past it). The two-bit one-hot is `[is_bidding, is_playing]`. Open the encoder with `debug_assert!(matches!(state.phase(), GamePhase::Bidding | GamePhase::Playing))` so any caller that tries to encode a Scoring/Complete state fails loudly in dev builds
 - **CLS token**: no features from encoder — it's a learned 128-dim parameter in the neural network. Encoder emits a zero-vector or special marker
+- **Encoder signature**:
+  ```rust
+  fn encode(state: &BlobState, perspective: u8) -> EncodedState
+  ```
+  The `perspective` argument is the player whose viewpoint the encoding represents. It drives `is_me` (player-state token), `relative_position`, and the choice of which hand the hand-card tokens iterate. **MCTS always passes `state.current_player`** (Section 4.2 / 5.2) — the leaf evaluator encodes from the perspective of whoever is about to act. Other call sites (e.g. eval tooling) may pass a fixed seat
 - **Sequence assembly order**: `[CLS, context, player_states..., hand_cards..., played_cards...]`
-  - Total tokens: 1 + 1 + num_players + hand_size + cards_played = 14–56
+  - Total tokens: 1 + 1 + num_players + hand_size + cards_played, ranging roughly **6 to 58** end-to-end. Lower bound: 3P, 1-card round, no plays yet (`1+1+3+1+0 = 6`). Upper bound: 4P×13C late game, last play (`1+1+4+1+51 = 58`). Typical 5P7C early game ≈ 14, late game ≈ 49
   - Must also emit token type IDs (0–4) for each position, so the network knows which input projection to use
-- Output struct: `EncodedState { features: Vec<Vec<f32>>, token_types: Vec<u8>, chronological_indices: Vec<u8>, num_tokens: usize }`
-- **Internal consistency tests**: construct known game states by hand, verify each token type's features match expected values exactly. Test derived features (highest/lowest in suit, remaining counts, void flags) across various game phases — early trick, mid-game, and late-game states. No cross-validation against the Python legacy encoder, since the Rust encoder produces an entirely different representation (variable-length entity tokens vs. fixed 256-dim vector)
+- Output struct:
+  ```rust
+  EncodedState {
+      features: Vec<Vec<f32>>,
+      token_types: Vec<u8>,
+      chronological_indices: Vec<u8>,
+      hand_card_indices: SmallVec<[u8; 13]>,  // card indices in token-emit order; same order as Hand::iter()
+      num_tokens: usize,
+  }
+  ```
+  - `hand_card_indices` is the contract that lets MCTS map the playing head's per-position scores back to card indices without re-iterating the hand. Length equals the number of hand-card tokens; entry `i` is the card index emitted at hand-card token slot `i`. Must match `Hand::iter()` ordering exactly (Session 2.1)
+- **Internal consistency tests**: construct known game states by hand, verify each token type's features match expected values exactly. Test derived features (highest/lowest in suit, remaining counts, void flags) across various game phases — early trick, mid-game, and late-game states. Also verify `hand_card_indices` matches `state.hands[perspective]` enumerated via `Hand::iter()`, and that the encoder rejects `Scoring`/`Complete` states in debug. No cross-validation against the Python legacy encoder, since the Rust encoder produces an entirely different representation (variable-length entity tokens vs. fixed 256-dim vector)
 - Benchmark: encoding should be <1μs per state (mostly arithmetic on small arrays)
 
 ---
