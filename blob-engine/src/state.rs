@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::MAX_CARDS_DEALT;
 
+/// Minimum players supported by the engine.
+pub const MIN_PLAYERS: usize = 3;
 /// Hard cap on players supported by the engine.
 pub const MAX_PLAYERS: usize = 8;
 
