@@ -34,10 +34,10 @@ BlobState (stack, ~410 bytes)
 **BlobState** must be extended from the minimal struct in `prepare-migration.md §3.6` to include a `trick_history: [TrickRecord; 13]` field — the entity encoder requires the full ordered log of who played what card in which trick (see `development-plan.md` Session 2).
 
 **Entity encoder** transforms `BlobState` into five token types:
-- Hand cards (1–8), Played cards (0–48), Player states (3–8), Context (1), CLS (1)
-- Rank/suit embeddings are **shared** between hand and played card tokens
-- Player embeddings are **shared** between played cards and player state tokens
-- Played card tokens receive additional chronological embeddings (52×128 table)
+- Hand cards (1–13), Played cards (0–51), Player states (3–8), Context (1), CLS (1)
+- Rank, suit, and player are encoded as **raw one-hots inside per-token feature vectors**, not as learned embedding tables. Each token type has its own input projection (`Linear(30,128)` for hand, `Linear(48,128)` for played, `Linear(29,128)` for player state, `Linear(13,128)` for context — see `development-plan.md` Session 3.1), so the projection's weight matrix absorbs the rank/suit/player columns. There is no weight sharing between token types
+- Played card tokens additionally index a learned chronological embedding table (`nn::Embedding(52, 128)`), added on top of the input projection
+- The encoder takes a `perspective: u8` argument; MCTS always passes `state.current_player`
 
 **MCTS** uses determinization: sample N consistent opponent hand assignments, run full tree search on each, aggregate visit counts. Arena-allocate nodes as contiguous `Vec<MctsNode>`. Start at **5×100 sims/move minimum** — fewer produces uniform visit distributions and zero learning signal (the root cause of the Python failure).
 
