@@ -27,6 +27,13 @@ target/
 **/*.rs.bk
 *.pdb
 Cargo.lock.bak
+# rust-analyzer / IDE-generated Rust project metadata
+rust-project.json
+# Profiling / coverage artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
 
 # IDE
 .idea/
