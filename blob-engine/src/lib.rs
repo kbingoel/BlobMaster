@@ -24,6 +24,7 @@ pub mod encoder;
 pub mod evaluator;
 pub mod game;
 pub mod hand;
+pub mod mcts;
 pub mod onnx;
 pub mod playing;
 pub mod round;
@@ -36,6 +37,10 @@ pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};
 pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
+pub use mcts::{
+    select_best_child, select_leaf, ucb1_score, MctsArena, MctsNode, DEFAULT_ARENA_CAPACITY,
+    DEFAULT_C_PUCT,
+};
 pub use playing::{apply_play, legal_plays, score_round};
 pub use round::{
     cards_dealt_for_round, round_structure, total_rounds, trump_for_round, validate_round_params,
