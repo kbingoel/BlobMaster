@@ -28,6 +28,7 @@ pub mod hand;
 pub mod mcts;
 pub mod onnx;
 pub mod playing;
+pub mod replay;
 pub mod round;
 pub mod state;
 
@@ -45,6 +46,7 @@ pub use mcts::{
     MctsNode, MctsResult, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
 pub use playing::{apply_play, legal_plays, score_round};
+pub use replay::{BidBatch, PlayBatch, ReplayBuffer, SparsePolicy, MAX_BID_ACTIONS, MAX_PLAY_ACTIONS};
 pub use round::{
     cards_dealt_for_round, round_structure, total_rounds, trump_for_round, validate_round_params,
     RoundParamsError, NO_TRUMP, TRUMP_CYCLE_LEN,
