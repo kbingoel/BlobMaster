@@ -19,8 +19,10 @@
 //! - Playing: `action` = card index in `0..=51` (absolute — hand-card
 //!   positions shift after every play).
 
+use rand::Rng;
 use smallvec::SmallVec;
 
+use crate::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
 use crate::bidding::{apply_bid, legal_bids};
 use crate::encoder::encode;
 use crate::evaluator::{Evaluator, NUM_BIDS};
@@ -391,6 +393,283 @@ pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
         .collect()
 }
 
+/// Search-time configuration threaded through `mcts_search`.
+///
+/// Defaults match the plan's target budget (`5 × 100 = 500 sims`) with
+/// a hard floor of 60 total simulations for any non-forced decision.
+#[derive(Debug, Clone, Copy)]
+pub struct MctsConfig {
+    pub c_puct: f32,
+    /// Default determinizations per decision; `adaptive_budget` may
+    /// raise this to satisfy per-branching-factor floors.
+    pub num_determinizations: u32,
+    /// Default simulations per determinization; `adaptive_budget` may
+    /// raise this too.
+    pub sims_per_determinization: u32,
+    /// Hard absolute floor on `num_determinizations * sims_per_det`.
+    /// Python post-mortem showed that starving MCTS produces no
+    /// learning signal — this floor blocks that failure mode.
+    pub min_sims_floor: u32,
+    pub temperature: f32,
+    pub arena_capacity: usize,
+}
+
+impl Default for MctsConfig {
+    fn default() -> Self {
+        Self {
+            c_puct: DEFAULT_C_PUCT,
+            num_determinizations: 5,
+            sims_per_determinization: 100,
+            min_sims_floor: 60,
+            temperature: 1.0,
+            arena_capacity: DEFAULT_ARENA_CAPACITY,
+        }
+    }
+}
+
+/// Aggregated result of an `mcts_search` call.
+///
+/// `policy` is a dense vector indexed by the phase's canonical action
+/// space: bids 0..14 in `Bidding`, hand-card positions (per
+/// `EncodedState::hand_card_indices`) in `Playing`. `visit_entropy`,
+/// `top1_visit_share`, and `value_estimate` are diagnostic signals used
+/// by the training loop to calibrate the adaptive budget table.
+#[derive(Debug, Clone)]
+pub struct MctsResult {
+    pub policy: Vec<f32>,
+    pub visit_entropy: f32,
+    pub top1_visit_share: f32,
+    pub total_visits: u32,
+    pub value_estimate: f32,
+}
+
+/// Pick per-decision `(num_determinizations, sims_per_determinization)`.
+///
+/// Branching-factor floors come from the development plan:
+/// - `num_legal == 1`: `(1, 0)` — caller short-circuits, no search.
+/// - `num_legal ≤ 3`: at least `3 × 20` = 60 sims.
+/// - `num_legal ≤ 7`: at least `3 × 50` = 150 sims.
+/// - `num_legal > 7`: at least `5 × 80` = 400 sims.
+///
+/// The config's values are used as the *baseline* — floors raise them
+/// but never lower them. The absolute `min_sims_floor` is enforced on
+/// the product `dets × sims` as a safety net.
+pub fn adaptive_budget(num_legal: usize, cfg: &MctsConfig) -> (u32, u32) {
+    if num_legal <= 1 {
+        return (1, 0);
+    }
+    let (floor_dets, floor_sims) = if num_legal <= 3 {
+        (3u32, 20u32)
+    } else if num_legal <= 7 {
+        (3, 50)
+    } else {
+        (5, 80)
+    };
+    let dets = cfg.num_determinizations.max(floor_dets);
+    let mut sims = cfg.sims_per_determinization.max(floor_sims);
+
+    // Absolute floor on the product: if dets×sims < min_sims_floor,
+    // bump sims just enough. `dets` is already ≥ floor_dets, so this
+    // only grows from here.
+    let total = dets.saturating_mul(sims);
+    if total < cfg.min_sims_floor {
+        let needed = cfg.min_sims_floor.div_ceil(dets);
+        sims = sims.max(needed);
+    }
+    (dets, sims)
+}
+
+/// Shannon entropy of a probability vector (base e). Zero probabilities
+/// contribute zero (`0·ln 0 = 0` by convention).
+#[inline]
+fn entropy(p: &[f32]) -> f32 {
+    let mut h = 0.0f32;
+    for &v in p {
+        if v > 0.0 {
+            h -= v * v.ln();
+        }
+    }
+    h
+}
+
+/// Normalized signal quality: `1 - H(policy) / ln(num_legal)`. Zero when
+/// the policy is uniform over legal actions, one when the policy is a
+/// delta function. Development plan target: `> 0.3`.
+pub fn signal_ratio(result: &MctsResult, num_legal: usize) -> f32 {
+    if num_legal <= 1 {
+        return 1.0;
+    }
+    let h_max = (num_legal as f32).ln();
+    if h_max <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - result.visit_entropy / h_max).clamp(0.0, 1.0)
+}
+
+/// Turn an action label into its dense-policy index for the given phase.
+///
+/// - Bidding: bid value is its own index.
+/// - Playing: card index → hand-card-position via `hand_card_indices`.
+///   Returns `None` if the card is not in the perspective hand (should
+///   not happen for a legal child).
+fn action_to_policy_index(
+    phase: GamePhase,
+    action: u8,
+    hand_card_indices: &[u8],
+) -> Option<usize> {
+    match phase {
+        GamePhase::Bidding => Some(action as usize),
+        GamePhase::Playing => hand_card_indices.iter().position(|&c| c == action),
+        _ => None,
+    }
+}
+
+/// Full multi-determinization MCTS search with diagnostics.
+///
+/// Orchestrates Session 4.3: for each of `adaptive_budget`-selected
+/// determinizations, sample opponent hands consistent with void
+/// beliefs, run a fresh tree (Sessions 4.1 / 4.2), and aggregate root
+/// visit counts into a single dense policy. Temperature, entropy, and
+/// top-1 share come from the aggregate, not per-tree.
+pub fn mcts_search<E, R>(
+    state: &BlobState,
+    eval: &E,
+    cfg: &MctsConfig,
+    rng: &mut R,
+) -> MctsResult
+where
+    E: Evaluator,
+    R: Rng + ?Sized,
+{
+    let phase = state.phase();
+    if matches!(phase, GamePhase::Scoring | GamePhase::Complete) {
+        return MctsResult {
+            policy: Vec::new(),
+            visit_entropy: 0.0,
+            top1_visit_share: 0.0,
+            total_visits: 0,
+            value_estimate: 0.0,
+        };
+    }
+
+    let perspective = state.current_player;
+
+    // Canonical action space + forced-move detection.
+    let (policy_len, hand_card_indices, num_legal, forced_action) = match phase {
+        GamePhase::Bidding => {
+            let mask = legal_bids(state);
+            let n = mask.count_ones() as usize;
+            let forced = if n == 1 {
+                Some(mask.trailing_zeros() as u8)
+            } else {
+                None
+            };
+            (NUM_BIDS, SmallVec::<[u8; 13]>::new(), n, forced)
+        }
+        GamePhase::Playing => {
+            let enc = encode(state, perspective);
+            let legal = legal_plays(state);
+            let n = legal.count_ones() as usize;
+            let forced = if n == 1 {
+                Some(legal.trailing_zeros() as u8)
+            } else {
+                None
+            };
+            (enc.hand_card_indices.len(), enc.hand_card_indices, n, forced)
+        }
+        _ => unreachable!(),
+    };
+
+    // Forced move: skip MCTS entirely. Signal ratio is 1 by convention.
+    if num_legal == 1 {
+        let mut policy = vec![0.0f32; policy_len];
+        if let Some(action) = forced_action {
+            if let Some(idx) = action_to_policy_index(phase, action, &hand_card_indices) {
+                policy[idx] = 1.0;
+            }
+        }
+        return MctsResult {
+            policy,
+            visit_entropy: 0.0,
+            top1_visit_share: 1.0,
+            total_visits: 0,
+            value_estimate: 0.0,
+        };
+    }
+
+    let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
+    let voids = void_suits(state);
+
+    let mut agg_visits = vec![0u64; policy_len];
+    let mut total_visits: u32 = 0;
+    let mut value_sum = 0.0f32;
+    let mut value_n = 0u32;
+
+    for _ in 0..num_dets {
+        let det_state = determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+        let mut arena = MctsArena::with_capacity(perspective, cfg.arena_capacity);
+        run_search(&mut arena, &det_state, eval, sims_per, cfg.c_puct);
+
+        let root = arena.root();
+        for &c in root.children.iter() {
+            let child = arena.node(c);
+            if let Some(idx) = action_to_policy_index(phase, child.action, &hand_card_indices) {
+                agg_visits[idx] += child.visit_count as u64;
+                total_visits = total_visits.saturating_add(child.visit_count);
+            }
+        }
+        // Per-determinization root Q from the perspective seat. The
+        // root is always acted on by `perspective`, so that slot is
+        // the one UCB1 read during selection.
+        if root.value_counts[perspective as usize] > 0 {
+            value_sum += root.q(perspective);
+            value_n += 1;
+        }
+    }
+
+    // Temperature-applied policy over aggregated visits.
+    let mut policy = vec![0.0f32; policy_len];
+    let sum_visits: u64 = agg_visits.iter().sum();
+    if sum_visits > 0 {
+        if cfg.temperature < 1e-3 {
+            let (best_i, _) = agg_visits
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, v)| **v)
+                .unwrap();
+            policy[best_i] = 1.0;
+        } else {
+            let inv_tau = 1.0 / cfg.temperature;
+            let weights: Vec<f32> = agg_visits
+                .iter()
+                .map(|&v| (v as f32).powf(inv_tau))
+                .collect();
+            let z: f32 = weights.iter().sum();
+            if z > 0.0 {
+                for (i, w) in weights.iter().enumerate() {
+                    policy[i] = w / z;
+                }
+            }
+        }
+    }
+
+    let visit_entropy = entropy(&policy);
+    let top1_visit_share = policy.iter().cloned().fold(0.0f32, f32::max);
+    let value_estimate = if value_n > 0 {
+        value_sum / value_n as f32
+    } else {
+        0.0
+    };
+
+    MctsResult {
+        policy,
+        visit_entropy,
+        top1_visit_share,
+        total_visits,
+        value_estimate,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +954,134 @@ mod tests {
             let expected = n.visit_count as f32 / total_visits as f32;
             assert!((p - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn adaptive_budget_respects_branching_floors() {
+        let cfg = MctsConfig {
+            num_determinizations: 1,
+            sims_per_determinization: 1,
+            min_sims_floor: 60,
+            ..MctsConfig::default()
+        };
+        // Forced move → (1, 0).
+        assert_eq!(adaptive_budget(1, &cfg), (1, 0));
+        // Small branching → at least 3×20.
+        let (d, s) = adaptive_budget(2, &cfg);
+        assert!(d >= 3 && s >= 20 && d * s >= 60);
+        // Mid branching → at least 3×50.
+        let (d, s) = adaptive_budget(5, &cfg);
+        assert!(d >= 3 && s >= 50);
+        // Large branching → at least 5×80.
+        let (d, s) = adaptive_budget(10, &cfg);
+        assert!(d >= 5 && s >= 80);
+        // Config values take over when higher than floor.
+        let cfg2 = MctsConfig {
+            num_determinizations: 8,
+            sims_per_determinization: 200,
+            ..MctsConfig::default()
+        };
+        assert_eq!(adaptive_budget(10, &cfg2), (8, 200));
+    }
+
+    #[test]
+    fn mcts_search_forced_move_shortcut() {
+        // Build a state where only one bid is legal. Easiest: 0-card round
+        // not representable; instead craft a small synthetic bidding state
+        // where cards_dealt=0 forces bid=0 (mask = 0b1).
+        let mut s = BlobState::empty();
+        s.num_players = 3;
+        s.cards_dealt = 0;
+        s.dealer = 2;
+        s.current_player = 0;
+        s.game_phase = GamePhase::Bidding as u8;
+        // legal_bids returns bits 0..=0 with dealer forbidden check; since
+        // current_player != dealer, mask = 1.
+        assert_eq!(legal_bids(&s), 1);
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        let cfg = MctsConfig::default();
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        assert_eq!(r.policy.len(), NUM_BIDS);
+        assert!((r.policy[0] - 1.0).abs() < 1e-6);
+        assert_eq!(r.total_visits, 0);
+        assert!((r.top1_visit_share - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mcts_search_bidding_produces_normalized_policy() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(101);
+        let mut s = new_game(4, 5).unwrap();
+        crate::dealing::deal(&mut s, &mut rng);
+        assert_eq!(s.phase(), GamePhase::Bidding);
+        let num_legal = legal_bids(&s).count_ones() as usize;
+
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 40,
+            min_sims_floor: 60,
+            ..MctsConfig::default()
+        };
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        assert_eq!(r.policy.len(), NUM_BIDS);
+        let sum: f32 = r.policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
+
+        // Every legal bid has nonzero probability, illegal bids are zero.
+        let mask = legal_bids(&s);
+        let mut legal_nonzero = 0usize;
+        for b in 0..NUM_BIDS {
+            if (mask >> b) & 1 == 1 {
+                assert!(r.policy[b] > 0.0, "legal bid {b} has zero policy");
+                legal_nonzero += 1;
+            } else {
+                assert_eq!(r.policy[b], 0.0, "illegal bid {b} has nonzero policy");
+            }
+        }
+        assert_eq!(legal_nonzero, num_legal);
+        assert!(r.total_visits > 0);
+    }
+
+    #[test]
+    fn mcts_search_playing_indexes_policy_by_hand_position() {
+        let s = playing_state(77);
+        let perspective = s.current_player;
+        let enc = encode(&s, perspective);
+        let legal = legal_plays(&s);
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(77);
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 30,
+            min_sims_floor: 60,
+            ..MctsConfig::default()
+        };
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        assert_eq!(r.policy.len(), enc.hand_card_indices.len());
+        let sum: f32 = r.policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
+
+        for (pos, &ci) in enc.hand_card_indices.iter().enumerate() {
+            let legal_card = (legal >> ci) & 1 == 1;
+            if legal_card {
+                assert!(r.policy[pos] > 0.0, "legal pos {pos} has zero policy");
+            } else {
+                assert_eq!(r.policy[pos], 0.0, "illegal pos {pos} has nonzero policy");
+            }
+        }
+    }
+
+    #[test]
+    fn signal_ratio_zero_for_uniform_policy() {
+        let r = MctsResult {
+            policy: vec![0.25, 0.25, 0.25, 0.25],
+            visit_entropy: (4f32).ln(),
+            top1_visit_share: 0.25,
+            total_visits: 40,
+            value_estimate: 0.0,
+        };
+        let sr = signal_ratio(&r, 4);
+        assert!(sr.abs() < 1e-6, "sr={sr}");
     }
 
     #[test]
