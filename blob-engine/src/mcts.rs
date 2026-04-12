@@ -10,8 +10,8 @@
 //! tracks `value_sums[seat]` and `value_counts[seat]` and UCB1 reads the
 //! **acting** player's slot.
 //!
-//! Session 4.2 adds expansion/evaluation/backprop and the search loop;
-//! this module only covers the structures and selection.
+//! Session 4.2 adds expansion, evaluation, backpropagation, and the
+//! full search loop on top of the selection primitives above.
 //!
 //! Action encoding on each child is phase-stable (not re-indexed across
 //! depth):
@@ -21,7 +21,11 @@
 
 use smallvec::SmallVec;
 
-use crate::state::MAX_PLAYERS;
+use crate::bidding::{apply_bid, legal_bids};
+use crate::encoder::encode;
+use crate::evaluator::{Evaluator, NUM_BIDS};
+use crate::playing::{apply_play, legal_plays};
+use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
 /// Default `c_puct` exploration constant. Tuned later in Section 6.
 pub const DEFAULT_C_PUCT: f32 = 1.5;
@@ -199,9 +203,202 @@ where
     }
 }
 
+/// Apply a phase-stable `action` label to `state`, dispatching to
+/// `apply_bid` or `apply_play` based on the current phase. No-op in
+/// terminal phases (`Scoring`, `Complete`) — expansion never produces
+/// children from those phases.
+#[inline]
+pub fn apply_action(state: &mut BlobState, action: u8) {
+    match state.phase() {
+        GamePhase::Bidding => apply_bid(state, action),
+        GamePhase::Playing => apply_play(state, action),
+        GamePhase::Scoring | GamePhase::Complete => {}
+    }
+}
+
+/// True for phases where no more decisions exist in this round.
+#[inline]
+pub fn is_terminal(state: &BlobState) -> bool {
+    matches!(state.phase(), GamePhase::Scoring | GamePhase::Complete)
+}
+
+/// Expand `node_idx` by creating one child per legal action.
+///
+/// `policy` is the evaluator output for `state` (bidding: length
+/// `NUM_BIDS` over bid values; playing: length `hand_card_indices.len()`
+/// over hand positions — see [`crate::evaluator`]).
+///
+/// Children are labelled with phase-stable actions:
+/// - Bidding: `action = bid`, `prior = policy[bid]`.
+/// - Playing: `action = card_idx`, `prior = policy[pos]` where `pos` is
+///   the card's position in `hand_card_indices`.
+///
+/// No-op if the node is already expanded or the state is terminal.
+pub fn expand(arena: &mut MctsArena, node_idx: u32, state: &BlobState, policy: &[f32]) {
+    if arena.node(node_idx).is_expanded() || is_terminal(state) {
+        return;
+    }
+    match state.phase() {
+        GamePhase::Bidding => {
+            let mask = legal_bids(state);
+            let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
+            for b in 0..NUM_BIDS as u8 {
+                if (mask >> b) & 1 == 1 {
+                    let prior = policy.get(b as usize).copied().unwrap_or(0.0);
+                    new_children.push(arena.alloc(prior, b));
+                }
+            }
+            arena.node_mut(node_idx).children = new_children;
+        }
+        GamePhase::Playing => {
+            let enc = encode(state, state.current_player);
+            let legal = legal_plays(state);
+            let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
+            for (pos, &card_idx) in enc.hand_card_indices.iter().enumerate() {
+                if (legal >> card_idx) & 1 == 1 {
+                    let prior = policy.get(pos).copied().unwrap_or(0.0);
+                    new_children.push(arena.alloc(prior, card_idx));
+                }
+            }
+            arena.node_mut(node_idx).children = new_children;
+        }
+        GamePhase::Scoring | GamePhase::Complete => {}
+    }
+}
+
+/// Backpropagate a leaf value `v` evaluated from seat `leaf_seat`'s
+/// perspective along every node in `path` (root → leaf inclusive).
+///
+/// - `visit_count += 1` at every node (used by UCB1's exploration term).
+/// - `value_sums[leaf_seat] += v`, `value_counts[leaf_seat] += 1` only in
+///   that seat's slot. UCB1's `Q` averages per-seat, so other seats stay
+///   undiluted. See module docs.
+pub fn backprop(arena: &mut MctsArena, path: &[u32], leaf_seat: u8, v: f32) {
+    for &idx in path {
+        let node = arena.node_mut(idx);
+        node.visit_count += 1;
+        node.value_sums[leaf_seat as usize] += v;
+        node.value_counts[leaf_seat as usize] += 1;
+    }
+}
+
+/// Run `num_simulations` MCTS iterations against `root_state`.
+///
+/// Each iteration: walk from the root picking UCB1-best children (using
+/// the acting seat stored in a replayed `BlobState`), evaluate the leaf
+/// with `eval`, expand it, and backpropagate the value. Terminal leaves
+/// skip expansion and backprop the evaluator's value as-is.
+///
+/// The initial root expansion is performed inside the first simulation
+/// (path is just `[0]` when the tree is empty).
+pub fn run_search<E: Evaluator>(
+    arena: &mut MctsArena,
+    root_state: &BlobState,
+    eval: &E,
+    num_simulations: u32,
+    c_puct: f32,
+) {
+    for _ in 0..num_simulations {
+        let mut state = *root_state;
+        let mut path: Vec<u32> = Vec::with_capacity(16);
+        let mut idx: u32 = 0;
+        path.push(idx);
+
+        // Walk from root, descending while expanded. The acting seat at
+        // each step is `state.current_player` (the seat that will act
+        // *from* this node), which UCB1 needs to read its Q slot from.
+        while arena.node(idx).is_expanded() && !is_terminal(&state) {
+            let acting = state.current_player;
+            let child_idx = select_best_child(arena, idx, acting, c_puct);
+            let action = arena.node(child_idx).action;
+            apply_action(&mut state, action);
+            idx = child_idx;
+            path.push(idx);
+        }
+
+        // Evaluate the leaf (terminal phases short-circuit to v = 0).
+        let (policy, value) = if is_terminal(&state) {
+            (Vec::new(), 0.0)
+        } else {
+            eval.evaluate(&state)
+        };
+        let leaf_seat = state.current_player;
+
+        if !is_terminal(&state) {
+            expand(arena, idx, &state, &policy);
+        }
+        backprop(arena, &path, leaf_seat, value);
+    }
+}
+
+/// Action probabilities over the root's children, sharpened/flattened by
+/// temperature `tau`. Returns `(action, probability)` pairs in the order
+/// children were allocated (phase-stable action labels).
+///
+/// - `tau == 1.0`: directly proportional to visit counts.
+/// - `tau → 0`: approaches argmax on visit count (deterministic); the
+///   implementation treats `tau < 1e-3` as argmax to avoid `f32::powf`
+///   overflow.
+/// - `tau > 1.0`: flatter distribution (more exploration).
+///
+/// Returns an empty vec if the root is unexpanded.
+pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
+    let root = arena.root();
+    if root.children.is_empty() {
+        return Vec::new();
+    }
+
+    let visits: Vec<(u8, u32)> = root
+        .children
+        .iter()
+        .map(|&c| {
+            let n = arena.node(c);
+            (n.action, n.visit_count)
+        })
+        .collect();
+
+    // Argmax regime: any near-zero tau, or all-zero visits (nothing to
+    // distribute proportionally without NaNs).
+    let total_visits: u32 = visits.iter().map(|(_, n)| *n).sum();
+    if tau < 1e-3 || total_visits == 0 {
+        let mut out: Vec<(u8, f32)> = visits.iter().map(|(a, _)| (*a, 0.0)).collect();
+        // Pick the first child with the max visit count. Ties break on
+        // allocation order, matching `select_best_child`.
+        let (mut best_i, mut best_n) = (0usize, 0u32);
+        for (i, (_, n)) in visits.iter().enumerate() {
+            if *n > best_n {
+                best_n = *n;
+                best_i = i;
+            }
+        }
+        out[best_i].1 = 1.0;
+        return out;
+    }
+
+    let inv_tau = 1.0 / tau;
+    let weights: Vec<f32> = visits
+        .iter()
+        .map(|(_, n)| (*n as f32).powf(inv_tau))
+        .collect();
+    let z: f32 = weights.iter().sum();
+    if z == 0.0 {
+        return visits.iter().map(|(a, _)| (*a, 0.0)).collect();
+    }
+    visits
+        .iter()
+        .zip(weights.iter())
+        .map(|((a, _), w)| (*a, w / z))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bidding::{apply_bid as bid_apply, legal_bids as bid_legal};
+    use crate::dealing::deal;
+    use crate::evaluator::DummyEvaluator;
+    use crate::game::new_game;
+    use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
 
     #[test]
     fn arena_root_is_node_zero() {
@@ -323,5 +520,174 @@ mod tests {
         let (leaf, path) = select_leaf(&arena, DEFAULT_C_PUCT, |_| 0);
         assert_eq!(leaf, a1);
         assert_eq!(path, vec![0, a, a1]);
+    }
+
+    fn playing_state(seed: u64) -> BlobState {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        let mut s = new_game(4, 5).unwrap();
+        deal(&mut s, &mut rng);
+        while s.game_phase == GamePhase::Bidding as u8 {
+            let mask = bid_legal(&s);
+            let b = mask.trailing_zeros() as u8;
+            bid_apply(&mut s, b);
+        }
+        s
+    }
+
+    #[test]
+    fn expand_bidding_creates_one_child_per_legal_bid() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+        let mut s = new_game(4, 5).unwrap();
+        deal(&mut s, &mut rng);
+        assert_eq!(s.phase(), GamePhase::Bidding);
+
+        let mut arena = MctsArena::new(s.current_player);
+        let (policy, _) = DummyEvaluator.evaluate(&s);
+        expand(&mut arena, 0, &s, &policy);
+
+        let mask = legal_bids(&s);
+        let expected: Vec<u8> = (0..NUM_BIDS as u8).filter(|b| (mask >> b) & 1 == 1).collect();
+        let actions: Vec<u8> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).action)
+            .collect();
+        assert_eq!(actions, expected);
+        // Priors match the dummy's uniform-over-legal policy.
+        for &c in arena.root().children.iter() {
+            let child = arena.node(c);
+            assert!((child.prior - policy[child.action as usize]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn expand_playing_uses_card_index_actions() {
+        let s = playing_state(11);
+        let mut arena = MctsArena::new(s.current_player);
+        let (policy, _) = DummyEvaluator.evaluate(&s);
+        expand(&mut arena, 0, &s, &policy);
+
+        let enc = encode(&s, s.current_player);
+        let legal = legal_plays(&s);
+        let expected_card_indices: Vec<u8> = enc
+            .hand_card_indices
+            .iter()
+            .filter(|&&ci| (legal >> ci) & 1 == 1)
+            .copied()
+            .collect();
+        let got: Vec<u8> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).action)
+            .collect();
+        assert_eq!(got, expected_card_indices);
+    }
+
+    #[test]
+    fn expand_is_noop_when_already_expanded_or_terminal() {
+        let s = playing_state(3);
+        let mut arena = MctsArena::new(s.current_player);
+        let (policy, _) = DummyEvaluator.evaluate(&s);
+        expand(&mut arena, 0, &s, &policy);
+        let n = arena.nodes.len();
+        expand(&mut arena, 0, &s, &policy);
+        assert_eq!(arena.nodes.len(), n);
+
+        // Terminal state: forge a Scoring phase.
+        let mut term = s;
+        term.game_phase = GamePhase::Scoring as u8;
+        let mut a2 = MctsArena::new(0);
+        expand(&mut a2, 0, &term, &[]);
+        assert!(!a2.root().is_expanded());
+    }
+
+    #[test]
+    fn backprop_updates_path_and_only_leaf_seat_slot() {
+        let mut arena = MctsArena::new(0);
+        let c1 = arena.alloc(0.5, 1);
+        let c2 = arena.alloc(0.5, 2);
+        arena.node_mut(0).children.extend_from_slice(&[c1, c2]);
+
+        backprop(&mut arena, &[0, c1], 3, 0.75);
+        assert_eq!(arena.node(0).visit_count, 1);
+        assert_eq!(arena.node(c1).visit_count, 1);
+        assert_eq!(arena.node(c2).visit_count, 0);
+        assert!((arena.node(0).value_sums[3] - 0.75).abs() < 1e-6);
+        assert_eq!(arena.node(0).value_counts[3], 1);
+        for seat in 0..MAX_PLAYERS {
+            if seat != 3 {
+                assert_eq!(arena.node(0).value_counts[seat], 0);
+                assert_eq!(arena.node(0).value_sums[seat], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn run_search_visits_all_legal_actions_and_sums_correctly() {
+        let s = playing_state(42);
+        let mut arena = MctsArena::new(s.current_player);
+        let sims = 100u32;
+        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+
+        // Every legal child of root should be visited at least once.
+        for &c in arena.root().children.iter() {
+            assert!(
+                arena.node(c).visit_count > 0,
+                "child action {} unvisited",
+                arena.node(c).action
+            );
+        }
+
+        // Root visit count equals number of simulations.
+        assert_eq!(arena.root().visit_count, sims);
+        let sum_child_visits: u32 = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).visit_count)
+            .sum();
+        // One visit lands on the root itself on the first sim (pre-expansion),
+        // the remaining `sims - 1` descend into exactly one root child.
+        assert_eq!(sum_child_visits, sims - 1);
+    }
+
+    #[test]
+    fn root_action_probs_match_visits_at_tau_one() {
+        let s = playing_state(5);
+        let mut arena = MctsArena::new(s.current_player);
+        run_search(&mut arena, &s, &DummyEvaluator, 80, DEFAULT_C_PUCT);
+
+        let probs = root_action_probs(&arena, 1.0);
+        let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
+
+        let total_visits: u32 = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).visit_count)
+            .sum();
+        for (&c, (a, p)) in arena.root().children.iter().zip(probs.iter()) {
+            let n = arena.node(c);
+            assert_eq!(n.action, *a);
+            let expected = n.visit_count as f32 / total_visits as f32;
+            assert!((p - expected).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn root_action_probs_argmax_at_tau_zero() {
+        let s = playing_state(9);
+        let mut arena = MctsArena::new(s.current_player);
+        run_search(&mut arena, &s, &DummyEvaluator, 60, DEFAULT_C_PUCT);
+
+        let probs = root_action_probs(&arena, 0.0);
+        let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        // Exactly one non-zero entry at 1.0.
+        let ones = probs.iter().filter(|(_, p)| *p == 1.0).count();
+        assert_eq!(ones, 1);
     }
 }
