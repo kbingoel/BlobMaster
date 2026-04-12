@@ -62,6 +62,7 @@ dependencies = [
  "blob-engine",
  "rand_xoshiro",
  "serde",
+ "smallvec",
  "tracing",
 ]
 
