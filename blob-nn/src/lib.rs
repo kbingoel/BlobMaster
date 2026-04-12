@@ -13,3 +13,4 @@ pub use blob_engine::encoder;
 
 pub mod input;
 pub mod transformer;
+pub mod heads;
