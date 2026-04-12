@@ -101,6 +101,7 @@ name = "blob-nn"
 version = "0.1.0"
 dependencies = [
  "blob-engine",
+ "rand 0.8.5",
  "rand_xoshiro",
  "serde",
  "smallvec",
