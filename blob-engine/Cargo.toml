@@ -10,6 +10,8 @@ rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
+ndarray = "0.17"
 
 [dev-dependencies]
 proptest = { workspace = true }
