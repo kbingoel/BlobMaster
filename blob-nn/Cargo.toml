@@ -8,3 +8,6 @@ license.workspace = true
 blob-engine = { path = "../blob-engine" }
 serde = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rand_xoshiro = { workspace = true }
