@@ -352,6 +352,8 @@ Implement imperfect information handling via determinization, and add signal qua
 
 Implement the replay buffer storing raw game states with circular FIFO semantics.
 
+- **Crate placement**: `ReplayBuffer` lives in `blob-engine/src/replay.rs`. It is pure data (no ML dep) and needs to be usable from both `blob-nn` (training) and self-play workers, so placing it in `blob-engine` avoids a circular dep and keeps the inference crate boundary intact
+- **New dependency**: add `bincode = "1"` to `blob-engine`'s `Cargo.toml` for buffer serialization. `BlobState` already derives `Serialize`/`Deserialize`, and `SmallVec` has `serde` enabled in the workspace dep
 - **Design rationale**: store `BlobState` (~410 bytes) + policy + value + phase. Re-encode to entity tokens on the fly during training. 500K × 410B = ~205MB for states. Encoding is <1μs so batch of 512 = <0.5ms overhead. This means encoding changes never invalidate the buffer
 - **Final design**:
   ```
@@ -398,6 +400,8 @@ Implement the self-play engine that generates training examples from complete ga
 
 Parallelize self-play across threads and build the orchestrating self-play engine.
 
+- **Crate placement**: the self-play engine and training loop live in `blob-nn` (alongside the `tch` training code), not in `blob-engine`. `blob-engine` stays inference-only so the deployment binary isn't pulled into training dependencies. Self-play consumes `blob_engine::{mcts_search, OnnxEvaluator, ReplayBuffer}` and owns the `rayon`/`indicatif` deps
+- **New dependencies**: add to `blob-nn`'s `Cargo.toml`: `rayon = "1"` (thread pool + parallel iterators) and `indicatif = "0.17"` (progress bars). Keep both out of `blob-engine` — the inference binary (`blob-bin`) must not depend on them
 - **Thread pool**: `rayon::ThreadPoolBuilder::new().num_threads(32).build()` — one pool for all self-play
 - Each thread runs independent full games with its own RNG (seeded from thread index + iteration for reproducibility)
 - **Model sharing for self-play inference**: use per-thread `ort::Session` instances loaded from the ONNX export (Section 3.5). ONNX Runtime at ~0.15ms/eval is ~3× faster than `tch` CPU inference (~0.5ms), and this difference is critical for self-play throughput — 40M evaluations per iteration means ONNX saves ~4 CPU-hours vs `tch`
