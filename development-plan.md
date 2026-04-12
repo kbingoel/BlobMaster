@@ -257,9 +257,13 @@ Implement the MCTS node structure with arena allocation and the selection phase.
 
 - Arena allocation for cache-friendly traversal:
   ```
-  MctsNode { visit_count: u32, value_sums: [f32; 8], value_counts: [u32; 8], prior: f32, action: u8, children: SmallVec<[u32; 8]> }
+  MctsNode { visit_count: u32, value_sums: [f32; 8], value_counts: [u32; 8], prior: f32, action: u8, children: SmallVec<[u32; 14]> }
   MctsArena { nodes: Vec<MctsNode>, root_player: u8 }
   ```
+  - **Action encoding** (`action: u8`): phase-dependent but always stable (no re-indexing across tree depth).
+    - Bidding children: `action` = bid value 0..=13. Applied via `apply_bid(state, action)`.
+    - Playing children: `action` = card index 0..=51. Applied via `apply_play(state, action)`. Card index is preferred over hand-card-position because positions are relative to the current encoding and shift after every play, whereas card indices are absolute. During expansion the policy (returned by `Evaluator` indexed by hand-card-position, per [evaluator.rs](blob-engine/src/evaluator.rs)) is translated to priors via `enc.hand_card_indices`: iterate `(pos, card_idx)` and push child `{ action: card_idx, prior: policy[pos] }`.
+  - `SmallVec` inline capacity is 14 to cover the worst case (14 bids; up to 13 plays) without spilling to the heap.
   - **Per-player value storage**: each node stores value estimates and visit counts for all player seats, not a single scalar. This correctly models multiplayer dynamics — players who have "blobbed" (busted their bid) become spoilers with different objectives, and multiple players can score in the same round. A two-player zero-sum sign-flip would be wrong here
   - **Why per-player visit counts**: the neural network evaluates leaves from the current player's perspective. In a 5-player game, only ~1/5 of leaf evaluations produce a value for any given player. Using a global `visit_count` as denominator would dilute Q-values non-uniformly across children (depending on which player-turns their subtrees lead to), biasing UCB1 selection. Per-player `value_counts` ensures correct averaging
   - Node index 0 = root. Children stored as indices into `nodes` vec
@@ -297,16 +301,28 @@ Implement the remaining MCTS phases and the full simulation loop.
 Implement imperfect information handling via determinization, and add signal quality instrumentation.
 
 - **Belief tracking**: for each opponent, track which suits they **cannot** have (void suits). Detected when: opponent doesn't follow led suit (played different suit when not leading)
-  - Scan `trick_history`: for each play where `followed_suit == false && was_lead == false`, mark that player as void in the led suit
+  - `TrickRecord` does not carry `followed_suit`/`was_lead` flags; derive from the existing fields. For each completed trick in `trick_history[0..tricks_completed]`, for slot `i` in `1..num_played` (slot 0 is the lead and cannot reveal a void): let `(player, card) = cards[i]`; if `card / NUM_RANKS != suit_led`, set `void_suits[player][suit_led] = true`
   - Store as `void_suits: [[bool; 4]; 8]` — compact, O(1) lookup
 - **Determinization sampling**: given current player's known hand and belief constraints, sample consistent opponent hands
-  1. Collect all unseen cards: 52 - (my hand) - (all played cards via `played_this_round`)
-  2. For each opponent, determine how many cards they hold: `cards_dealt - tricks_completed` (minus cards played this trick)
+  1. Collect all unseen cards: 52 − (my hand) − (`played_this_round`). `played_this_round` already captures both completed-trick cards and the in-progress trick's cards, so no separate bookkeeping is needed
+  2. For each opponent, determine how many cards they hold: start with `cards_dealt - state.tricks_completed`, then subtract 1 if that opponent has already contributed to the in-progress trick (scan `trick_play_order[0..trick_cards_played]`, mapping slot `j` → player `(trick_leader + j) % num_players`)
   3. Shuffle unseen cards, deal to opponents respecting void constraints
   4. **Rejection sampling**: if a dealt hand violates a void constraint (contains a card of a voided suit), resample. Use early termination if constraints are unsatisfiable after N attempts (fall back to unconstrained)
   - Optimization: sort opponents by most constrained first, deal to them first to reduce rejection rate
 - **Aggregated search**: for each of N determinizations, create a determinized `BlobState`, run full MCTS, collect root visit counts. Final policy = sum of visit counts across all determinizations, normalized
 - `fn mcts_search(state: &BlobState, evaluator: &dyn Evaluator, config: &MctsConfig) -> MctsResult`
+- **MctsConfig** — defined in 4.3 and threaded through 4.1 / 4.2 signatures:
+  ```
+  MctsConfig {
+      c_puct: f32,                // 1.5
+      num_determinizations: u32,  // 5 default
+      sims_per_determinization: u32, // 100 default
+      min_sims_floor: u32,        // 60
+      temperature: f32,           // 1.0 early, →0 late
+      arena_capacity: usize,      // 10_000
+  }
+  ```
+  The adaptive budget table from this session consumes `num_legal_actions` and `MctsConfig` to produce the per-decision `(num_determinizations, sims_per_determinization)` pair.
 - **MctsResult struct** — return diagnostics alongside the policy:
   ```
   MctsResult {
