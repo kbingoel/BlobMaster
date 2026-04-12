@@ -10,3 +10,5 @@
 //! Re-exported here for backwards compatibility during the transition.
 
 pub use blob_engine::encoder;
+
+pub mod input;

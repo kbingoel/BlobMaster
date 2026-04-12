@@ -148,7 +148,7 @@ Build the context token, CLS token placeholder, assemble the full variable-lengt
 
 Set up the libtorch Rust bindings and implement the per-token-type input projections.
 
-- Add `tch = "0.24"` (latest as of 2026-04) to `blob-nn/Cargo.toml`. Requires libtorch installed — document setup for Linux (training only). The `tch` crate does not cut GitHub releases; pin to the latest crates.io version at session start
+- **Dependency pinning** (decided in Session 3.1): `tch = { version = "0.20", features = ["download-libtorch"] }` in `blob-nn/Cargo.toml`. The `download-libtorch` feature makes `torch-sys`'s build script fetch a pinned libtorch 2.7.0 CPU build into `target/` on first compile — no system libtorch install, no Python venv dependency, no `LIBTORCH_*` env vars. `Cargo.lock` locks the exact tch/torch-sys versions. **Do not bump tch without cause**: newer versions (0.24 + libtorch 2.11 as of 2026-04) bring FlashAttention, FP8, distributed training — none of which this 1.63M-param CPU-trained model uses. The ops we need (Linear, Embedding, LayerNorm, MHA, AdamW, cross-entropy, MSE, ONNX export via Python bridge in Session 3.5) have been stable since PyTorch 1.x. Revisit only if Section 3.4 hits a concrete blocker or we switch to a CUDA build for training
 - Alternatively evaluate `candle` (Hugging Face pure-Rust ML) vs `tch` (libtorch bindings):
   - `tch`: mature, full PyTorch parity, GPU support, but external C++ dependency
   - `candle`: pure Rust, simpler build, but less mature optimizer/training support

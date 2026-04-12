@@ -8,6 +8,7 @@ license.workspace = true
 blob-engine = { path = "../blob-engine" }
 serde = { workspace = true }
 smallvec = { workspace = true }
+tch = { version = "0.20", features = ["download-libtorch"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
