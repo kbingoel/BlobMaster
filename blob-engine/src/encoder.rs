@@ -14,11 +14,11 @@
 //! token sequence `[CLS, context, player_states…, hand_cards…, played_cards…]`,
 //! token type IDs, chronological indices, and hand-card index mapping.
 
-use blob_engine::bidding::forbidden_bid;
-use blob_engine::card::{Card, NUM_SUITS};
-use blob_engine::hand::Hand;
-use blob_engine::round::total_rounds;
-use blob_engine::state::{BlobState, GamePhase, MAX_PLAYERS};
+use crate::bidding::forbidden_bid;
+use crate::card::{Card, NUM_SUITS};
+use crate::hand::Hand;
+use crate::round::total_rounds;
+use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 use smallvec::SmallVec;
 
 /// Dimensionality of a hand-card token.
@@ -518,9 +518,9 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blob_engine::card::{Card, Suit};
-    use blob_engine::round::NO_TRUMP;
-    use blob_engine::state::{GamePhase, TrickRecord};
+    use crate::card::{Card, Suit};
+    use crate::round::NO_TRUMP;
+    use crate::state::{GamePhase, TrickRecord};
 
     /// Helper: make a Card from suit and rank.
     fn c(suit: Suit, rank: u8) -> Card {
@@ -1016,10 +1016,10 @@ mod tests {
 
     #[test]
     fn encode_after_real_game_play() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -1505,10 +1505,10 @@ mod tests {
 
     #[test]
     fn played_cards_integration_with_real_game() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -1571,10 +1571,10 @@ mod tests {
 
     #[test]
     fn player_states_integration_with_real_game() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -2060,10 +2060,10 @@ mod tests {
 
     #[test]
     fn encode_integration_early_game() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -2122,10 +2122,10 @@ mod tests {
 
     #[test]
     fn encode_integration_mid_game() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -2177,10 +2177,10 @@ mod tests {
 
     #[test]
     fn encode_integration_late_game() {
-        use blob_engine::bidding::{apply_bid, legal_bids};
-        use blob_engine::dealing::start_round;
-        use blob_engine::game::new_game;
-        use blob_engine::playing::{apply_play, legal_plays};
+        use crate::bidding::{apply_bid, legal_bids};
+        use crate::dealing::start_round;
+        use crate::game::new_game;
+        use crate::playing::{apply_play, legal_plays};
         use rand_xoshiro::rand_core::SeedableRng;
         use rand_xoshiro::Xoshiro256PlusPlus;
 

@@ -148,12 +148,13 @@ Build the context token, CLS token placeholder, assemble the full variable-lengt
 
 Set up the libtorch Rust bindings and implement the per-token-type input projections.
 
-- Add `tch = "0.17"` (or latest) to `blob-nn/Cargo.toml`. Requires libtorch installed — document setup for Linux (training only)
+- Add `tch = "0.24"` (latest as of 2026-04) to `blob-nn/Cargo.toml`. Requires libtorch installed — document setup for Linux (training only). The `tch` crate does not cut GitHub releases; pin to the latest crates.io version at session start
 - Alternatively evaluate `candle` (Hugging Face pure-Rust ML) vs `tch` (libtorch bindings):
   - `tch`: mature, full PyTorch parity, GPU support, but external C++ dependency
   - `candle`: pure Rust, simpler build, but less mature optimizer/training support
   - **Recommendation**: `tch` for training (proven ecosystem), export to ONNX for inference via `ort` (Session 3.5)
 - **Crate separation**: `blob-nn` depends on `tch` (training only, Linux). `blob-bin` depends only on `ort` (inference, cross-platform). `blob-bin` must **never** depend on `tch` — this ensures the inference binary runs on the Windows laptop (Intel i5-1135G7 + Iris Xe) without libtorch
+- **Encoder location**: the entity encoder (`blob_engine::encoder`) was implemented in Section 2 and lives in `blob-engine`, not `blob-nn`. It is pure Rust with no ML dependency. `blob-nn` re-exports it for convenience. The neural network code in `blob-nn` imports the encoder from `blob-engine` directly — this avoids a circular dependency when MCTS (also in `blob-engine`) needs to encode states
 - Input projections (one `nn::Linear` per token type):
   - Hand card: `Linear(30, 128)`
   - Played card: `Linear(48, 128)` — 48 = 16 rank + 8 suit + 16 player + 8 scalar features
@@ -161,7 +162,8 @@ Set up the libtorch Rust bindings and implement the per-token-type input project
   - Context: `Linear(13, 128)`
   - CLS: learned `nn::Parameter` of shape `[128]`
 - Chronological embedding table: `nn::Embedding(52, 128)` — added to played card projections only
-- Forward pass for input stage: iterate tokens, dispatch to appropriate projection by token_type, add chronological embedding for played cards, collect into `[batch, seq_len, 128]` tensor
+- **Feature padding for batching**: the encoder's `EncodedState.features` contains variable-dimension feature vectors per token type (CLS=0, context=13, player=29, hand=30, played=48). For tensor construction, **pad all features to 48** (the maximum dimension) with trailing zeros. Each per-token-type `Linear` projection consumes only its meaningful prefix (e.g., hand card projection reads indices `[0..30)`, ignoring padding `[30..48)`). The CLS token's 48 zeros are discarded entirely — replaced by the learned 128-dim parameter. This padding is ~15% wasted memory but keeps the tensor construction trivial: stack padded features into `[batch, seq_len, 48]`, then dispatch per token type
+- Forward pass for input stage: for each token type, gather positions from `token_types` tensor, slice the corresponding rows from the padded `[batch, seq_len, 48]` input, project through that type's `Linear`, and scatter results back into `[batch, seq_len, 128]`. Add chronological embedding for played card positions only. Apply attention mask for padding tokens
 - Handle **variable sequence lengths** within a batch: pad to max_seq_len in batch, create attention mask (`true` for real tokens, `false` for padding)
 - Test: random input → verify output shape `[batch, seq_len, 128]`
 
@@ -226,17 +228,24 @@ Set up the ONNX export pipeline and inference path early — ONNX Runtime is req
   1. Save model weights from Rust via `VarStore::save("model.pt")`
   2. Run a small Python script (~20 lines) that loads weights into an equivalent PyTorch model definition and calls `torch.onnx.export()` with dynamic axes
   3. This script is a build artifact in `scripts/export_onnx.py`, run once per iteration after training
-  - Input: `features: [batch, max_seq, feat_dim]`, `token_types: [batch, max_seq]`, `attention_mask: [batch, max_seq]`
+  - Input: `features: [batch, max_seq, 48]`, `token_types: [batch, max_seq]`, `attention_mask: [batch, max_seq]` — `feat_dim=48` matches the padded feature width from Session 3.1
   - Outputs: `bid_policy: [batch, 14]`, `play_scores: [batch, max_hand]`, `value: [batch, 1]`
   - The Python model definition must mirror the Rust `tch` model exactly — keep both in sync. Changes to the network require updating both
-- **ONNX Runtime inference** (`ort` crate in `blob-engine` or shared crate, NOT `blob-nn`):
+- **ONNX Runtime inference** (`ort` crate in `blob-engine`, NOT `blob-nn`):
   - Load exported model, create session with `CpuExecutionProvider`
   - Configure `intra_op_num_threads=1` for per-rayon-thread sessions (each thread gets its own session, no contention)
   - Verify output matches `tch` model within 1e-5 tolerance on 100 random inputs
 - **Performance validation**: benchmark ONNX CPU inference for batch=1 at typical sequence lengths (14, 29, 41 tokens). Target: <0.2ms average
 - **Cross-platform check**: verify ONNX model loads and runs on Windows with `ort`. Should work out of the box since ONNX Runtime is cross-platform
 - **OpenVINO exploration** (optional): Intel Iris Xe is supported by OpenVINO as an `ort` execution provider. Test whether `OpenVINOExecutionProvider` accelerates inference on the i5-1135G7 compared to CPU-only. If it does, use it for the deployment binary
-- **Evaluator trait implementation**: implement `trait Evaluator` (from Session 4.2) backed by `ort::Session`, so MCTS can use ONNX inference directly
+- **Evaluator trait** — define in `blob-engine` so MCTS can use it without depending on `blob-nn`:
+  ```rust
+  pub trait Evaluator {
+      fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32);
+  }
+  ```
+  The trait takes a `BlobState` and returns `(policy, value)`. Implementations handle encoding internally (calling `blob_engine::encoder::encode`). The policy vector's semantics depend on `game_phase`: bid probabilities (len ≤ 14) during bidding, hand-card-position scores during playing. MCTS (Session 4.2) consumes this trait — it never calls the encoder or neural network directly
+- **ONNX Evaluator implementation**: implement `Evaluator` backed by `ort::Session` in `blob-engine`. This is the production evaluator for both self-play and deployment. A `tch`-backed `Evaluator` can optionally live in `blob-nn` for debugging, but is not required — self-play always uses ONNX
 
 ---
 
@@ -272,7 +281,7 @@ Implement the remaining MCTS phases and the full simulation loop.
 - **Expansion**: at leaf node, generate all legal actions from game state, create child node per action with `prior = network_policy[action]`, `visit_count = 0`, `total_value = 0.0`
 - **Evaluation**: run neural network on leaf state → `(policy, value)`. The policy provides priors for new children; the value is backpropagated
   - For now, use a **dummy evaluator** (uniform policy, random value) to test MCTS mechanics without neural network dependency
-  - Define trait: `trait Evaluator { fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32); }`
+  - Use `trait Evaluator` defined in Session 3.5 (`blob_engine::evaluator`). The dummy evaluator implements this same trait
 - **Backpropagation — per-player values for multiplayer**:
   - Blob is multiplayer (3-8 players), not two-player adversarial. Each player independently maximizes their own score. There is no zero-sum relationship to exploit — multiple players can score in the same round, and "blobbed" players become spoilers with shifted objectives (disrupting others)
   - **Design**: the neural network evaluates the leaf state from `state.current_player`'s perspective, returning a single value `v`. During backpropagation, store this value in `value_sums[leaf_current_player]` and increment `value_counts[leaf_current_player]` at every node on the path. Over many simulations, each node accumulates value estimates from multiple players' perspectives as different players act at different tree depths
