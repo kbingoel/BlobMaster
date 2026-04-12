@@ -8,11 +8,18 @@
 //! Session 2.2: Played card tokens and player state tokens.
 //! Produces chronologically-ordered 48-dim played card tokens and
 //! per-player 29-dim state tokens with void detection.
+//!
+//! Session 2.3: Context token, CLS placeholder, full sequence assembly.
+//! `encode(state, perspective)` → `EncodedState` with variable-length
+//! token sequence `[CLS, context, player_states…, hand_cards…, played_cards…]`,
+//! token type IDs, chronological indices, and hand-card index mapping.
 
+use blob_engine::bidding::forbidden_bid;
 use blob_engine::card::{Card, NUM_SUITS};
 use blob_engine::hand::Hand;
 use blob_engine::round::total_rounds;
-use blob_engine::state::{BlobState, MAX_PLAYERS};
+use blob_engine::state::{BlobState, GamePhase, MAX_PLAYERS};
+use smallvec::SmallVec;
 
 /// Dimensionality of a hand-card token.
 pub const HAND_CARD_DIM: usize = 30;
@@ -347,6 +354,165 @@ pub fn encode_player_states(
     }
 
     tokens
+}
+
+// ===================================================================
+// Session 2.3 — Context token, CLS, sequence assembly
+// ===================================================================
+
+/// Dimensionality of the context token.
+pub const CONTEXT_DIM: usize = 13;
+
+/// Token type IDs (0–4) for each position in the assembled sequence.
+pub const TOKEN_TYPE_CLS: u8 = 0;
+pub const TOKEN_TYPE_CONTEXT: u8 = 1;
+pub const TOKEN_TYPE_PLAYER: u8 = 2;
+pub const TOKEN_TYPE_HAND: u8 = 3;
+pub const TOKEN_TYPE_PLAYED: u8 = 4;
+
+/// Assembled variable-length sequence output from the encoder.
+///
+/// Sequence order: `[CLS, context, player_states…, hand_cards…, played_cards…]`.
+///
+/// `hand_card_indices` maps hand-card token positions back to card indices
+/// so MCTS can translate playing-head scores to actions without re-iterating
+/// the hand. Entry `i` is the card index emitted at hand-card token slot `i`,
+/// matching `Hand::iter()` order exactly.
+#[derive(Debug, Clone)]
+pub struct EncodedState {
+    pub features: Vec<Vec<f32>>,
+    pub token_types: Vec<u8>,
+    pub chronological_indices: Vec<u8>,
+    pub hand_card_indices: SmallVec<[u8; 13]>,
+    pub num_tokens: usize,
+}
+
+/// Encode the 13-dim context token for the current game state.
+///
+/// Layout:
+/// - `[0..5)`: trump_suit one-hot (♠=0, ♥=1, ♣=2, ♦=3, NoTrump=4)
+/// - `[5]`: cards_dealt (normalized by 13, the hard cap)
+/// - `[6]`: current_trick (tricks_completed / cards_dealt)
+/// - `[7]`: tricks_remaining ((cards_dealt − tricks_completed) / cards_dealt)
+/// - `[8]`: num_players (normalized by 8, the max)
+/// - `[9]`: round_number (round_idx / total_rounds(start_cards, num_players))
+/// - `[10..12)`: game_phase one-hot: \[is_bidding, is_playing\]
+/// - `[12]`: bidding_constraint_active (1.0 iff bidding, current player is
+///   dealer, and the forbidden-bid constraint applies)
+pub fn encode_context(state: &BlobState) -> [f32; CONTEXT_DIM] {
+    let mut feat = [0.0f32; CONTEXT_DIM];
+
+    // Trump suit one-hot [0..5): value 0–3 for suits, 4 for NoTrump.
+    feat[state.trump_suit.min(4) as usize] = 1.0;
+
+    // cards_dealt [5]: normalized by MAX_CARDS_DEALT (13).
+    feat[5] = state.cards_dealt as f32 / 13.0;
+
+    // current_trick [6]: tricks_completed / cards_dealt.
+    let cd = state.cards_dealt.max(1) as f32;
+    feat[6] = state.tricks_completed as f32 / cd;
+
+    // tricks_remaining [7]: (cards_dealt − tricks_completed) / cards_dealt.
+    let remaining = state.cards_dealt.saturating_sub(state.tricks_completed);
+    feat[7] = remaining as f32 / cd;
+
+    // num_players [8]: normalized by MAX_PLAYERS (8).
+    feat[8] = state.num_players as f32 / MAX_PLAYERS as f32;
+
+    // round_number [9]: round_idx / total_rounds.
+    let total_r = total_rounds(state.start_cards.max(1), state.num_players.max(3));
+    feat[9] = state.round_idx as f32 / total_r as f32;
+
+    // game_phase one-hot [10..12): [is_bidding, is_playing].
+    match state.phase() {
+        GamePhase::Bidding => feat[10] = 1.0,
+        GamePhase::Playing => feat[11] = 1.0,
+        _ => {} // debug_assert in encode() prevents this path
+    }
+
+    // bidding_constraint_active [12].
+    if state.phase() == GamePhase::Bidding
+        && state.current_player == state.dealer
+        && forbidden_bid(state).is_some()
+    {
+        feat[12] = 1.0;
+    }
+
+    feat
+}
+
+/// Full encoder entry point. Assembles the variable-length token sequence
+/// from the perspective of the given player.
+///
+/// Sequence: `[CLS, context, player_states…, hand_cards…, played_cards…]`.
+///
+/// The `perspective` argument is the player whose viewpoint the encoding
+/// represents. MCTS always passes `state.current_player`; other call sites
+/// (e.g. eval tooling) may pass a fixed seat.
+///
+/// Panics in debug if called from `Scoring` or `Complete` phase.
+pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
+    debug_assert!(
+        matches!(state.phase(), GamePhase::Bidding | GamePhase::Playing),
+        "encoder called in {:?} phase — only Bidding/Playing are valid",
+        state.phase()
+    );
+
+    let hand_cards = encode_hand_cards(state, perspective);
+    let played_cards = encode_played_cards(state);
+    let player_states = encode_player_states(state, perspective);
+    let context = encode_context(state);
+
+    let np = state.num_players as usize;
+    let num_hand = hand_cards.len();
+    let num_played = played_cards.len();
+    let num_tokens = 1 + 1 + np + num_hand + num_played;
+
+    let mut features = Vec::with_capacity(num_tokens);
+    let mut token_types = Vec::with_capacity(num_tokens);
+    let mut chrono_indices = Vec::with_capacity(num_tokens);
+    let mut hand_card_indices = SmallVec::with_capacity(num_hand);
+
+    // CLS token: zero-length feature vector (NN uses a learned 128-dim parameter).
+    features.push(Vec::new());
+    token_types.push(TOKEN_TYPE_CLS);
+    chrono_indices.push(0);
+
+    // Context token.
+    features.push(context.to_vec());
+    token_types.push(TOKEN_TYPE_CONTEXT);
+    chrono_indices.push(0);
+
+    // Player state tokens.
+    for ps in &player_states {
+        features.push(ps.to_vec());
+        token_types.push(TOKEN_TYPE_PLAYER);
+        chrono_indices.push(0);
+    }
+
+    // Hand card tokens — record card indices for MCTS action mapping.
+    let hand = Hand::new(state.hands[perspective as usize]);
+    for (i, card) in hand.iter().enumerate() {
+        features.push(hand_cards[i].to_vec());
+        token_types.push(TOKEN_TYPE_HAND);
+        chrono_indices.push(0);
+        hand_card_indices.push(card.index());
+    }
+
+    // Played card tokens.
+    for pc in &played_cards {
+        features.push(pc.features.to_vec());
+        token_types.push(TOKEN_TYPE_PLAYED);
+        chrono_indices.push(pc.chrono_index);
+    }
+
+    EncodedState {
+        features,
+        token_types,
+        chronological_indices: chrono_indices,
+        hand_card_indices,
+        num_tokens,
+    }
 }
 
 #[cfg(test)]
@@ -1468,5 +1634,593 @@ mod tests {
 
         // Current player's relative_position is 0.
         assert_eq!(tokens[s.current_player as usize][22], 0.0);
+    }
+
+    // ===============================================================
+    // Session 2.3 — Context token tests
+    // ===============================================================
+
+    #[test]
+    fn context_token_trump_one_hot_spades() {
+        let s = state_with_tricks(4, 5, 5, Suit::Spades as u8, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[0], 1.0, "Spades");
+        assert_eq!(ctx[1], 0.0);
+        assert_eq!(ctx[2], 0.0);
+        assert_eq!(ctx[3], 0.0);
+        assert_eq!(ctx[4], 0.0);
+    }
+
+    #[test]
+    fn context_token_trump_one_hot_no_trump() {
+        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[0], 0.0);
+        assert_eq!(ctx[1], 0.0);
+        assert_eq!(ctx[2], 0.0);
+        assert_eq!(ctx[3], 0.0);
+        assert_eq!(ctx[4], 1.0, "NoTrump");
+    }
+
+    #[test]
+    fn context_token_trump_one_hot_diamonds() {
+        let s = state_with_tricks(4, 5, 5, Suit::Diamonds as u8, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[3], 1.0, "Diamonds");
+        let sum: f32 = ctx[0..5].iter().sum();
+        assert_eq!(sum, 1.0, "exactly one trump bit");
+    }
+
+    #[test]
+    fn context_token_cards_dealt_normalization() {
+        let s = state_with_tricks(4, 7, 7, NO_TRUMP, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert!((ctx[5] - 7.0 / 13.0).abs() < 1e-6, "cards_dealt=7/13");
+    }
+
+    #[test]
+    fn context_token_current_trick_and_remaining() {
+        // 5 cards dealt, 2 tricks completed → current=2/5, remaining=3/5.
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
+        let t1 = make_trick(&[(0, 1), (1, 14), (2, 27), (3, 40)], 1, 0);
+        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[t0, t1], &[]);
+        let ctx = encode_context(&s);
+        assert!((ctx[6] - 2.0 / 5.0).abs() < 1e-6, "current_trick=2/5");
+        assert!((ctx[7] - 3.0 / 5.0).abs() < 1e-6, "tricks_remaining=3/5");
+    }
+
+    #[test]
+    fn context_token_no_tricks_played() {
+        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[6], 0.0, "current_trick=0");
+        assert!((ctx[7] - 1.0).abs() < 1e-6, "tricks_remaining=5/5=1.0");
+    }
+
+    #[test]
+    fn context_token_num_players_normalization() {
+        for np in 3..=6u8 {
+            let s = state_with_tricks(np, 5, 5, NO_TRUMP, 0, &[], &[]);
+            let ctx = encode_context(&s);
+            assert!(
+                (ctx[8] - np as f32 / 8.0).abs() < 1e-6,
+                "num_players={np}/8"
+            );
+        }
+    }
+
+    #[test]
+    fn context_token_round_number_normalization() {
+        // 4 players, start_cards=5 → total_rounds = 2*5+4-2 = 12.
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        s.round_idx = 3;
+        let ctx = encode_context(&s);
+        assert!((ctx[9] - 3.0 / 12.0).abs() < 1e-6, "round_idx=3/12");
+    }
+
+    #[test]
+    fn context_token_phase_bidding() {
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Bidding as u8;
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[10], 1.0, "is_bidding");
+        assert_eq!(ctx[11], 0.0, "not is_playing");
+    }
+
+    #[test]
+    fn context_token_phase_playing() {
+        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[10], 0.0, "not is_bidding");
+        assert_eq!(ctx[11], 1.0, "is_playing");
+    }
+
+    #[test]
+    fn context_token_bidding_constraint_active() {
+        // 4 players, 1 card dealt. Players 1,2,3 bid 0. Dealer=0.
+        // Sum of others' bids = 0. Forbidden bid = 1-0 = 1. Constraint active.
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 1;
+        s.start_cards = 1;
+        s.game_phase = GamePhase::Bidding as u8;
+        s.dealer = 0;
+        s.current_player = 0; // dealer's turn
+        s.bids[1] = 0;
+        s.bids[2] = 0;
+        s.bids[3] = 0;
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[12], 1.0, "bidding constraint active for dealer");
+    }
+
+    #[test]
+    fn context_token_bidding_constraint_not_active_non_dealer() {
+        // Current player is not dealer → constraint not active.
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Bidding as u8;
+        s.dealer = 3;
+        s.current_player = 1; // not dealer
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[12], 0.0, "non-dealer has no constraint");
+    }
+
+    #[test]
+    fn context_token_bidding_constraint_not_active_playing_phase() {
+        // Playing phase → constraint not active regardless.
+        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        let ctx = encode_context(&s);
+        assert_eq!(ctx[12], 0.0, "no constraint in playing phase");
+    }
+
+    #[test]
+    fn context_token_all_features_in_range() {
+        let t = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
+        let s = state_with_tricks(4, 7, 7, Suit::Hearts as u8, 2, &[t], &[]);
+        let ctx = encode_context(&s);
+
+        // Trump one-hot: exactly one 1.0 in [0..5).
+        let trump_sum: f32 = ctx[0..5].iter().sum();
+        assert_eq!(trump_sum, 1.0);
+
+        // Normalized features in [0, 1].
+        assert!(ctx[5] >= 0.0 && ctx[5] <= 1.0, "cards_dealt in [0,1]");
+        assert!(ctx[6] >= 0.0 && ctx[6] <= 1.0, "current_trick in [0,1]");
+        assert!(ctx[7] >= 0.0 && ctx[7] <= 1.0, "tricks_remaining in [0,1]");
+        assert!(ctx[8] > 0.0 && ctx[8] <= 1.0, "num_players in (0,1]");
+        assert!(ctx[9] >= 0.0 && ctx[9] < 1.0, "round_number in [0,1)");
+
+        // Phase one-hot: exactly one 1.0 in [10..12).
+        let phase_sum: f32 = ctx[10..12].iter().sum();
+        assert_eq!(phase_sum, 1.0);
+
+        // Bidding constraint is binary.
+        assert!(ctx[12] == 0.0 || ctx[12] == 1.0);
+    }
+
+    // ===============================================================
+    // Session 2.3 — Full encode() tests
+    // ===============================================================
+
+    #[test]
+    fn encode_sequence_structure() {
+        // 4 players, 5 cards dealt, 1 trick completed, 1 card in current trick.
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
+        let mut s = state_with_tricks(4, 5, 5, Suit::Spades as u8, 3, &[t0], &[(0, 1)]);
+        // Give perspective player (P0) a hand of 4 cards (5 dealt - 1 played).
+        s.hands[0] = c(Suit::Hearts, 0).bit()
+            | c(Suit::Hearts, 5).bit()
+            | c(Suit::Clubs, 10).bit()
+            | c(Suit::Diamonds, 3).bit();
+
+        let enc = encode(&s, 0);
+
+        // Total tokens: 1 CLS + 1 context + 4 players + 4 hand + 5 played = 15.
+        assert_eq!(enc.num_tokens, 15);
+        assert_eq!(enc.features.len(), 15);
+        assert_eq!(enc.token_types.len(), 15);
+        assert_eq!(enc.chronological_indices.len(), 15);
+    }
+
+    #[test]
+    fn encode_token_types_correct() {
+        let mut s = state_with_tricks(3, 3, 3, NO_TRUMP, 0, &[], &[]);
+        s.hands[1] = c(Suit::Spades, 0).bit()
+            | c(Suit::Spades, 1).bit()
+            | c(Suit::Spades, 2).bit();
+
+        let enc = encode(&s, 1);
+
+        // [CLS, context, P0, P1, P2, hand0, hand1, hand2]
+        assert_eq!(enc.token_types[0], TOKEN_TYPE_CLS);
+        assert_eq!(enc.token_types[1], TOKEN_TYPE_CONTEXT);
+        assert_eq!(enc.token_types[2], TOKEN_TYPE_PLAYER);
+        assert_eq!(enc.token_types[3], TOKEN_TYPE_PLAYER);
+        assert_eq!(enc.token_types[4], TOKEN_TYPE_PLAYER);
+        assert_eq!(enc.token_types[5], TOKEN_TYPE_HAND);
+        assert_eq!(enc.token_types[6], TOKEN_TYPE_HAND);
+        assert_eq!(enc.token_types[7], TOKEN_TYPE_HAND);
+        assert_eq!(enc.num_tokens, 8); // no played cards
+    }
+
+    #[test]
+    fn encode_token_types_with_played_cards() {
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
+        let mut s = state_with_tricks(3, 3, 3, NO_TRUMP, 2, &[t0], &[]);
+        s.hands[0] = c(Suit::Spades, 1).bit() | c(Suit::Spades, 2).bit();
+
+        let enc = encode(&s, 0);
+
+        // [CLS, context, P0, P1, P2, hand0, hand1, played0, played1, played2]
+        assert_eq!(enc.num_tokens, 10);
+        for i in 7..10 {
+            assert_eq!(enc.token_types[i], TOKEN_TYPE_PLAYED, "slot {i} is played");
+        }
+    }
+
+    #[test]
+    fn encode_cls_token_empty_features() {
+        let s = state_with_tricks(3, 3, 3, NO_TRUMP, 0, &[], &[]);
+        let enc = encode(&s, 0);
+        assert!(enc.features[0].is_empty(), "CLS has no encoder features");
+    }
+
+    #[test]
+    fn encode_context_token_has_correct_dim() {
+        let s = state_with_tricks(4, 5, 5, Suit::Hearts as u8, 0, &[], &[]);
+        let enc = encode(&s, 0);
+        assert_eq!(enc.features[1].len(), CONTEXT_DIM, "context is 13-dim");
+    }
+
+    #[test]
+    fn encode_player_state_tokens_have_correct_dim() {
+        let s = state_with_tricks(5, 7, 7, NO_TRUMP, 0, &[], &[]);
+        let enc = encode(&s, 0);
+        for i in 2..7 {
+            assert_eq!(
+                enc.features[i].len(),
+                PLAYER_STATE_DIM,
+                "player token {i} is 29-dim"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_hand_card_tokens_have_correct_dim() {
+        let mut s = state_with_tricks(3, 3, 3, NO_TRUMP, 0, &[], &[]);
+        s.hands[0] = c(Suit::Spades, 0).bit()
+            | c(Suit::Hearts, 5).bit()
+            | c(Suit::Clubs, 12).bit();
+
+        let enc = encode(&s, 0);
+        // Hand tokens start at offset 1+1+3 = 5.
+        for i in 5..8 {
+            assert_eq!(
+                enc.features[i].len(),
+                HAND_CARD_DIM,
+                "hand token {i} is 30-dim"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_played_card_tokens_have_correct_dim() {
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
+        let s = state_with_tricks(3, 3, 3, NO_TRUMP, 2, &[t0], &[]);
+        let enc = encode(&s, 0);
+        let played_start = 1 + 1 + 3 + Hand::new(s.hands[0]).count() as usize;
+        for i in played_start..enc.num_tokens {
+            assert_eq!(
+                enc.features[i].len(),
+                PLAYED_CARD_DIM,
+                "played token {i} is 48-dim"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_hand_card_indices_match_hand_iter() {
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        s.hands[2] = c(Suit::Diamonds, 12).bit()  // idx 51
+            | c(Suit::Spades, 0).bit()             // idx 0
+            | c(Suit::Hearts, 6).bit()             // idx 19
+            | c(Suit::Clubs, 3).bit()              // idx 29
+            | c(Suit::Spades, 11).bit();           // idx 11
+
+        let enc = encode(&s, 2);
+        let hand = Hand::new(s.hands[2]);
+        let expected: Vec<u8> = hand.iter().map(|c| c.index()).collect();
+        let actual: Vec<u8> = enc.hand_card_indices.iter().copied().collect();
+        assert_eq!(actual, expected, "hand_card_indices matches Hand::iter()");
+    }
+
+    #[test]
+    fn encode_hand_card_indices_ascending_order() {
+        let mut s = state_with_tricks(3, 3, 3, NO_TRUMP, 0, &[], &[]);
+        s.hands[0] = c(Suit::Clubs, 12).bit()     // idx 38
+            | c(Suit::Spades, 5).bit()             // idx 5
+            | c(Suit::Hearts, 0).bit();            // idx 13
+
+        let enc = encode(&s, 0);
+        // Hand::iter() yields ascending card index: 5, 13, 38.
+        assert_eq!(enc.hand_card_indices[0], 5);
+        assert_eq!(enc.hand_card_indices[1], 13);
+        assert_eq!(enc.hand_card_indices[2], 38);
+    }
+
+    #[test]
+    fn encode_chrono_indices_only_for_played() {
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
+        let mut s = state_with_tricks(3, 3, 3, NO_TRUMP, 2, &[t0], &[(0, 1)]);
+        s.hands[0] = c(Suit::Spades, 2).bit() | c(Suit::Hearts, 5).bit();
+
+        let enc = encode(&s, 0);
+        let played_start = 1 + 1 + 3 + 2; // CLS + ctx + 3 players + 2 hand
+
+        // Non-played tokens have chrono_index 0.
+        for i in 0..played_start {
+            assert_eq!(enc.chronological_indices[i], 0, "non-played slot {i}");
+        }
+
+        // Played tokens have sequential chrono indices.
+        for (j, i) in (played_start..enc.num_tokens).enumerate() {
+            assert_eq!(
+                enc.chronological_indices[i], j as u8,
+                "played slot {i} has chrono {j}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_num_tokens_formula() {
+        // 1 + 1 + num_players + hand_size + cards_played
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 3, &[t0], &[(0, 1)]);
+        s.hands[0] = c(Suit::Spades, 2).bit()
+            | c(Suit::Hearts, 5).bit()
+            | c(Suit::Clubs, 10).bit()
+            | c(Suit::Diamonds, 3).bit();
+
+        let enc = encode(&s, 0);
+        let expected = 1 + 1 + 4 + 4 + 5; // CLS + ctx + players + hand + played
+        assert_eq!(enc.num_tokens, expected);
+    }
+
+    #[test]
+    fn encode_minimal_state_3p_1card_no_plays() {
+        // Lower bound scenario: 3 players, 1 card, no plays yet.
+        let mut s = state_with_tricks(3, 1, 1, NO_TRUMP, 0, &[], &[]);
+        s.hands[0] = c(Suit::Spades, 0).bit();
+
+        let enc = encode(&s, 0);
+        // 1 + 1 + 3 + 1 + 0 = 6
+        assert_eq!(enc.num_tokens, 6, "minimal state: 6 tokens");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "only Bidding/Playing are valid")]
+    fn encode_rejects_scoring_phase() {
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Scoring as u8;
+        let _ = encode(&s, 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "only Bidding/Playing are valid")]
+    fn encode_rejects_complete_phase() {
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Complete as u8;
+        let _ = encode(&s, 0);
+    }
+
+    #[test]
+    fn encode_bidding_phase_state() {
+        // During bidding: no played cards, hands are full.
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Bidding as u8;
+        s.dealer = 3;
+        s.current_player = 0;
+        s.trump_suit = Suit::Hearts as u8;
+        // Give player 0 a hand of 5 cards.
+        s.hands[0] = c(Suit::Spades, 0).bit()
+            | c(Suit::Spades, 1).bit()
+            | c(Suit::Hearts, 5).bit()
+            | c(Suit::Clubs, 10).bit()
+            | c(Suit::Diamonds, 3).bit();
+
+        let enc = encode(&s, 0);
+        // 1 + 1 + 4 + 5 + 0 = 11
+        assert_eq!(enc.num_tokens, 11);
+        assert_eq!(enc.hand_card_indices.len(), 5);
+
+        // Context token should show bidding phase.
+        assert_eq!(enc.features[1][10], 1.0, "is_bidding");
+        assert_eq!(enc.features[1][11], 0.0, "not is_playing");
+    }
+
+    // ---------------------------------------------------------------
+    // Full encode integration with real game engine
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn encode_integration_early_game() {
+        use blob_engine::bidding::{apply_bid, legal_bids};
+        use blob_engine::dealing::start_round;
+        use blob_engine::game::new_game;
+        use blob_engine::playing::{apply_play, legal_plays};
+        use rand_xoshiro::rand_core::SeedableRng;
+        use rand_xoshiro::Xoshiro256PlusPlus;
+
+        let mut s = new_game(4, 5).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
+        start_round(&mut s, &mut rng);
+
+        // Bidding: encode during bidding phase.
+        let perspective = s.current_player;
+        let enc_bid = encode(&s, perspective);
+        assert_eq!(enc_bid.features[1][10], 1.0, "bidding phase");
+        assert_eq!(enc_bid.features[1][11], 0.0, "not playing");
+
+        // Complete bidding.
+        while s.phase() == GamePhase::Bidding {
+            let mask = legal_bids(&s);
+            let bid = (0..=13u8).find(|b| (mask >> b) & 1 == 1).unwrap();
+            apply_bid(&mut s, bid);
+        }
+
+        // Play 1 trick.
+        for _ in 0..s.num_players {
+            let mask = legal_plays(&s);
+            let card = mask.trailing_zeros() as u8;
+            apply_play(&mut s, card);
+        }
+
+        let perspective = s.current_player;
+        let enc = encode(&s, perspective);
+
+        // Verify structure.
+        let hand = Hand::new(s.hands[perspective as usize]);
+        let expected_tokens = 1 + 1 + 4 + hand.count() as usize
+            + (s.tricks_completed as usize * 4 + s.trick_cards_played as usize);
+        assert_eq!(enc.num_tokens, expected_tokens);
+
+        // hand_card_indices matches Hand::iter().
+        let hand_indices: Vec<u8> = hand.iter().map(|c| c.index()).collect();
+        let enc_indices: Vec<u8> = enc.hand_card_indices.iter().copied().collect();
+        assert_eq!(enc_indices, hand_indices);
+
+        // Token types are in correct order.
+        assert_eq!(enc.token_types[0], TOKEN_TYPE_CLS);
+        assert_eq!(enc.token_types[1], TOKEN_TYPE_CONTEXT);
+        for i in 2..6 {
+            assert_eq!(enc.token_types[i], TOKEN_TYPE_PLAYER);
+        }
+        let hand_end = 6 + hand.count() as usize;
+        for i in 6..hand_end {
+            assert_eq!(enc.token_types[i], TOKEN_TYPE_HAND);
+        }
+        for i in hand_end..enc.num_tokens {
+            assert_eq!(enc.token_types[i], TOKEN_TYPE_PLAYED);
+        }
+    }
+
+    #[test]
+    fn encode_integration_mid_game() {
+        use blob_engine::bidding::{apply_bid, legal_bids};
+        use blob_engine::dealing::start_round;
+        use blob_engine::game::new_game;
+        use blob_engine::playing::{apply_play, legal_plays};
+        use rand_xoshiro::rand_core::SeedableRng;
+        use rand_xoshiro::Xoshiro256PlusPlus;
+
+        let mut s = new_game(5, 7).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(77);
+        start_round(&mut s, &mut rng);
+
+        // Complete bidding.
+        while s.phase() == GamePhase::Bidding {
+            let mask = legal_bids(&s);
+            let bid = (0..=13u8).find(|b| (mask >> b) & 1 == 1).unwrap();
+            apply_bid(&mut s, bid);
+        }
+
+        // Play 4 full tricks + 2 cards of 5th trick.
+        for _ in 0..4 {
+            for _ in 0..s.num_players {
+                let mask = legal_plays(&s);
+                let card = mask.trailing_zeros() as u8;
+                apply_play(&mut s, card);
+            }
+        }
+        for _ in 0..2 {
+            let mask = legal_plays(&s);
+            let card = mask.trailing_zeros() as u8;
+            apply_play(&mut s, card);
+        }
+
+        let perspective = s.current_player;
+        let enc = encode(&s, perspective);
+
+        let hand = Hand::new(s.hands[perspective as usize]);
+        let total_played =
+            s.tricks_completed as usize * 5 + s.trick_cards_played as usize;
+        let expected = 1 + 1 + 5 + hand.count() as usize + total_played;
+        assert_eq!(enc.num_tokens, expected);
+
+        // Context features: playing phase, mid-round.
+        assert_eq!(enc.features[1][11], 1.0, "playing phase");
+        assert!((enc.features[1][6] - s.tricks_completed as f32 / 7.0).abs() < 1e-6);
+
+        // All features are finite and non-NaN.
+        for (i, feat) in enc.features.iter().enumerate() {
+            for (j, &v) in feat.iter().enumerate() {
+                assert!(v.is_finite(), "features[{i}][{j}] is finite");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_integration_late_game() {
+        use blob_engine::bidding::{apply_bid, legal_bids};
+        use blob_engine::dealing::start_round;
+        use blob_engine::game::new_game;
+        use blob_engine::playing::{apply_play, legal_plays};
+        use rand_xoshiro::rand_core::SeedableRng;
+        use rand_xoshiro::Xoshiro256PlusPlus;
+
+        let mut s = new_game(4, 5).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(99);
+        start_round(&mut s, &mut rng);
+
+        // Complete bidding.
+        while s.phase() == GamePhase::Bidding {
+            let mask = legal_bids(&s);
+            let bid = (0..=13u8).find(|b| (mask >> b) & 1 == 1).unwrap();
+            apply_bid(&mut s, bid);
+        }
+
+        // Play 4 tricks (1 trick remaining, 1 card each).
+        for _ in 0..4 {
+            for _ in 0..s.num_players {
+                let mask = legal_plays(&s);
+                let card = mask.trailing_zeros() as u8;
+                apply_play(&mut s, card);
+            }
+        }
+
+        let perspective = s.current_player;
+        let enc = encode(&s, perspective);
+        let hand = Hand::new(s.hands[perspective as usize]);
+
+        // Each player has 1 card left.
+        assert_eq!(hand.count(), 1, "1 card remaining");
+        assert_eq!(enc.hand_card_indices.len(), 1);
+
+        // 16 played cards (4 tricks × 4 players).
+        let played_count: usize = enc
+            .token_types
+            .iter()
+            .filter(|&&t| t == TOKEN_TYPE_PLAYED)
+            .count();
+        assert_eq!(played_count, 16);
+
+        // Context: tricks_remaining = 1/5 = 0.2.
+        assert!((enc.features[1][7] - 1.0 / 5.0).abs() < 1e-6);
     }
 }
