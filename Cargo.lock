@@ -60,6 +60,7 @@ name = "blob-nn"
 version = "0.1.0"
 dependencies = [
  "blob-engine",
+ "rand_xoshiro",
  "serde",
  "tracing",
 ]
