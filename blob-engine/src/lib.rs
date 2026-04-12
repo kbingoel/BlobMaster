@@ -38,8 +38,8 @@ pub use dealing::{deal, start_round};
 pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
 pub use mcts::{
-    select_best_child, select_leaf, ucb1_score, MctsArena, MctsNode, DEFAULT_ARENA_CAPACITY,
-    DEFAULT_C_PUCT,
+    apply_action, backprop, expand, is_terminal, root_action_probs, run_search, select_best_child,
+    select_leaf, ucb1_score, MctsArena, MctsNode, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
 pub use playing::{apply_play, legal_plays, score_round};
 pub use round::{
