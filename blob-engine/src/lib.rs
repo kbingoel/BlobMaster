@@ -12,10 +12,15 @@
 //!
 //! Session 1.4 wires the per-phase primitives into the full multi-round game
 //! loop (`game` module): `new_game`, `advance_round`, and `is_game_over`.
+//!
+//! Session 2.1–2.3 adds the entity encoder (`encoder` module): variable-length
+//! token sequences for neural network input, with hand card, played card,
+//! player state, and context tokens.
 
 pub mod bidding;
 pub mod card;
 pub mod dealing;
+pub mod encoder;
 pub mod game;
 pub mod hand;
 pub mod playing;
