@@ -17,6 +17,7 @@
 //! token sequences for neural network input, with hand card, played card,
 //! player state, and context tokens.
 
+pub mod belief;
 pub mod bidding;
 pub mod card;
 pub mod dealing;
@@ -37,9 +38,11 @@ pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};
 pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
+pub use belief::{determinize, void_suits, VoidTable, DEFAULT_DETERMINIZE_ATTEMPTS};
 pub use mcts::{
-    apply_action, backprop, expand, is_terminal, root_action_probs, run_search, select_best_child,
-    select_leaf, ucb1_score, MctsArena, MctsNode, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
+    adaptive_budget, apply_action, backprop, expand, is_terminal, mcts_search, root_action_probs,
+    run_search, select_best_child, select_leaf, signal_ratio, ucb1_score, MctsArena, MctsConfig,
+    MctsNode, MctsResult, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
 pub use playing::{apply_play, legal_plays, score_round};
 pub use round::{
