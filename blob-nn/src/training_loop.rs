@@ -616,6 +616,9 @@ impl LossAccumulators {
     fn add_bid(&mut self, model: &BlobNet, tb: &TrainBatch, policy_loss: f64, value_loss: f64) {
         self.bid_policy_sum += policy_loss;
         self.bid_count += 1;
+        // Count one forward pass per example in this batch (Session 6.1
+        // carry-over fix — the counter was declared but never incremented).
+        self.num_nn_evals += tb.input.features.size()[0] as u64;
         self.value_sum += value_loss;
         self.value_count += 1;
         let combined = policy_loss + VALUE_LOSS_COEF * value_loss;
@@ -635,6 +638,7 @@ impl LossAccumulators {
     fn add_play(&mut self, model: &BlobNet, tb: &TrainBatch, policy_loss: f64, value_loss: f64) {
         self.play_policy_sum += policy_loss;
         self.play_count += 1;
+        self.num_nn_evals += tb.input.features.size()[0] as u64;
         self.value_sum += value_loss;
         self.value_count += 1;
         let combined = policy_loss + VALUE_LOSS_COEF * value_loss;

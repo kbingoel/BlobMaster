@@ -33,7 +33,7 @@ pub mod round;
 pub mod state;
 
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
-pub use evaluator::{DummyEvaluator, Evaluator, NUM_BIDS};
+pub use evaluator::{DummyEvaluator, Evaluator, HeuristicEvaluator, NUM_BIDS};
 pub use onnx::OnnxEvaluator;
 pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};
