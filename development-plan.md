@@ -310,7 +310,7 @@ Implement imperfect information handling via determinization, and add signal qua
   4. **Rejection sampling**: if a dealt hand violates a void constraint (contains a card of a voided suit), resample. Use early termination if constraints are unsatisfiable after N attempts (fall back to unconstrained)
   - Optimization: sort opponents by most constrained first, deal to them first to reduce rejection rate
 - **Aggregated search**: for each of N determinizations, create a determinized `BlobState`, run full MCTS, collect root visit counts. Final policy = sum of visit counts across all determinizations, normalized
-- `fn mcts_search(state: &BlobState, evaluator: &dyn Evaluator, config: &MctsConfig) -> MctsResult`
+- `fn mcts_search<R: Rng + ?Sized>(state: &BlobState, evaluator: &dyn Evaluator, config: &MctsConfig, rng: &mut R) -> MctsResult` — `rng` drives determinization shuffles and temperature-sampled action selection, kept out of `MctsConfig` so the config stays `Copy` and thread-safe.
 - **MctsConfig** — defined in 4.3 and threaded through 4.1 / 4.2 signatures:
   ```
   MctsConfig {
@@ -451,70 +451,119 @@ Wire up the complete training iteration with all diagnostic metrics from the sta
 
 ## Section 6: Evaluation, CLI & Hardening (3 sessions, ~9h)
 
-### Session 6.1 — Model comparison and strength tracking
+### Session 6.1 — Model comparison, strength tracking, and promotion
 
-Implement the model comparison system for tracking training progress. No ELO — use direct metrics.
+Implement the model comparison system for tracking training progress. No ELO — use direct metrics. This session adds no new crates; it reuses `OnnxEvaluator`, `DummyEvaluator`, and the MCTS stack already in `blob-engine`.
 
-- **Evaluation cadence**: every 5 iterations, play current model vs the checkpoint from 20 iterations ago (= 4 evaluations back). This saves ~95% of evaluation compute vs evaluating every iteration while providing statistically reliable comparisons across meaningful training intervals
-  - Example: eval at iter 5 vs random/heuristic baseline (no prior checkpoint yet), eval at iter 10 vs iter 5, ..., eval at iter 25 vs iter 5, eval at iter 30 vs iter 10, eval at iter 50 vs iter 30
-  - Every iteration is checkpointed (see Session 5.4), but only evaluation-iteration checkpoints are kept permanently
-- **Evaluation games**: play **200 full games** per evaluation with fair seat rotation. Each model controls exactly **one seat** per game. Remaining seats filled by a fixed baseline (random or heuristic). This avoids the multi-seat coordination bias of putting one model in multiple seats. Track:
-    - **Win rate** (higher cumulative game score more often): primary comparison metric. 200 games gives a 95% CI of ~±7% — sufficient to detect a 55% true win rate reliably
-    - **Score differential**: mean(model_A_cumulative - model_B_cumulative) per game. More granular than binary win
-    - **Bid success rate**: % of rounds across all games where model hits bid exactly. Domain-specific strength measure
-  - Win rate with 95% confidence interval (binomial). Need >55% to declare improvement
-- **Strength tracking over time** (replaces ELO):
-  - CSV log per evaluation: `iteration, win_rate_vs_N20, bid_success_rate, score_differential, policy_loss, value_loss, visit_entropy, kl_divergence`
-  - Plot curves: the slope of win_rate tells you whether training is accelerating, steady, or stalling
-  - **Bid success rate** is the single most interpretable domain metric — a strong Blob player bids accurately
-- **Heuristic baseline** (valuable intermediate benchmark): simple rule-based player — bid = count of (aces + kings in trump suit + aces in non-trump), play highest legal card if winning else lowest. Win rate vs heuristic measures absolute progress beyond random
-- **Promotion logic**: if current model's bid success rate exceeds best model's by >2% over 200 games, promote as new best. Self-play uses best model for training stability
-- Test: run comparison with two random models — verify ~50% win rate within statistical noise
+- **Heuristic baseline evaluator** (new struct, lives in `blob-engine/src/evaluator.rs` next to `DummyEvaluator` so both comparison eval and future deployment can use it without pulling `blob-nn`):
+  - `HeuristicEvaluator` implements `Evaluator`.
+  - **Bid rule**: `raw = count(aces in trump suit) + count(kings in trump suit) + count(aces in non-trump suits)`, then project onto the `legal_bids(state)` mask (nearest legal bid, rounding down on ties — handles the dealer's forbidden bid cleanly). Each card is counted exactly once: trump aces and trump kings are the near-guaranteed tricks; non-trump aces are strong but can be trumped. In NoTrump rounds the trump-suit terms vanish naturally and the formula collapses to `count(aces in hand)`, which is the correct NoTrump baseline.
+  - **Play rule**: if the current trick winner is already the heuristic's own card, play the lowest legal card; otherwise play the lowest legal card that beats the current winner, falling back to the lowest legal card if none can. Blob has no partnerships — the model is purely "win this trick vs dump".
+  - **Value**: return `0.0` (heuristic doesn't estimate values).
+  - Policy-vector shape and masking match `DummyEvaluator` exactly (bids: `[NUM_BIDS]` masked+renormalized; plays: `[hand_card_indices.len()]` over hand positions).
+- **Eval game harness** lives in `blob-nn/src/eval.rs`. Self-play's `play_one_game` is left untouched — evaluation games use a new entry point that supports per-seat evaluators and captures per-round outcomes:
+  ```rust
+  pub struct SeatEvaluators<'a>([Option<&'a dyn Evaluator>; MAX_PLAYERS]);
+  pub struct RoundOutcome { pub bids: [u8; MAX_PLAYERS], pub tricks_won: [u8; MAX_PLAYERS], pub num_players: u8 }
+  pub struct EvalGameOutcome { pub final_scores: [u16; MAX_PLAYERS], pub rounds: SmallVec<[RoundOutcome; 24]> }
+  pub fn play_eval_game<R: Rng + ?Sized>(n: u8, c: u8, seats: &SeatEvaluators, mcts_cfg: &MctsConfig, rng: &mut R) -> EvalGameOutcome
+  ```
+  - Decision loop dispatches per acting seat: `let eval = seats.0[state.current_player as usize].expect("seat evaluator for active seat")`. MCTS is called once with that evaluator; leaves inside the tree also use it (standard AlphaZero semantics — the acting player models all moves with their own policy).
+  - **Per-round outcome capture** happens in the `GamePhase::Scoring` branch *before* `advance_round`: copy `state.bids` and `state.tricks_won` into a `RoundOutcome` and push onto `outcome.rounds`. `advance_round` calls `start_round` which clears those fields, so the capture must precede the transition. The engine API stays unchanged.
+  - No `TrainingExample`s are emitted — evaluation games never enter the replay buffer.
+- **Evaluation cadence**: every 5 iterations (matches `EVAL_CHECKPOINT_EVERY` already set by Session 5.4). The opponent-selection rule is pinned as:
+  - `opponent_iter = max{ i : i ≤ current_iter − eval_lookback, i % EVAL_CHECKPOINT_EVERY == 0, i > 0 }`. Fallback to `HeuristicEvaluator` if no eligible checkpoint exists (first four evaluations).
+  - `eval_lookback` defaults to 20. Worked examples: iter 5/10/15/20 → heuristic baseline; iter 25 → iter 5; iter 30 → iter 10; iter 50 → iter 30.
+- **Head-to-head seat assignment** (200 games per evaluation):
+  - `seat_A = game_idx % num_players`, `seat_B = (game_idx + num_players / 2) % num_players`, the remaining `num_players − 2` seats filled with `HeuristicEvaluator`.
+  - Over 200 games this rotates every ordered (A-seat, B-seat) pair equally and keeps each model in exactly one seat per game — breaks the multi-seat coordination bias without losing head-to-head directness.
+- **Metrics per evaluation**:
+  - **Win rate**: fraction of games where `final_scores[seat_A] > final_scores[seat_B]`. 95% binomial CI (Wilson). **Improvement gate: `win_rate_lower95 > 0.5`** (stricter than a bare point estimate of 55%, which can be inside the CI at n=200).
+  - **Score differential**: `mean(final_scores[seat_A] − final_scores[seat_B])` per game.
+  - **Bid success rate** (per model): `count(rounds where bids[seat] == tricks_won[seat]) / total_rounds`, summed over all games for the model's seat. ~3,400 rounds per evaluation → ±1.7% precision at α=0.05 — the most interpretable domain metric for Blob.
+- **Strength tracking CSV** at `{checkpoint_dir}/strength.csv`, one row appended per evaluation:
+  `iteration, opponent_iter_or_baseline, win_rate, win_rate_lower95, win_rate_upper95, score_differential, bid_success_rate_current, bid_success_rate_opponent, policy_loss, value_loss, visit_entropy, kl_divergence`.
+  - Plot `win_rate_lower95` over iteration to track progress; the slope tells you whether training is accelerating, steady, or stalling.
+- **Best-model tracking and promotion**:
+  - Training maintains a `best_model.onnx` pointer inside `checkpoint_dir` — symlink on Linux, portable-fallback via `File::rename` atomic replace.
+  - Alongside the pointer, persist `{checkpoint_dir}/best_stats.json` = `{ iteration: u64, win_rate_lower95: f32, bid_success_rate: f32 }`. Updated atomically on each promotion; read at startup so `bid_success_rate_best` survives across runs.
+  - **Promotion gate**: promote when `win_rate_lower95 > 0.5` AND `bid_success_rate_current ≥ bid_success_rate_best − 0.01` (no-regression floor, not an improvement requirement). The win-rate lower bound is the real quality signal; the bid-success-rate clause only blocks promotions that win through noise while regressing on the most interpretable domain metric.
+  - Self-play reads `best_model.onnx`. `TrainingLoop::run_iteration` grows a `best_onnx_path: &Path` argument passed down to `self_play_iteration`; promotion updates this pointer between iterations.
+  - Cold-start (iterations 0..4, before any evaluation or promotion has run): `best_model.onnx` is initialized on iteration 0 to point at the freshly-exported `iter_000000/model.onnx`, and each subsequent pre-evaluation iteration repoints it at its own `iter_######/model.onnx`. This preserves Session 5.4's "self-play uses previous iteration's export" behavior while keeping a single read path (`best_onnx_path`) in the codebase. Once the first evaluation runs (iter 5), promotion takes over and the pointer stops auto-advancing.
+- **Carry-over fix from Session 5.4**: `LossAccumulators::num_nn_evals` (in `blob-nn/src/training_loop.rs`) is declared but never incremented, so `IterationMetrics::num_nn_evaluations` is always 0 and the "loss improvement per evaluation" metric is unusable. Wire it in this session: increment by `batch.input.features.size()[0]` per training step (one forward pass per batch × batch size). Self-play MCTS evals can be added later if the granularity proves useful.
+- **Tests**:
+  - Two `DummyEvaluator`s as seat_A and seat_B, heuristic elsewhere, 200 games → win-rate 95% CI contains 0.5.
+  - `HeuristicEvaluator` vs `DummyEvaluator`, 200 games → heuristic's bid success rate > 25% (beats random's ~1/cards_dealt).
+  - Per-round capture: play 1 game, assert `outcome.rounds.len() == total_rounds(start_cards, num_players)` and every `RoundOutcome.bids` sums to ≤ `cards_dealt` (legal-bid invariant).
 
 ### Session 6.2 — CLI, configuration, and logging
 
-Build the command-line interface for running training, evaluation, and analysis.
+Split the CLI so the deployment binary stays inference-only and the training binary can pull `tch`/`rayon`/`indicatif`. This preserves the Session 5.3 invariant ("inference binary must not depend on training-only deps") and lines up with the Windows/Intel-iGPU deployment target in AGENTS.md.
 
-- **CLI** with `clap` derive macro: subcommands `train`, `evaluate`, `self-play`, `export`
-  - `train`: `--iterations`, `--games-per-iter`, `--batch-size`, `--epochs`, `--resume`, `--checkpoint-dir`
-  - `evaluate`: `--model-a`, `--model-b`, `--num-games`, `--num-players`
-  - `self-play`: `--model`, `--num-games`, `--output` (generate examples without training)
-  - `export`: `--model`, `--output` (export to ONNX)
-- **Configuration**: `TrainingConfig` struct with serde, loadable from TOML file or CLI args. CLI args override file values
-  - MCTS params: `determinizations`, `simulations_per_det`, `c_puct`, `temperature`, `temp_threshold`
-  - Training params: `lr_peak`, `lr_min`, `weight_decay`, `batch_size`, `max_epochs_per_iter`, `buffer_capacity`
-  - Self-play params: `num_games`, `num_threads`, `player_distribution: [f32; 4]` (for n=4,5,6,7), `cards_dealt_distribution: [f32; 2]` (for C=7,8)
-  - Eval params: `eval_games: 200`, `eval_interval: 5`, `eval_lookback: 20`, `promotion_threshold`
-- **Logging**: `tracing` with structured fields. Log levels: INFO for iteration summaries, DEBUG for per-batch metrics, TRACE for per-round details
-  - Output to both terminal (pretty) and file (JSON lines) via `tracing-subscriber` layers
-  - Key metrics per iteration: games_generated, examples_added, policy_loss_bid, policy_loss_play, value_loss, bid_accuracy, visit_entropy, kl_divergence, games_per_sec, inference_ms_avg
-- **Progress display**: `indicatif` multi-progress bars during training — one for self-play rounds, one for training batches
+- **Workspace change — new `blob-train` crate**. Add to the workspace:
+  ```
+  members = ["blob-engine", "blob-nn", "blob-bin", "blob-train"]
+  ```
+  - `blob-train/Cargo.toml`: depends on `blob-engine`, `blob-nn`, `clap = { version = "4", features = ["derive"] }`, `serde`, `toml = "0.8"`, `tracing`, `tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }`, `indicatif`.
+  - `blob-train/src/main.rs` + `blob-train/src/config.rs`.
+  - Binary name: `blobmaster-train`.
+- **`blob-bin` stays inference-only**. Adds only `clap` and `tracing-subscriber`; keeps the existing `blob-engine` dep. No `blob-nn`, no `tch`, no `rayon`. Binary name remains `blobmaster`.
+- **`blobmaster-train` subcommands** (training workflow):
+  - `train --config <path> [--resume] [--checkpoint-dir <dir>] [overrides...]`
+  - `evaluate --model-a <path> --model-b <path-or-baseline> --num-games N --num-players n --cards-dealt C`
+  - `self-play --model <path> --num-games N --output <replay.bin>` (generate examples without training)
+  - `export --checkpoint <dir> --output <model.onnx>` (invokes `scripts/export_onnx.py` or the Rust equivalent added in Section 3.5)
+- **`blobmaster` subcommands** (inference + deployment):
+  - `play --model <path.onnx> --num-players n --seat k` (human-vs-AI scaffolding for Section 9)
+  - `analyze --model <path.onnx> --state <state.json>` (single-state policy+value dump — useful for debugging without any training dep)
+- **Configuration**: root `TrainingConfig` in `blob-train/src/config.rs`, `#[derive(Serialize, Deserialize)]`, loadable from TOML. CLI flags override file values (populate config, then apply `clap`-parsed `Option<T>` overrides).
+  - Add `#[derive(Serialize, Deserialize)]` to the three existing config structs: `blob_engine::mcts::MctsConfig`, `blob_nn::engine::SelfPlayConfig`, `blob_nn::training_loop::TrainingLoopConfig`. Compose them:
+    ```rust
+    pub struct TrainingConfig {
+        pub training: TrainingLoopConfig,
+        pub self_play: SelfPlayConfig,
+        pub mcts: MctsConfig,
+        pub eval: EvalConfig,
+    }
+    pub struct EvalConfig {
+        pub eval_games: usize,         // default 200
+        pub eval_interval: u64,        // default 5
+        pub eval_lookback: u64,        // default 20
+        pub bid_success_promotion_delta: f32, // default 0.02
+    }
+    ```
+  - `PathBuf` fields serialize naturally; ship a sample `config.toml` and a round-trip test.
+- **Logging**: `tracing` with JSON output via `tracing-subscriber::fmt().json()` → `{checkpoint_dir}/training.jsonl`, plus pretty output to stderr. Same field names as the Session 5.4 `metrics.jsonl` so downstream plotting can union both sources.
+  - Levels: INFO for iteration summaries, DEBUG for per-batch metrics, TRACE for per-round details.
+  - Key per-iteration fields: `games_generated, examples_added, policy_loss_bid, policy_loss_play, value_loss, bid_accuracy, visit_entropy, kl_divergence, games_per_sec, inference_ms_avg`.
+- **Progress display**: `indicatif` multi-progress in `blob-train` only — one bar for self-play games, one for training batches. `blob-bin` has none.
 
 ### Session 6.3 — Performance profiling, hardening, and gate verification
 
 Profile end-to-end performance, fix bottlenecks, and verify all completion gates.
 
-- **Benchmark suite** using `criterion`:
-  - `BlobState` copy: target ~100ns (~410 bytes — verify actual size with `std::mem::size_of::<BlobState>()`)
-  - Legal move generation (bitmask return): target ~5ns
-  - Entity encoding: target <1μs
-  - ONNX inference (single, batch=1): target <0.2ms (ort CPU)
-  - MCTS 100 sims (with ONNX eval): target <20ms
-  - Full move (5 det × 100 sims): target <100ms
-  - Single full game self-play (5P7C, 17 rounds): target <30s neural time
-- **Full iteration benchmark**: self-play (~177 games) + training (10 epochs) — target <5 minutes total with 32 threads
-- **Memory profiling**: track peak RSS during 32-thread self-play. Verify no memory leaks over 100 iterations
-- **Numerical stability**: run 50 training iterations, verify no NaN/Inf in loss, gradients, or model outputs. Check value head stays in [-1, 1] range
+- **Benchmark suite** using `criterion` (add as `[dev-dependencies]` in `blob-engine`):
+  - `BlobState` copy: ~100 ns (the existing 512 B size test in `state.rs` already guards the struct size).
+  - Legal move generation (bitmask return): ~5 ns.
+  - Entity encoding: < 1 µs.
+  - ONNX inference (batch=1): < 0.2 ms (ort CPU).
+  - MCTS 100 sims (with ONNX eval): < 20 ms.
+  - Full move (5 det × 100 sims): < 100 ms.
+  - Single full 5P7C game self-play (17 rounds): < 30 s of neural time.
+- **Full iteration wall-clock**: self-play (~177 games) + training (10 epochs) with 32 threads: **< 5 minutes**. Reconcile AGENTS.md's "Verification Gates" section in this session — its earlier "< 60 seconds" figure was aspirational for small-game sanity runs and should be replaced by the 5-minute target so the two docs agree.
+- **Memory profiling**: track peak RSS during 32-thread self-play; verify no leak over 100 iterations.
+- **Numerical stability**: 50 training iterations with no NaN/Inf in loss, gradients, or model outputs; value head stays in [−1, 1].
+- **ONNX ↔ tch parity test**: push the same input through `tch` forward and `OnnxEvaluator`; per-element agreement within 1e-5 on policy (logits/probs) and value. Add this to `scripts/export_onnx.py`'s post-export verification and as a Rust-side integration test gated on `BLOB_ONNX_MODEL`.
 - **Gate checklist verification**:
-  - [ ] All ported game engine tests pass (143 from `test_blob.py`, adjusted for the round-structure correction)
-  - [ ] MCTS 5×100 → top1_visit_share > 2/num_legal_actions (non-uniform signal)
-  - [ ] Policy loss < ln(7) ≈ 1.95 within 10 iterations
-  - [ ] Win rate vs random > 55% within 20 iterations
-  - [ ] Full iteration < 5 minutes (32 threads)
-  - [ ] 32-thread scaling > 80% efficiency
-  - [ ] ONNX inference < 0.2ms (ort CPU, single sample)
-  - [ ] ONNX ↔ tch output agreement within 1e-5
-- Fix any gates that don't pass. This session is buffer/contingency for issues found during integration
+  - [ ] All ported game-engine tests pass (143 from `test_blob.py`, adjusted for the round-structure correction).
+  - [ ] MCTS 5×100 → `top1_visit_share > 2 / num_legal_actions` (non-uniform signal).
+  - [ ] Policy loss < `ln(7) ≈ 1.95` within 10 iterations.
+  - [ ] Eval `win_rate_lower95 > 0.5` vs heuristic baseline within 20 iterations.
+  - [ ] Full iteration < 5 minutes (32 threads).
+  - [ ] 32-thread scaling > 80% efficiency.
+  - [ ] ONNX inference < 0.2 ms (ort CPU, single sample).
+  - [ ] ONNX ↔ tch output agreement within 1e-5.
+- Fix any gates that don't pass. This session is buffer/contingency for issues found during integration.
 
 ---
 
