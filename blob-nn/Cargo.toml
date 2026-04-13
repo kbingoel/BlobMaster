@@ -12,5 +12,7 @@ rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 tch = { version = "0.20", features = ["download-libtorch"] }
 tracing = { workspace = true }
+rayon = "1"
+indicatif = "0.17"
 
 [dev-dependencies]

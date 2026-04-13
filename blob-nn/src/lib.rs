@@ -16,6 +16,8 @@ pub mod transformer;
 pub mod heads;
 pub mod model;
 pub mod self_play;
+pub mod engine;
 pub mod train;
 
 pub use self_play::{backfill_values, play_one_game, sample_game_params, TrainingExample};
+pub use engine::{self_play_iteration, SelfPlayConfig, DEFAULT_NUM_THREADS};
