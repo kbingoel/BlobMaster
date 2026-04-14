@@ -16,3 +16,13 @@ bincode = "1"
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rand = { workspace = true }
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "onnx_mcts"
+harness = false

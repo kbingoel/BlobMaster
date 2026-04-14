@@ -211,8 +211,14 @@ class BlobNet(nn.Module):
 
 
 def _rust_to_torch_key(rust_key: str) -> str:
-    # VarStore uses `/` as a path separator; PyTorch uses `.`.
-    return rust_key.replace("/", ".")
+    # tch's VarStore TorchScript archive exposes names like
+    # `transformer|layer0|attn|qkv|weight` and sub-module names like
+    # `layer0` → PyTorch uses `.` separators and numeric indices.
+    k = rust_key.replace("|", ".").replace("/", ".")
+    # `transformer.layer0.x` → `transformer.layers.0.x` to match nn.ModuleList.
+    import re
+    k = re.sub(r"\.layer(\d+)\.", r".layers.\1.", k)
+    return k
 
 
 def load_varstore_into(model: BlobNet, weights_path: Path) -> None:
@@ -222,10 +228,20 @@ def load_varstore_into(model: BlobNet, weights_path: Path) -> None:
     serialization format. `torch.load` with `weights_only=True` handles it
     in recent PyTorch versions; older versions need `weights_only=False`.
     """
+    # tch VarStore::save writes a TorchScript archive (zip of named tensors).
+    # Load via torch.jit and extract named parameters/buffers.
     try:
-        raw = torch.load(weights_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        raw = torch.load(weights_path, map_location="cpu")
+        module = torch.jit.load(str(weights_path), map_location="cpu")
+        raw = {}
+        for name, param in module.named_parameters(recurse=True):
+            raw[name] = param.detach()
+        for name, buf in module.named_buffers(recurse=True):
+            raw.setdefault(name, buf.detach())
+    except Exception:
+        try:
+            raw = torch.load(weights_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            raw = torch.load(weights_path, map_location="cpu")
 
     remapped = {}
     for k, v in raw.items():
@@ -268,6 +284,7 @@ def export(model: BlobNet, out_path: Path) -> None:
         },
         opset_version=17,
         do_constant_folding=True,
+        dynamo=False,
     )
 
 
