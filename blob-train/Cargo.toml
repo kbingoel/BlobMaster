@@ -1,0 +1,20 @@
+[package]
+name = "blob-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blobmaster-train"
+path = "src/main.rs"
+
+[dependencies]
+blob-engine = { path = "../blob-engine" }
+blob-nn = { path = "../blob-nn" }
+tch = { version = "0.20", features = ["download-libtorch"] }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+indicatif = "0.17"

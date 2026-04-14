@@ -4,6 +4,7 @@ members = [
     "blob-engine",
     "blob-nn",
     "blob-bin",
+    "blob-train",
 ]
 
 [workspace.package]
