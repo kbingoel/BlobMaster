@@ -27,7 +27,7 @@ use crate::self_play::{play_one_game, sample_game_params, TrainingExample};
 pub const DEFAULT_NUM_THREADS: usize = 32;
 
 /// Configuration for one self-play iteration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SelfPlayConfig {
     pub num_games: usize,
     pub num_threads: usize,

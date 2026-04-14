@@ -397,7 +397,7 @@ pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
 ///
 /// Defaults match the plan's target budget (`5 × 100 = 500 sims`) with
 /// a hard floor of 60 total simulations for any non-forced decision.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct MctsConfig {
     pub c_puct: f32,
     /// Default determinizations per decision; `adaptive_budget` may

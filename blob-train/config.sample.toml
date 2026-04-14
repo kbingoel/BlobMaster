@@ -1,0 +1,32 @@
+# Sample TrainingConfig for blobmaster-train.
+# CLI flags (--checkpoint-dir, --batch-size, --num-games, --num-threads,
+# --device) override the matching values below.
+
+[training]
+checkpoint_dir = "checkpoints"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_training_steps = 200000
+device = "cuda:0"
+
+[self_play]
+num_games = 64
+num_threads = 32
+iteration = 0
+show_progress = true
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+
+[eval]
+eval_games = 200
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02

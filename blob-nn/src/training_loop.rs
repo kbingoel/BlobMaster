@@ -45,7 +45,7 @@ pub const DEFAULT_EPOCHS_PER_ITERATION: usize = 10;
 pub const EVAL_CHECKPOINT_EVERY: u64 = 5;
 
 /// Configuration for one training run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingLoopConfig {
     pub checkpoint_dir: PathBuf,
     pub buffer_capacity: usize,
@@ -55,7 +55,48 @@ pub struct TrainingLoopConfig {
     /// this threshold. 0.0 disables early stop.
     pub epoch_early_stop_rel: f64,
     pub total_training_steps: i64,
+    /// `tch::Device` is not serde-friendly, so round-trip as a string
+    /// tag (`"cpu"` / `"cuda"` / `"cuda:N"` / `"mps"`).
+    #[serde(with = "device_serde")]
     pub device: Device,
+}
+
+mod device_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use tch::Device;
+
+    pub fn serialize<S: Serializer>(dev: &Device, s: S) -> Result<S::Ok, S::Error> {
+        let tag = match dev {
+            Device::Cpu => "cpu".to_string(),
+            Device::Cuda(i) => format!("cuda:{i}"),
+            Device::Mps => "mps".to_string(),
+            Device::Vulkan => "vulkan".to_string(),
+        };
+        s.serialize_str(&tag)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Device, D::Error> {
+        let tag = String::deserialize(d)?;
+        let t = tag.to_ascii_lowercase();
+        if t == "cpu" {
+            Ok(Device::Cpu)
+        } else if t == "mps" {
+            Ok(Device::Mps)
+        } else if t == "vulkan" {
+            Ok(Device::Vulkan)
+        } else if t == "cuda" {
+            Ok(Device::Cuda(0))
+        } else if let Some(rest) = t.strip_prefix("cuda:") {
+            let i: usize = rest
+                .parse()
+                .map_err(|e| serde::de::Error::custom(format!("invalid cuda index: {e}")))?;
+            Ok(Device::Cuda(i))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unknown device tag: {tag}"
+            )))
+        }
+    }
 }
 
 impl Default for TrainingLoopConfig {
