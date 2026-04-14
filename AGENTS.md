@@ -72,7 +72,7 @@ Before considering a phase complete:
 - Game engine: all 143 ported tests pass (adjusted for round-structure correction); `BlobState` copy benchmarks at ~100ns (~410 B across ~6 cache lines)
 - MCTS: with 5×100 sims, top action has >2× average visit count (non-uniform signal)
 - Training: policy loss drops below `ln(avg_legal_actions)` within 10 iterations; win rate vs random > 55% within 20 iterations
-- Performance: full iteration (self-play + training) completes in <60 seconds; 32-thread self-play >80% scaling efficiency
+- Performance: full iteration (self-play + training, ~177 games × 10 epochs) completes in <5 minutes on 32 threads; 32-thread self-play >80% scaling efficiency; ONNX inference <0.2 ms (batch=1, ort CPU); ONNX ↔ tch output agreement within 1e-5. (The earlier "<60 seconds" figure was a small-game sanity target; Session 6.3 reconciled it with the realistic full-iteration budget in `development-plan.md` and the benches under `blob-engine/benches/`.)
 
 ## Hardware Target
 

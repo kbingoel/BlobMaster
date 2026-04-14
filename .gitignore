@@ -1,5 +1,6 @@
 # Python
 venv
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -46,3 +47,7 @@ flamegraph.svg
 *.pkl
 *.onnx
 *.safetensors
+*.ot
+
+# Claude Code local state
+.claude/scheduled_tasks.lock
