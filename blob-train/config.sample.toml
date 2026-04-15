@@ -9,13 +9,19 @@ batch_size = 512
 epochs_per_iteration = 10
 epoch_early_stop_rel = 0.005
 total_training_steps = 200000
+total_iterations = 1
 device = "cuda:0"
 
 [self_play]
-num_games = 64
+# 118 × ~680 decisions ≈ 80K examples/iter (matches Section 5/6 downstream
+# sizing). Session 7.1 bumped this from 64.
+num_games = 118
 num_threads = 32
 iteration = 0
 show_progress = true
+# Session 7.1 smoke test forces 5P7C; remove / set to `false` for the mixed
+# Section 5 distribution.
+# fixed_player_count = [5, 7]
 
 [mcts]
 c_puct = 1.5

@@ -18,3 +18,4 @@ toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 indicatif = "0.17"
+rand_xoshiro = { workspace = true }

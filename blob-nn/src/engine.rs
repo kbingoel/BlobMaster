@@ -21,7 +21,9 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::self_play::{play_one_game, sample_game_params, TrainingExample};
+use crate::self_play::{
+    play_one_game_with_stats, sample_game_params, DecisionStat, TrainingExample,
+};
 
 /// Default self-play worker count. Section 5.3 targets 32-thread scaling.
 pub const DEFAULT_NUM_THREADS: usize = 32;
@@ -36,6 +38,11 @@ pub struct SelfPlayConfig {
     pub iteration: u64,
     /// If false, suppress the `indicatif` progress bar (useful for tests).
     pub show_progress: bool,
+    /// Session 7.1: if `Some((n, c))`, every worker uses this `(num_players,
+    /// start_cards)` instead of drawing from `sample_game_params`. Used for
+    /// the 7.1 / 7.2 fixed-5P7C runs; production training leaves it `None`.
+    #[serde(default)]
+    pub fixed_player_count: Option<(u8, u8)>,
 }
 
 impl Default for SelfPlayConfig {
@@ -45,6 +52,7 @@ impl Default for SelfPlayConfig {
             num_threads: DEFAULT_NUM_THREADS,
             iteration: 0,
             show_progress: true,
+            fixed_player_count: None,
         }
     }
 }
@@ -59,7 +67,7 @@ pub fn self_play_iteration(
     model_path: &Path,
     cfg: &SelfPlayConfig,
     mcts_cfg: &MctsConfig,
-) -> Vec<TrainingExample> {
+) -> (Vec<TrainingExample>, Vec<DecisionStat>) {
     let pool = ThreadPoolBuilder::new()
         .num_threads(cfg.num_threads)
         .build()
@@ -80,7 +88,7 @@ pub fn self_play_iteration(
 
     let example_count = AtomicUsize::new(0);
 
-    let results: Vec<Vec<TrainingExample>> = pool.install(|| {
+    let results: Vec<(Vec<TrainingExample>, Vec<DecisionStat>)> = pool.install(|| {
         (0..cfg.num_games)
             .into_par_iter()
             .map(|game_idx| {
@@ -92,8 +100,12 @@ pub fn self_play_iteration(
                 let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
                 let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-                let (n, c) = sample_game_params(&mut rng);
-                let examples = play_one_game(n, c, &eval, mcts_cfg, &mut rng);
+                let (n, c) = match cfg.fixed_player_count {
+                    Some(nc) => nc,
+                    None => sample_game_params(&mut rng),
+                };
+                let (examples, stats) =
+                    play_one_game_with_stats(n, c, &eval, mcts_cfg, &mut rng);
 
                 let new_total =
                     example_count.fetch_add(examples.len(), Ordering::Relaxed) + examples.len();
@@ -101,7 +113,7 @@ pub fn self_play_iteration(
                     pb.inc(1);
                     pb.set_message(new_total.to_string());
                 }
-                examples
+                (examples, stats)
             })
             .collect()
     });
@@ -110,12 +122,14 @@ pub fn self_play_iteration(
         pb.finish_and_clear();
     }
 
-    let total: usize = results.iter().map(|v| v.len()).sum();
+    let total: usize = results.iter().map(|(v, _)| v.len()).sum();
     let mut out = Vec::with_capacity(total);
-    for v in results {
+    let mut stats_out: Vec<DecisionStat> = Vec::with_capacity(total);
+    for (v, s) in results {
         out.extend(v);
+        stats_out.extend(s);
     }
-    out
+    (out, stats_out)
 }
 
 /// SplitMix64-style scramble so `(iteration, thread, game)` triples produce
@@ -180,8 +194,9 @@ mod tests {
             num_threads: 2,
             iteration: 0,
             show_progress: false,
+            fixed_player_count: None,
         };
-        let examples = self_play_iteration(&path, &cfg, &mcts_cfg);
+        let (examples, _stats) = self_play_iteration(&path, &cfg, &mcts_cfg);
         assert!(!examples.is_empty());
     }
 }

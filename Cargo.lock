@@ -187,6 +187,7 @@ dependencies = [
  "blob-nn",
  "clap",
  "indicatif",
+ "rand_xoshiro",
  "serde",
  "tch",
  "toml",
