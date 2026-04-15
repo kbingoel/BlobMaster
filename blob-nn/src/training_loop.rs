@@ -27,7 +27,7 @@ use crate::engine::{self_play_iteration, SelfPlayConfig};
 use crate::heads::NUM_BIDS;
 use crate::input::pad_batch;
 use crate::model::BlobNet;
-use crate::self_play::TrainingExample;
+use crate::self_play::{DecisionStat, TrainingExample};
 use crate::train::{
     build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint, value_mse,
     LrSchedule, Phase, TrainBatch, VALUE_LOSS_COEF, GRAD_CLIP_MAX_NORM,
@@ -44,6 +44,10 @@ pub const DEFAULT_EPOCHS_PER_ITERATION: usize = 10;
 /// checkpoints are kept permanently. Matches Session 5.4's retention plan.
 pub const EVAL_CHECKPOINT_EVERY: u64 = 5;
 
+fn default_total_iterations() -> u64 {
+    1
+}
+
 /// Configuration for one training run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingLoopConfig {
@@ -55,6 +59,11 @@ pub struct TrainingLoopConfig {
     /// this threshold. 0.0 disables early stop.
     pub epoch_early_stop_rel: f64,
     pub total_training_steps: i64,
+    /// Session 7.1: number of `run_iteration` calls the `blobmaster-train
+    /// train` driver should perform for a single invocation. The in-process
+    /// training loop doesn't enforce this itself — it's read by the CLI.
+    #[serde(default = "default_total_iterations")]
+    pub total_iterations: u64,
     /// `tch::Device` is not serde-friendly, so round-trip as a string
     /// tag (`"cpu"` / `"cuda"` / `"cuda:N"` / `"mps"`).
     #[serde(with = "device_serde")]
@@ -108,6 +117,7 @@ impl Default for TrainingLoopConfig {
             epochs_per_iteration: DEFAULT_EPOCHS_PER_ITERATION,
             epoch_early_stop_rel: 0.005,
             total_training_steps: 200_000,
+            total_iterations: 1,
             device: Device::Cpu,
         }
     }
@@ -137,6 +147,20 @@ pub struct IterationMetrics {
     pub num_nn_evaluations: u64,
     pub examples_generated: usize,
     pub buffer_len: usize,
+    /// Session 7.1 — P10/P50/P90 of `DecisionStat::signal_ratio`, bucketed
+    /// by branching factor (`num_legal`): `bucket_low` = `num_legal ≤ 3`,
+    /// `bucket_mid` = `4..=7`, `bucket_high` = `> 7`. Missing buckets emit
+    /// NaN so downstream tooling can distinguish "no data" from "zero".
+    pub signal_p10_low: f64,
+    pub signal_p50_low: f64,
+    pub signal_p90_low: f64,
+    pub signal_p10_mid: f64,
+    pub signal_p50_mid: f64,
+    pub signal_p90_mid: f64,
+    pub signal_p10_high: f64,
+    pub signal_p50_high: f64,
+    pub signal_p90_high: f64,
+    pub num_decisions: usize,
 }
 
 impl IterationMetrics {
@@ -173,6 +197,16 @@ impl IterationMetrics {
         kv!("num_nn_evaluations", self.num_nn_evaluations);
         kv!("examples_generated", self.examples_generated);
         kv!("buffer_len", self.buffer_len);
+        kv!("num_decisions", self.num_decisions);
+        kv!("signal_p10_low", json_f64(self.signal_p10_low));
+        kv!("signal_p50_low", json_f64(self.signal_p50_low));
+        kv!("signal_p90_low", json_f64(self.signal_p90_low));
+        kv!("signal_p10_mid", json_f64(self.signal_p10_mid));
+        kv!("signal_p50_mid", json_f64(self.signal_p50_mid));
+        kv!("signal_p90_mid", json_f64(self.signal_p90_mid));
+        kv!("signal_p10_high", json_f64(self.signal_p10_high));
+        kv!("signal_p50_high", json_f64(self.signal_p50_high));
+        kv!("signal_p90_high", json_f64(self.signal_p90_high));
         s.push(',');
         s.push_str("\"grad_norms\":{");
         for (i, (k, v)) in self.grad_norms.iter().enumerate() {
@@ -189,6 +223,48 @@ impl IterationMetrics {
         s.push('\n');
         s
     }
+}
+
+fn percentile_sorted(sorted: &[f32], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let rank = (pct / 100.0) * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    let a = sorted[lo] as f64;
+    let b = sorted[hi] as f64;
+    a + (b - a) * frac
+}
+
+fn fold_decision_stats(metrics: &mut IterationMetrics, stats: &[DecisionStat]) {
+    metrics.num_decisions = stats.len();
+    let mut low: Vec<f32> = Vec::new();
+    let mut mid: Vec<f32> = Vec::new();
+    let mut high: Vec<f32> = Vec::new();
+    for s in stats {
+        let r = s.signal_ratio;
+        if s.num_legal <= 3 {
+            low.push(r);
+        } else if s.num_legal <= 7 {
+            mid.push(r);
+        } else {
+            high.push(r);
+        }
+    }
+    for v in [&mut low, &mut mid, &mut high] {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    metrics.signal_p10_low = percentile_sorted(&low, 10.0);
+    metrics.signal_p50_low = percentile_sorted(&low, 50.0);
+    metrics.signal_p90_low = percentile_sorted(&low, 90.0);
+    metrics.signal_p10_mid = percentile_sorted(&mid, 10.0);
+    metrics.signal_p50_mid = percentile_sorted(&mid, 50.0);
+    metrics.signal_p90_mid = percentile_sorted(&mid, 90.0);
+    metrics.signal_p10_high = percentile_sorted(&high, 10.0);
+    metrics.signal_p50_high = percentile_sorted(&high, 50.0);
+    metrics.signal_p90_high = percentile_sorted(&high, 90.0);
 }
 
 fn json_f64(x: f64) -> String {
@@ -528,19 +604,22 @@ impl TrainingLoop {
         R: Rng + ?Sized,
         F: FnOnce(&Path, &Path) -> std::io::Result<()>,
     {
-        let examples = self_play_iteration(onnx_model_path, self_play_cfg, mcts_cfg);
+        let (examples, decision_stats) =
+            self_play_iteration(onnx_model_path, self_play_cfg, mcts_cfg);
         for ex in &examples {
             if matches!(ex.phase, GamePhase::Bidding | GamePhase::Playing) {
                 self.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
             }
         }
 
-        let metrics = self.train_phase(rng, &examples);
+        let mut metrics = self.train_phase(rng, &examples);
+        fold_decision_stats(&mut metrics, &decision_stats);
 
         let dir = self.iteration_dir(self.iteration);
         save_model_checkpoint(&self.vs, self.iteration, &dir)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         self.append_metrics_line(&metrics)?;
+        self.append_decision_stats(&decision_stats)?;
 
         let new_onnx_path = dir.join("model.onnx");
         on_export(&dir.join("model.ot"), &new_onnx_path)?;
@@ -548,6 +627,40 @@ impl TrainingLoop {
         self.prune_checkpoints()?;
         self.iteration += 1;
         Ok(metrics)
+    }
+
+    fn decision_stats_path(&self) -> PathBuf {
+        self.cfg.checkpoint_dir.join("decision_stats.jsonl")
+    }
+
+    fn append_decision_stats(&self, stats: &[DecisionStat]) -> std::io::Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.cfg.checkpoint_dir)?;
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.decision_stats_path())?;
+        for s in stats {
+            let phase = match s.phase {
+                GamePhase::Bidding => "bidding",
+                GamePhase::Playing => "playing",
+                GamePhase::Scoring => "scoring",
+                GamePhase::Complete => "complete",
+            };
+            writeln!(
+                f,
+                "{{\"iteration\":{},\"phase\":\"{}\",\"num_legal\":{},\"sims_used\":{},\"signal_ratio\":{}}}",
+                self.iteration,
+                phase,
+                s.num_legal,
+                s.sims_used,
+                json_f64(s.signal_ratio as f64)
+            )?;
+        }
+        Ok(())
     }
 
     fn append_metrics_line(&self, m: &IterationMetrics) -> std::io::Result<()> {
@@ -595,6 +708,12 @@ impl TrainingLoop {
     /// Scan `checkpoint_dir` for `iter_*` directories and load weights
     /// from the highest-numbered one. Returns the iteration resumed from,
     /// or `None` if no checkpoint exists.
+    /// Session 7.1 alias — development-plan refers to `try_resume`. Behavior
+    /// is identical to `resume_from_latest`.
+    pub fn try_resume(&mut self) -> std::io::Result<Option<u64>> {
+        self.resume_from_latest()
+    }
+
     pub fn resume_from_latest(&mut self) -> std::io::Result<Option<u64>> {
         let dir = &self.cfg.checkpoint_dir;
         if !dir.exists() {
@@ -781,6 +900,16 @@ impl LossAccumulators {
             num_nn_evaluations: self.num_nn_evals,
             examples_generated,
             buffer_len,
+            num_decisions: 0,
+            signal_p10_low: f64::NAN,
+            signal_p50_low: f64::NAN,
+            signal_p90_low: f64::NAN,
+            signal_p10_mid: f64::NAN,
+            signal_p50_mid: f64::NAN,
+            signal_p90_mid: f64::NAN,
+            signal_p10_high: f64::NAN,
+            signal_p50_high: f64::NAN,
+            signal_p90_high: f64::NAN,
         }
     }
 }
@@ -856,6 +985,7 @@ mod tests {
             epochs_per_iteration: 4,
             epoch_early_stop_rel: -1.0, // never stop early
             total_training_steps: 10_000,
+            total_iterations: 1,
             device: Device::Cpu,
         };
         let mut tl = TrainingLoop::new(cfg);

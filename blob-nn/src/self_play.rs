@@ -5,13 +5,13 @@
 //! then backfills a z-scored value target computed from cumulative game
 //! scores once the game ends.
 
-use blob_engine::bidding::apply_bid;
+use blob_engine::bidding::{apply_bid, legal_bids};
 use blob_engine::dealing::start_round;
 use blob_engine::evaluator::Evaluator;
 use blob_engine::game::{advance_round, is_game_over, new_game};
 use blob_engine::hand::Hand;
-use blob_engine::mcts::{mcts_search, MctsConfig};
-use blob_engine::playing::apply_play;
+use blob_engine::mcts::{adaptive_budget, mcts_search, signal_ratio, MctsConfig};
+use blob_engine::playing::{apply_play, legal_plays};
 use blob_engine::replay::{SparsePolicy, MAX_BID_ACTIONS};
 use blob_engine::state::{BlobState, GamePhase, MAX_PLAYERS};
 use rand::Rng;
@@ -87,6 +87,18 @@ fn dense_to_sparse(policy: &[f32]) -> SparsePolicy {
     out
 }
 
+/// Per-decision signal-quality record (development-plan §7.1). Emitted
+/// alongside `TrainingExample`s so the training loop can write a
+/// `decision_stats.jsonl` sidecar and roll signal-ratio percentiles into
+/// `IterationMetrics`.
+#[derive(Debug, Clone, Copy)]
+pub struct DecisionStat {
+    pub phase: GamePhase,
+    pub num_legal: u32,
+    pub sims_used: u32,
+    pub signal_ratio: f32,
+}
+
 /// Play one complete game and return the decision-point examples.
 ///
 /// MCTS is driven by `eval` + `cfg`; actions are sampled from the MCTS
@@ -103,20 +115,47 @@ where
     E: Evaluator,
     R: Rng + ?Sized,
 {
+    let (ex, _) = play_one_game_with_stats(num_players, start_cards, eval, cfg, rng);
+    ex
+}
+
+/// Like `play_one_game`, additionally returning a `DecisionStat` per
+/// decision point. Introduced in Session 7.1 to feed `decision_stats.jsonl`
+/// and the adaptive-budget tuning planned in Session 7.3.
+pub fn play_one_game_with_stats<E, R>(
+    num_players: u8,
+    start_cards: u8,
+    eval: &E,
+    cfg: &MctsConfig,
+    rng: &mut R,
+) -> (Vec<TrainingExample>, Vec<DecisionStat>)
+where
+    E: Evaluator,
+    R: Rng + ?Sized,
+{
     let mut state = new_game(num_players, start_cards).expect("valid game params");
     start_round(&mut state, rng);
 
     let mut examples: Vec<TrainingExample> = Vec::new();
+    let mut stats: Vec<DecisionStat> = Vec::new();
 
     while !is_game_over(&state) {
         match state.phase() {
             GamePhase::Bidding => {
+                let num_legal = legal_bids(&state).count_ones() as usize;
+                let (dets, sims) = adaptive_budget(num_legal, cfg);
                 let result = mcts_search(&state, eval, cfg, rng);
                 debug_assert_eq!(result.policy.len(), MAX_BID_ACTIONS);
                 let perspective = state.current_player;
                 let sparse = dense_to_sparse(&result.policy);
                 let snapshot = state;
                 let action = sample_from_policy(&result.policy, rng) as u8;
+                stats.push(DecisionStat {
+                    phase: GamePhase::Bidding,
+                    num_legal: num_legal as u32,
+                    sims_used: dets.saturating_mul(sims),
+                    signal_ratio: signal_ratio(&result, num_legal),
+                });
                 examples.push(TrainingExample {
                     state: snapshot,
                     policy: sparse,
@@ -132,12 +171,20 @@ where
                     .iter()
                     .map(|c| c.index())
                     .collect();
+                let num_legal = legal_plays(&state).count_ones() as usize;
+                let (dets, sims) = adaptive_budget(num_legal, cfg);
                 let result = mcts_search(&state, eval, cfg, rng);
                 debug_assert_eq!(result.policy.len(), hand_cards.len());
                 let sparse = dense_to_sparse(&result.policy);
                 let snapshot = state;
                 let pos = sample_from_policy(&result.policy, rng);
                 let card_idx = hand_cards[pos];
+                stats.push(DecisionStat {
+                    phase: GamePhase::Playing,
+                    num_legal: num_legal as u32,
+                    sims_used: dets.saturating_mul(sims),
+                    signal_ratio: signal_ratio(&result, num_legal),
+                });
                 examples.push(TrainingExample {
                     state: snapshot,
                     policy: sparse,
@@ -155,7 +202,7 @@ where
     }
 
     backfill_values(&mut examples, &state);
-    examples
+    (examples, stats)
 }
 
 /// Fill each example's `value` with the z-scored cumulative score of its
