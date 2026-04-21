@@ -147,6 +147,7 @@ fn parse_device(tag: &str) -> Result<tch::Device, String> {
 /// through `run_iteration`'s error channel.
 fn run_export_script(ot_path: &Path, onnx_path: &Path) -> std::io::Result<()> {
     let status = ProcCommand::new("python3")
+        .env_remove("LD_PRELOAD")
         .arg("scripts/export_onnx.py")
         .arg("--weights")
         .arg(ot_path)
@@ -217,13 +218,28 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
         let iter = tl.iteration;
         cfg.self_play.iteration = iter;
         let started = std::time::Instant::now();
-        let metrics = tl.run_iteration(
-            &mut rng,
-            &cfg.self_play,
-            &cfg.mcts,
-            &onnx_path,
-            |ot, onnx| run_export_script(ot, onnx),
-        )?;
+        let metrics = if cfg.gpu_eval.enabled {
+            let device = parse_device(&cfg.gpu_eval.device).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "invalid gpu_eval.device; falling back to cpu");
+                tch::Device::Cpu
+            });
+            tl.run_iteration_gpu(
+                &mut rng,
+                &cfg.self_play,
+                &cfg.mcts,
+                device,
+                cfg.gpu_eval.batch,
+                |ot, onnx| run_export_script(ot, onnx),
+            )?
+        } else {
+            tl.run_iteration(
+                &mut rng,
+                &cfg.self_play,
+                &cfg.mcts,
+                &onnx_path,
+                |ot, onnx| run_export_script(ot, onnx),
+            )?
+        };
         let elapsed = started.elapsed();
         tracing::info!(
             iteration = iter,

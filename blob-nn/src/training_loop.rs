@@ -23,7 +23,10 @@ use blob_engine::state::GamePhase;
 use rand::Rng;
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::engine::{self_play_iteration, SelfPlayConfig};
+use crate::engine::{
+    self_play_iteration, self_play_iteration_with_evaluator, SelfPlayConfig,
+};
+use crate::gpu_eval::{BatchCfg, BatchedGpuEvaluator};
 use crate::heads::NUM_BIDS;
 use crate::input::pad_batch;
 use crate::model::BlobNet;
@@ -585,6 +588,61 @@ impl TrainingLoop {
             examples_from_self_play.len(),
             self.buffer.len(),
         )
+    }
+
+    /// Run one full training iteration driven by a `BatchedGpuEvaluator`
+    /// built from the current in-memory weights — bypasses ONNX export on
+    /// the hot path (the export still happens post-iteration so deployment
+    /// / anchor-comparison paths can consume an `.onnx`).
+    pub fn run_iteration_gpu<R, F>(
+        &mut self,
+        rng: &mut R,
+        self_play_cfg: &SelfPlayConfig,
+        mcts_cfg: &MctsConfig,
+        inference_device: Device,
+        batch_cfg: BatchCfg,
+        on_export: F,
+    ) -> std::io::Result<IterationMetrics>
+    where
+        R: Rng + ?Sized,
+        F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    {
+        let eval = BatchedGpuEvaluator::new(&self.vs, inference_device, batch_cfg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let started = std::time::Instant::now();
+        let (examples, decision_stats) =
+            self_play_iteration_with_evaluator(&eval, self_play_cfg, mcts_cfg);
+        let sp_elapsed = started.elapsed();
+        tracing::info!(
+            iteration = self.iteration,
+            examples = examples.len(),
+            self_play_secs = sp_elapsed.as_secs_f64(),
+            stats = %eval.stats().summary(),
+            "gpu self-play complete"
+        );
+        drop(eval);
+
+        for ex in &examples {
+            if matches!(ex.phase, GamePhase::Bidding | GamePhase::Playing) {
+                self.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
+            }
+        }
+
+        let mut metrics = self.train_phase(rng, &examples);
+        fold_decision_stats(&mut metrics, &decision_stats);
+
+        let dir = self.iteration_dir(self.iteration);
+        save_model_checkpoint(&self.vs, self.iteration, &dir)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        self.append_metrics_line(&metrics)?;
+        self.append_decision_stats(&decision_stats)?;
+
+        let new_onnx_path = dir.join("model.onnx");
+        on_export(&dir.join("model.ot"), &new_onnx_path)?;
+
+        self.prune_checkpoints()?;
+        self.iteration += 1;
+        Ok(metrics)
     }
 
     /// Run one full training iteration: self-play → buffer → training →

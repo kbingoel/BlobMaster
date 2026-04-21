@@ -112,7 +112,7 @@ pub fn play_one_game<E, R>(
     rng: &mut R,
 ) -> Vec<TrainingExample>
 where
-    E: Evaluator,
+    E: Evaluator + ?Sized,
     R: Rng + ?Sized,
 {
     let (ex, _) = play_one_game_with_stats(num_players, start_cards, eval, cfg, rng);
@@ -130,7 +130,7 @@ pub fn play_one_game_with_stats<E, R>(
     rng: &mut R,
 ) -> (Vec<TrainingExample>, Vec<DecisionStat>)
 where
-    E: Evaluator,
+    E: Evaluator + ?Sized,
     R: Rng + ?Sized,
 {
     let mut state = new_game(num_players, start_cards).expect("valid game params");

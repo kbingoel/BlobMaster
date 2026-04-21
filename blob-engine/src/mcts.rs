@@ -293,7 +293,7 @@ pub fn backprop(arena: &mut MctsArena, path: &[u32], leaf_seat: u8, v: f32) {
 ///
 /// The initial root expansion is performed inside the first simulation
 /// (path is just `[0]` when the tree is empty).
-pub fn run_search<E: Evaluator>(
+pub fn run_search<E: Evaluator + ?Sized>(
     arena: &mut MctsArena,
     root_state: &BlobState,
     eval: &E,
@@ -538,7 +538,7 @@ pub fn mcts_search<E, R>(
     rng: &mut R,
 ) -> MctsResult
 where
-    E: Evaluator,
+    E: Evaluator + ?Sized,
     R: Rng + ?Sized,
 {
     let phase = state.phase();

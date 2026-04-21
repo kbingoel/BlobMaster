@@ -43,6 +43,13 @@ pub struct SelfPlayConfig {
     /// the 7.1 / 7.2 fixed-5P7C runs; production training leaves it `None`.
     #[serde(default)]
     pub fixed_player_count: Option<(u8, u8)>,
+    /// Section 7 — oversubscribed rayon pool size when using a shared
+    /// `BatchedGpuEvaluator`. Workers spend most of their wall time blocked
+    /// on the inference channel, so growing the worker count is cheap and
+    /// grows steady-state batch size. `None` means "use `num_threads`".
+    /// Ignored by the legacy per-thread ONNX path.
+    #[serde(default)]
+    pub concurrent_games: Option<usize>,
 }
 
 impl Default for SelfPlayConfig {
@@ -53,8 +60,79 @@ impl Default for SelfPlayConfig {
             iteration: 0,
             show_progress: true,
             fixed_player_count: None,
+            concurrent_games: None,
         }
     }
+}
+
+/// Run one self-play iteration with a shared, user-supplied evaluator.
+///
+/// Every rayon worker calls through the same `&dyn Evaluator + Sync` — this
+/// is the GPU-backed path (`BatchedGpuEvaluator`), and the only place where
+/// `concurrent_games` (oversubscription) takes effect.
+pub fn self_play_iteration_with_evaluator(
+    eval: &(dyn blob_engine::evaluator::Evaluator + Sync),
+    cfg: &SelfPlayConfig,
+    mcts_cfg: &MctsConfig,
+) -> (Vec<TrainingExample>, Vec<DecisionStat>) {
+    let worker_threads = cfg.concurrent_games.unwrap_or(cfg.num_threads).max(1);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()
+        .expect("build rayon pool");
+
+    let progress = if cfg.show_progress {
+        let pb = ProgressBar::new(cfg.num_games as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner} {pos}/{len} games ({per_sec}) examples={msg} eta={eta}",
+            )
+            .unwrap(),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    let example_count = AtomicUsize::new(0);
+
+    let results: Vec<(Vec<TrainingExample>, Vec<DecisionStat>)> = pool.install(|| {
+        (0..cfg.num_games)
+            .into_par_iter()
+            .map(|game_idx| {
+                let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
+                let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
+                let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+                let (n, c) = match cfg.fixed_player_count {
+                    Some(nc) => nc,
+                    None => sample_game_params(&mut rng),
+                };
+                let (examples, stats) =
+                    play_one_game_with_stats(n, c, eval, mcts_cfg, &mut rng);
+
+                let new_total =
+                    example_count.fetch_add(examples.len(), Ordering::Relaxed) + examples.len();
+                if let Some(pb) = &progress {
+                    pb.inc(1);
+                    pb.set_message(new_total.to_string());
+                }
+                (examples, stats)
+            })
+            .collect()
+    });
+
+    if let Some(pb) = progress {
+        pb.finish_and_clear();
+    }
+
+    let total: usize = results.iter().map(|(v, _)| v.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    let mut stats_out: Vec<DecisionStat> = Vec::with_capacity(total);
+    for (v, s) in results {
+        out.extend(v);
+        stats_out.extend(s);
+    }
+    (out, stats_out)
 }
 
 /// Run one self-play iteration.
@@ -158,6 +236,52 @@ mod tests {
     }
 
     #[test]
+    fn gpu_eval_path_runs_self_play_end_to_end() {
+        // Drive self_play_iteration_with_evaluator using a BatchedGpuEvaluator
+        // on CPU — proves the channel wiring, oversubscription, and tear-down
+        // work across a real self-play iteration.
+        use crate::gpu_eval::{BatchCfg, BatchedGpuEvaluator};
+        use crate::model::BlobNet;
+        use tch::{nn, Device};
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _ = BlobNet::new(&vs.root());
+        let batch_cfg = BatchCfg {
+            max_batch: 8,
+            max_wait_us: 500,
+            pad_to_max_seq: true,
+        };
+        let eval = BatchedGpuEvaluator::new(&vs, Device::Cpu, batch_cfg)
+            .expect("build batched evaluator");
+
+        let mcts_cfg = MctsConfig {
+            c_puct: 1.5,
+            num_determinizations: 1,
+            sims_per_determinization: 1,
+            min_sims_floor: 1,
+            temperature: 1.0,
+            arena_capacity: blob_engine::mcts::DEFAULT_ARENA_CAPACITY,
+        };
+        let cfg = SelfPlayConfig {
+            num_games: 2,
+            num_threads: 2,
+            iteration: 0,
+            show_progress: false,
+            fixed_player_count: Some((4, 5)),
+            concurrent_games: Some(4),
+        };
+        let (examples, stats) = self_play_iteration_with_evaluator(&eval, &cfg, &mcts_cfg);
+        assert!(!examples.is_empty(), "no examples produced");
+        assert!(!stats.is_empty(), "no decision stats produced");
+        let s = eval.stats().summary();
+        // Must have actually submitted requests.
+        assert!(
+            eval.stats().requests_total.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no batched requests recorded; summary={s}"
+        );
+    }
+
+    #[test]
     fn self_play_config_defaults() {
         let c = SelfPlayConfig::default();
         assert_eq!(c.num_threads, DEFAULT_NUM_THREADS);
@@ -195,6 +319,7 @@ mod tests {
             iteration: 0,
             show_progress: false,
             fixed_player_count: None,
+            concurrent_games: None,
         };
         let (examples, _stats) = self_play_iteration(&path, &cfg, &mcts_cfg);
         assert!(!examples.is_empty());
