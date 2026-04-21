@@ -10,8 +10,31 @@ use std::path::Path;
 
 use blob_engine::mcts::MctsConfig;
 use blob_nn::engine::SelfPlayConfig;
+use blob_nn::gpu_eval::BatchCfg;
 use blob_nn::training_loop::TrainingLoopConfig;
 use serde::{Deserialize, Serialize};
+
+/// Section 7 — GPU-backed batched inference during self-play.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuEvalConfig {
+    /// Flip to `false` to fall back to the per-thread ONNX CPU path.
+    pub enabled: bool,
+    /// Device tag (e.g. "cpu", "cuda", "cuda:0"). Parsed the same way as
+    /// `training.device`.
+    pub device: String,
+    #[serde(flatten)]
+    pub batch: BatchCfg,
+}
+
+impl Default for GpuEvalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device: "cuda:0".to_string(),
+            batch: BatchCfg::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalConfig {
@@ -42,6 +65,8 @@ pub struct TrainingConfig {
     pub mcts: MctsConfig,
     #[serde(default)]
     pub eval: EvalConfig,
+    #[serde(default)]
+    pub gpu_eval: GpuEvalConfig,
 }
 
 fn default_training() -> TrainingLoopConfig {
