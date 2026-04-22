@@ -1,0 +1,2 @@
+[export_onnx] wrote checkpoints/smoke-7.1/bootstrap/model.onnx
+[export_onnx] wrote checkpoints/smoke-7.1/iter_000000/model.onnx

@@ -9,7 +9,7 @@ batch_size = 512
 epochs_per_iteration = 10
 epoch_early_stop_rel = 0.005
 total_training_steps = 200000
-total_iterations = 1
+total_iterations = 11
 device = "cuda:0"
 
 [self_play]
