@@ -589,7 +589,7 @@ Analysis: back-of-envelope on the model (8 layers × d=128, seq≈29, FFN=512 �
 
 Held-in-reserve optimizations (only pursued if the 32-thread wall-clock measurement in 7.1 fails):
 
-- Batch MCTS leaf evaluations within a determinization (virtual-loss + queue) so the NN sees batch>1 per forward. Highest-leverage single change.
+- **CPU-side** batching of MCTS leaf evaluations within a determinization (virtual-loss + queue) so each ort session sees batch>1 per forward. Highest-leverage single change remaining. (Note: *GPU* batching was implemented, profiled, and ruled out at this model size — CUDA coordination overhead exceeded compute savings at ~50M FLOPs/forward. See `gpu-inference-summary.md`. Revisit GPU only if model grows >10×.)
 - Pad sequences to a fixed MAX_SEQ in `OnnxEvaluator::run_encoded` so ort can reuse planned kernels across calls.
 - Tune `ort::SessionBuilder` (`intra_op_num_threads`, `OptimizedModelFilePath` caching).
 - FP16 / INT8 quantization (last resort; adds parity risk for a small model).
@@ -610,7 +610,7 @@ Before any multi-iteration run, close the remaining gaps between plan and code a
 - Add `SelfPlayConfig::fixed_player_count: Option<(u8, u8)>`. When set, `self_play_iteration` skips `sample_game_params` and uses that `(n, c)`. Lets 7.1/7.2 force n=5/c=7 while keeping the mixed sampler as default.
 - Add periodic evaluation to `run_iteration`: every `eval.eval_interval` iterations call `eval::evaluate_pair` against the iteration-1 checkpoint (the "anchor" checkpoint). Append `eval_win_rate`, `eval_win_rate_lower95`, `eval_bid_success_rate_current`, `eval_bid_success_rate_opponent` to `metrics.jsonl`. On the anchor iteration itself, skip eval.
 - Add per-decision signal-quality logging: extend `MctsResult` (or its caller wrapper) so `play_one_game` can emit `(phase, num_legal, sims_used, signal_ratio)` per decision to a sidecar `decision_stats.jsonl` in the checkpoint dir. Aggregated percentiles (P10/P50/P90 of `signal_ratio` per branching bucket) also roll into `IterationMetrics` for at-a-glance reading. This unblocks 7.3's adaptive budget.
-- Reconcile config defaults: bump `config.sample.toml` `num_games` from 64 to 118 to match the "~80K examples/iter" figure used downstream. Document that 118 × ~680 decisions ≈ 80K.
+- Reconcile config defaults: bump `config.sample.toml` `num_games` from 64 to 118. Originally sized to hit the "~80K examples/iter" figure used downstream, but the 7.1 smoke test measured ~380 decisions/game at 5P7C (5 bid + ~35 play + forced-play skips folded in), so 118 games → ~45K examples/iter, not 80K. Downstream buffer/epoch sizing assumes ~45K; raising `num_games` to push back toward 80K would roughly double self-play wall-clock — defer that call until 7.2 shows whether 45K is a real bottleneck.
 
 **Single-iteration smoke test:**
 
@@ -624,22 +624,27 @@ Before any multi-iteration run, close the remaining gaps between plan and code a
   - Iteration completes without panic, NaN, or Inf in any metric.
   - `bid_policy_loss` < `ln(14) ≈ 2.64`, `play_policy_loss` < `ln(7) ≈ 1.95` (trivially true after one epoch of real data, but flags obviously-broken training).
   - Per-group `grad_norms` within ~2 orders of magnitude of each other.
-  - Full iteration wall-clock **< 5 minutes**. If it exceeds this, do *not* proceed to 7.2 — return to 6.3 held-in-reserve optimizations (batch leaf evaluations first).
+  - Full iteration wall-clock **≤ ~25 min at 118 games, 5×100 MCTS, 32 threads** (measured baseline: 11.5 min at 64 games in `gpu-inference-summary.md` → ~21 min linear-scaled to 118; allow ~20% headroom for training-time variance and eval harness). This replaces the original 5-min gate, which assumed 6.3's benchmark-based extrapolation (~3.8 min/iter) rather than the measured self-play cost. If wall-clock materially exceeds ~25 min, do *not* proceed to 7.2 — return to 6.3 held-in-reserve optimizations (CPU-side leaf batching first). Wall-clock is now a sanity bound, not the binding constraint: proceed to 7.2 if signal-quality metrics (below) are sensible even at the upper end of this range.
   - ONNX export produces a loadable model that the next iteration's self-play could consume (verify by loading once via `OnnxEvaluator::from_file`).
 - **If any smoke-test condition fails:** debug before moving on. Most likely failure mode is wall-clock — see 6.3 fallback list. Second-most-likely: value target distribution degenerate (all zeros because z-scoring on a single game with tied scores collapses).
 
-### Session 7.2 — 20-iteration diagnostic run
+### Session 7.2 — 10-iteration diagnostic run (11 loop iters)
 
-Once 7.1 passes, run a 20-iteration training with the same config (fixed n=5, 5×100 MCTS) and read the diagnostics.
+Once 7.1 passes, run a **10-iteration** training with the same config (fixed n=5, 5×100 MCTS) and read the diagnostics. The original plan called for 20 iters; 10 is sufficient because all the learning milestones — loss drop, bid-success gains, eval_win_rate crossing 0.5 — should be clearly visible by iter 10 if training is working. If they aren't, more iterations do not save it.
 
-- **Read the diagnostics after every few iterations** — this is not a blind run:
-  - After iter 1–3: is `visit_entropy_mean` dropping? Is `bid_policy_loss` / `play_policy_loss` moving? If not, something is fundamentally broken.
-  - After iter 5–10: is the eval harness (vs iter-1 anchor) showing `bid_success_rate_current` > `1 / cards_dealt`? Is `policy_kl_divergence` dropping?
-  - After iter 10–20: is `eval_win_rate_lower95` > 0.5 vs iter-1? Is bid success rate improving iteration-over-iteration?
-- **Expected learning milestones:**
-  - Iter 1–5: policy losses drop sharply from ~ln(legal_actions) as the network learns basic card ranking.
-  - Iter 5–15: bid success rate improves (hand-strength-to-bid correlation).
-  - Iter 15–20: `eval_win_rate_lower95` vs iter-1 clearly > 0.5.
+**Off-by-one note:** `total_iterations=11` in config, not 10. The eval-vs-anchor check at [blob-train/src/main.rs:245-247](blob-train/src/main.rs#L245-L247) reads `iter` *before* running the loop body, then evals after the training step. With `total_iterations=10` we'd produce checkpoints iter 0..9 and only get eval at iter 5; we need 11 loop iters to produce iter 10's checkpoint *and* trigger its eval vs anchor.
+
+**Why fixed 5×100 through the whole run (rather than tuning budget by intuition first):** `signal_ratio` is the primary diagnostic 7.3 uses to derive an adaptive MCTS schedule. It conflates two effects — "MCTS had enough sims" vs "NN prior got good enough that MCTS didn't need to search much". Holding the sim budget fixed across iterations is the only way to separate them. 7.3 reads the `signal_ratio(num_legal, iteration)` table produced here and cuts budget in buckets where signal saturates fast, raises it where it doesn't. Up-front budget tuning skips the control and locks in a guess.
+
+- **Read the diagnostics every 1–3 iterations** — this is not a blind run:
+  - After iter 1–2: is `visit_entropy_mean` dropping? Is `bid_policy_loss` / `play_policy_loss` moving? If not, something is fundamentally broken — stop and debug.
+  - After iter 5 (first eval vs iter-0 anchor): is `bid_success_rate_current` > `1 / cards_dealt`? Is `policy_kl_divergence` dropping? Is `eval_win_rate` at least trending above 0.5?
+  - After iter 10: is `eval_win_rate_lower95` ≥ 0.5 vs iter 0? Is bid success rate improving iter-over-iter?
+- **Iter-5 early-exit:** if by iter 5 both `bid_policy_loss` has not moved from its iter-0 value AND `visit_entropy_mean` is flat, stop. Grinding 5 more iters of broken training is wasted wall-clock; debug instead.
+- **Expected learning milestones (compressed from the 20-iter plan):**
+  - Iter 1–3: policy losses drop sharply from ~ln(legal_actions) as the network learns basic card ranking.
+  - Iter 3–7: bid success rate improves (hand-strength-to-bid correlation).
+  - Iter 7–10: `eval_win_rate_lower95` vs iter-0 clearly > 0.5.
 - **Diagnostic-driven debugging** (same rules as before):
   - If `visit_entropy_mean` stays high: MCTS budget insufficient (surprising at 5×100) — first check evaluator is actually connected and returning non-uniform policies.
   - If policy loss plateaus near random: dump 10 sample MCTS policies; verify they're non-uniform.
@@ -647,28 +652,97 @@ Once 7.1 passes, run a 20-iteration training with the same config (fixed n=5, 5�
   - If per-layer `grad_norms` vary by >100×: attention or skip-connection issue.
   - If `policy_kl_divergence` stays high but loss drops: network is learning something but not what MCTS teaches — head wiring issue.
 - **32-thread scaling check**: if not already done in 7.1, measure wall-clock at 1 / 8 / 32 threads on one iteration to confirm >80% scaling efficiency.
-- Artifacts out: 20 iterations of `metrics.jsonl`, `decision_stats.jsonl`, iter-1/5/10/15/20 checkpoints retained.
+- Artifacts out: 10 iterations of `metrics.jsonl`, `decision_stats.jsonl`, iter-0/5/10 checkpoints retained; `strength.csv` with eval-vs-anchor at iter 5 and iter 10.
+- **Expected wall-clock:** 10 × ~19 min self-play/train + 2 eval rounds (~30 min each at 200 games 5×100) ≈ **3.5–4.5 h total**.
 
 ### Session 7.3 — Adaptive tuning and extended run
 
-Use iter-1..20 diagnostics to tune hyperparameters, then run extended training.
+Apply the four data-driven changes drawn from the 7.2 diagnostics, validate them on a 20-iter fixed-config rerun, then go to extended training. The original "tuning knob menu" survives at the end of this section as deferred levers — only pull them if the validation rerun surfaces the conditions that justify them.
 
-- **Adaptive MCTS budget** using the logged `decision_stats.jsonl`:
-  - Bucket triples by `num_legal_actions`; compute median `signal_ratio` per bucket.
-  - If most decisions achieve signal_ratio > 0.5 at 5×100: reduce floors for those branching buckets. E.g., late-game tricks with 2–3 legal plays may only need 3×20.
-  - If decisions with >7 legal actions consistently show signal_ratio < 0.2: raise their floor to 5×150 or 7×100.
-  - Total compute per game should stay roughly constant — savings from easy buckets fund harder ones.
-  - **Hard floor**: never below 60 sims for any decision with >1 legal action; skip MCTS entirely when only 1 legal action.
-  - Implementation: the current `adaptive_budget()` in the engine is hardcoded. Either (a) edit the floors directly based on the bucketed data, or (b) load the table from `MctsConfig` — (a) is simpler and sufficient for now.
-- **Temperature schedule** (requires a new `MctsConfig::temperature_schedule` field and a decision-index argument into `mcts_search`): τ=1.0 for the first 15 decisions in a round (exploration), τ=0.1 for the remainder (exploit). Applied per-round, not per-game.
-- **Adaptive epochs**: `epoch_early_stop_rel` already exists; tune it from the 20-iter data.
-- **Adaptive games per iteration**: if `policy_kl_divergence` drops below 0.1 quickly, reduce `num_games`; if it stays high, increase.
-- **Learning rate**: if loss oscillates between iterations, reduce `peak_lr`. If loss plateaus while KL is high, raise `peak_lr` or extend warmup.
-- **c_puct tuning**: if `top1_visit_share_mean` > 0.8 consistently (MCTS too greedy), raise toward 2.5. If < 0.2 (too diffuse), drop toward 1.0.
-- **Player count**: flip `fixed_player_count` back to `None` to re-enable the n=4/5/6/7 mixture once n=5-only shows bid success rate > 40%. Verify n=5 loss doesn't regress after mixing.
-- **Replay buffer sizing**: if loss drops fast then rises (overfitting to stale data), reduce `buffer_capacity`; if training is slow to improve, raise it.
-- **Extended run**: with tuned parameters, run 100+ iterations. Win rate vs checkpoint-20 is the primary progress indicator.
-- Save final base model checkpoint for Section 8 fine-tuning.
+**Background — what the 7.2 run actually told us (read this before editing anything):**
+
+- Signal-quality bucketing of all 493K decisions in `checkpoints/7.2-run/decision_stats.jsonl` shows ~60% of MCTS sim cost lands in `num_legal ≤ 3` decisions where signal is already informative (p50 signal_ratio 0.20–0.49 at iter 10 across both phases). Cutting those buckets to floors is the single biggest wall-clock lever.
+- Forced moves (`num_legal == 1`) are 39% of all decisions and already cost 0 — no work to do there.
+- Mid (`num_legal 4–7`) buckets sit at p50 signal_ratio ~0.26–0.32 at iter 10 — not saturating, but also not collapsing. Trim modestly, not aggressively.
+- High (`num_legal 8+`) buckets remain the floor-binding case (p50 ~0.31–0.44 at iter 10). Leave at 5×100.
+- `num_epochs_run` collapsed to 2 by iter 2 because `epoch_early_stop_rel = 0.005` triggers too easily with the slow late-iter loss descent.
+- `value_head` grad norm reached 4.57 by iter 10 while every other group stayed under 1 — flag, not yet a fire, but worth pre-empting.
+- Eval cost was ~4.7× per-game self-play cost. At 200 games × 2 evals/run, that's ~3 h of an ~7 h training run — sequential stopping recovers most of it without hurting the gate.
+
+#### 7.3a — Concrete edits to ship in this session
+
+1. **Update `adaptive_budget()` floors per the 7.2 data** ([blob-engine/src/mcts.rs:457](blob-engine/src/mcts.rs#L457)). Replace the existing bucket arms with the schedule below. Determinization count never drops below 3 for non-forced decisions — belief averaging across opponent-hand assignments is what determinization buys, and you can't do that with a single tree.
+
+   | `num_legal` | `(num_dets, sims_per_det)` | total sims | rationale |
+   |---|---|---|---|
+   | 1 | `(1, 0)` | 0 | forced — already short-circuited in `mcts_search` |
+   | 2 | `(3, 20)` | 60 | iter-10 p50 signal_ratio 0.24 (play) / 0.49 (bid); deep search adds nothing on a 2-wide branch |
+   | 3 | `(3, 30)` | 90 | iter-10 p50 ~0.28–0.33; modest budget keeps the third option honest |
+   | 4–6 | `(3, 100)` | 300 | iter-10 p50 ~0.26–0.32; `MctsConfig` baseline of 5 dets dropped to 3, sims kept at 100 |
+   | 7 | `(5, 100)` | 500 | unchanged — not saturating |
+   | 8+ | `(5, 100)` | 500 | unchanged; revisit upward to 5×150 only if 7.3b validation shows signal_ratio p50 < 0.15 here |
+
+   Implementation note: `MctsConfig`'s `num_determinizations` and `sims_per_determinization` fields stay as the "default for buckets not otherwise specified" baseline — `adaptive_budget` enforces both floors and (new) ceilings per bucket. Do **not** silently let high `MctsConfig` values override the bucket cap; the whole point is that the table is the source of truth. Update the existing `adaptive_budget_respects_branching_floors` test to cover the new ceilings as well as floors. Keep the `min_sims_floor` safety net (currently 60) — it should never fire under the new schedule but is cheap insurance.
+
+   Expected impact: total sims/iter drop from ~13.7M to ~6.2M (~55% reduction), self-play wall-clock drops from ~19 min/iter to ~9–10 min.
+
+2. **Loosen `epoch_early_stop_rel` from `0.005` to `0.001`** in `blob-train/config.sample.toml`. Each iter ran 2 epochs in 7.2 instead of the configured 10; loosening the threshold (or deleting it entirely if the 0.001 setting still trips early) restores the budgeted training-pass count without raising any other cost. If after the 7.3b validation it's still tripping at <5 epochs/iter, drop the relative-stop check entirely and rely on the absolute `epochs_per_iteration = 10` cap.
+
+3. **Add a value-head learning-rate multiplier of 0.5** in `blob-nn`'s optimizer construction. The optimizer currently builds one parameter group; split into two — `value_head` parameters at `peak_lr * 0.5`, everything else at `peak_lr`. Watch `grad_norms.value_head` in `metrics.jsonl` over the 7.3b validation run; if it now stays comparable to `bid_head` (under 2.5), the multiplier did its job. If it keeps drifting up, drop to 0.25 in the extended run.
+
+4. **Sequential evaluation, capped at 200 games**. Replace the unconditional 200-game loop in `blob-nn/src/eval.rs::evaluate_pair` with a sequential schedule:
+
+   - Play games in chunks of 50 (4 chunks → 200-game cap).
+   - After each chunk, recompute the Wilson 95% CI on the cumulative win-rate.
+   - **Stop early** if either: `lower95 ≥ 0.55` (clear improvement) or `upper95 ≤ 0.45` (clear regression). The 0.05 cushion above/below the 0.5 promotion gate prevents stopping on a coin-flip CI that just barely clears the line and would later widen back across it.
+   - **Maximum games is 200** — never run more, even if the CI hasn't separated. Inconclusive results at 200 games are a valid outcome; record `eval_inconclusive: true` in `strength.csv` for that row and let the promotion gate handle it (`win_rate_lower95 > 0.5` will simply fail).
+   - Add `eval_games_played: u32` and `eval_inconclusive: bool` columns to `strength.csv` so we can see post-hoc how often early-stop fired and at what chunk.
+   - Bid-success-rate stats are still reported on whatever sample size was actually played (Wilson CI scales with n).
+   - **Do not** parallelize across chunks — the early-stop check needs to see chunk N's result before deciding whether to launch chunk N+1. Within a chunk, the existing per-game parallelism stays.
+   - Expected savings: when models are clearly separated (early iterations vs heuristic, late iterations vs anchor) this stops at chunk 1 or 2. When they're close, it runs the full 200. Average over a 100-iter run: ~120–130 games per eval instead of 200.
+
+#### 7.3b — Validation rerun (20 iters fixed 5P7C)
+
+Re-run the same `fixed_player_count = [5, 7]`, 118-game, batch-512 config from 7.2, but for **20 iterations** instead of 10, with all four 7.3a edits in place. This is a controlled comparison against the 7.2 run — same data distribution, only the budget table / early-stop / value-LR / eval logic have changed. Eval against the iter-0 anchor at iter 5/10/15/20 (every 5 iters as configured).
+
+**Pass conditions (must all hold):**
+
+- Per-iter wall-clock at ~9–11 min (the predicted ~50% drop). Wall-clock more than 14 min/iter means the budget table didn't take effect; investigate.
+- `signal_p50_low` (the `nl ≤ 3` aggregate already in `IterationMetrics`) does **not** collapse to <0.10 at any iteration. Some drop from 7.2's iter-10 values is expected as the prior tightens, but a free-fall means the budget cut went too far.
+- `eval_win_rate_lower95` at iter 10 ≥ 0.65 (vs 7.2's 0.707) — small regression acceptable, large regression is not. Iter 20 should clear 0.75.
+- `bid_success_rate_current` at iter 20 ≥ 0.40 (vs 7.2's 0.35 at iter 10).
+- `num_epochs_run` averages ≥ 5 across iters 1–20 (was ~2 in 7.2).
+- `grad_norms.value_head` stays under 2.5 by iter 20 (was 4.57 in 7.2 at iter 10).
+
+**If any pass condition fails:**
+
+- Wall-clock high → check the budget table actually wires through `mcts_search`; print the `(num_dets, sims_per_det)` for a sample of decisions and confirm.
+- `signal_p50_low` collapse → walk the affected bucket back up by one tier (e.g. `nl=2` from 3×20 to 3×30, or 5×20).
+- Win-rate regression → most likely the value-head LR cut broke value learning; revert the multiplier to 1.0 and re-test.
+- Epoch count still low → drop `epoch_early_stop_rel` entirely.
+
+#### 7.3c — Extended run (100 iters, mixed player count)
+
+Once 7.3b validates, flip `fixed_player_count` to `None` to re-enable the n=4/5/6/7 mixture (Section 5.2 distribution: n=4 10%, n=5 60%, n=6 25%, n=7 5%) and run 100 iterations from a fresh init (not from the 7.3b checkpoint — mixed-player distribution shift would invalidate the value targets baked into the buffer). Keep all 7.3a settings.
+
+- Eval cadence stays every 5 iters; opponent rotates per the existing `eval_lookback = 20` rule.
+- Save iter-25 / iter-50 / iter-75 / iter-100 checkpoints permanently as fine-tuning candidates for Section 8.
+- Primary progress indicator: `eval_win_rate_lower95` vs the iter-20 anchor (mid-training reference, more discriminating than vs iter-0 once the network has learned the basics).
+- Watch for n=5 bid-success-rate regression vs the n=5-only 7.3b run — some regression is expected from the broader distribution; >5pp absolute drop is a problem and would suggest reverting to fixed n=5 for the base model and doing the multi-n stretch in Section 8.
+- Save the final iter-100 base model checkpoint as the input to Section 8 fine-tuning.
+
+**Expected wall-clock:** 100 × ~10 min self-play+train + 20 evals × ~12 min (sequential-stop average) ≈ **~21 h**. Fit it in two overnight runs with a `--resume` checkpoint at iter 50.
+
+#### 7.3d — Deferred tuning knobs (only pull if 7.3b/7.3c surface the trigger)
+
+These were in the original 7.3 plan; they remain valid contingencies but are **not** part of the default 7.3 work. Each one carries a specific trigger; don't speculatively apply them.
+
+- **Temperature schedule** (new `MctsConfig::temperature_schedule` field + decision-index arg threaded into `mcts_search`): τ=1.0 for the first 15 decisions in a round, τ=0.1 for the remainder. *Trigger:* late-game `top1_visit_share_mean` < 0.5 (network can't commit to a play even when it should).
+- **Adaptive games per iteration**: *Trigger:* `policy_kl_divergence` drops below 0.05 within 3 iters → cut `num_games`. Stays above 0.15 by iter 30 → raise it.
+- **Learning rate**: *Trigger:* loss oscillates ±10% iteration-to-iteration → halve `peak_lr`. Loss plateaus while KL still > 0.1 → raise `peak_lr` 1.5× or double warmup length.
+- **c_puct tuning**: *Trigger:* `top1_visit_share_mean` > 0.85 sustained → raise to 2.0. < 0.25 sustained → drop to 1.0.
+- **Replay buffer sizing**: *Trigger:* loss drops then rises across iterations (stale-data overfitting) → reduce `buffer_capacity` from 500K to 250K. Slow improvement with KL still high → raise to 1M.
+- **CPU-side leaf batching within a determinization** (the held-in-reserve item from 6.3): *Trigger:* 7.3b wall-clock per iter > 12 min. This is implementation work, not a config flip — virtual-loss + queued forwards so each ort session sees batch>1.
 
 ---
 
