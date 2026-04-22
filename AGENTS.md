@@ -77,3 +77,27 @@ Before considering a phase complete:
 ## Hardware Target
 
 Training: Ubuntu 24.04, Ryzen 9 7950X (16C/32T), RTX 4060 8GB, 128GB DDR5. Future inference: Windows + Intel iGPU via ONNX Runtime.
+
+## Runtime environment (training runs on this machine)
+
+All long training runs go through `./target/release/blobmaster-train train ...` and need three things lined up. Skip any of them and you either get a "missing shared library" abort at startup, a silent CPU fallback, or `scripts/export_onnx.py` blowing up with `ModuleNotFoundError: torch`.
+
+- **Pinned Python venv**: `.venv/` at the repo root, pinned to `torch==2.5.1+cu124`. `scripts/export_onnx.py` is invoked as `python3` by [blob-train/src/main.rs](blob-train/src/main.rs) each iteration, so the venv must be first on `PATH` — `python3 -c "import torch"` against system Python has no torch.
+- **Downloaded libtorch**: `tch` + `download-libtorch` drops a libtorch tree under `target/<profile>/build/torch-sys-*/out/libtorch/libtorch/lib`. The `torch-sys-*` hash changes whenever `tch` rebuilds, so re-resolve the directory with `find` rather than hard-coding.
+- **CUDA preload**: without `LD_PRELOAD=libtorch_cuda.so`, libtorch loads CPU-only and the run silently falls back. Without `LD_LIBRARY_PATH=$LIBTORCH_DIR`, the binary fails to load at all.
+
+Canonical launch template:
+
+```bash
+cd /home/kbuntu/Documents/Github/BlobMaster
+LIBTORCH_DIR="$(find target/release/build -maxdepth 4 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
+PATH=".venv/bin:$PATH" \
+LD_LIBRARY_PATH="$LIBTORCH_DIR:${LD_LIBRARY_PATH:-}" \
+LD_PRELOAD="$LIBTORCH_DIR/libtorch_cuda.so" \
+RUST_LOG=info \
+./target/release/blobmaster-train train \
+  --config blob-train/config.sample.toml \
+  --checkpoint-dir checkpoints/<run-name>
+```
+
+`scripts/README.md` has the same incantation; keep them in sync when re-rooting. GPU on this box is a single RTX 4060 (`cuda:0`); `nvidia-smi --query-gpu=memory.used,memory.total --format=csv` before launching if another run might be resident.

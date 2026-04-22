@@ -31,6 +31,23 @@ pub const ADAM_BETA1: f64 = 0.9;
 pub const ADAM_BETA2: f64 = 0.999;
 pub const WEIGHT_DECAY: f64 = 1e-4;
 
+/// Parameter-group id for the value head. Anything not registered under
+/// this group stays in the default group 0.
+pub const VALUE_HEAD_GROUP: usize = 1;
+/// Multiplier applied to the value-head param group's LR, relative to
+/// `peak_lr`. Session 7.3a set this to 0.5 to keep `grad_norms.value_head`
+/// comparable to the other heads — 7.2 saw it climb to ~4.57 while every
+/// other group stayed under 1.
+pub const VALUE_HEAD_LR_SCALE: f64 = 0.5;
+
+/// Apply `lr` to the default param group and `lr * VALUE_HEAD_LR_SCALE`
+/// to `VALUE_HEAD_GROUP`. Use this in the training loop instead of
+/// bare `optimizer.set_lr(lr)` so the multiplier stays in one place.
+pub fn set_schedule_lr(optimizer: &mut nn::Optimizer, lr: f64) {
+    optimizer.set_lr(lr);
+    optimizer.set_lr_group(VALUE_HEAD_GROUP, lr * VALUE_HEAD_LR_SCALE);
+}
+
 /// Which head the batch targets. The value head always contributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -134,14 +151,20 @@ pub struct StepLosses {
 }
 
 /// Build the AdamW optimizer with the project defaults, bound to `vs`.
+///
+/// The `VALUE_HEAD_GROUP` param group is started at `PEAK_LR *
+/// VALUE_HEAD_LR_SCALE`; the LR schedule in the training loop must use
+/// [`set_schedule_lr`] (not bare `set_lr`) to keep the ratio after warmup.
 pub fn build_optimizer(vs: &VarStore) -> Result<nn::Optimizer, tch::TchError> {
-    nn::AdamW {
+    let mut opt = nn::AdamW {
         beta1: ADAM_BETA1,
         beta2: ADAM_BETA2,
         wd: WEIGHT_DECAY,
         ..Default::default()
     }
-    .build(vs, PEAK_LR)
+    .build(vs, PEAK_LR)?;
+    opt.set_lr_group(VALUE_HEAD_GROUP, PEAK_LR * VALUE_HEAD_LR_SCALE);
+    Ok(opt)
 }
 
 /// One training step: forward, loss, backward, clip, step. Returns the

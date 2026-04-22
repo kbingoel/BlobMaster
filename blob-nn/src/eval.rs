@@ -147,6 +147,11 @@ pub struct EvaluationResult {
     pub score_differential: f64,
     pub bid_success_rate_a: f64,
     pub bid_success_rate_b: f64,
+    /// True iff neither early-stop band (`lower95 ≥ 0.55` or
+    /// `upper95 ≤ 0.45`) was ever crossed and we burned the full cap.
+    /// Session 7.3a exposes this so the promotion gate can see post-hoc
+    /// how often the CI stayed ambiguous at 200 games.
+    pub inconclusive: bool,
 }
 
 /// Wilson 95% confidence interval.
@@ -164,13 +169,32 @@ pub fn wilson_95(successes: usize, n: usize) -> (f64, f64) {
     ((center - margin).max(0.0), (center + margin).min(1.0))
 }
 
+/// Chunk size for sequential early-stop evaluation (Session 7.3a). The CI
+/// is rechecked at every multiple of this; 50 gives four decision points
+/// inside the 200-game cap.
+pub const EVAL_CHUNK_SIZE: usize = 50;
+/// Early-stop threshold: if `win_rate_lower95 ≥ EVAL_EARLY_STOP_HIGH` we
+/// declare a clear improvement. 0.55 cushions above the 0.5 promotion
+/// gate so a CI that just barely clears 0.5 doesn't trigger stop-and-
+/// promote only to widen back below it on later chunks.
+pub const EVAL_EARLY_STOP_HIGH: f64 = 0.55;
+/// Mirror of `EVAL_EARLY_STOP_HIGH` for the regression side.
+pub const EVAL_EARLY_STOP_LOW: f64 = 0.45;
+
 /// Run a head-to-head evaluation between `eval_a` (the "current" model) and
 /// `eval_b` (the opponent). Remaining seats are filled with `heuristic`.
 ///
 /// Seat assignment rotates so each model spends an equal share of games in
-/// each seat pair over `num_games` runs:
+/// each seat pair:
 ///   `seat_A = game_idx % num_players`
 ///   `seat_B = (game_idx + num_players / 2) % num_players`
+///
+/// Session 7.3a: `num_games` is a **cap**, not the number actually played.
+/// Games run in chunks of `EVAL_CHUNK_SIZE`; after each chunk the Wilson
+/// 95% CI on the cumulative win rate is recomputed, and we stop as soon
+/// as `lower95 ≥ EVAL_EARLY_STOP_HIGH` (clear improvement) or `upper95 ≤
+/// EVAL_EARLY_STOP_LOW` (clear regression). If neither band is crossed
+/// by `num_games`, the returned `EvaluationResult.inconclusive` is true.
 pub fn run_evaluation<R: Rng + ?Sized>(
     eval_a: &dyn Evaluator,
     eval_b: &dyn Evaluator,
@@ -189,50 +213,67 @@ pub fn run_evaluation<R: Rng + ?Sized>(
     let mut b_hits = 0usize;
     let mut b_rounds = 0usize;
 
-    for game_idx in 0..num_games {
-        let seat_a = game_idx % num_players as usize;
-        let seat_b = (game_idx + half) % num_players as usize;
-        debug_assert_ne!(seat_a, seat_b);
+    let mut games_played = 0usize;
+    let mut lo = 0.0f64;
+    let mut hi = 1.0f64;
+    let mut stopped_early = false;
 
-        let mut seats = SeatEvaluators::new();
-        for s in 0..num_players as usize {
-            seats.0[s] = Some(heuristic);
-        }
-        seats.0[seat_a] = Some(eval_a);
-        seats.0[seat_b] = Some(eval_b);
+    'outer: while games_played < num_games {
+        let chunk_end = (games_played + EVAL_CHUNK_SIZE).min(num_games);
+        for game_idx in games_played..chunk_end {
+            let seat_a = game_idx % num_players as usize;
+            let seat_b = (game_idx + half) % num_players as usize;
+            debug_assert_ne!(seat_a, seat_b);
 
-        let outcome = play_eval_game(num_players, start_cards, &seats, mcts_cfg, rng);
-        let sa = outcome.final_scores[seat_a] as i64;
-        let sb = outcome.final_scores[seat_b] as i64;
-        if sa > sb {
-            wins_a += 1;
+            let mut seats = SeatEvaluators::new();
+            for s in 0..num_players as usize {
+                seats.0[s] = Some(heuristic);
+            }
+            seats.0[seat_a] = Some(eval_a);
+            seats.0[seat_b] = Some(eval_b);
+
+            let outcome = play_eval_game(num_players, start_cards, &seats, mcts_cfg, rng);
+            let sa = outcome.final_scores[seat_a] as i64;
+            let sb = outcome.final_scores[seat_b] as i64;
+            if sa > sb {
+                wins_a += 1;
+            }
+            score_diff_sum += sa - sb;
+            for r in &outcome.rounds {
+                if r.bids[seat_a] == r.tricks_won[seat_a] {
+                    a_hits += 1;
+                }
+                if r.bids[seat_b] == r.tricks_won[seat_b] {
+                    b_hits += 1;
+                }
+                a_rounds += 1;
+                b_rounds += 1;
+            }
         }
-        score_diff_sum += sa - sb;
-        for r in &outcome.rounds {
-            if r.bids[seat_a] == r.tricks_won[seat_a] {
-                a_hits += 1;
-            }
-            if r.bids[seat_b] == r.tricks_won[seat_b] {
-                b_hits += 1;
-            }
-            a_rounds += 1;
-            b_rounds += 1;
+        games_played = chunk_end;
+
+        let (l, h) = wilson_95(wins_a, games_played);
+        lo = l;
+        hi = h;
+        if lo >= EVAL_EARLY_STOP_HIGH || hi <= EVAL_EARLY_STOP_LOW {
+            stopped_early = true;
+            break 'outer;
         }
     }
 
-    let (lo, hi) = wilson_95(wins_a, num_games);
+    let inconclusive = !stopped_early && games_played >= num_games;
     EvaluationResult {
-        num_games,
+        num_games: games_played,
         wins_a,
-        win_rate: if num_games > 0 {
-            wins_a as f64 / num_games as f64
+        win_rate: if games_played > 0 {
+            wins_a as f64 / games_played as f64
         } else {
             0.0
         },
         win_rate_lower95: lo,
         win_rate_upper95: hi,
-        score_differential: if num_games > 0 {
-            score_diff_sum as f64 / num_games as f64
+        score_differential: if games_played > 0 {
+            score_diff_sum as f64 / games_played as f64
         } else {
             0.0
         },
@@ -246,11 +287,14 @@ pub fn run_evaluation<R: Rng + ?Sized>(
         } else {
             0.0
         },
+        inconclusive,
     }
 }
 
 /// One CSV row written by `append_strength_row` — mirrors the columns
-/// described in development-plan §6.1.
+/// described in development-plan §6.1, plus the Session 7.3a
+/// `eval_games_played` / `eval_inconclusive` columns so post-hoc analysis
+/// can see how often the sequential early-stop fired.
 #[derive(Debug, Clone)]
 pub struct StrengthRow {
     pub iteration: u64,
@@ -266,6 +310,8 @@ pub struct StrengthRow {
     pub value_loss: f64,
     pub visit_entropy: f64,
     pub kl_divergence: f64,
+    pub eval_games_played: u32,
+    pub eval_inconclusive: bool,
 }
 
 /// Append (creating if needed) one row to `{checkpoint_dir}/strength.csv`.
@@ -280,12 +326,12 @@ pub fn append_strength_row(checkpoint_dir: &Path, row: &StrengthRow) -> std::io:
     if !exists {
         writeln!(
             f,
-            "iteration,opponent,win_rate,win_rate_lower95,win_rate_upper95,score_differential,bid_success_rate_current,bid_success_rate_opponent,policy_loss,value_loss,visit_entropy,kl_divergence"
+            "iteration,opponent,win_rate,win_rate_lower95,win_rate_upper95,score_differential,bid_success_rate_current,bid_success_rate_opponent,policy_loss,value_loss,visit_entropy,kl_divergence,eval_games_played,eval_inconclusive"
         )?;
     }
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         row.iteration,
         row.opponent,
         row.win_rate,
@@ -298,6 +344,8 @@ pub fn append_strength_row(checkpoint_dir: &Path, row: &StrengthRow) -> std::io:
         row.value_loss,
         row.visit_entropy,
         row.kl_divergence,
+        row.eval_games_played,
+        row.eval_inconclusive,
     )?;
     Ok(())
 }
@@ -514,6 +562,8 @@ mod tests {
             value_loss: 0.3,
             visit_entropy: 1.1,
             kl_divergence: 0.05,
+            eval_games_played: 200,
+            eval_inconclusive: false,
         };
         append_strength_row(&tmp, &row).unwrap();
         append_strength_row(&tmp, &row).unwrap();

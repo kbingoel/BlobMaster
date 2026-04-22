@@ -29,8 +29,9 @@ use crate::input::pad_batch;
 use crate::model::BlobNet;
 use crate::self_play::{DecisionStat, TrainingExample};
 use crate::train::{
-    build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint, value_mse,
-    LrSchedule, Phase, TrainBatch, VALUE_LOSS_COEF, GRAD_CLIP_MAX_NORM,
+    build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint,
+    set_schedule_lr, value_mse, LrSchedule, Phase, TrainBatch, VALUE_LOSS_COEF,
+    GRAD_CLIP_MAX_NORM,
 };
 
 /// Target batch size sampled from the replay buffer each training step.
@@ -515,7 +516,7 @@ impl TrainingLoop {
             return None;
         }
         let lr = self.lr_schedule.lr(self.global_step);
-        self.optimizer.set_lr(lr);
+        set_schedule_lr(&mut self.optimizer, lr);
         accumulators.last_lr = lr;
 
         let (bid, play) = self.buffer.sample_batch(self.cfg.batch_size, rng);

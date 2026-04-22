@@ -7,9 +7,9 @@ checkpoint_dir = "checkpoints"
 buffer_capacity = 500000
 batch_size = 512
 epochs_per_iteration = 10
-epoch_early_stop_rel = 0.005
+epoch_early_stop_rel = 0.001
 total_training_steps = 200000
-total_iterations = 11
+total_iterations = 21
 device = "cuda:0"
 
 [self_play]
