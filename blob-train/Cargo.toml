@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-default = []
-cuda = ["blob-nn/cuda"]
-
 [[bin]]
 name = "blobmaster-train"
 path = "src/main.rs"
