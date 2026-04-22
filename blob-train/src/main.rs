@@ -308,6 +308,8 @@ fn run_eval_against_anchor(
             value_loss: metrics.value_loss,
             visit_entropy: metrics.visit_entropy_mean,
             kl_divergence: metrics.policy_kl_divergence,
+            eval_games_played: result.num_games as u32,
+            eval_inconclusive: result.inconclusive,
         },
     )?;
     Ok(())

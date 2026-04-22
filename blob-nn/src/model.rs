@@ -9,6 +9,7 @@ use tch::{nn, Tensor};
 
 use crate::heads::{BiddingHead, PlayingHead, ValueHead};
 use crate::input::{InputBatch, InputProjection};
+use crate::train::VALUE_HEAD_GROUP;
 use crate::transformer::TransformerEncoder;
 
 /// Full network. Hold this alongside the `VarStore` it was built against.
@@ -26,13 +27,17 @@ impl BlobNet {
     /// under `input/`, `transformer/`, `play_head/`, `bid_head/`,
     /// `value_head/` so parameter names are stable across runs and
     /// checkpoints round-trip.
+    ///
+    /// `value_head` parameters are registered into param group
+    /// `VALUE_HEAD_GROUP` so the training loop can scale the value-head
+    /// learning rate independently (Session 7.3a: 0.5× peak_lr).
     pub fn new(vs: &nn::Path) -> Self {
         Self {
             input: InputProjection::new(&(vs / "input")),
             transformer: TransformerEncoder::new(&(vs / "transformer")),
             play_head: PlayingHead::new(&(vs / "play_head")),
             bid_head: BiddingHead::new(&(vs / "bid_head")),
-            value_head: ValueHead::new(&(vs / "value_head")),
+            value_head: ValueHead::new(&(vs / "value_head").set_group(VALUE_HEAD_GROUP)),
         }
     }
 
