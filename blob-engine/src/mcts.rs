@@ -445,39 +445,21 @@ pub struct MctsResult {
 
 /// Pick per-decision `(num_determinizations, sims_per_determinization)`.
 ///
-/// The table below is the **source of truth** per Session 7.3a — it
-/// enforces both a floor (so starving MCTS can never kill signal) *and*
-/// a ceiling (so an over-ambitious `MctsConfig` can't silently blow the
-/// wall-clock budget in low-branching buckets where extra sims add no
-/// signal). Derived from 7.2 diagnostics: `nl ≤ 3` saturates fast, mid
-/// buckets hold at p50 signal_ratio ~0.26–0.32, `nl ≥ 7` remains the
-/// floor-binding case.
+/// Phase-A baseline (Session 7.3c): flat `5 × 100 = 500` sims for every
+/// non-forced decision, matching the 7.2 run that reached 0.77 eval win
+/// rate at iter 10. The 7.3a bucketed schedule starved low-branching
+/// decisions (60 / 90 sims at `nl ∈ {2, 3}`) — see `7.3b-analysis.md`
+/// §5 and §7.1. Forced moves (`num_legal ≤ 1`) still short-circuit with
+/// `(1, 0)` so `mcts_search` can skip the tree.
 ///
-/// | `num_legal` | `(dets, sims)` | total sims |
-/// |-------------|----------------|-----------|
-/// | 1           | (1, 0)         | 0         |
-/// | 2           | (3, 20)        | 60        |
-/// | 3           | (3, 30)        | 90        |
-/// | 4–6         | (3, 100)       | 300       |
-/// | 7           | (5, 100)       | 500       |
-/// | ≥ 8         | (5, 100)       | 500       |
-///
-/// `min_sims_floor` stays as a safety net on the product `dets × sims`;
-/// it should never fire under this schedule but remains cheap insurance.
+/// `min_sims_floor` remains as a safety net in case a future change
+/// lowers these numbers.
 pub fn adaptive_budget(num_legal: usize, cfg: &MctsConfig) -> (u32, u32) {
     if num_legal <= 1 {
         return (1, 0);
     }
-    let (dets, mut sims) = match num_legal {
-        2 => (3u32, 20u32),
-        3 => (3, 30),
-        4..=6 => (3, 100),
-        _ => (5, 100), // 7 and 8+
-    };
+    let (dets, mut sims) = (5u32, 100u32);
 
-    // Absolute floor on the product as a safety net. Under the 7.3a
-    // schedule every bucket already clears 60, but keep the check so a
-    // future bucket edit can't accidentally reintroduce starvation.
     let total = dets.saturating_mul(sims);
     if total < cfg.min_sims_floor {
         let needed = cfg.min_sims_floor.div_ceil(dets);
@@ -964,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_budget_respects_branching_floors() {
+    fn adaptive_budget_is_flat_5x100() {
         let cfg = MctsConfig {
             num_determinizations: 1,
             sims_per_determinization: 1,
@@ -973,30 +955,18 @@ mod tests {
         };
         // Forced move → (1, 0).
         assert_eq!(adaptive_budget(1, &cfg), (1, 0));
-        // num_legal == 2 → (3, 20).
-        assert_eq!(adaptive_budget(2, &cfg), (3, 20));
-        // num_legal == 3 → (3, 30).
-        assert_eq!(adaptive_budget(3, &cfg), (3, 30));
-        // num_legal 4..=6 → (3, 100).
-        assert_eq!(adaptive_budget(4, &cfg), (3, 100));
-        assert_eq!(adaptive_budget(5, &cfg), (3, 100));
-        assert_eq!(adaptive_budget(6, &cfg), (3, 100));
-        // num_legal == 7 → (5, 100).
-        assert_eq!(adaptive_budget(7, &cfg), (5, 100));
-        // num_legal >= 8 → (5, 100).
-        assert_eq!(adaptive_budget(10, &cfg), (5, 100));
-        assert_eq!(adaptive_budget(25, &cfg), (5, 100));
-        // Ceiling enforcement: an over-ambitious MctsConfig must NOT
-        // override the bucket cap. `adaptive_budget` is now the source
-        // of truth, per Session 7.3a.
+        // Every non-forced branching factor → flat (5, 100) per Phase-A.
+        for n in 2..=25 {
+            assert_eq!(adaptive_budget(n, &cfg), (5, 100), "nl={n}");
+        }
+        // A larger `min_sims_floor` can still raise sims above 100.
         let cfg2 = MctsConfig {
-            num_determinizations: 8,
-            sims_per_determinization: 200,
-            ..MctsConfig::default()
+            min_sims_floor: 750,
+            ..cfg
         };
-        assert_eq!(adaptive_budget(10, &cfg2), (5, 100));
-        assert_eq!(adaptive_budget(2, &cfg2), (3, 20));
-        assert_eq!(adaptive_budget(5, &cfg2), (3, 100));
+        let (dets, sims) = adaptive_budget(4, &cfg2);
+        assert_eq!(dets, 5);
+        assert!(dets * sims >= 750, "floor not enforced: {dets}×{sims}");
     }
 
     #[test]

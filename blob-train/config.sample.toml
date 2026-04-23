@@ -3,13 +3,17 @@
 # --device) override the matching values below.
 
 [training]
+# Session 7.3c (Phase A): reproduce the 7.2 baseline. Four reverts vs 7.3b:
+# flat 5×100 MCTS (in code), VALUE_HEAD_LR_SCALE=1.0 (in code),
+# epoch_early_stop_rel=0.005, total_iterations=15. The LR schedule now
+# decays per-iteration (no total_training_steps knob) so the epoch-stop
+# setting can no longer steepen the cosine; see 7.3b-analysis.md §7.3.
 checkpoint_dir = "checkpoints"
 buffer_capacity = 500000
 batch_size = 512
 epochs_per_iteration = 10
-epoch_early_stop_rel = 0.001
-total_training_steps = 200000
-total_iterations = 21
+epoch_early_stop_rel = 0.005
+total_iterations = 15
 device = "cuda:0"
 
 [self_play]

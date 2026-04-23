@@ -35,10 +35,11 @@ pub const WEIGHT_DECAY: f64 = 1e-4;
 /// this group stays in the default group 0.
 pub const VALUE_HEAD_GROUP: usize = 1;
 /// Multiplier applied to the value-head param group's LR, relative to
-/// `peak_lr`. Session 7.3a set this to 0.5 to keep `grad_norms.value_head`
-/// comparable to the other heads — 7.2 saw it climb to ~4.57 while every
-/// other group stayed under 1.
-pub const VALUE_HEAD_LR_SCALE: f64 = 0.5;
+/// `peak_lr`. Phase-A (7.3c) reverts to 1.0: the 7.2 baseline ran at 1.0
+/// with `grad_norms.value_head ≈ 5` and reached 0.77 eval win rate. The
+/// 7.3b attempt at 0.5 decoupled value from policy — see
+/// `7.3b-analysis.md` §7.2.
+pub const VALUE_HEAD_LR_SCALE: f64 = 1.0;
 
 /// Apply `lr` to the default param group and `lr * VALUE_HEAD_LR_SCALE`
 /// to `VALUE_HEAD_GROUP`. Use this in the training loop instead of
@@ -110,33 +111,47 @@ pub fn z_score_clip(scores: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Learning-rate schedule: linear warmup → cosine annealing.
+/// Learning-rate schedule: linear warmup → iteration-relative cosine.
+///
+/// Phase-A (Session 7.3c) replaces the old step-based schedule because it
+/// silently coupled LR decay to `epoch_early_stop_rel` — 7.3b ran ~4× more
+/// steps per iter than 7.2, which dragged the cosine to `min_lr` by iter
+/// 14 even though the iteration count was the same. The new schedule
+/// decays per-iteration, so changing the epoch cap can no longer warp the
+/// LR trajectory. See `7.3b-analysis.md` §7.3 for the failure mode.
+///
+/// Within iteration 0 we still linearly warm up over the first
+/// `warmup_steps` batches (protects the freshly-initialised bootstrap
+/// model from an immediate full-LR hit).
 #[derive(Debug, Clone, Copy)]
 pub struct LrSchedule {
     pub warmup_steps: i64,
-    pub total_steps: i64,
+    pub total_iterations: u64,
     pub peak_lr: f64,
     pub min_lr: f64,
 }
 
 impl LrSchedule {
-    pub fn new(total_steps: i64) -> Self {
+    pub fn new(total_iterations: u64) -> Self {
         Self {
             warmup_steps: DEFAULT_WARMUP_STEPS,
-            total_steps,
+            total_iterations,
             peak_lr: PEAK_LR,
             min_lr: MIN_LR,
         }
     }
 
-    /// LR at 0-indexed training `step`. Steps past `total_steps` stay at `min_lr`.
-    pub fn lr(&self, step: i64) -> f64 {
-        if step < self.warmup_steps {
-            let frac = (step + 1) as f64 / self.warmup_steps.max(1) as f64;
+    /// LR at `iteration` (0-indexed), with `step_in_run` batches consumed
+    /// in total since training started. `step_in_run` is only consulted
+    /// during iteration 0 to drive the initial warmup; afterwards the LR
+    /// depends purely on the iteration index.
+    pub fn lr(&self, iteration: u64, step_in_run: i64) -> f64 {
+        if iteration == 0 && step_in_run < self.warmup_steps {
+            let frac = (step_in_run + 1) as f64 / self.warmup_steps.max(1) as f64;
             return self.peak_lr * frac;
         }
-        let decay_steps = (self.total_steps - self.warmup_steps).max(1);
-        let t = ((step - self.warmup_steps) as f64 / decay_steps as f64).min(1.0);
+        let decay_span = self.total_iterations.saturating_sub(1).max(1) as f64;
+        let t = (iteration as f64 / decay_span).min(1.0);
         let cos = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
         self.min_lr + (self.peak_lr - self.min_lr) * cos
     }
@@ -322,19 +337,26 @@ mod tests {
     fn lr_schedule_warmup_peak_cosine() {
         let s = LrSchedule {
             warmup_steps: 100,
-            total_steps: 1000,
+            total_iterations: 15,
             peak_lr: 3e-4,
             min_lr: 1e-5,
         };
-        assert!(s.lr(0) > 0.0 && s.lr(0) < s.peak_lr);
-        assert!((s.lr(99) - s.peak_lr).abs() < 1e-9);
-        // End-of-schedule is min_lr.
-        assert!((s.lr(999) - s.min_lr).abs() < 1e-6);
-        // Mid-decay is between min and peak.
-        let mid = s.lr(550);
+        // Iteration 0 warms up over its first `warmup_steps` batches.
+        assert!(s.lr(0, 0) > 0.0 && s.lr(0, 0) < s.peak_lr);
+        assert!((s.lr(0, 99) - s.peak_lr).abs() < 1e-9);
+        // After warmup (still iter 0, step >= warmup_steps) LR hits peak
+        // exactly — `t = 0` on the cosine.
+        assert!((s.lr(0, 100) - s.peak_lr).abs() < 1e-9);
+        // Last iteration sits at min_lr.
+        assert!((s.lr(14, 0) - s.min_lr).abs() < 1e-9);
+        // Mid-run is strictly between peak and min.
+        let mid = s.lr(7, 0);
         assert!(mid > s.min_lr && mid < s.peak_lr);
-        // Past the end stays at min_lr.
-        assert!((s.lr(5_000) - s.min_lr).abs() < 1e-9);
+        // Past-the-end stays pinned at min_lr.
+        assert!((s.lr(99, 0) - s.min_lr).abs() < 1e-9);
+        // Warmup only triggers in iteration 0 — later iterations ignore
+        // the step counter.
+        assert_eq!(s.lr(1, 0), s.lr(1, 10_000));
     }
 
     #[test]
