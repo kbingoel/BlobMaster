@@ -78,8 +78,8 @@ mod tests {
         assert_eq!(cfg.training.buffer_capacity, back.training.buffer_capacity);
         assert_eq!(cfg.training.batch_size, back.training.batch_size);
         assert_eq!(
-            cfg.training.total_training_steps,
-            back.training.total_training_steps
+            cfg.training.total_iterations,
+            back.training.total_iterations
         );
         assert_eq!(cfg.training.checkpoint_dir, back.training.checkpoint_dir);
         assert_eq!(cfg.self_play.num_games, back.self_play.num_games);

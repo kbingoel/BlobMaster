@@ -59,10 +59,10 @@ pub struct TrainingLoopConfig {
     /// Stop epochs early when `(prev_loss - loss) / prev_loss` drops below
     /// this threshold. 0.0 disables early stop.
     pub epoch_early_stop_rel: f64,
-    pub total_training_steps: i64,
     /// Session 7.1: number of `run_iteration` calls the `blobmaster-train
-    /// train` driver should perform for a single invocation. The in-process
-    /// training loop doesn't enforce this itself — it's read by the CLI.
+    /// train` driver should perform for a single invocation. Also the
+    /// horizon that anchors the iteration-relative LR schedule
+    /// (`LrSchedule::total_iterations`).
     #[serde(default = "default_total_iterations")]
     pub total_iterations: u64,
     /// `tch::Device` is not serde-friendly, so round-trip as a string
@@ -117,7 +117,6 @@ impl Default for TrainingLoopConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             epochs_per_iteration: DEFAULT_EPOCHS_PER_ITERATION,
             epoch_early_stop_rel: 0.005,
-            total_training_steps: 200_000,
             total_iterations: 1,
             device: Device::Cpu,
         }
@@ -484,7 +483,7 @@ impl TrainingLoop {
         let model = BlobNet::new(&vs.root());
         let optimizer = build_optimizer(&vs).expect("build optimizer");
         let buffer = ReplayBuffer::new(cfg.buffer_capacity);
-        let lr_schedule = LrSchedule::new(cfg.total_training_steps);
+        let lr_schedule = LrSchedule::new(cfg.total_iterations);
         Self {
             cfg,
             vs,
@@ -515,7 +514,7 @@ impl TrainingLoop {
         if self.buffer.is_empty() {
             return None;
         }
-        let lr = self.lr_schedule.lr(self.global_step);
+        let lr = self.lr_schedule.lr(self.iteration, self.global_step);
         set_schedule_lr(&mut self.optimizer, lr);
         accumulators.last_lr = lr;
 
@@ -985,7 +984,6 @@ mod tests {
             batch_size: 4,
             epochs_per_iteration: 4,
             epoch_early_stop_rel: -1.0, // never stop early
-            total_training_steps: 10_000,
             total_iterations: 1,
             device: Device::Cpu,
         };
