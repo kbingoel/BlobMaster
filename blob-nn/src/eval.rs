@@ -10,16 +10,21 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use blob_engine::bidding::apply_bid;
 use blob_engine::dealing::start_round;
-use blob_engine::evaluator::Evaluator;
+use blob_engine::evaluator::{Evaluator, HeuristicEvaluator};
 use blob_engine::game::{advance_round, is_game_over, new_game};
 use blob_engine::hand::Hand;
 use blob_engine::mcts::{mcts_search, MctsConfig};
+use blob_engine::onnx::OnnxEvaluator;
 use blob_engine::playing::apply_play;
 use blob_engine::state::{BlobState, GamePhase, MAX_PLAYERS};
 use rand::Rng;
+use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use smallvec::SmallVec;
 
 /// Per-seat evaluator table. `None` is reserved for the `Complete`/`Scoring`
@@ -92,6 +97,33 @@ pub fn play_eval_game<R: Rng + ?Sized>(
     mcts_cfg: &MctsConfig,
     rng: &mut R,
 ) -> EvalGameOutcome {
+    // A never-triggered abort flag so the non-abortable public API
+    // reuses the same loop without any behavior change.
+    play_eval_game_until(
+        num_players,
+        start_cards,
+        seats,
+        mcts_cfg,
+        rng,
+        &AtomicBool::new(false),
+    )
+    .expect("play_eval_game without abort flag never returns None")
+}
+
+/// Abortable variant of `play_eval_game`. Checks `abort` between moves
+/// and returns `None` as soon as it's set — caps worst-case abort
+/// latency at one MCTS call (~one move's worth of work). Used by the
+/// parallel eval harness so workers drop in-flight games immediately
+/// once the early-stop CI boundary is reached, instead of running them
+/// to completion only to have their contributions thrown away.
+fn play_eval_game_until<R: Rng + ?Sized>(
+    num_players: u8,
+    start_cards: u8,
+    seats: &SeatEvaluators,
+    mcts_cfg: &MctsConfig,
+    rng: &mut R,
+    abort: &AtomicBool,
+) -> Option<EvalGameOutcome> {
     let mut state = new_game(num_players, start_cards).expect("valid game params");
     start_round(&mut state, rng);
     let mut outcome = EvalGameOutcome {
@@ -100,6 +132,9 @@ pub fn play_eval_game<R: Rng + ?Sized>(
     };
 
     while !is_game_over(&state) {
+        if abort.load(Ordering::Relaxed) {
+            return None;
+        }
         match state.phase() {
             GamePhase::Bidding => {
                 let seat = state.current_player as usize;
@@ -133,7 +168,7 @@ pub fn play_eval_game<R: Rng + ?Sized>(
         }
     }
     outcome.final_scores = state.cumulative_scores;
-    outcome
+    Some(outcome)
 }
 
 /// Aggregate head-to-head result of one evaluation (current vs opponent).
@@ -169,10 +204,6 @@ pub fn wilson_95(successes: usize, n: usize) -> (f64, f64) {
     ((center - margin).max(0.0), (center + margin).min(1.0))
 }
 
-/// Chunk size for sequential early-stop evaluation (Session 7.3a). The CI
-/// is rechecked at every multiple of this; 50 gives four decision points
-/// inside the 200-game cap.
-pub const EVAL_CHUNK_SIZE: usize = 50;
 /// Early-stop threshold: if `win_rate_lower95 ≥ EVAL_EARLY_STOP_HIGH` we
 /// declare a clear improvement. 0.55 cushions above the 0.5 promotion
 /// gate so a CI that just barely clears 0.5 doesn't trigger stop-and-
@@ -181,114 +212,274 @@ pub const EVAL_EARLY_STOP_HIGH: f64 = 0.55;
 /// Mirror of `EVAL_EARLY_STOP_HIGH` for the regression side.
 pub const EVAL_EARLY_STOP_LOW: f64 = 0.45;
 
-/// Run a head-to-head evaluation between `eval_a` (the "current" model) and
-/// `eval_b` (the opponent). Remaining seats are filled with `heuristic`.
+/// One game's contribution to the running aggregates. Produced by worker
+/// threads and consumed by the main thread.
+struct GameContribution {
+    won_a: bool,
+    score_diff: i64,
+    a_hits: u32,
+    a_rounds: u32,
+    b_hits: u32,
+    b_rounds: u32,
+}
+
+/// Play one eval game for `game_idx` and return its contribution, or
+/// `None` if the `abort` flag was set mid-game (in which case the caller
+/// should drop the game entirely — its contribution would have landed
+/// outside the early-stop commit prefix anyway).
+fn play_game_at_index(
+    game_idx: usize,
+    num_players: u8,
+    start_cards: u8,
+    eval_a: &dyn Evaluator,
+    eval_b: &dyn Evaluator,
+    heuristic: &dyn Evaluator,
+    mcts_cfg: &MctsConfig,
+    base_seed: u64,
+    abort: &AtomicBool,
+) -> Option<GameContribution> {
+    let half = (num_players as usize) / 2;
+    let seat_a = game_idx % num_players as usize;
+    let seat_b = (game_idx + half) % num_players as usize;
+    debug_assert_ne!(seat_a, seat_b);
+
+    let mut seats = SeatEvaluators::new();
+    for s in 0..num_players as usize {
+        seats.0[s] = Some(heuristic);
+    }
+    seats.0[seat_a] = Some(eval_a);
+    seats.0[seat_b] = Some(eval_b);
+
+    // Derive a per-game seed so thread scheduling can't perturb results.
+    let game_seed =
+        base_seed ^ (game_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(game_seed);
+    let outcome =
+        play_eval_game_until(num_players, start_cards, &seats, mcts_cfg, &mut rng, abort)?;
+
+    let sa = outcome.final_scores[seat_a] as i64;
+    let sb = outcome.final_scores[seat_b] as i64;
+    let mut a_hits = 0u32;
+    let mut b_hits = 0u32;
+    let mut a_rounds = 0u32;
+    let mut b_rounds = 0u32;
+    for r in &outcome.rounds {
+        if r.bids[seat_a] == r.tricks_won[seat_a] {
+            a_hits += 1;
+        }
+        if r.bids[seat_b] == r.tricks_won[seat_b] {
+            b_hits += 1;
+        }
+        a_rounds += 1;
+        b_rounds += 1;
+    }
+    Some(GameContribution {
+        won_a: sa > sb,
+        score_diff: sa - sb,
+        a_hits,
+        a_rounds,
+        b_hits,
+        b_rounds,
+    })
+}
+
+/// Run a head-to-head evaluation between the model at `eval_a_path` (the
+/// "current" model) and `eval_b_path` (the opponent). Remaining seats are
+/// filled with `HeuristicEvaluator`.
 ///
 /// Seat assignment rotates so each model spends an equal share of games in
 /// each seat pair:
 ///   `seat_A = game_idx % num_players`
 ///   `seat_B = (game_idx + num_players / 2) % num_players`
 ///
-/// Session 7.3a: `num_games` is a **cap**, not the number actually played.
-/// Games run in chunks of `EVAL_CHUNK_SIZE`; after each chunk the Wilson
-/// 95% CI on the cumulative win rate is recomputed, and we stop as soon
-/// as `lower95 ≥ EVAL_EARLY_STOP_HIGH` (clear improvement) or `upper95 ≤
-/// EVAL_EARLY_STOP_LOW` (clear regression). If neither band is crossed
-/// by `num_games`, the returned `EvaluationResult.inconclusive` is true.
-pub fn run_evaluation<R: Rng + ?Sized>(
-    eval_a: &dyn Evaluator,
-    eval_b: &dyn Evaluator,
-    heuristic: &dyn Evaluator,
+/// Games are dispatched across `num_threads` worker threads via a
+/// work-stealing atomic counter. Each thread owns its own `OnnxEvaluator`
+/// sessions (the ONNX sessions are `Mutex`-guarded, so per-thread
+/// ownership avoids serializing inference). A per-game seed is derived
+/// from `base_seed ^ game_idx` so each game's outcome depends only on
+/// its index, not on thread scheduling.
+///
+/// `num_games` is a **cap**, not the number actually played. Completed
+/// games are folded into the running aggregate **in index order** — the
+/// Wilson 95% CI is recomputed every time the contiguous-prefix count
+/// crosses a `num_threads` boundary, and we stop as soon as
+/// `lower95 ≥ EVAL_EARLY_STOP_HIGH` (clear improvement) or
+/// `upper95 ≤ EVAL_EARLY_STOP_LOW` (clear regression). Contributions
+/// that arrive after the stop signal but fall beyond the committed
+/// prefix are dropped, so repeat evals with the same `base_seed` and
+/// `num_threads` produce bit-identical aggregates. If neither band is
+/// crossed by `num_games`, the returned `EvaluationResult.inconclusive`
+/// is true.
+pub fn run_evaluation(
+    eval_a_path: &Path,
+    eval_b_path: &Path,
     num_games: usize,
     num_players: u8,
     start_cards: u8,
     mcts_cfg: &MctsConfig,
-    rng: &mut R,
+    base_seed: u64,
+    num_threads: usize,
 ) -> EvaluationResult {
-    let half = (num_players as usize) / 2;
-    let mut wins_a = 0usize;
-    let mut score_diff_sum: i64 = 0;
-    let mut a_hits = 0usize;
-    let mut a_rounds = 0usize;
-    let mut b_hits = 0usize;
-    let mut b_rounds = 0usize;
+    let num_threads = num_threads.max(1);
+    let check_stride = num_threads;
 
-    let mut games_played = 0usize;
-    let mut lo = 0.0f64;
-    let mut hi = 1.0f64;
-    let mut stopped_early = false;
+    let next_idx = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<(usize, GameContribution)>();
 
-    'outer: while games_played < num_games {
-        let chunk_end = (games_played + EVAL_CHUNK_SIZE).min(num_games);
-        for game_idx in games_played..chunk_end {
-            let seat_a = game_idx % num_players as usize;
-            let seat_b = (game_idx + half) % num_players as usize;
-            debug_assert_ne!(seat_a, seat_b);
+    // `std::thread::scope` runs its body on the calling thread (so the
+    // non-`Send` `Receiver` is fine to drain locally) and joins every
+    // spawned worker before returning.
+    std::thread::scope(|scope| {
+        for _ in 0..num_threads {
+            let tx = tx.clone();
+            let next_idx = &next_idx;
+            let stop = &stop;
+            scope.spawn(move || {
+                let eval_a = OnnxEvaluator::from_file(eval_a_path)
+                    .expect("load ONNX model A for eval worker");
+                let eval_b = OnnxEvaluator::from_file(eval_b_path)
+                    .expect("load ONNX model B for eval worker");
+                let heuristic = HeuristicEvaluator;
 
-            let mut seats = SeatEvaluators::new();
-            for s in 0..num_players as usize {
-                seats.0[s] = Some(heuristic);
-            }
-            seats.0[seat_a] = Some(eval_a);
-            seats.0[seat_b] = Some(eval_b);
-
-            let outcome = play_eval_game(num_players, start_cards, &seats, mcts_cfg, rng);
-            let sa = outcome.final_scores[seat_a] as i64;
-            let sb = outcome.final_scores[seat_b] as i64;
-            if sa > sb {
-                wins_a += 1;
-            }
-            score_diff_sum += sa - sb;
-            for r in &outcome.rounds {
-                if r.bids[seat_a] == r.tricks_won[seat_a] {
-                    a_hits += 1;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_games {
+                        break;
+                    }
+                    // `stop` doubles as the per-game abort flag: if the
+                    // main thread flips it mid-game (early-stop CI
+                    // cleared), `play_game_at_index` returns `None` at
+                    // the next move boundary and the worker exits
+                    // without sending.
+                    let Some(contrib) = play_game_at_index(
+                        idx,
+                        num_players,
+                        start_cards,
+                        &eval_a,
+                        &eval_b,
+                        &heuristic,
+                        mcts_cfg,
+                        base_seed,
+                        stop,
+                    ) else {
+                        break;
+                    };
+                    if tx.send((idx, contrib)).is_err() {
+                        break;
+                    }
                 }
-                if r.bids[seat_b] == r.tricks_won[seat_b] {
-                    b_hits += 1;
+            });
+        }
+        // Drop the outer sender so `rx.recv()` exits once all workers are gone.
+        drop(tx);
+
+        // Index-keyed buffer so CI and the final aggregate are computed
+        // over a deterministic prefix `[0, contiguous_len)` — independent
+        // of which worker lands which idx first. Contributions that
+        // arrive beyond the committed prefix after early-stop are
+        // dropped so repeat evals with the same `base_seed` are
+        // bit-identical.
+        let mut results: Vec<Option<GameContribution>> =
+            (0..num_games).map(|_| None).collect();
+        let mut contiguous_len = 0usize;
+        let mut wins_a = 0usize;
+        let mut score_diff_sum: i64 = 0;
+        let mut a_hits = 0u32;
+        let mut a_rounds = 0u32;
+        let mut b_hits = 0u32;
+        let mut b_rounds = 0u32;
+        let mut lo = 0.0f64;
+        let mut hi = 1.0f64;
+        let mut stopped_early = false;
+
+        'drain: while let Ok((idx, c)) = rx.recv() {
+            debug_assert!(results[idx].is_none());
+            results[idx] = Some(c);
+
+            // Fold every newly-contiguous contribution into the running
+            // aggregate in index order, then re-check CI whenever the
+            // prefix crosses a `check_stride` boundary.
+            while contiguous_len < num_games
+                && results[contiguous_len].is_some()
+            {
+                let c = results[contiguous_len].as_ref().unwrap();
+                if c.won_a {
+                    wins_a += 1;
                 }
-                a_rounds += 1;
-                b_rounds += 1;
+                score_diff_sum += c.score_diff;
+                a_hits += c.a_hits;
+                a_rounds += c.a_rounds;
+                b_hits += c.b_hits;
+                b_rounds += c.b_rounds;
+                contiguous_len += 1;
+
+                if !stopped_early && contiguous_len % check_stride == 0 {
+                    let (l, h) = wilson_95(wins_a, contiguous_len);
+                    lo = l;
+                    hi = h;
+                    tracing::info!(
+                        games = contiguous_len,
+                        wins_a,
+                        win_rate = wins_a as f64 / contiguous_len as f64,
+                        lower95 = lo,
+                        upper95 = hi,
+                        "eval: CI update"
+                    );
+                    if lo >= EVAL_EARLY_STOP_HIGH || hi <= EVAL_EARLY_STOP_LOW {
+                        stopped_early = true;
+                        stop.store(true, Ordering::Relaxed);
+                        // Freeze the aggregate at the decision boundary;
+                        // scope will join any still-in-flight workers
+                        // whose `(idx, contrib)` falls outside this prefix.
+                        break 'drain;
+                    }
+                }
             }
         }
-        games_played = chunk_end;
 
-        let (l, h) = wilson_95(wins_a, games_played);
-        lo = l;
-        hi = h;
-        if lo >= EVAL_EARLY_STOP_HIGH || hi <= EVAL_EARLY_STOP_LOW {
-            stopped_early = true;
-            break 'outer;
+        // When we ran to the cap without early-stop and `num_games` isn't a
+        // multiple of `check_stride`, the trailing games past the last
+        // boundary still need a final CI so the reported bounds match
+        // `contiguous_len`.
+        if !stopped_early && contiguous_len > 0 && contiguous_len % check_stride != 0 {
+            let (l, h) = wilson_95(wins_a, contiguous_len);
+            lo = l;
+            hi = h;
         }
-    }
 
-    let inconclusive = !stopped_early && games_played >= num_games;
-    EvaluationResult {
-        num_games: games_played,
-        wins_a,
-        win_rate: if games_played > 0 {
-            wins_a as f64 / games_played as f64
-        } else {
-            0.0
-        },
-        win_rate_lower95: lo,
-        win_rate_upper95: hi,
-        score_differential: if games_played > 0 {
-            score_diff_sum as f64 / games_played as f64
-        } else {
-            0.0
-        },
-        bid_success_rate_a: if a_rounds > 0 {
-            a_hits as f64 / a_rounds as f64
-        } else {
-            0.0
-        },
-        bid_success_rate_b: if b_rounds > 0 {
-            b_hits as f64 / b_rounds as f64
-        } else {
-            0.0
-        },
-        inconclusive,
-    }
+        let inconclusive = !stopped_early && contiguous_len >= num_games;
+        EvaluationResult {
+            num_games: contiguous_len,
+            wins_a,
+            win_rate: if contiguous_len > 0 {
+                wins_a as f64 / contiguous_len as f64
+            } else {
+                0.0
+            },
+            win_rate_lower95: lo,
+            win_rate_upper95: hi,
+            score_differential: if contiguous_len > 0 {
+                score_diff_sum as f64 / contiguous_len as f64
+            } else {
+                0.0
+            },
+            bid_success_rate_a: if a_rounds > 0 {
+                a_hits as f64 / a_rounds as f64
+            } else {
+                0.0
+            },
+            bid_success_rate_b: if b_rounds > 0 {
+                b_hits as f64 / b_rounds as f64
+            } else {
+                0.0
+            },
+            inconclusive,
+        }
+    })
 }
 
 /// One CSV row written by `append_strength_row` — mirrors the columns

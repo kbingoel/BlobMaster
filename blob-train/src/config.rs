@@ -13,21 +13,31 @@ use blob_nn::engine::SelfPlayConfig;
 use blob_nn::training_loop::TrainingLoopConfig;
 use serde::{Deserialize, Serialize};
 
+fn default_eval_num_threads() -> usize {
+    32
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalConfig {
     pub eval_games: usize,
     pub eval_interval: u64,
     pub eval_lookback: u64,
     pub bid_success_promotion_delta: f32,
+    #[serde(default = "default_eval_num_threads")]
+    pub eval_num_threads: usize,
 }
 
 impl Default for EvalConfig {
     fn default() -> Self {
         Self {
-            eval_games: 200,
+            // 192 = 6 × 32-thread batches — the last decision boundary
+            // under the 32-way parallel CI-check design. 200 would force
+            // a 7th batch of which only 8 games count toward the CI.
+            eval_games: 192,
             eval_interval: 5,
             eval_lookback: 20,
             bid_success_promotion_delta: 0.02,
+            eval_num_threads: default_eval_num_threads(),
         }
     }
 }
