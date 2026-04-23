@@ -11,7 +11,7 @@ links against it, but at runtime the dynamic loader and CUDA's lazy symbol
 resolution both need to find it explicitly:
 
 ```bash
-LIBTORCH_DIR="$(find target/release/build -maxdepth 4 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
+LIBTORCH_DIR="$(find target/release/build -maxdepth 6 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
 export LD_LIBRARY_PATH="$LIBTORCH_DIR:${LD_LIBRARY_PATH:-}"
 export LD_PRELOAD="$LIBTORCH_DIR/libtorch_cuda.so"
 ./target/release/blob-train <args>
