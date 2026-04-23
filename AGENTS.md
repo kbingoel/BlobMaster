@@ -90,7 +90,7 @@ Canonical launch template:
 
 ```bash
 cd /home/kbuntu/Documents/Github/BlobMaster
-LIBTORCH_DIR="$(find target/release/build -maxdepth 4 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
+LIBTORCH_DIR="$(find target/release/build -maxdepth 6 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
 PATH=".venv/bin:$PATH" \
 LD_LIBRARY_PATH="$LIBTORCH_DIR:${LD_LIBRARY_PATH:-}" \
 LD_PRELOAD="$LIBTORCH_DIR/libtorch_cuda.so" \
