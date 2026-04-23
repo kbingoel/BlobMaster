@@ -62,14 +62,25 @@ enum Command {
     Evaluate {
         #[arg(long)]
         model_a: PathBuf,
+        /// Path to opponent ONNX model.
         #[arg(long)]
-        model_b: String,
+        model_b: PathBuf,
+        /// Game cap; the evaluator stops earlier as soon as the Wilson
+        /// 95% CI clears the ±0.55/0.45 bands (chunks of 50).
         #[arg(long)]
         num_games: usize,
         #[arg(long)]
         num_players: u8,
         #[arg(long)]
         cards_dealt: u8,
+        /// Optional config TOML — its `[mcts]` section is used so the
+        /// eval matches the training-time MCTS budget. Defaults to
+        /// `MctsConfig::default()` (5 × 100, c_puct=1.5).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Optional RNG seed for reproducibility.
+        #[arg(long, default_value_t = 0xE5A1_5EEDu64)]
+        seed: u64,
     },
     SelfPlay {
         #[arg(long)]
@@ -315,6 +326,62 @@ fn run_eval_against_anchor(
     Ok(())
 }
 
+fn run_evaluate(
+    model_a: &Path,
+    model_b: &Path,
+    num_games: usize,
+    num_players: u8,
+    cards_dealt: u8,
+    config: Option<&Path>,
+    seed: u64,
+) -> std::io::Result<()> {
+    let mcts_cfg = if let Some(p) = config {
+        TrainingConfig::load(p)?.mcts
+    } else {
+        blob_engine::mcts::MctsConfig::default()
+    };
+    let a = OnnxEvaluator::from_file(model_a)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let b = OnnxEvaluator::from_file(model_b)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let heuristic = blob_engine::evaluator::HeuristicEvaluator;
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    tracing::info!(
+        ?model_a,
+        ?model_b,
+        cap_games = num_games,
+        num_players,
+        cards_dealt,
+        c_puct = mcts_cfg.c_puct,
+        num_determinizations = mcts_cfg.num_determinizations,
+        sims_per_determinization = mcts_cfg.sims_per_determinization,
+        "evaluate — starting head-to-head (adaptive early-stop, 50-game chunks)"
+    );
+    let result = run_evaluation(
+        &a,
+        &b,
+        &heuristic,
+        num_games,
+        num_players,
+        cards_dealt,
+        &mcts_cfg,
+        &mut rng,
+    );
+    tracing::info!(
+        games_played = result.num_games,
+        wins_a = result.wins_a,
+        win_rate = result.win_rate,
+        win_rate_lower95 = result.win_rate_lower95,
+        win_rate_upper95 = result.win_rate_upper95,
+        score_differential = result.score_differential,
+        bid_success_a = result.bid_success_rate_a,
+        bid_success_b = result.bid_success_rate_b,
+        inconclusive = result.inconclusive,
+        "evaluate — result"
+    );
+    Ok(())
+}
+
 fn main() {
     init_logging();
 
@@ -368,15 +435,21 @@ fn main() {
             num_games,
             num_players,
             cards_dealt,
+            config,
+            seed,
         } => {
-            tracing::info!(
-                ?model_a,
-                model_b,
+            if let Err(e) = run_evaluate(
+                &model_a,
+                &model_b,
                 num_games,
                 num_players,
                 cards_dealt,
-                "evaluate — driver wiring lands in later session"
-            );
+                config.as_deref(),
+                seed,
+            ) {
+                tracing::error!(error = %e, "evaluation failed");
+                std::process::exit(1);
+            }
         }
         Command::SelfPlay {
             model,
