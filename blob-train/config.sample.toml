@@ -36,7 +36,11 @@ temperature = 1.0
 arena_capacity = 4096
 
 [eval]
-eval_games = 200
+# 192 = 6 × 32-thread batches. Under the parallel eval harness the Wilson
+# CI is checked at multiples of `eval_num_threads`; 200 would schedule a
+# 7th batch in which only 8 games count toward the CI before the cap.
+eval_games = 192
 eval_interval = 5
 eval_lookback = 20
 bid_success_promotion_delta = 0.02
+eval_num_threads = 32

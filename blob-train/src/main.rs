@@ -19,13 +19,12 @@ mod config;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
-use blob_engine::onnx::OnnxEvaluator;
 use blob_nn::eval::{
     append_strength_row, iteration_onnx_path, run_evaluation, StrengthRow,
 };
 use blob_nn::training_loop::TrainingLoop;
 use clap::{Parser, Subcommand};
-use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::config::TrainingConfig;
@@ -279,21 +278,19 @@ fn run_eval_against_anchor(
         tracing::warn!(?anchor_onnx, ?current_onnx, "eval: missing ONNX; skipping");
         return Ok(());
     }
-    let anchor = OnnxEvaluator::from_file(&anchor_onnx)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let current = OnnxEvaluator::from_file(&current_onnx)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let heuristic = blob_engine::evaluator::HeuristicEvaluator;
     let (n_players, cards) = cfg.self_play.fixed_player_count.unwrap_or((5, 7));
+    // Pull a single u64 from the training-loop RNG so eval remains
+    // reproducible across runs (downstream per-game seeds come from this).
+    let base_seed: u64 = rng.next_u64();
     let result = run_evaluation(
-        &current,
-        &anchor,
-        &heuristic,
+        &current_onnx,
+        &anchor_onnx,
         cfg.eval.eval_games,
         n_players,
         cards,
         &cfg.mcts,
-        rng,
+        base_seed,
+        cfg.eval.eval_num_threads,
     );
     tracing::info!(
         current_iter,
@@ -335,37 +332,33 @@ fn run_evaluate(
     config: Option<&Path>,
     seed: u64,
 ) -> std::io::Result<()> {
-    let mcts_cfg = if let Some(p) = config {
-        TrainingConfig::load(p)?.mcts
+    let (mcts_cfg, num_threads) = if let Some(p) = config {
+        let loaded = TrainingConfig::load(p)?;
+        (loaded.mcts, loaded.eval.eval_num_threads)
     } else {
-        blob_engine::mcts::MctsConfig::default()
+        (blob_engine::mcts::MctsConfig::default(), 32)
     };
-    let a = OnnxEvaluator::from_file(model_a)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let b = OnnxEvaluator::from_file(model_b)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let heuristic = blob_engine::evaluator::HeuristicEvaluator;
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     tracing::info!(
         ?model_a,
         ?model_b,
         cap_games = num_games,
         num_players,
         cards_dealt,
+        num_threads,
         c_puct = mcts_cfg.c_puct,
         num_determinizations = mcts_cfg.num_determinizations,
         sims_per_determinization = mcts_cfg.sims_per_determinization,
-        "evaluate — starting head-to-head (adaptive early-stop, 50-game chunks)"
+        "evaluate — starting head-to-head (parallel, adaptive early-stop)"
     );
     let result = run_evaluation(
-        &a,
-        &b,
-        &heuristic,
+        model_a,
+        model_b,
         num_games,
         num_players,
         cards_dealt,
         &mcts_cfg,
-        &mut rng,
+        seed,
+        num_threads,
     );
     tracing::info!(
         games_played = result.num_games,
