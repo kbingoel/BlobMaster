@@ -1,1 +1,16 @@
 [export_onnx] wrote checkpoints/7.3c-run/bootstrap/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000000/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000001/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000002/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000003/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000004/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000005/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000006/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000007/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000008/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000009/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000010/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000011/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000012/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000013/model.onnx
+[export_onnx] wrote checkpoints/7.3c-run/iter_000014/model.onnx
