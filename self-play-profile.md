@@ -80,3 +80,33 @@ Secondary wins still available, independent of thread count:
 **Not applied — `.with_inter_threads(1)`.** Investigated and dropped. ORT's default execution mode is `Sequential` (the `ort` 2.0 crate defaults `with_parallel_execution` to `false`), and the crate's own docstring on `with_inter_threads` states *"This has no effect when the session execution mode is set to `Sequential`."* The inter-op pool is never used by our sessions — there is nothing to constrain. This would only matter if we ever called `with_parallel_execution(true)`, which has no payoff for a batch-1 transformer with a mostly-linear graph. The 16T per-call slowdown of 1.67× confirms intra-op is already correctly constrained by `with_intra_threads(1)` at [blob-engine/src/onnx.rs:63](blob-engine/src/onnx.rs#L63); no hidden inter-op pool is spawning work.
 
 **Open — SMT-related.** Disabling SMT in BIOS was considered: not expected to change the 16T number measurably (Linux's CFS already places 16 runnable workers one-per-physical-core), and it would penalize other workloads on the box. Equivalent effect available without a BIOS change via `RAYON_NUM_THREADS=16` and/or `taskset`. No action taken.
+
+## Follow-ups (2026-04-24) — thread-count sweep after evaluator-reuse
+
+After landing the per-thread `OnnxEvaluator` reuse change ([blob-nn/src/engine.rs](blob-nn/src/engine.rs)),
+re-baselined T=16 and swept neighbouring thread counts to find the per-game-wall optimum.
+Each row is 5 games per thread (so total games = 5 × T). Same model, MCTS, and game shape as the original profile.
+
+Algorithm: from T=16, walk one step in each direction; on a regression vs best-so-far, take one validation
+step further; stop that direction if the validation step also regresses. Script: [scripts/thread-sweep.sh](scripts/thread-sweep.sh),
+raw logs: [logs/thread-sweep-2026-04-24/](logs/thread-sweep-2026-04-24/).
+
+| threads | total games | wall (s) | per-game wall (s) | per-decision (ms) | onnx_inference avg (µs) | vs 16T |
+|--------:|------------:|---------:|------------------:|------------------:|------------------------:|-------:|
+| 14 | 70 | 529.2 | 7.560 | 278.5 | 1186.6 | 1.043× |
+| 15 | 75 | 548.6 | 7.315 | 288.7 | 1229.7 | 1.009× |
+| 16 | 80 | 580.0 | 7.250 | 305.3 | 1290.2 | 1.000× |
+| 17 | 85 | 646.2 | 7.602 | 340.1 | 1355.1 | 1.049× |
+| 18 | 90 | 686.6 | 7.629 | 361.4 | 1441.9 | 1.052× |
+
+Run order (sequential, one config at a time):
+
+```
+16 (per_game=7.249700s)
+15 (per_game=7.314957s)
+14 (per_game=7.560087s)
+17 (per_game=7.602072s)
+18 (per_game=7.629394s)
+```
+
+**Direction bests:** DOWN best at T= (7.249700s/game), UP best at T=16 (7.249700s/game), baseline T=16 (7.249700s/game).
