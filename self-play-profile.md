@@ -72,3 +72,11 @@ The `GATES.md` "32-thread self-play >80% scaling efficiency" target is unachieva
 Secondary wins still available, independent of thread count:
 - Reuse `OnnxEvaluator` per thread instead of per game (saves ~20 s/iter — session construction is currently called 118× instead of 16×).
 - Try `.with_inter_threads(1)` on the Session builder to stop ORT's default inter-op pool from oversubscribing.
+
+## Follow-ups (2026-04-24)
+
+**Applied — reuse `OnnxEvaluator` per worker, not per game.** `blob-nn/src/engine.rs` now uses `rayon::iter::ParallelIterator::map_init` so each worker constructs one `OnnxEvaluator` when it picks up a chunk and reuses it across every game in that chunk. `session_construction` count per iteration drops from ~118 to a small multiple of `num_threads`, and the allocator no longer churns ~10 MB of weight buffers every game. End-to-end `runs_iteration_if_model_available` test passes against `checkpoints/7.3c-run/iter_000014/model.onnx`.
+
+**Not applied — `.with_inter_threads(1)`.** Investigated and dropped. ORT's default execution mode is `Sequential` (the `ort` 2.0 crate defaults `with_parallel_execution` to `false`), and the crate's own docstring on `with_inter_threads` states *"This has no effect when the session execution mode is set to `Sequential`."* The inter-op pool is never used by our sessions — there is nothing to constrain. This would only matter if we ever called `with_parallel_execution(true)`, which has no payoff for a batch-1 transformer with a mostly-linear graph. The 16T per-call slowdown of 1.67× confirms intra-op is already correctly constrained by `with_intra_threads(1)` at [blob-engine/src/onnx.rs:63](blob-engine/src/onnx.rs#L63); no hidden inter-op pool is spawning work.
+
+**Open — SMT-related.** Disabling SMT in BIOS was considered: not expected to change the 16T number measurably (Linux's CFS already places 16 runnable workers one-per-physical-core), and it would penalize other workloads on the box. Equivalent effect available without a BIOS change via `RAYON_NUM_THREADS=16` and/or `taskset`. No action taken.

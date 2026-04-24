@@ -88,33 +88,39 @@ pub fn self_play_iteration(
 
     let example_count = AtomicUsize::new(0);
 
+    // `map_init` constructs one `OnnxEvaluator` per rayon work chunk and
+    // reuses it across every game in that chunk, rather than per-game. The
+    // session's internal mutex still prevents sharing one evaluator across
+    // threads, so each worker keeps its own.
     let results: Vec<(Vec<TrainingExample>, Vec<DecisionStat>)> = pool.install(|| {
         (0..cfg.num_games)
             .into_par_iter()
-            .map(|game_idx| {
-                // Per-thread ONNX session — `ort::Session` inside
-                // `OnnxEvaluator` is guarded by a mutex, so sharing across
-                // threads would serialize inference. Keep it local.
-                let eval = OnnxEvaluator::from_file(model_path)
-                    .expect("load ONNX model for self-play worker");
-                let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
-                let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
-                let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-                let (n, c) = match cfg.fixed_player_count {
-                    Some(nc) => nc,
-                    None => sample_game_params(&mut rng),
-                };
-                let (examples, stats) =
-                    play_one_game_with_stats(n, c, &eval, mcts_cfg, &mut rng);
+            .map_init(
+                || {
+                    OnnxEvaluator::from_file(model_path)
+                        .expect("load ONNX model for self-play worker")
+                },
+                |eval, game_idx| {
+                    let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
+                    let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
+                    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+                    let (n, c) = match cfg.fixed_player_count {
+                        Some(nc) => nc,
+                        None => sample_game_params(&mut rng),
+                    };
+                    let (examples, stats) =
+                        play_one_game_with_stats(n, c, eval, mcts_cfg, &mut rng);
 
-                let new_total =
-                    example_count.fetch_add(examples.len(), Ordering::Relaxed) + examples.len();
-                if let Some(pb) = &progress {
-                    pb.inc(1);
-                    pb.set_message(new_total.to_string());
-                }
-                (examples, stats)
-            })
+                    let new_total = example_count
+                        .fetch_add(examples.len(), Ordering::Relaxed)
+                        + examples.len();
+                    if let Some(pb) = &progress {
+                        pb.inc(1);
+                        pb.set_message(new_total.to_string());
+                    }
+                    (examples, stats)
+                },
+            )
             .collect()
     });
 
