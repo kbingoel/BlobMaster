@@ -95,6 +95,28 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Self-play profiler — plays `games_per_thread * num_threads` games
+    /// through the live rayon engine and prints a bucket breakdown of
+    /// time spent in MCTS, ONNX, encoding, determinization, etc.
+    Profile {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        games_per_thread: usize,
+        #[arg(long, default_value_t = 32)]
+        num_threads: usize,
+        #[arg(long)]
+        num_players: Option<u8>,
+        #[arg(long)]
+        cards_dealt: Option<u8>,
+        /// Optional config TOML — its `[mcts]` section is used so profiling
+        /// matches the real self-play MCTS budget. Defaults to
+        /// `MctsConfig::default()` (5 × 100, c_puct=1.5).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = 0xB10B_5EEDu64)]
+        seed: u64,
+    },
 }
 
 fn init_logging() {
@@ -323,6 +345,132 @@ fn run_eval_against_anchor(
     Ok(())
 }
 
+fn run_profile(
+    model: &Path,
+    games_per_thread: usize,
+    num_threads: usize,
+    num_players: Option<u8>,
+    cards_dealt: Option<u8>,
+    config: Option<&Path>,
+    seed: u64,
+) -> std::io::Result<()> {
+    use blob_engine::profiling;
+    use blob_nn::engine::{self_play_iteration, SelfPlayConfig};
+
+    let mcts_cfg = if let Some(p) = config {
+        TrainingConfig::load(p)?.mcts
+    } else {
+        blob_engine::mcts::MctsConfig::default()
+    };
+
+    let fixed = match (num_players, cards_dealt) {
+        (Some(n), Some(c)) => Some((n, c)),
+        (None, None) => None,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pass both --num-players and --cards-dealt, or neither",
+            ));
+        }
+    };
+
+    let num_games = games_per_thread.saturating_mul(num_threads);
+    let sp_cfg = SelfPlayConfig {
+        num_games,
+        num_threads,
+        iteration: seed,
+        show_progress: false,
+        fixed_player_count: fixed,
+    };
+
+    tracing::info!(
+        ?model,
+        num_games,
+        num_threads,
+        games_per_thread,
+        ?fixed,
+        c_puct = mcts_cfg.c_puct,
+        num_determinizations = mcts_cfg.num_determinizations,
+        sims_per_determinization = mcts_cfg.sims_per_determinization,
+        "profile — starting self-play profiling run"
+    );
+
+    profiling::reset_all();
+    profiling::enable();
+    let started = std::time::Instant::now();
+    let (examples, stats) = self_play_iteration(model, &sp_cfg, &mcts_cfg);
+    let wall = started.elapsed();
+    profiling::disable();
+
+    let thread_seconds_ns = (wall.as_nanos() as u64).saturating_mul(num_threads as u64);
+
+    let total_sims: u64 = stats.iter().map(|s| s.sims_used as u64).sum();
+    let num_decisions = stats.len();
+
+    println!();
+    println!("=== blobmaster-train profile ===");
+    println!("games               : {num_games} ({games_per_thread} × {num_threads} threads)");
+    println!("fixed_player_count  : {fixed:?}");
+    println!(
+        "mcts                : {} det × {} sims (floor={}, c_puct={})",
+        mcts_cfg.num_determinizations,
+        mcts_cfg.sims_per_determinization,
+        mcts_cfg.min_sims_floor,
+        mcts_cfg.c_puct
+    );
+    println!("wall clock (s)      : {:.3}", wall.as_secs_f64());
+    println!("thread-seconds      : {:.3}", thread_seconds_ns as f64 / 1e9);
+    println!("decisions           : {num_decisions}");
+    println!("examples            : {}", examples.len());
+    println!("total sims          : {total_sims}");
+    if num_decisions > 0 {
+        println!(
+            "avg per-game wall   : {:.3} ms",
+            wall.as_secs_f64() * 1000.0 / num_games as f64
+        );
+        println!(
+            "avg per-decision    : {:.3} ms  ({:.1} decisions/game)",
+            (thread_seconds_ns as f64 / 1e6) / num_decisions as f64,
+            num_decisions as f64 / num_games as f64
+        );
+    }
+    println!();
+
+    println!(
+        "{:<22} {:>14} {:>10} {:>14} {:>8} {:>8}",
+        "bucket", "total_ms", "calls", "avg_us", "%wall", "%threads"
+    );
+    println!("{}", "-".repeat(80));
+    for b in profiling::ALL_BUCKETS {
+        let (nanos, count) = b.snapshot();
+        let ms = nanos as f64 / 1e6;
+        let avg_us = if count > 0 {
+            (nanos as f64 / 1e3) / count as f64
+        } else {
+            0.0
+        };
+        let pct_wall = 100.0 * nanos as f64 / wall.as_nanos() as f64;
+        let pct_threads = if thread_seconds_ns > 0 {
+            100.0 * nanos as f64 / thread_seconds_ns as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{:<22} {:>14.2} {:>10} {:>14.2} {:>7.1}% {:>7.1}%",
+            b.name, ms, count, avg_us, pct_wall, pct_threads
+        );
+    }
+    println!();
+    println!(
+        "Notes: buckets are nested — ONNX_* are a sub-slice of MCTS_SEARCH. %wall is"
+    );
+    println!(
+        "summed-thread-time over wall clock (>100% when multi-threaded, divided by"
+    );
+    println!("num_threads gives per-thread share). %threads is share of wall × threads.");
+    Ok(())
+}
+
 fn run_evaluate(
     model_a: &Path,
     model_b: &Path,
@@ -453,6 +601,28 @@ fn main() {
         }
         Command::Export { checkpoint, output } => {
             tracing::info!(?checkpoint, ?output, "export — driver wiring lands in later session");
+        }
+        Command::Profile {
+            model,
+            games_per_thread,
+            num_threads,
+            num_players,
+            cards_dealt,
+            config,
+            seed,
+        } => {
+            if let Err(e) = run_profile(
+                &model,
+                games_per_thread,
+                num_threads,
+                num_players,
+                cards_dealt,
+                config.as_deref(),
+                seed,
+            ) {
+                tracing::error!(error = %e, "profile run failed");
+                std::process::exit(1);
+            }
         }
     }
 }
