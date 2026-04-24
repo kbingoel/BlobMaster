@@ -133,76 +133,78 @@ where
     E: Evaluator + ?Sized,
     R: Rng + ?Sized,
 {
-    let mut state = new_game(num_players, start_cards).expect("valid game params");
-    start_round(&mut state, rng);
+    blob_engine::profiling::time(&blob_engine::profiling::GAME_TOTAL, || {
+        let mut state = new_game(num_players, start_cards).expect("valid game params");
+        start_round(&mut state, rng);
 
-    let mut examples: Vec<TrainingExample> = Vec::new();
-    let mut stats: Vec<DecisionStat> = Vec::new();
+        let mut examples: Vec<TrainingExample> = Vec::new();
+        let mut stats: Vec<DecisionStat> = Vec::new();
 
-    while !is_game_over(&state) {
-        match state.phase() {
-            GamePhase::Bidding => {
-                let num_legal = legal_bids(&state).count_ones() as usize;
-                let (dets, sims) = adaptive_budget(num_legal, cfg);
-                let result = mcts_search(&state, eval, cfg, rng);
-                debug_assert_eq!(result.policy.len(), MAX_BID_ACTIONS);
-                let perspective = state.current_player;
-                let sparse = dense_to_sparse(&result.policy);
-                let snapshot = state;
-                let action = sample_from_policy(&result.policy, rng) as u8;
-                stats.push(DecisionStat {
-                    phase: GamePhase::Bidding,
-                    num_legal: num_legal as u32,
-                    sims_used: dets.saturating_mul(sims),
-                    signal_ratio: signal_ratio(&result, num_legal),
-                });
-                examples.push(TrainingExample {
-                    state: snapshot,
-                    policy: sparse,
-                    value: f32::NAN,
-                    phase: GamePhase::Bidding,
-                    perspective,
-                });
-                apply_bid(&mut state, action);
+        while !is_game_over(&state) {
+            match state.phase() {
+                GamePhase::Bidding => {
+                    let num_legal = legal_bids(&state).count_ones() as usize;
+                    let (dets, sims) = adaptive_budget(num_legal, cfg);
+                    let result = mcts_search(&state, eval, cfg, rng);
+                    debug_assert_eq!(result.policy.len(), MAX_BID_ACTIONS);
+                    let perspective = state.current_player;
+                    let sparse = dense_to_sparse(&result.policy);
+                    let snapshot = state;
+                    let action = sample_from_policy(&result.policy, rng) as u8;
+                    stats.push(DecisionStat {
+                        phase: GamePhase::Bidding,
+                        num_legal: num_legal as u32,
+                        sims_used: dets.saturating_mul(sims),
+                        signal_ratio: signal_ratio(&result, num_legal),
+                    });
+                    examples.push(TrainingExample {
+                        state: snapshot,
+                        policy: sparse,
+                        value: f32::NAN,
+                        phase: GamePhase::Bidding,
+                        perspective,
+                    });
+                    apply_bid(&mut state, action);
+                }
+                GamePhase::Playing => {
+                    let perspective = state.current_player;
+                    let hand_cards: Vec<u8> = Hand::new(state.hands[perspective as usize])
+                        .iter()
+                        .map(|c| c.index())
+                        .collect();
+                    let num_legal = legal_plays(&state).count_ones() as usize;
+                    let (dets, sims) = adaptive_budget(num_legal, cfg);
+                    let result = mcts_search(&state, eval, cfg, rng);
+                    debug_assert_eq!(result.policy.len(), hand_cards.len());
+                    let sparse = dense_to_sparse(&result.policy);
+                    let snapshot = state;
+                    let pos = sample_from_policy(&result.policy, rng);
+                    let card_idx = hand_cards[pos];
+                    stats.push(DecisionStat {
+                        phase: GamePhase::Playing,
+                        num_legal: num_legal as u32,
+                        sims_used: dets.saturating_mul(sims),
+                        signal_ratio: signal_ratio(&result, num_legal),
+                    });
+                    examples.push(TrainingExample {
+                        state: snapshot,
+                        policy: sparse,
+                        value: f32::NAN,
+                        phase: GamePhase::Playing,
+                        perspective,
+                    });
+                    apply_play(&mut state, card_idx);
+                }
+                GamePhase::Scoring => {
+                    advance_round(&mut state, rng);
+                }
+                GamePhase::Complete => break,
             }
-            GamePhase::Playing => {
-                let perspective = state.current_player;
-                let hand_cards: Vec<u8> = Hand::new(state.hands[perspective as usize])
-                    .iter()
-                    .map(|c| c.index())
-                    .collect();
-                let num_legal = legal_plays(&state).count_ones() as usize;
-                let (dets, sims) = adaptive_budget(num_legal, cfg);
-                let result = mcts_search(&state, eval, cfg, rng);
-                debug_assert_eq!(result.policy.len(), hand_cards.len());
-                let sparse = dense_to_sparse(&result.policy);
-                let snapshot = state;
-                let pos = sample_from_policy(&result.policy, rng);
-                let card_idx = hand_cards[pos];
-                stats.push(DecisionStat {
-                    phase: GamePhase::Playing,
-                    num_legal: num_legal as u32,
-                    sims_used: dets.saturating_mul(sims),
-                    signal_ratio: signal_ratio(&result, num_legal),
-                });
-                examples.push(TrainingExample {
-                    state: snapshot,
-                    policy: sparse,
-                    value: f32::NAN,
-                    phase: GamePhase::Playing,
-                    perspective,
-                });
-                apply_play(&mut state, card_idx);
-            }
-            GamePhase::Scoring => {
-                advance_round(&mut state, rng);
-            }
-            GamePhase::Complete => break,
         }
-    }
 
-    backfill_values(&mut examples, &state);
-    (examples, stats)
+        backfill_values(&mut examples, &state);
+        (examples, stats)
+    })
 }
 
 /// Fill each example's `value` with the z-scored cumulative score of its

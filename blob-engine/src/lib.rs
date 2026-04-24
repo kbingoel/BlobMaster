@@ -28,6 +28,7 @@ pub mod hand;
 pub mod mcts;
 pub mod onnx;
 pub mod playing;
+pub mod profiling;
 pub mod replay;
 pub mod round;
 pub mod state;

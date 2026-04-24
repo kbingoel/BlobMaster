@@ -452,67 +452,69 @@ pub fn encode_context(state: &BlobState) -> [f32; CONTEXT_DIM] {
 ///
 /// Panics in debug if called from `Scoring` or `Complete` phase.
 pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
-    debug_assert!(
-        matches!(state.phase(), GamePhase::Bidding | GamePhase::Playing),
-        "encoder called in {:?} phase — only Bidding/Playing are valid",
-        state.phase()
-    );
+    crate::profiling::time(&crate::profiling::ENCODE, || {
+        debug_assert!(
+            matches!(state.phase(), GamePhase::Bidding | GamePhase::Playing),
+            "encoder called in {:?} phase — only Bidding/Playing are valid",
+            state.phase()
+        );
 
-    let hand_cards = encode_hand_cards(state, perspective);
-    let played_cards = encode_played_cards(state);
-    let player_states = encode_player_states(state, perspective);
-    let context = encode_context(state);
+        let hand_cards = encode_hand_cards(state, perspective);
+        let played_cards = encode_played_cards(state);
+        let player_states = encode_player_states(state, perspective);
+        let context = encode_context(state);
 
-    let np = state.num_players as usize;
-    let num_hand = hand_cards.len();
-    let num_played = played_cards.len();
-    let num_tokens = 1 + 1 + np + num_hand + num_played;
+        let np = state.num_players as usize;
+        let num_hand = hand_cards.len();
+        let num_played = played_cards.len();
+        let num_tokens = 1 + 1 + np + num_hand + num_played;
 
-    let mut features = Vec::with_capacity(num_tokens);
-    let mut token_types = Vec::with_capacity(num_tokens);
-    let mut chrono_indices = Vec::with_capacity(num_tokens);
-    let mut hand_card_indices = SmallVec::with_capacity(num_hand);
+        let mut features = Vec::with_capacity(num_tokens);
+        let mut token_types = Vec::with_capacity(num_tokens);
+        let mut chrono_indices = Vec::with_capacity(num_tokens);
+        let mut hand_card_indices = SmallVec::with_capacity(num_hand);
 
-    // CLS token: zero-length feature vector (NN uses a learned 128-dim parameter).
-    features.push(Vec::new());
-    token_types.push(TOKEN_TYPE_CLS);
-    chrono_indices.push(0);
-
-    // Context token.
-    features.push(context.to_vec());
-    token_types.push(TOKEN_TYPE_CONTEXT);
-    chrono_indices.push(0);
-
-    // Player state tokens.
-    for ps in &player_states {
-        features.push(ps.to_vec());
-        token_types.push(TOKEN_TYPE_PLAYER);
+        // CLS token: zero-length feature vector (NN uses a learned 128-dim parameter).
+        features.push(Vec::new());
+        token_types.push(TOKEN_TYPE_CLS);
         chrono_indices.push(0);
-    }
 
-    // Hand card tokens — record card indices for MCTS action mapping.
-    let hand = Hand::new(state.hands[perspective as usize]);
-    for (i, card) in hand.iter().enumerate() {
-        features.push(hand_cards[i].to_vec());
-        token_types.push(TOKEN_TYPE_HAND);
+        // Context token.
+        features.push(context.to_vec());
+        token_types.push(TOKEN_TYPE_CONTEXT);
         chrono_indices.push(0);
-        hand_card_indices.push(card.index());
-    }
 
-    // Played card tokens.
-    for pc in &played_cards {
-        features.push(pc.features.to_vec());
-        token_types.push(TOKEN_TYPE_PLAYED);
-        chrono_indices.push(pc.chrono_index);
-    }
+        // Player state tokens.
+        for ps in &player_states {
+            features.push(ps.to_vec());
+            token_types.push(TOKEN_TYPE_PLAYER);
+            chrono_indices.push(0);
+        }
 
-    EncodedState {
-        features,
-        token_types,
-        chronological_indices: chrono_indices,
-        hand_card_indices,
-        num_tokens,
-    }
+        // Hand card tokens — record card indices for MCTS action mapping.
+        let hand = Hand::new(state.hands[perspective as usize]);
+        for (i, card) in hand.iter().enumerate() {
+            features.push(hand_cards[i].to_vec());
+            token_types.push(TOKEN_TYPE_HAND);
+            chrono_indices.push(0);
+            hand_card_indices.push(card.index());
+        }
+
+        // Played card tokens.
+        for pc in &played_cards {
+            features.push(pc.features.to_vec());
+            token_types.push(TOKEN_TYPE_PLAYED);
+            chrono_indices.push(pc.chrono_index);
+        }
+
+        EncodedState {
+            features,
+            token_types,
+            chronological_indices: chrono_indices,
+            hand_card_indices,
+            num_tokens,
+        }
+    })
 }
 
 #[cfg(test)]

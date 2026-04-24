@@ -57,57 +57,68 @@ impl OnnxEvaluator {
     /// `intra_op_num_threads=1` so multiple rayon threads can each hold
     /// their own session without contention.
     pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(1)?
-            .commit_from_file(path)?;
-        Ok(Self {
-            session: Mutex::new(session),
+        crate::profiling::time(&crate::profiling::SESSION_CONSTRUCTION, || {
+            let session = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(1)?
+                .commit_from_file(path)?;
+            Ok(Self {
+                session: Mutex::new(session),
+            })
         })
     }
 
     fn run_encoded(&self, enc: &EncodedState) -> ort::Result<(Vec<f32>, Vec<f32>, f32)> {
         let s = enc.num_tokens;
-        let mut features = Array3::<f32>::zeros((1, s, FEAT_DIM));
-        let mut token_types = Array2::<i64>::zeros((1, s));
-        let mut chrono = Array2::<i64>::zeros((1, s));
-        let mut mask = Array2::<bool>::from_elem((1, s), false);
 
-        for i in 0..s {
-            let row = &enc.features[i];
-            for (j, v) in row.iter().enumerate() {
-                features[[0, i, j]] = *v;
+        let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
+            let mut features = Array3::<f32>::zeros((1, s, FEAT_DIM));
+            let mut token_types = Array2::<i64>::zeros((1, s));
+            let mut chrono = Array2::<i64>::zeros((1, s));
+            let mut mask = Array2::<bool>::from_elem((1, s), false);
+
+            for i in 0..s {
+                let row = &enc.features[i];
+                for (j, v) in row.iter().enumerate() {
+                    features[[0, i, j]] = *v;
+                }
+                token_types[[0, i]] = enc.token_types[i] as i64;
+                chrono[[0, i]] = enc.chronological_indices[i] as i64;
+                mask[[0, i]] = true;
             }
-            token_types[[0, i]] = enc.token_types[i] as i64;
-            chrono[[0, i]] = enc.chronological_indices[i] as i64;
-            mask[[0, i]] = true;
-        }
+
+            let inputs = ort::inputs![
+                "features" => Value::from_array(features)?,
+                "token_types" => Value::from_array(token_types)?,
+                "chrono_indices" => Value::from_array(chrono)?,
+                "attention_mask" => Value::from_array(mask)?,
+            ];
+            Ok::<_, ort::Error>(inputs)
+        })?;
 
         let mut sess = self
             .session
             .lock()
             .expect("OnnxEvaluator session mutex poisoned");
 
-        let inputs = ort::inputs![
-            "features" => Value::from_array(features)?,
-            "token_types" => Value::from_array(token_types)?,
-            "chrono_indices" => Value::from_array(chrono)?,
-            "attention_mask" => Value::from_array(mask)?,
-        ];
-        let outputs = sess.run(inputs)?;
+        let outputs = crate::profiling::time(&crate::profiling::ONNX_INFERENCE, || {
+            sess.run(inputs)
+        })?;
 
-        let bid = outputs["bid_policy"]
-            .try_extract_array::<f32>()?
-            .to_owned();
-        let play = outputs["play_scores"]
-            .try_extract_array::<f32>()?
-            .to_owned();
-        let value = outputs["value"].try_extract_array::<f32>()?.to_owned();
+        crate::profiling::time(&crate::profiling::ONNX_OUTPUT_EXTRACT, || {
+            let bid = outputs["bid_policy"]
+                .try_extract_array::<f32>()?
+                .to_owned();
+            let play = outputs["play_scores"]
+                .try_extract_array::<f32>()?
+                .to_owned();
+            let value = outputs["value"].try_extract_array::<f32>()?.to_owned();
 
-        let bid_vec: Vec<f32> = bid.iter().copied().take(NUM_BIDS).collect();
-        let play_vec: Vec<f32> = play.iter().copied().take(s).collect();
-        let v: f32 = *value.iter().next().unwrap_or(&0.0);
-        Ok((bid_vec, play_vec, v))
+            let bid_vec: Vec<f32> = bid.iter().copied().take(NUM_BIDS).collect();
+            let play_vec: Vec<f32> = play.iter().copied().take(s).collect();
+            let v: f32 = *value.iter().next().unwrap_or(&0.0);
+            Ok((bid_vec, play_vec, v))
+        })
     }
 }
 

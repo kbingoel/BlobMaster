@@ -237,35 +237,37 @@ pub fn is_terminal(state: &BlobState) -> bool {
 ///
 /// No-op if the node is already expanded or the state is terminal.
 pub fn expand(arena: &mut MctsArena, node_idx: u32, state: &BlobState, policy: &[f32]) {
-    if arena.node(node_idx).is_expanded() || is_terminal(state) {
-        return;
-    }
-    match state.phase() {
-        GamePhase::Bidding => {
-            let mask = legal_bids(state);
-            let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
-            for b in 0..NUM_BIDS as u8 {
-                if (mask >> b) & 1 == 1 {
-                    let prior = policy.get(b as usize).copied().unwrap_or(0.0);
-                    new_children.push(arena.alloc(prior, b));
-                }
-            }
-            arena.node_mut(node_idx).children = new_children;
+    crate::profiling::time(&crate::profiling::EXPAND, || {
+        if arena.node(node_idx).is_expanded() || is_terminal(state) {
+            return;
         }
-        GamePhase::Playing => {
-            let enc = encode(state, state.current_player);
-            let legal = legal_plays(state);
-            let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
-            for (pos, &card_idx) in enc.hand_card_indices.iter().enumerate() {
-                if (legal >> card_idx) & 1 == 1 {
-                    let prior = policy.get(pos).copied().unwrap_or(0.0);
-                    new_children.push(arena.alloc(prior, card_idx));
+        match state.phase() {
+            GamePhase::Bidding => {
+                let mask = legal_bids(state);
+                let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
+                for b in 0..NUM_BIDS as u8 {
+                    if (mask >> b) & 1 == 1 {
+                        let prior = policy.get(b as usize).copied().unwrap_or(0.0);
+                        new_children.push(arena.alloc(prior, b));
+                    }
                 }
+                arena.node_mut(node_idx).children = new_children;
             }
-            arena.node_mut(node_idx).children = new_children;
+            GamePhase::Playing => {
+                let enc = encode(state, state.current_player);
+                let legal = legal_plays(state);
+                let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
+                for (pos, &card_idx) in enc.hand_card_indices.iter().enumerate() {
+                    if (legal >> card_idx) & 1 == 1 {
+                        let prior = policy.get(pos).copied().unwrap_or(0.0);
+                        new_children.push(arena.alloc(prior, card_idx));
+                    }
+                }
+                arena.node_mut(node_idx).children = new_children;
+            }
+            GamePhase::Scoring | GamePhase::Complete => {}
         }
-        GamePhase::Scoring | GamePhase::Complete => {}
-    }
+    })
 }
 
 /// Backpropagate a leaf value `v` evaluated from seat `leaf_seat`'s
@@ -276,12 +278,14 @@ pub fn expand(arena: &mut MctsArena, node_idx: u32, state: &BlobState, policy: &
 ///   that seat's slot. UCB1's `Q` averages per-seat, so other seats stay
 ///   undiluted. See module docs.
 pub fn backprop(arena: &mut MctsArena, path: &[u32], leaf_seat: u8, v: f32) {
-    for &idx in path {
-        let node = arena.node_mut(idx);
-        node.visit_count += 1;
-        node.value_sums[leaf_seat as usize] += v;
-        node.value_counts[leaf_seat as usize] += 1;
-    }
+    crate::profiling::time(&crate::profiling::BACKPROP, || {
+        for &idx in path {
+            let node = arena.node_mut(idx);
+            node.visit_count += 1;
+            node.value_sums[leaf_seat as usize] += v;
+            node.value_counts[leaf_seat as usize] += 1;
+        }
+    })
 }
 
 /// Run `num_simulations` MCTS iterations against `root_state`.
@@ -530,133 +534,138 @@ where
     E: Evaluator + ?Sized,
     R: Rng + ?Sized,
 {
-    let phase = state.phase();
-    if matches!(phase, GamePhase::Scoring | GamePhase::Complete) {
-        return MctsResult {
-            policy: Vec::new(),
-            visit_entropy: 0.0,
-            top1_visit_share: 0.0,
-            total_visits: 0,
-            value_estimate: 0.0,
+    crate::profiling::time(&crate::profiling::MCTS_SEARCH, || {
+        let phase = state.phase();
+        if matches!(phase, GamePhase::Scoring | GamePhase::Complete) {
+            return MctsResult {
+                policy: Vec::new(),
+                visit_entropy: 0.0,
+                top1_visit_share: 0.0,
+                total_visits: 0,
+                value_estimate: 0.0,
+            };
+        }
+
+        let perspective = state.current_player;
+
+        // Canonical action space + forced-move detection.
+        let (policy_len, hand_card_indices, num_legal, forced_action) = match phase {
+            GamePhase::Bidding => {
+                let mask = legal_bids(state);
+                let n = mask.count_ones() as usize;
+                let forced = if n == 1 {
+                    Some(mask.trailing_zeros() as u8)
+                } else {
+                    None
+                };
+                (NUM_BIDS, SmallVec::<[u8; 13]>::new(), n, forced)
+            }
+            GamePhase::Playing => {
+                let enc = encode(state, perspective);
+                let legal = legal_plays(state);
+                let n = legal.count_ones() as usize;
+                let forced = if n == 1 {
+                    Some(legal.trailing_zeros() as u8)
+                } else {
+                    None
+                };
+                (enc.hand_card_indices.len(), enc.hand_card_indices, n, forced)
+            }
+            _ => unreachable!(),
         };
-    }
 
-    let perspective = state.current_player;
-
-    // Canonical action space + forced-move detection.
-    let (policy_len, hand_card_indices, num_legal, forced_action) = match phase {
-        GamePhase::Bidding => {
-            let mask = legal_bids(state);
-            let n = mask.count_ones() as usize;
-            let forced = if n == 1 {
-                Some(mask.trailing_zeros() as u8)
-            } else {
-                None
+        // Forced move: skip MCTS entirely. Signal ratio is 1 by convention.
+        if num_legal == 1 {
+            let mut policy = vec![0.0f32; policy_len];
+            if let Some(action) = forced_action {
+                if let Some(idx) = action_to_policy_index(phase, action, &hand_card_indices) {
+                    policy[idx] = 1.0;
+                }
+            }
+            return MctsResult {
+                policy,
+                visit_entropy: 0.0,
+                top1_visit_share: 1.0,
+                total_visits: 0,
+                value_estimate: 0.0,
             };
-            (NUM_BIDS, SmallVec::<[u8; 13]>::new(), n, forced)
         }
-        GamePhase::Playing => {
-            let enc = encode(state, perspective);
-            let legal = legal_plays(state);
-            let n = legal.count_ones() as usize;
-            let forced = if n == 1 {
-                Some(legal.trailing_zeros() as u8)
-            } else {
-                None
-            };
-            (enc.hand_card_indices.len(), enc.hand_card_indices, n, forced)
-        }
-        _ => unreachable!(),
-    };
 
-    // Forced move: skip MCTS entirely. Signal ratio is 1 by convention.
-    if num_legal == 1 {
+        let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
+        let voids = void_suits(state);
+
+        let mut agg_visits = vec![0u64; policy_len];
+        let mut total_visits: u32 = 0;
+        let mut value_sum = 0.0f32;
+        let mut value_n = 0u32;
+
+        for _ in 0..num_dets {
+            let det_state =
+                determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+            let mut arena = MctsArena::with_capacity(perspective, cfg.arena_capacity);
+            run_search(&mut arena, &det_state, eval, sims_per, cfg.c_puct);
+
+            let root = arena.root();
+            for &c in root.children.iter() {
+                let child = arena.node(c);
+                if let Some(idx) =
+                    action_to_policy_index(phase, child.action, &hand_card_indices)
+                {
+                    agg_visits[idx] += child.visit_count as u64;
+                    total_visits = total_visits.saturating_add(child.visit_count);
+                }
+            }
+            // Per-determinization root Q from the perspective seat. The
+            // root is always acted on by `perspective`, so that slot is
+            // the one UCB1 read during selection.
+            if root.value_counts[perspective as usize] > 0 {
+                value_sum += root.q(perspective);
+                value_n += 1;
+            }
+        }
+
+        // Temperature-applied policy over aggregated visits.
         let mut policy = vec![0.0f32; policy_len];
-        if let Some(action) = forced_action {
-            if let Some(idx) = action_to_policy_index(phase, action, &hand_card_indices) {
-                policy[idx] = 1.0;
-            }
-        }
-        return MctsResult {
-            policy,
-            visit_entropy: 0.0,
-            top1_visit_share: 1.0,
-            total_visits: 0,
-            value_estimate: 0.0,
-        };
-    }
-
-    let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
-    let voids = void_suits(state);
-
-    let mut agg_visits = vec![0u64; policy_len];
-    let mut total_visits: u32 = 0;
-    let mut value_sum = 0.0f32;
-    let mut value_n = 0u32;
-
-    for _ in 0..num_dets {
-        let det_state = determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
-        let mut arena = MctsArena::with_capacity(perspective, cfg.arena_capacity);
-        run_search(&mut arena, &det_state, eval, sims_per, cfg.c_puct);
-
-        let root = arena.root();
-        for &c in root.children.iter() {
-            let child = arena.node(c);
-            if let Some(idx) = action_to_policy_index(phase, child.action, &hand_card_indices) {
-                agg_visits[idx] += child.visit_count as u64;
-                total_visits = total_visits.saturating_add(child.visit_count);
-            }
-        }
-        // Per-determinization root Q from the perspective seat. The
-        // root is always acted on by `perspective`, so that slot is
-        // the one UCB1 read during selection.
-        if root.value_counts[perspective as usize] > 0 {
-            value_sum += root.q(perspective);
-            value_n += 1;
-        }
-    }
-
-    // Temperature-applied policy over aggregated visits.
-    let mut policy = vec![0.0f32; policy_len];
-    let sum_visits: u64 = agg_visits.iter().sum();
-    if sum_visits > 0 {
-        if cfg.temperature < 1e-3 {
-            let (best_i, _) = agg_visits
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, v)| **v)
-                .unwrap();
-            policy[best_i] = 1.0;
-        } else {
-            let inv_tau = 1.0 / cfg.temperature;
-            let weights: Vec<f32> = agg_visits
-                .iter()
-                .map(|&v| (v as f32).powf(inv_tau))
-                .collect();
-            let z: f32 = weights.iter().sum();
-            if z > 0.0 {
-                for (i, w) in weights.iter().enumerate() {
-                    policy[i] = w / z;
+        let sum_visits: u64 = agg_visits.iter().sum();
+        if sum_visits > 0 {
+            if cfg.temperature < 1e-3 {
+                let (best_i, _) = agg_visits
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, v)| **v)
+                    .unwrap();
+                policy[best_i] = 1.0;
+            } else {
+                let inv_tau = 1.0 / cfg.temperature;
+                let weights: Vec<f32> = agg_visits
+                    .iter()
+                    .map(|&v| (v as f32).powf(inv_tau))
+                    .collect();
+                let z: f32 = weights.iter().sum();
+                if z > 0.0 {
+                    for (i, w) in weights.iter().enumerate() {
+                        policy[i] = w / z;
+                    }
                 }
             }
         }
-    }
 
-    let visit_entropy = entropy(&policy);
-    let top1_visit_share = policy.iter().cloned().fold(0.0f32, f32::max);
-    let value_estimate = if value_n > 0 {
-        value_sum / value_n as f32
-    } else {
-        0.0
-    };
+        let visit_entropy = entropy(&policy);
+        let top1_visit_share = policy.iter().cloned().fold(0.0f32, f32::max);
+        let value_estimate = if value_n > 0 {
+            value_sum / value_n as f32
+        } else {
+            0.0
+        };
 
-    MctsResult {
-        policy,
-        visit_entropy,
-        top1_visit_share,
-        total_visits,
-        value_estimate,
-    }
+        MctsResult {
+            policy,
+            visit_entropy,
+            top1_visit_share,
+            total_visits,
+            value_estimate,
+        }
+    })
 }
 
 #[cfg(test)]

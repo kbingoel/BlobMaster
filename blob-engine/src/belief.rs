@@ -90,62 +90,65 @@ pub fn determinize<R: Rng + ?Sized>(
     rng: &mut R,
     max_attempts: u32,
 ) -> BlobState {
-    let mut out = *state;
-    let num_players = state.num_players as usize;
-    let my_hand = state.hands[perspective as usize];
+    crate::profiling::time(&crate::profiling::DETERMINIZE, || {
+        let mut out = *state;
+        let num_players = state.num_players as usize;
+        let my_hand = state.hands[perspective as usize];
 
-    // Unseen cards = deck − perspective's hand − cards that have hit the
-    // table this round (completed + in-progress). `played_this_round` is
-    // maintained incrementally by `apply_play`, so this is exact.
-    let deck_mask: u64 = (1u64 << 52) - 1;
-    let unseen_mask = deck_mask & !my_hand & !state.played_this_round;
-    let unseen_cards: Vec<u8> = (0..52u8).filter(|&c| (unseen_mask >> c) & 1 == 1).collect();
+        // Unseen cards = deck − perspective's hand − cards that have hit the
+        // table this round (completed + in-progress). `played_this_round` is
+        // maintained incrementally by `apply_play`, so this is exact.
+        let deck_mask: u64 = (1u64 << 52) - 1;
+        let unseen_mask = deck_mask & !my_hand & !state.played_this_round;
+        let unseen_cards: Vec<u8> = (0..52u8).filter(|&c| (unseen_mask >> c) & 1 == 1).collect();
 
-    let required = required_hand_sizes(state, perspective);
-    let total_required: usize = required.iter().sum();
-    debug_assert!(
-        unseen_cards.len() >= total_required,
-        "unseen pool ({}) smaller than total required opponent hand size ({total_required})",
-        unseen_cards.len()
-    );
-    // The unseen pool may be larger than the opponents' combined hand
-    // size when `num_players * cards_dealt < 52` (undealt cards remain
-    // "unseen" from perspective's point of view). We shuffle the whole
-    // pool and use only the first `total_required` slots each attempt;
-    // the tail represents cards that weren't dealt to anyone.
+        let required = required_hand_sizes(state, perspective);
+        let total_required: usize = required.iter().sum();
+        debug_assert!(
+            unseen_cards.len() >= total_required,
+            "unseen pool ({}) smaller than total required opponent hand size ({total_required})",
+            unseen_cards.len()
+        );
+        // The unseen pool may be larger than the opponents' combined hand
+        // size when `num_players * cards_dealt < 52` (undealt cards remain
+        // "unseen" from perspective's point of view). We shuffle the whole
+        // pool and use only the first `total_required` slots each attempt;
+        // the tail represents cards that weren't dealt to anyone.
 
-    // Most-constrained-first ordering: opponents with more voids get
-    // first pick to reduce the rejection probability.
-    let mut order: Vec<usize> = (0..num_players).filter(|&p| p as u8 != perspective).collect();
-    order.sort_by_key(|&p| {
-        let voided = voids[p].iter().filter(|v| **v).count();
-        std::cmp::Reverse(voided)
-    });
+        // Most-constrained-first ordering: opponents with more voids get
+        // first pick to reduce the rejection probability.
+        let mut order: Vec<usize> =
+            (0..num_players).filter(|&p| p as u8 != perspective).collect();
+        order.sort_by_key(|&p| {
+            let voided = voids[p].iter().filter(|v| **v).count();
+            std::cmp::Reverse(voided)
+        });
 
-    let mut deck = unseen_cards.clone();
-    for _ in 0..max_attempts.max(1) {
+        let mut deck = unseen_cards.clone();
+        for _ in 0..max_attempts.max(1) {
+            deck.shuffle(rng);
+            if let Some(new_hands) = try_deal(&deck, &order, &required, voids) {
+                out.hands = new_hands_merged(state.hands, &new_hands, perspective);
+                return out;
+            }
+        }
+
+        // Fallback: unconstrained deal in `order` (still excludes perspective).
         deck.shuffle(rng);
-        if let Some(new_hands) = try_deal(&deck, &order, &required, voids) {
-            out.hands = new_hands_merged(state.hands, &new_hands, perspective);
-            return out;
+        let mut cursor = 0usize;
+        let mut fallback = [0u64; MAX_PLAYERS];
+        for &p in &order {
+            let need = required[p];
+            let mut h: u64 = 0;
+            for &c in &deck[cursor..cursor + need] {
+                h |= 1u64 << c;
+            }
+            cursor += need;
+            fallback[p] = h;
         }
-    }
-
-    // Fallback: unconstrained deal in `order` (still excludes perspective).
-    deck.shuffle(rng);
-    let mut cursor = 0usize;
-    let mut fallback = [0u64; MAX_PLAYERS];
-    for &p in &order {
-        let need = required[p];
-        let mut h: u64 = 0;
-        for &c in &deck[cursor..cursor + need] {
-            h |= 1u64 << c;
-        }
-        cursor += need;
-        fallback[p] = h;
-    }
-    out.hands = new_hands_merged(state.hands, &fallback, perspective);
-    out
+        out.hands = new_hands_merged(state.hands, &fallback, perspective);
+        out
+    })
 }
 
 fn try_deal(
