@@ -1,0 +1,3 @@
+current=T18 started=2026-04-24T10:40:40+02:00
+UP_BEST_T=16
+completed: 2026-04-24T10:52:07+02:00

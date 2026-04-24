@@ -1,0 +1,39 @@
+=============================================
+Running T=16  (5 × 16 = 80 games)  2026-04-24T10:02:15+02:00
+=============================================
+  -> wall=579.976s  per_game=7.249700s  per_decision=305.251ms  onnx_avg=1290.16us
+
+### Sweeping DOWN from T=16 ###
+=============================================
+Running T=15  (5 × 15 = 75 games)  2026-04-24T10:11:55+02:00
+=============================================
+  -> wall=548.622s  per_game=7.314957s  per_decision=288.748ms  onnx_avg=1229.71us
+  DOWN: T=15 regressed (7.314957s vs best 7.249700s); validating with T=14
+=============================================
+Running T=14  (5 × 14 = 70 games)  2026-04-24T10:21:04+02:00
+=============================================
+  -> wall=529.206s  per_game=7.560087s  per_decision=278.530ms  onnx_avg=1186.57us
+  DOWN: validation T=14 also regressed (7.560087s vs best 7.249700s). Stopping DOWN.
+DOWN best: T=16 at 7.249700s/game
+DOWN_BEST_T=16 DOWN_BEST_S=7.249700
+
+### Sweeping UP from T=16 ###
+=============================================
+Running T=17  (5 × 17 = 85 games)  2026-04-24T10:29:54+02:00
+=============================================
+  -> wall=646.176s  per_game=7.602072s  per_decision=340.093ms  onnx_avg=1355.13us
+  UP: T=17 regressed (7.602072s vs best 7.249700s); validating with T=18
+=============================================
+Running T=18  (5 × 18 = 90 games)  2026-04-24T10:40:40+02:00
+=============================================
+  -> wall=686.645s  per_game=7.629394s  per_decision=361.392ms  onnx_avg=1441.89us
+  UP: validation T=18 also regressed (7.629394s vs best 7.249700s). Stopping UP.
+UP best: T=16 at 7.249700s/game
+UP_BEST_T=16 UP_BEST_S=7.249700
+
+===========================================
+sweep complete: 2026-04-24T10:52:07+02:00
+results CSV : logs/thread-sweep-2026-04-24/results.csv
+table fragment: logs/thread-sweep-2026-04-24/results-table.md
+appended to : /home/kbuntu/Documents/Github/BlobMaster/self-play-profile.md
+===========================================

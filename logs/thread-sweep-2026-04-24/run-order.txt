@@ -1,0 +1,5 @@
+16 (per_game=7.249700s)
+15 (per_game=7.314957s)
+14 (per_game=7.560087s)
+17 (per_game=7.602072s)
+18 (per_game=7.629394s)
