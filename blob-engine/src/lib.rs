@@ -35,7 +35,9 @@ pub mod state;
 
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
 pub use evaluator::{DummyEvaluator, Evaluator, HeuristicEvaluator, NUM_BIDS};
-pub use onnx::OnnxEvaluator;
+pub use onnx::{
+    finish_calibration_capture, start_calibration_capture, write_calibration_file, OnnxEvaluator,
+};
 pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};
 pub use game::{advance_round, is_game_over, new_game};

@@ -110,3 +110,58 @@ Run order (sequential, one config at a time):
 ```
 
 **Direction bests:** DOWN best at T= (7.249700s/game), UP best at T=16 (7.249700s/game), baseline T=16 (7.249700s/game).
+
+## Follow-ups (2026-04-26) — INT8 quantization (Session 7.4b)
+
+Quantized [checkpoints/7.3c-run/iter_000014/model.onnx](checkpoints/7.3c-run/iter_000014/model.onnx) (1.63M-param FP32, 6.6 MB) to a QDQ-INT8 sibling (2.1 MB on disk, 3.1× smaller) using `scripts/export_onnx.py --int8-out ... --calibration ...`. Calibration: 500 real `EncodedState`s captured during a 1T self-play run via the new `blobmaster-train profile --dump-calibration` path. Quantization spec: QDQ format, INT8 weights (`per_channel=True`), UINT8 activations, MinMax calibration, LayerNorm/Softmax + the three output heads (play/bid/value MLPs) excluded; the heads are <1% of FLOPs but their CLS-slot logits are most-quantization-sensitive. `quant_pre_process` is run before `quantize_static` to silence NaN-scale warnings on activations whose range collapses on some branches.
+
+Re-ran the same 16T / 5-games-per-thread / 5P7C profile against the INT8 model. Reproduce:
+
+```bash
+LIBTORCH_DIR="$(find target/release/build -maxdepth 6 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)" \
+LD_LIBRARY_PATH="$LIBTORCH_DIR:${LD_LIBRARY_PATH:-}" \
+RUST_LOG=info \
+./target/release/blobmaster-train profile \
+  --model checkpoints/7.3c-run/iter_000014/model.onnx \
+  --games-per-thread 5 --num-threads 16 \
+  --num-players 5 --cards-dealt 7 \
+  --use-int8
+```
+
+Raw log: [logs/int8-2026-04-26/profile-16T-int8.log](logs/int8-2026-04-26/profile-16T-int8.log).
+
+| metric | 16T FP32 (2026-04-24) | 16T INT8 (2026-04-26) | INT8 vs FP32 |
+|---|---:|---:|---:|
+| wall clock (s) | 579.98 | **414.55** | **0.715× (1.40× faster)** |
+| per-game wall (s) | 7.250 | **5.182** | **0.715×** |
+| per-decision wall (ms) | 305.3 | **218.2** | **0.715×** |
+| onnx_inference avg (µs) | 1290.2 | **908.5** | **0.704× (1.42× faster)** |
+| onnx_inference share | 97.2% | 95.0% | -2.2pp |
+| ONNX calls | 6,898,086 | 6,937,725 | +0.6% |
+| `encode` avg (µs) | 2.36 | 4.45 | +89% |
+| `expand` avg (µs) | 3.86 | 7.42 | +92% |
+
+**Speed result:** **1.40× per-iteration speedup at 16T**, exactly at the dev-plan pass threshold (≥1.4×). The per-ONNX-call cost drops from 1.30 ms to 0.91 ms, right at the 0.9 ms ship-line and a touch above the 0.7 ms "bandwidth-bound theory confirmed" mark — consistent with the d_model=128 / 1.63M-param model being weight-bandwidth-bound but with a modest compute share that VNNI can only partly amortize. The 1.40× wall-clock speedup matching the 1.42× per-call speedup confirms self-play is still essentially a sequence of single-batch forwards, not bottlenecked by Rust-side work. The Rust-side bucket inflation (`encode`, `expand` avg µs ~doubled) is most plausibly cache pressure: with each `sess.run` returning faster, the surrounding code now runs more often per wall-second and shares L1/L2 with concurrently-running workers' decoder work.
+
+**Quality gate FAIL:** `scripts/validate_int8.py` over the same 500 calibration states gives:
+
+| metric | result | gate | pass |
+|---|---:|---:|:---:|
+| bid argmax agreement (INT8 vs FP32) | 0.848 | ≥0.95 | ❌ |
+| play argmax agreement | 0.960 | (informational) | — |
+| value sign agreement | 0.942 | =1.00 | ❌ |
+
+Excluding the three output heads from quantization barely moved the needle (84.2 → 84.8% / 93.8 → 94.2%), so the corruption is upstream — error compounding through 8 transformer layers at d_model=128 is hammering the CLS representation before the heads see it. The dev plan flagged exactly this risk ("our `d_model = 128` shrinks the compute share of that gain"). Static-gate failure does **not** automatically mean an eval-win-rate regression, but the dev plan's hold-back rule (>5pp eval drop at iter 10 → revert) almost certainly trips at this static disagreement level.
+
+**Recommendation: hold INT8 back from 7.5.** The speed prize is real (1.4× / saves ~3 min/iter at the 100-iter budget) but the static gate is well below the 95% / 100% bars and tuning didn't close it cheaply. Three independent levers remain if we want to revisit:
+
+1. **Symmetric INT8 activations (S8S8 instead of U8S8).** The ORT transformer-quantization guide recommends this for transformers; we currently use U8S8 because VNNI prefers it. Worth a one-flag try (`activation_type=QuantType.QInt8`) before bigger surgery.
+2. **Entropy calibration.** MinMax saturates on extremes; entropy minimizes the FP32-vs-INT8 KL on activations and typically helps deep transformers.
+3. **Body exclusions by sensitivity.** Re-quantize layer-by-layer and find which transformer blocks contribute most agreement loss; exclude only those (likely the last 2–3, where CLS reads occur).
+
+7.4c (batched MCTS) is independent of this and doesn't need the INT8 path to land first. Recommend pursuing 7.4c next, then revisiting 7.4b only if the combined 7.4a + 7.4c speedup falls short of the 100-iter budget.
+
+Artifacts on disk:
+- [checkpoints/7.3c-run/iter_000014/model.int8.onnx](checkpoints/7.3c-run/iter_000014/model.int8.onnx) — quantized model (kept for future tuning experiments).
+- [checkpoints/7.3c-run/calibration.bin](checkpoints/7.3c-run/calibration.bin) — 500 real EncodedStates in BCAL format.
+- [logs/int8-2026-04-26/](logs/int8-2026-04-26/) — quantize, validate, and 16T INT8 profile logs.

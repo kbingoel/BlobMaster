@@ -663,6 +663,22 @@ The two remaining levers — INT8 (7.4b) and batched MCTS (7.4c) — are indepen
 
 **Hold-back:** if INT8 silently degrades policy quality (eval win rate at iter 10 drops >5pp vs FP32), revert and run 7.5 on FP32. Quantization-aware training is out of scope.
 
+**Status (2026-04-26): plumbing landed, benchmark run, hold-back triggered.** Speed gate passed (1.40× per-iter at 16T, ONNX/call 1.30 → 0.91 ms — right at the 0.9 ms ship line); static quality gate **failed** (bid argmax 0.848 < 0.95, value-sign 0.942 < 1.00 over 500 real-state calibration). Excluding the output heads moved the numbers <1pp — the cumulative quantization error through 8 transformer layers at d_model=128 corrupts the CLS representation before the heads see it. Recommendation: hold INT8 back from 7.5 and pursue 7.4c (batched MCTS) next; revisit INT8 only if the combined 7.4a + 7.4c speedup falls short of budget. Three follow-up levers if/when revisited: S8S8 activations, entropy calibration, sensitivity-driven body exclusions. Full numbers, side-by-side comparison, and reproducer command in [self-play-profile.md](self-play-profile.md).
+
+- `scripts/export_onnx.py` accepts `--int8-out` and `--calibration` and runs `quantize_static` (QDQ, INT8 weights, UINT8 activations, MinMax, LayerNorm/Softmax excluded by op-type, `per_channel=True`).
+- `blob_engine::onnx` exposes `start_calibration_capture` / `finish_calibration_capture` / `write_calibration_file`; capture is a thread-safe no-op when disabled. The on-disk `calibration.bin` is the BCAL binary format documented in `blob-engine/src/onnx.rs`.
+- `blobmaster-train profile --dump-calibration <path> [--dump-calibration-limit N]` records up to N encoded states from a real self-play run. `--use-int8` on the profile command runs the same workload against `model.int8.onnx` for the post-quantization per-call timing.
+- `SelfPlayConfig::use_int8` (default `false`) makes self-play workers swap `model.onnx` for `model.int8.onnx`. `config.sample.toml` documents the toggle. Eval still loads whatever path the caller passes, so `run_eval_against_anchor` stays on FP32 by construction.
+- `run_export_script` / `bootstrap_initial_onnx` pass `--int8-out` and `--calibration` to the Python exporter when `use_int8` is set and `<checkpoint_dir>/calibration.bin` exists; if the calibration file is missing, the iter logs a warning and degrades to FP32 self-play (no INT8 sibling produced).
+- `scripts/validate_int8.py` runs the FP32 and INT8 graphs on every BCAL state and reports/gates bid-argmax (≥95%) and value-sign (100%) agreement.
+
+Operator runbook (one-time per checkpoint family):
+1. Pick a recent FP32 iter checkpoint, run `blobmaster-train profile --model <iter>/model.onnx --dump-calibration <ckpt_dir>/calibration.bin`.
+2. Re-export that checkpoint with `python scripts/export_onnx.py --weights <iter>/model.ot --out <iter>/model.onnx --int8-out <iter>/model.int8.onnx --calibration <ckpt_dir>/calibration.bin`.
+3. Gate: `python scripts/validate_int8.py --fp32 ... --int8 ... --calibration ...`.
+4. Re-profile at 16T with `--use-int8` to verify per-call ONNX < 0.9 ms.
+5. Set `use_int8 = true` in the training TOML; subsequent iters auto-emit the INT8 sibling.
+
 #### 7.4c — Batched MCTS leaves with virtual loss
 
 **Why it should help.** At batch=1 every transformer linear is a GEMV (memory-bound: each weight read once, used once). At batch B>1 they're GEMMs with weights re-used B times — more SIMD-efficient and bandwidth-amortized. ORT's MlasGemm path is much friendlier on the GEMM shape. With fewer rayon threads (less SMT contention as a side benefit), **expected: 2–3× alone, 3–4× combined with INT8.** This is the standard AlphaZero parallelization.

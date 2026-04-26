@@ -23,7 +23,9 @@
 //! rather than relying on the graph-internal mask, so one exported model
 //! works for any phase and any hand size.
 
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use ndarray::{Array2, Array3};
@@ -40,6 +42,108 @@ use crate::state::{BlobState, GamePhase};
 
 /// Per-token feature width (matches `blob_nn::input::FEAT_DIM`).
 pub const FEAT_DIM: usize = PLAYED_CARD_DIM;
+
+// ---- Session 7.4b: calibration capture for INT8 static quantization --------
+//
+// `OnnxEvaluator::run_encoded` consults the global `CALIBRATION_ENABLED` flag
+// before any FP32 inference and, when active, records up to
+// `CALIBRATION_LIMIT` `EncodedState`s into `CALIBRATION_SINK`. The
+// `dump-calibration` profile path then drains the sink to a binary file
+// consumed by `scripts/export_onnx.py --calibration`.
+
+static CALIBRATION_ENABLED: AtomicBool = AtomicBool::new(false);
+static CALIBRATION_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static CALIBRATION_SINK: Mutex<Vec<EncodedState>> = Mutex::new(Vec::new());
+
+/// Magic header for the calibration binary format. Python parser must match.
+pub const CALIBRATION_MAGIC: u32 = 0x42_43_41_4C; // "BCAL"
+/// File-format version. Bump on layout change.
+pub const CALIBRATION_VERSION: u32 = 1;
+
+/// Begin recording up to `limit` encoded states. Idempotent: re-arming with a
+/// new limit clears the sink and resets the cap.
+pub fn start_calibration_capture(limit: usize) {
+    CALIBRATION_SINK
+        .lock()
+        .expect("calibration sink poisoned")
+        .clear();
+    CALIBRATION_LIMIT.store(limit, Ordering::Relaxed);
+    CALIBRATION_ENABLED.store(true, Ordering::Release);
+}
+
+/// Stop recording and return the captured states. Resets the global sink so a
+/// subsequent run starts clean.
+pub fn finish_calibration_capture() -> Vec<EncodedState> {
+    CALIBRATION_ENABLED.store(false, Ordering::Release);
+    CALIBRATION_LIMIT.store(0, Ordering::Relaxed);
+    let mut sink = CALIBRATION_SINK
+        .lock()
+        .expect("calibration sink poisoned");
+    std::mem::take(&mut *sink)
+}
+
+#[inline]
+fn maybe_capture(enc: &EncodedState) {
+    if !CALIBRATION_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut sink = CALIBRATION_SINK
+        .lock()
+        .expect("calibration sink poisoned");
+    let limit = CALIBRATION_LIMIT.load(Ordering::Relaxed);
+    if sink.len() >= limit {
+        // Stop recording further calls — cheap fast-path next time.
+        CALIBRATION_ENABLED.store(false, Ordering::Release);
+        return;
+    }
+    sink.push(enc.clone());
+}
+
+/// Serialize a list of `EncodedState`s in the BCAL binary format:
+///
+/// ```text
+/// header:    u32 magic = 0x4243414C ("BCAL"), u32 version = 1, u32 num_states
+/// per state: u32 num_tokens (S),
+///            f32[S * 48] features (row-major, LE),
+///            i64[S]      token_types (LE),
+///            i64[S]      chrono_indices (LE)
+/// ```
+///
+/// The `attention_mask` is implicit (the first `num_tokens` positions are
+/// valid; padding to a fixed sequence length happens on the Python side).
+pub fn write_calibration_file(path: &Path, states: &[EncodedState]) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    let mut w = BufWriter::new(f);
+    w.write_all(&CALIBRATION_MAGIC.to_le_bytes())?;
+    w.write_all(&CALIBRATION_VERSION.to_le_bytes())?;
+    w.write_all(&(states.len() as u32).to_le_bytes())?;
+    for st in states {
+        let s = st.num_tokens as u32;
+        w.write_all(&s.to_le_bytes())?;
+        // Per-row width is variable in `EncodedState` (CLS=0, context=13,
+        // player=29, hand=30, played=48 — see `encoder::encode`). The ONNX
+        // graph expects `[B, S, FEAT_DIM=48]` zero-padded on the right, so
+        // we serialize the same shape Python will reshape into.
+        let pad_zero = 0.0f32.to_le_bytes();
+        for row in &st.features {
+            let n = row.len().min(FEAT_DIM);
+            for v in &row[..n] {
+                w.write_all(&v.to_le_bytes())?;
+            }
+            for _ in n..FEAT_DIM {
+                w.write_all(&pad_zero)?;
+            }
+        }
+        for tt in st.token_types.iter().take(st.num_tokens) {
+            w.write_all(&(*tt as i64).to_le_bytes())?;
+        }
+        for ci in st.chronological_indices.iter().take(st.num_tokens) {
+            w.write_all(&(*ci as i64).to_le_bytes())?;
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
 
 /// ONNX-backed evaluator. Own one per thread for self-play.
 pub struct OnnxEvaluator {
@@ -69,6 +173,7 @@ impl OnnxEvaluator {
     }
 
     fn run_encoded(&self, enc: &EncodedState) -> ort::Result<(Vec<f32>, Vec<f32>, f32)> {
+        maybe_capture(enc);
         let s = enc.num_tokens;
 
         let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {

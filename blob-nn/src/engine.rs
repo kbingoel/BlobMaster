@@ -10,7 +10,7 @@
 //! and `self_play_iteration` loads it fresh on each call. Games are
 //! embarrassingly parallel — no synchronization between workers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use blob_engine::mcts::MctsConfig;
@@ -43,6 +43,12 @@ pub struct SelfPlayConfig {
     /// the 7.1 / 7.2 fixed-5P7C runs; production training leaves it `None`.
     #[serde(default)]
     pub fixed_player_count: Option<(u8, u8)>,
+    /// Session 7.4b: when true, self-play swaps `model.onnx` for the
+    /// `model.int8.onnx` sibling produced by `scripts/export_onnx.py
+    /// --int8-out`. Eval (`blob_nn::eval`) is unaffected — it loads whatever
+    /// path the caller passes, so eval continues running on FP32.
+    #[serde(default)]
+    pub use_int8: bool,
 }
 
 impl Default for SelfPlayConfig {
@@ -53,6 +59,7 @@ impl Default for SelfPlayConfig {
             iteration: 0,
             show_progress: true,
             fixed_player_count: None,
+            use_int8: false,
         }
     }
 }
@@ -72,6 +79,26 @@ pub fn self_play_iteration(
         .num_threads(cfg.num_threads)
         .build()
         .expect("build rayon pool");
+
+    // Session 7.4b: if INT8 self-play is requested, swap the FP32 path for
+    // its `.int8.onnx` sibling. The caller still passes the FP32 path so
+    // eval (downstream) and the path-tracking logic in `blob-train` keep
+    // pointing at the canonical artifact.
+    let resolved_model: PathBuf = if cfg.use_int8 {
+        let int8 = int8_model_path(model_path);
+        if int8.exists() {
+            int8
+        } else {
+            tracing::warn!(
+                ?model_path,
+                "use_int8 set but model.int8.onnx not found; falling back to FP32"
+            );
+            model_path.to_path_buf()
+        }
+    } else {
+        model_path.to_path_buf()
+    };
+    let resolved_model = std::sync::Arc::new(resolved_model);
 
     let progress = if cfg.show_progress {
         let pb = ProgressBar::new(cfg.num_games as u64);
@@ -96,9 +123,12 @@ pub fn self_play_iteration(
         (0..cfg.num_games)
             .into_par_iter()
             .map_init(
-                || {
-                    OnnxEvaluator::from_file(model_path)
-                        .expect("load ONNX model for self-play worker")
+                {
+                    let resolved_model = resolved_model.clone();
+                    move || {
+                        OnnxEvaluator::from_file(resolved_model.as_ref())
+                            .expect("load ONNX model for self-play worker")
+                    }
                 },
                 |eval, game_idx| {
                     let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
@@ -136,6 +166,17 @@ pub fn self_play_iteration(
         stats_out.extend(s);
     }
     (out, stats_out)
+}
+
+/// Map `…/model.onnx` → `…/model.int8.onnx`. If `path` doesn't end in
+/// `.onnx`, append `.int8.onnx` to its stem.
+pub fn int8_model_path(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model".to_string());
+    dir.join(format!("{stem}.int8.onnx"))
 }
 
 /// SplitMix64-style scramble so `(iteration, thread, game)` triples produce
@@ -201,6 +242,7 @@ mod tests {
             iteration: 0,
             show_progress: false,
             fixed_player_count: None,
+            use_int8: false,
         };
         let (examples, _stats) = self_play_iteration(&path, &cfg, &mcts_cfg);
         assert!(!examples.is_empty());

@@ -26,6 +26,12 @@ show_progress = true
 # Session 7.1 smoke test forces 5P7C; remove / set to `false` for the mixed
 # Section 5 distribution.
 fixed_player_count = [5, 7]
+# Session 7.4b: when true, self-play workers load `model.int8.onnx` (the
+# QDQ-quantized sibling produced by `scripts/export_onnx.py --int8-out`).
+# Eval keeps using the FP32 `model.onnx` so the eval signal is not fighting
+# quantization noise on both sides. Enable only after running
+# `scripts/validate_int8.py` to confirm the policy-agreement gate.
+use_int8 = false
 
 [mcts]
 c_puct = 1.5

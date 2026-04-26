@@ -1,0 +1,3 @@
+threads,wall_s,per_game_s,per_decision_ms,onnx_avg_us,total_games,timestamp,variant
+16,579.976,7.249700,305.251,1290.16,80,2026-04-24T10:02:15+02:00,fp32
+16,414.546,5.181824,218.182,908.48,80,2026-04-26T08:03:55+02:00,int8
