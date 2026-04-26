@@ -337,6 +337,113 @@ pub fn run_search<E: Evaluator + ?Sized>(
     }
 }
 
+/// Walk from the root of `arena` along UCB1-best children, replaying
+/// actions on a clone of `root_state`, until reaching either an unexpanded
+/// node or a terminal state. Returns `(leaf_idx, path, leaf_state)` where
+/// `path` includes both endpoints (root and leaf inclusive). Mirrors the
+/// per-sim descent inside `run_search` exactly so callers can round-trip
+/// through batched evaluation without changing semantics.
+pub fn select_leaf_state(
+    arena: &MctsArena,
+    root_state: &BlobState,
+    c_puct: f32,
+) -> (u32, Vec<u32>, BlobState) {
+    let mut state = *root_state;
+    let mut path: Vec<u32> = Vec::with_capacity(16);
+    let mut idx: u32 = 0;
+    path.push(idx);
+    while arena.node(idx).is_expanded() && !is_terminal(&state) {
+        let acting = state.current_player;
+        let child_idx = select_best_child(arena, idx, acting, c_puct);
+        let action = arena.node(child_idx).action;
+        apply_action(&mut state, action);
+        idx = child_idx;
+        path.push(idx);
+    }
+    (idx, path, state)
+}
+
+/// Lockstep search across multiple independent determinization trees.
+///
+/// At each of `num_simulations` "steps", every det that still has sims to
+/// run contributes one leaf descent. Non-terminal leaves are batched into
+/// a single `Evaluator::evaluate_batch` call; terminal leaves backprop
+/// `v=0` immediately. After the batch returns, each pending leaf is
+/// expanded and backpropagated in order.
+///
+/// Within any single det, the sequence of `select_leaf → eval → expand →
+/// backprop` events is identical to `run_search` on that det's
+/// `(arena, root_state)` pair, so per-det visit-count distributions and
+/// arena allocation order are bit-identical to the serial driver on the
+/// same RNG seed (no MCTS-correctness change, just one batched inference
+/// in place of `num_dets` serial ones per step).
+pub fn run_lockstep_search<E: Evaluator + ?Sized>(
+    arenas: &mut [MctsArena],
+    root_states: &[BlobState],
+    eval: &E,
+    num_simulations: u32,
+    c_puct: f32,
+) {
+    debug_assert_eq!(arenas.len(), root_states.len());
+    let num_dets = arenas.len();
+    if num_dets == 0 || num_simulations == 0 {
+        return;
+    }
+
+    // Reused across steps to avoid per-step allocation churn. `pending`
+    // holds the non-terminal leaves to evaluate; `pending_states` is the
+    // by-reference view passed to `evaluate_batch`.
+    struct Pending {
+        det: usize,
+        leaf_idx: u32,
+        path: Vec<u32>,
+        leaf_state: BlobState,
+        leaf_seat: u8,
+    }
+
+    let mut pending: Vec<Pending> = Vec::with_capacity(num_dets);
+
+    for _ in 0..num_simulations {
+        pending.clear();
+
+        for det in 0..num_dets {
+            let (leaf_idx, path, leaf_state) =
+                select_leaf_state(&arenas[det], &root_states[det], c_puct);
+            let leaf_seat = leaf_state.current_player;
+            if is_terminal(&leaf_state) {
+                // Terminal leaves don't need eval or expand; backprop the
+                // canonical v=0 immediately, matching `run_search`.
+                backprop(&mut arenas[det], &path, leaf_seat, 0.0);
+            } else {
+                pending.push(Pending {
+                    det,
+                    leaf_idx,
+                    path,
+                    leaf_state,
+                    leaf_seat,
+                });
+            }
+        }
+
+        if pending.is_empty() {
+            // Every det's tree is exhausted of non-terminal leaves; no
+            // remaining sim can produce useful work. Continue ticking the
+            // counter to preserve `num_simulations` semantics — each tick
+            // is just a no-op walk-and-backprop on terminal paths above.
+            continue;
+        }
+
+        let states_ref: Vec<&BlobState> = pending.iter().map(|p| &p.leaf_state).collect();
+        let results = eval.evaluate_batch(&states_ref);
+        debug_assert_eq!(results.len(), pending.len());
+
+        for (p, (policy, value)) in pending.drain(..).zip(results.into_iter()) {
+            expand(&mut arenas[p.det], p.leaf_idx, &p.leaf_state, &policy);
+            backprop(&mut arenas[p.det], &p.path, p.leaf_seat, value);
+        }
+    }
+}
+
 /// Action probabilities over the root's children, sharpened/flattened by
 /// temperature `tau`. Returns `(action, probability)` pairs in the order
 /// children were allocated (phase-stable action labels).
@@ -594,17 +701,33 @@ where
         let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
         let voids = void_suits(state);
 
+        // Session 7.4c stage-1: cross-determinization batching.
+        //
+        // Allocate every det's state and arena up front, then drive in
+        // lockstep — each "step" walks one leaf per det and submits the
+        // (up to `num_dets`) non-terminal leaves in a single
+        // `evaluate_batch` call. Terminal leaves are backpropagated
+        // immediately with v=0 (no expand needed). Within a single det the
+        // sequence of `select_leaf → expand → backprop` events is identical
+        // to the old serial driver, so per-det visit-count distributions
+        // are bit-identical on the same RNG seed.
+        let mut det_states: Vec<BlobState> = Vec::with_capacity(num_dets as usize);
+        let mut arenas: Vec<MctsArena> = Vec::with_capacity(num_dets as usize);
+        for _ in 0..num_dets {
+            let det_state =
+                determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+            det_states.push(det_state);
+            arenas.push(MctsArena::with_capacity(perspective, cfg.arena_capacity));
+        }
+
+        run_lockstep_search(&mut arenas, &det_states, eval, sims_per, cfg.c_puct);
+
         let mut agg_visits = vec![0u64; policy_len];
         let mut total_visits: u32 = 0;
         let mut value_sum = 0.0f32;
         let mut value_n = 0u32;
 
-        for _ in 0..num_dets {
-            let det_state =
-                determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
-            let mut arena = MctsArena::with_capacity(perspective, cfg.arena_capacity);
-            run_search(&mut arena, &det_state, eval, sims_per, cfg.c_puct);
-
+        for arena in &arenas {
             let root = arena.root();
             for &c in root.children.iter() {
                 let child = arena.node(c);
@@ -1076,6 +1199,82 @@ mod tests {
         };
         let sr = signal_ratio(&r, 4);
         assert!(sr.abs() < 1e-6, "sr={sr}");
+    }
+
+    /// Session 7.4c stage-1 parity: lockstep batching across multiple
+    /// independent dets must reproduce the per-det visit-count distribution
+    /// and per-seat value accumulators of the serial driver bit-for-bit.
+    ///
+    /// We run `run_search` on each `(arena, root_state)` independently and
+    /// compare against `run_lockstep_search` on the same inputs. The
+    /// `DummyEvaluator` makes `evaluate` and `evaluate_batch` produce
+    /// identical output (the trait's default `evaluate_batch` just loops
+    /// `evaluate`), so any divergence would indicate a logic bug in the
+    /// lockstep driver, not numerical noise from a real ONNX session.
+    #[test]
+    fn lockstep_search_matches_serial_per_det() {
+        let states = [
+            playing_state(101),
+            playing_state(202),
+            playing_state(303),
+        ];
+        let sims = 80u32;
+
+        // Serial baseline.
+        let mut serial_arenas: Vec<MctsArena> = states
+            .iter()
+            .map(|s| MctsArena::new(s.current_player))
+            .collect();
+        for (arena, state) in serial_arenas.iter_mut().zip(states.iter()) {
+            run_search(arena, state, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+        }
+
+        // Lockstep driver.
+        let mut lockstep_arenas: Vec<MctsArena> = states
+            .iter()
+            .map(|s| MctsArena::new(s.current_player))
+            .collect();
+        let states_vec: Vec<BlobState> = states.to_vec();
+        run_lockstep_search(
+            &mut lockstep_arenas,
+            &states_vec,
+            &DummyEvaluator,
+            sims,
+            DEFAULT_C_PUCT,
+        );
+
+        // Each det's arena must match: same node count, same per-node
+        // visit counts, value sums, and child structure.
+        for (i, (a, b)) in serial_arenas.iter().zip(lockstep_arenas.iter()).enumerate() {
+            assert_eq!(
+                a.nodes.len(),
+                b.nodes.len(),
+                "det {i}: node count differs (serial={}, lockstep={})",
+                a.nodes.len(),
+                b.nodes.len()
+            );
+            for (j, (na, nb)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+                assert_eq!(na.visit_count, nb.visit_count, "det {i} node {j} visit_count");
+                assert_eq!(na.action, nb.action, "det {i} node {j} action");
+                assert_eq!(
+                    na.children.as_slice(),
+                    nb.children.as_slice(),
+                    "det {i} node {j} children",
+                );
+                for seat in 0..MAX_PLAYERS {
+                    assert_eq!(
+                        na.value_counts[seat], nb.value_counts[seat],
+                        "det {i} node {j} value_counts[{seat}]"
+                    );
+                    assert!(
+                        (na.value_sums[seat] - nb.value_sums[seat]).abs() < 1e-6,
+                        "det {i} node {j} value_sums[{seat}]: serial={}, lockstep={}",
+                        na.value_sums[seat],
+                        nb.value_sums[seat],
+                    );
+                }
+            }
+        }
     }
 
     #[test]

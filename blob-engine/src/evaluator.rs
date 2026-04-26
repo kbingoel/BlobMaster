@@ -29,6 +29,20 @@ pub const NUM_BIDS: usize = 14;
 ///   `state.current_player`.
 pub trait Evaluator: Send + Sync {
     fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32);
+
+    /// Batched inference. Returns one `(policy, value)` per input state, in
+    /// the same order. Default implementation loops `evaluate`, which is
+    /// correct but does not amortize per-call overhead — production
+    /// implementations (`OnnxEvaluator`) override this with a single
+    /// `sess.run` over a `[B, S_max, FEAT_DIM]` zero-padded tensor.
+    ///
+    /// Session 7.4c stage-1: lockstep MCTS across determinizations calls
+    /// this once per "step" with B = number of dets currently producing a
+    /// non-terminal leaf. Terminal leaves are filtered by the caller; this
+    /// method must not be called with a state in `Scoring`/`Complete`.
+    fn evaluate_batch(&self, states: &[&BlobState]) -> Vec<(Vec<f32>, f32)> {
+        states.iter().map(|s| self.evaluate(s)).collect()
+    }
 }
 
 /// Dummy evaluator: uniform over legal actions, value = 0.0.

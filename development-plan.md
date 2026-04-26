@@ -719,6 +719,19 @@ Forced-move dets that resolve in 1 sim simply stop contributing leaves on subseq
 
 **Pass condition for stage 1:** ≥1.7× per-iteration speedup vs 7.3c, with policy-equivalence preserved (visit-count distributions match serial within Monte Carlo noise on 100 sample decisions). **If hit, ship and skip stage 2.**
 
+**Status (2026-04-26): stage-1 plumbing landed; speed gate failed.** Code:
+
+- `Evaluator::evaluate_batch(&[&BlobState]) -> Vec<(Vec<f32>, f32)>` added with a default `evaluate`-loop impl ([blob-engine/src/evaluator.rs](blob-engine/src/evaluator.rs)).
+- `OnnxEvaluator::evaluate_batch` builds one `[B, S_max, FEAT_DIM]` zero-padded tensor and runs a single `sess.run`, then splits per-state outputs ([blob-engine/src/onnx.rs](blob-engine/src/onnx.rs)). Phase-aware mask + (re)normalization extracted to a shared `postprocess_policy` helper used by both `evaluate` and `evaluate_batch`. Calibration capture (Session 7.4b) still records every state, batched or not.
+- `mcts_search` allocates all `num_dets` arenas up front and drives them through `run_lockstep_search` ([blob-engine/src/mcts.rs](blob-engine/src/mcts.rs)) — at each step every det descends to a leaf, terminal leaves backprop `v=0` immediately, non-terminal leaves are submitted as one `evaluate_batch` call, and each pending leaf is expanded + backpropagated in order. Per-det visit-count distributions are bit-identical to the old serial driver on the same RNG seed (pinned by `mcts::tests::lockstep_search_matches_serial_per_det`).
+- ONNX-side parity is pinned by `onnx::tests::evaluate_batch_matches_serial` (skips when `BLOB_ONNX_MODEL` is unset; passes against `iter_000014/model.onnx` with element-wise diff < 1e-4).
+
+**Thread-count sweep at B=5 (full table in [self-play-profile.md](self-play-profile.md)).** New optimum is **T=32 at 4.770 s/game = 1.52× per-game wall** vs the B=1 T=16 baseline (7.250 s/game). The plan's "expect optimum ~8T" was wrong: at B=5 the ONNX call becomes a fatter GEMM (vs GEMV at B=1), per-call cost rises sub-linearly with thread count (4.29 → 7.76 µs · ms across T=16→32), and SMT contention *helps* rather than hurts because the second hyperthread fills memory-stall slots inside long GEMM bursts. The curve flattens between T=20 and T=24 (+0.8%), then T=32 picks up another +9% via SMT.
+
+**Speed gate failed.** 1.52× is below the stage-1 ≥1.7× pass condition. Combined with the 7.4b INT8 hold-back (which itself failed on quality), 7.5's wall-clock budget needs more headroom than stage-1 alone provides.
+
+Recommendation: **proceed to stage-2 (virtual loss within a tree)** before 7.5. Stage-2 raises B beyond `num_dets = 5` by queueing in-flight leaves *inside* a single det, which is where the remaining throughput lives — at T=32 the per-call ONNX cost (7.76 ms) is still well below the per-decision wall (401 ms / 5 dets = 80 ms per det → 0.8 ms per sim at B=5), suggesting we can afford `target_batch = 8..12` without saturating per-call latency. Independently, revisit 7.4b INT8 with the deferred levers (S8S8 activations, entropy calibration, sensitivity-driven body exclusions) since the combined target was 7.4b + 7.4c-stage-1 ≥ 2×.
+
 ##### Stage 2 — Virtual loss within one tree
 
 Only add this if stage 1 alone doesn't hit ≥1.7×. Within a single det's tree, sims are serially dependent (each sim's UCB1 reads previous sims' visit counts). Decorate in-flight nodes with a temporary "pessimistic" visit so parallel descents pick different leaves:
