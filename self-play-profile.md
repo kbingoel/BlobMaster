@@ -165,3 +165,36 @@ Artifacts on disk:
 - [checkpoints/7.3c-run/iter_000014/model.int8.onnx](checkpoints/7.3c-run/iter_000014/model.int8.onnx) — quantized model (kept for future tuning experiments).
 - [checkpoints/7.3c-run/calibration.bin](checkpoints/7.3c-run/calibration.bin) — 500 real EncodedStates in BCAL format.
 - [logs/int8-2026-04-26/](logs/int8-2026-04-26/) — quantize, validate, and 16T INT8 profile logs.
+
+## Follow-ups (2026-04-26) — thread-count sweep at B=5 (Session 7.4c stage-1)
+
+After landing the cross-determinization batching driver in
+[blob-engine/src/mcts.rs](blob-engine/src/mcts.rs), re-swept thread counts at B=5 lockstep batched ONNX
+inference. Same workload as [logs/thread-sweep-2026-04-24/](logs/thread-sweep-2026-04-24/): 5 games per thread,
+fixed 5P7C, `iter_000014/model.onnx`, MCTS at flat 5×100. Speedup column compares
+per-game wall against the B=1 T=16 baseline (7.2497 s/game from
+[logs/thread-sweep-2026-04-24/results.csv](logs/thread-sweep-2026-04-24/results.csv)).
+
+Script: [scripts/thread-sweep-b5.sh](scripts/thread-sweep-b5.sh) (T=4..16) and the T=20/24/32 extension run; raw logs in
+[logs/thread-sweep-b5-2026-04-26/](logs/thread-sweep-b5-2026-04-26/).
+
+| threads | total games | wall (s) | per-game wall (s) | per-decision (ms) | onnx_inference avg (µs) | speedup vs B=1 16T |
+|--------:|------------:|---------:|------------------:|------------------:|------------------------:|-------------------:|
+| 4 | 20 | 333.7 | 16.685 | 175.6 | 3375.1 | 0.435× |
+| 6 | 30 | 360.4 | 12.012 | 189.7 | 3664.8 | 0.604× |
+| 8 | 40 | 373.3 | 9.332 | 196.5 | 3820.4 | 0.777× |
+| 10 | 50 | 384.2 | 7.684 | 202.2 | 3855.3 | 0.943× |
+| 12 | 60 | 392.8 | 6.547 | 206.7 | 3964.3 | 1.107× |
+| 14 | 70 | 415.1 | 5.930 | 218.5 | 4115.7 | 1.223× |
+| 16 | 80 | 424.0 | 5.300 | 223.2 | 4289.4 | 1.368× |
+| 20 | 100 | 523.8 | 5.238 | 275.7 | 5109.0 | 1.384× |
+| 24 | 120 | 623.4 | 5.195 | 328.1 | 6061.0 | 1.395× |
+| **32** | **160** | **763.1** | **4.770** | **401.7** | **7763.6** | **1.520×** |
+
+**Optimum: T=32 at 1.52× per-game wall over the B=1 T=16 baseline.** Notable:
+
+- The plan's prediction ("expect optimum to drop to ~8T") did not hold. At B=5 each ONNX call does 5× the work as a fatter GEMM (vs GEMV at B=1), so per-thread compute density is higher and SMT contention reverses sign — the second hyperthread now fills memory-stall slots inside long GEMM bursts rather than fighting for AVX units. Measured per-call ONNX cost rises sub-linearly: 4.29 ms (T=16) → 5.11 ms (T=20) → 6.06 ms (T=24) → 7.76 ms (T=32), so doubling threads only ~1.8× the per-call cost while feeding 2× the calls in flight.
+- The curve from T=20 → T=24 is essentially flat (1.384× → 1.395×, +0.8%); T=32 picks up a real but modest +9% on top via SMT. Throughput is converging, not still climbing.
+- **The 1.52× ceiling falls short of the stage-1 pass condition (≥1.7×).** Per the development-plan branch, stage-2 (virtual loss within one tree) is the next lever — `target_batch ∈ {5, 8, 12, 16}` raises B further per call without adding more dets. With INT8 also held back ([Session 7.4b](#follow-ups-2026-04-26--int8-quantization-session-74b) above), getting 7.5's wall-clock budget under control likely needs both stage-2 and a revisit of INT8 with the deferred levers (S8S8 / entropy calibration / sensitivity-driven exclusions).
+- Visit-count parity vs the serial driver is verified by `mcts::tests::lockstep_search_matches_serial_per_det`; ORT batched-vs-serial parity by `onnx::tests::evaluate_batch_matches_serial`. Numbers above are pure throughput, not a quality regression.
+
