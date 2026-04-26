@@ -116,6 +116,19 @@ enum Command {
         config: Option<PathBuf>,
         #[arg(long, default_value_t = 0xB10B_5EEDu64)]
         seed: u64,
+        /// Session 7.4b: load the `model.int8.onnx` sibling of `--model`
+        /// instead of the FP32 path. Useful for the post-quantization
+        /// per-call profile (gate: ONNX < 0.9 ms vs ~1.30 ms FP32 at 16T).
+        #[arg(long, default_value_t = false)]
+        use_int8: bool,
+        /// Session 7.4b: capture up to `dump_calibration_limit` encoded
+        /// states to this file (BCAL binary format) for use as
+        /// `quantize_static` calibration data in `scripts/export_onnx.py`.
+        /// Run with the FP32 model; pair with `--use-int8 false`.
+        #[arg(long)]
+        dump_calibration: Option<PathBuf>,
+        #[arg(long, default_value_t = 500)]
+        dump_calibration_limit: usize,
     },
 }
 
@@ -174,18 +187,38 @@ fn parse_device(tag: &str) -> Result<tch::Device, String> {
     }
 }
 
-/// Invoke `scripts/export_onnx.py --weights <ot> --out <onnx>`. Returns an
+/// Optional INT8 export settings — when `Some`, `run_export_script` also
+/// emits `model.int8.onnx` next to the FP32 file.
+#[derive(Debug, Clone)]
+struct Int8ExportArgs {
+    /// `…/model.int8.onnx` to emit.
+    int8_out: PathBuf,
+    /// Calibration file (BCAL binary; produced by `profile --dump-calibration`).
+    calibration: PathBuf,
+}
+
+/// Invoke `scripts/export_onnx.py --weights <ot> --out <onnx>`. When `int8`
+/// is supplied, also passes `--int8-out` and `--calibration` so the script
+/// emits the QDQ-quantized sibling in the same invocation. Returns an
 /// `io::Error` if the script exits non-zero so the caller can propagate it
 /// through `run_iteration`'s error channel.
-fn run_export_script(ot_path: &Path, onnx_path: &Path) -> std::io::Result<()> {
-    let status = ProcCommand::new("python3")
-        .env_remove("LD_PRELOAD")
+fn run_export_script(
+    ot_path: &Path,
+    onnx_path: &Path,
+    int8: Option<&Int8ExportArgs>,
+) -> std::io::Result<()> {
+    let mut cmd = ProcCommand::new("python3");
+    cmd.env_remove("LD_PRELOAD")
         .arg("scripts/export_onnx.py")
         .arg("--weights")
         .arg(ot_path)
         .arg("--out")
-        .arg(onnx_path)
-        .status()?;
+        .arg(onnx_path);
+    if let Some(i) = int8 {
+        cmd.arg("--int8-out").arg(&i.int8_out);
+        cmd.arg("--calibration").arg(&i.calibration);
+    }
+    let status = cmd.status()?;
     if !status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -195,9 +228,35 @@ fn run_export_script(ot_path: &Path, onnx_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Build the per-iteration INT8 export args from the training config. Returns
+/// `None` when `use_int8` is false; warns and returns `None` (so the run
+/// degrades cleanly to FP32) if the calibration file is missing.
+fn int8_args_for(cfg: &TrainingConfig, onnx_path: &Path) -> Option<Int8ExportArgs> {
+    if !cfg.self_play.use_int8 {
+        return None;
+    }
+    let calibration = cfg.training.checkpoint_dir.join("calibration.bin");
+    if !calibration.exists() {
+        tracing::warn!(
+            ?calibration,
+            "use_int8 set but calibration file missing — run \
+             `blobmaster-train profile --dump-calibration <path>` once first; \
+             skipping INT8 export this iter"
+        );
+        return None;
+    }
+    Some(Int8ExportArgs {
+        int8_out: blob_nn::engine::int8_model_path(onnx_path),
+        calibration,
+    })
+}
+
 /// Export the in-memory weights to a bootstrap ONNX so the first iteration
 /// has an evaluator to drive self-play.
-fn bootstrap_initial_onnx(tl: &TrainingLoop) -> std::io::Result<PathBuf> {
+fn bootstrap_initial_onnx(
+    tl: &TrainingLoop,
+    cfg: &TrainingConfig,
+) -> std::io::Result<PathBuf> {
     use blob_nn::train::save_checkpoint;
     let dir = tl.cfg.checkpoint_dir.join("bootstrap");
     std::fs::create_dir_all(&dir)?;
@@ -205,7 +264,8 @@ fn bootstrap_initial_onnx(tl: &TrainingLoop) -> std::io::Result<PathBuf> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let ot = dir.join("model.ot");
     let onnx = dir.join("model.onnx");
-    run_export_script(&ot, &onnx)?;
+    let int8 = int8_args_for(cfg, &onnx);
+    run_export_script(&ot, &onnx, int8.as_ref())?;
     Ok(onnx)
 }
 
@@ -223,12 +283,12 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
         let p = iteration_onnx_path(&cfg.training.checkpoint_dir, iter_resumed);
         if !p.exists() {
             tracing::warn!(?p, "resumed checkpoint missing model.onnx; re-exporting");
-            bootstrap_initial_onnx(&tl)?
+            bootstrap_initial_onnx(&tl, &cfg)?
         } else {
             p
         }
     } else {
-        bootstrap_initial_onnx(&tl)?
+        bootstrap_initial_onnx(&tl, &cfg)?
     };
 
     // The anchor is the first saved iteration (= the `try_resume` baseline
@@ -250,12 +310,16 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
         let iter = tl.iteration;
         cfg.self_play.iteration = iter;
         let started = std::time::Instant::now();
+        let cfg_for_export = cfg.clone();
         let metrics = tl.run_iteration(
             &mut rng,
             &cfg.self_play,
             &cfg.mcts,
             &onnx_path,
-            |ot, onnx| run_export_script(ot, onnx),
+            |ot, onnx| {
+                let int8 = int8_args_for(&cfg_for_export, onnx);
+                run_export_script(ot, onnx, int8.as_ref())
+            },
         )?;
         let elapsed = started.elapsed();
         tracing::info!(
@@ -345,6 +409,7 @@ fn run_eval_against_anchor(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_profile(
     model: &Path,
     games_per_thread: usize,
@@ -353,6 +418,9 @@ fn run_profile(
     cards_dealt: Option<u8>,
     config: Option<&Path>,
     seed: u64,
+    use_int8: bool,
+    dump_calibration: Option<&Path>,
+    dump_calibration_limit: usize,
 ) -> std::io::Result<()> {
     use blob_engine::profiling;
     use blob_nn::engine::{self_play_iteration, SelfPlayConfig};
@@ -381,7 +449,12 @@ fn run_profile(
         iteration: seed,
         show_progress: false,
         fixed_player_count: fixed,
+        use_int8,
     };
+
+    if dump_calibration.is_some() {
+        blob_engine::start_calibration_capture(dump_calibration_limit);
+    }
 
     tracing::info!(
         ?model,
@@ -401,6 +474,21 @@ fn run_profile(
     let (examples, stats) = self_play_iteration(model, &sp_cfg, &mcts_cfg);
     let wall = started.elapsed();
     profiling::disable();
+
+    if let Some(out) = dump_calibration {
+        let captured = blob_engine::finish_calibration_capture();
+        if captured.is_empty() {
+            tracing::warn!(?out, "dump-calibration: no states captured");
+        } else {
+            blob_engine::write_calibration_file(out, &captured)?;
+            tracing::info!(
+                ?out,
+                num_states = captured.len(),
+                limit = dump_calibration_limit,
+                "dump-calibration: wrote BCAL file"
+            );
+        }
+    }
 
     let thread_seconds_ns = (wall.as_nanos() as u64).saturating_mul(num_threads as u64);
 
@@ -610,6 +698,9 @@ fn main() {
             cards_dealt,
             config,
             seed,
+            use_int8,
+            dump_calibration,
+            dump_calibration_limit,
         } => {
             if let Err(e) = run_profile(
                 &model,
@@ -619,6 +710,9 @@ fn main() {
                 cards_dealt,
                 config.as_deref(),
                 seed,
+                use_int8,
+                dump_calibration.as_deref(),
+                dump_calibration_limit,
             ) {
                 tracing::error!(error = %e, "profile run failed");
                 std::process::exit(1);
