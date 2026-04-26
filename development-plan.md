@@ -598,151 +598,180 @@ Gate checklist status after this run: engine-size gates ✅; ONNX single-inferen
 
 ---
 
-## Section 7: Adaptive Training & Analysis (3 sessions, ~9h)
+## Section 7: Adaptive Training, Optimization & Extended Run
 
-### Session 7.1 — Driver wiring and single-iteration smoke test
+7.1–7.3 are complete. 7.4 (self-play perf) is partly done; INT8 (7.4b) and batched MCTS (7.4c) remain. 7.5 is the 100-iter mixed-player run that gates Section 8.
 
-Before any multi-iteration run, close the remaining gaps between plan and code and validate end-to-end with **one** iteration. A single iteration already takes several minutes; do not pay for 20 of them until we know the driver produces sensible output.
+### Session 7.1 — Driver wiring and smoke test (done)
 
-**Prerequisites (wiring gaps surfaced in the 6.3 coherence review):**
+Wired `blobmaster-train train` to a real loop over `TrainingLoop::run_iteration`, added periodic eval against the iter-0 anchor, per-decision signal logging to `decision_stats.jsonl`, `SelfPlayConfig::fixed_player_count`, and `num_games = 118`. Single-iteration smoke at fixed 5P7C / 5×100 / 118 games passed all gates. Artifacts: `checkpoints/smoke-7.1/`.
 
-- Wire `blobmaster-train train` to an actual driver: `Cli::Train` currently only logs ([blob-train/src/main.rs:139](blob-train/src/main.rs#L139)). Replace the stub with a loop over `TrainingLoop::run_iteration` for `total_iterations` iterations, honoring `--resume` via `TrainingLoop::try_resume`. `on_export` should shell out to `scripts/export_onnx.py`.
-- Add `SelfPlayConfig::fixed_player_count: Option<(u8, u8)>`. When set, `self_play_iteration` skips `sample_game_params` and uses that `(n, c)`. Lets 7.1/7.2 force n=5/c=7 while keeping the mixed sampler as default.
-- Add periodic evaluation to `run_iteration`: every `eval.eval_interval` iterations call `eval::evaluate_pair` against the iteration-1 checkpoint (the "anchor" checkpoint). Append `eval_win_rate`, `eval_win_rate_lower95`, `eval_bid_success_rate_current`, `eval_bid_success_rate_opponent` to `metrics.jsonl`. On the anchor iteration itself, skip eval.
-- Add per-decision signal-quality logging: extend `MctsResult` (or its caller wrapper) so `play_one_game` can emit `(phase, num_legal, sims_used, signal_ratio)` per decision to a sidecar `decision_stats.jsonl` in the checkpoint dir. Aggregated percentiles (P10/P50/P90 of `signal_ratio` per branching bucket) also roll into `IterationMetrics` for at-a-glance reading. This unblocks 7.3's adaptive budget.
-- Reconcile config defaults: bump `config.sample.toml` `num_games` from 64 to 118. Originally sized to hit the "~80K examples/iter" figure used downstream, but the 7.1 smoke test measured ~380 decisions/game at 5P7C (5 bid + ~35 play + forced-play skips folded in), so 118 games → ~45K examples/iter, not 80K. Downstream buffer/epoch sizing assumes ~45K; raising `num_games` to push back toward 80K would roughly double self-play wall-clock — defer that call until 7.2 shows whether 45K is a real bottleneck.
+### Session 7.2 — 10-iter diagnostic baseline (done)
 
-**Single-iteration smoke test:**
+11 loop iters at fixed 5P7C, flat 5×100 MCTS, used as the budget-tuning control. Outcomes:
+- Eval win rate vs iter-0 anchor at iter 10: **0.77**.
+- ~60% of MCTS sim cost lands in `num_legal ≤ 3` decisions where signal_ratio is already informative (p50 0.20–0.49). Forced moves are 39% of all decisions and already cost 0.
+- `num_epochs_run` collapsed to 2 by iter 2 (`epoch_early_stop_rel = 0.005` triggered too easily).
+- `value_head` grad norm reached 4.57 by iter 10 vs <1 elsewhere.
+- Eval cost was ~4.7× per-game self-play cost.
 
-- Run exactly **one** iteration with `fixed_player_count=Some((5,7))`, 5×100 MCTS, 118 games, batch 512, 10 epochs.
-- Record and report:
-  - Wall-clock breakdown: self-play seconds, training seconds, ONNX export seconds.
-  - Whether the 32-thread self-play stays roughly proportional to single-thread (spot-check on 1, 8, 32 threads if wall-clock permits; otherwise defer to 7.2).
-  - All `IterationMetrics` fields: losses, visit_entropy_mean, top1_visit_share_mean, policy_kl_divergence, grad_norms per group.
-  - A sample of 10 `decision_stats.jsonl` rows — are `signal_ratio` values distributed sensibly (not all 0, not all 1)?
-- **Pass conditions for smoke test:**
-  - Iteration completes without panic, NaN, or Inf in any metric.
-  - `bid_policy_loss` < `ln(14) ≈ 2.64`, `play_policy_loss` < `ln(7) ≈ 1.95` (trivially true after one epoch of real data, but flags obviously-broken training).
-  - Per-group `grad_norms` within ~2 orders of magnitude of each other.
-  - Full iteration wall-clock **≤ ~25 min at 118 games, 5×100 MCTS, 32 threads** (measured baseline: 11.5 min at 64 games in `gpu-inference-summary.md` → ~21 min linear-scaled to 118; allow ~20% headroom for training-time variance and eval harness). This replaces the original 5-min gate, which assumed 6.3's benchmark-based extrapolation (~3.8 min/iter) rather than the measured self-play cost. If wall-clock materially exceeds ~25 min, do *not* proceed to 7.2 — return to 6.3 held-in-reserve optimizations (CPU-side leaf batching first). Wall-clock is now a sanity bound, not the binding constraint: proceed to 7.2 if signal-quality metrics (below) are sensible even at the upper end of this range.
-  - ONNX export produces a loadable model that the next iteration's self-play could consume (verify by loading once via `OnnxEvaluator::from_file`).
-- **If any smoke-test condition fails:** debug before moving on. Most likely failure mode is wall-clock — see 6.3 fallback list. Second-most-likely: value target distribution degenerate (all zeros because z-scoring on a single game with tied scores collapses).
+Full bucketing: `7.3b-analysis.md §3`.
 
-### Session 7.2 — 10-iteration diagnostic run (11 loop iters)
+### Session 7.3 — Adaptive tuning attempt, regression, partial revert (done)
 
-Once 7.1 passes, run a **10-iteration** training with the same config (fixed n=5, 5×100 MCTS) and read the diagnostics. The original plan called for 20 iters; 10 is sufficient because all the learning milestones — loss drop, bid-success gains, eval_win_rate crossing 0.5 — should be clearly visible by iter 10 if training is working. If they aren't, more iterations do not save it.
+7.3a shipped four changes together: bucketed MCTS budget, `value_head_lr_scale = 0.5`, `epoch_early_stop_rel = 0.001`, sequential Wilson-stop eval. The 7.3b 21-iter validation regressed eval win rate from 0.77 → 0.525 at iter 10 (`7.3b-analysis.md`).
 
-**Off-by-one note:** `total_iterations=11` in config, not 10. The eval-vs-anchor check at [blob-train/src/main.rs:245-247](blob-train/src/main.rs#L245-L247) reads `iter` *before* running the loop body, then evals after the training step. With `total_iterations=10` we'd produce checkpoints iter 0..9 and only get eval at iter 5; we need 11 loop iters to produce iter 10's checkpoint *and* trigger its eval vs anchor.
+7.3c reverted three of the four to the 7.2 baseline (flat 5×100 MCTS, single-group LR, `epoch_early_stop_rel = 0.005`) and re-ran 15 iters; trajectory matched 7.2 and the iter-14 checkpoint is the model now used by 7.4 profiling. The Wilson early-stop in eval **survived** the revert and was further parallelized within chunks (`eval_num_threads = 32`, `eval_games = 192`); the cap and stopping rule are kept.
 
-**Why fixed 5×100 through the whole run (rather than tuning budget by intuition first):** `signal_ratio` is the primary diagnostic 7.3 uses to derive an adaptive MCTS schedule. It conflates two effects — "MCTS had enough sims" vs "NN prior got good enough that MCTS didn't need to search much". Holding the sim budget fixed across iterations is the only way to separate them. 7.3 reads the `signal_ratio(num_legal, iteration)` table produced here and cuts budget in buckets where signal saturates fast, raises it where it doesn't. Up-front budget tuning skips the control and locks in a guess.
+**Decisions for 7.5:** flat 5×100 MCTS, single-group LR, `epoch_early_stop_rel = 0.005`, parallel Wilson-stop eval. The original 7.3d deferred-knobs menu survives in 7.4d as a contingency list.
 
-- **Read the diagnostics every 1–3 iterations** — this is not a blind run:
-  - After iter 1–2: is `visit_entropy_mean` dropping? Is `bid_policy_loss` / `play_policy_loss` moving? If not, something is fundamentally broken — stop and debug.
-  - After iter 5 (first eval vs iter-0 anchor): is `bid_success_rate_current` > `1 / cards_dealt`? Is `policy_kl_divergence` dropping? Is `eval_win_rate` at least trending above 0.5?
-  - After iter 10: is `eval_win_rate_lower95` ≥ 0.5 vs iter 0? Is bid success rate improving iter-over-iter?
-- **Iter-5 early-exit:** if by iter 5 both `bid_policy_loss` has not moved from its iter-0 value AND `visit_entropy_mean` is flat, stop. Grinding 5 more iters of broken training is wasted wall-clock; debug instead.
-- **Expected learning milestones (compressed from the 20-iter plan):**
-  - Iter 1–3: policy losses drop sharply from ~ln(legal_actions) as the network learns basic card ranking.
-  - Iter 3–7: bid success rate improves (hand-strength-to-bid correlation).
-  - Iter 7–10: `eval_win_rate_lower95` vs iter-0 clearly > 0.5.
-- **Diagnostic-driven debugging** (same rules as before):
-  - If `visit_entropy_mean` stays high: MCTS budget insufficient (surprising at 5×100) — first check evaluator is actually connected and returning non-uniform policies.
-  - If policy loss plateaus near random: dump 10 sample MCTS policies; verify they're non-uniform.
-  - If value loss doesn't decrease: print histogram of backfilled z-scored values. If bimodal at ±1 only, consider alternative normalization.
-  - If per-layer `grad_norms` vary by >100×: attention or skip-connection issue.
-  - If `policy_kl_divergence` stays high but loss drops: network is learning something but not what MCTS teaches — head wiring issue.
-- **32-thread scaling check**: if not already done in 7.1, measure wall-clock at 1 / 8 / 32 threads on one iteration to confirm >80% scaling efficiency.
-- Artifacts out: 10 iterations of `metrics.jsonl`, `decision_stats.jsonl`, iter-0/5/10 checkpoints retained; `strength.csv` with eval-vs-anchor at iter 5 and iter 10.
-- **Expected wall-clock:** 10 × ~19 min self-play/train + 2 eval rounds (~30 min each at 200 games 5×100) ≈ **3.5–4.5 h total**.
+### Session 7.4 — Self-play performance optimization
 
-### Session 7.3 — Adaptive tuning and extended run
+7.3c confirmed self-play wall-clock is the binding constraint (>95% of iteration time at flat 5×100 MCTS). 7.4 compresses it before committing 7.5's 100-iter budget.
 
-Apply the four data-driven changes drawn from the 7.2 diagnostics, validate them on a 20-iter fixed-config rerun, then go to extended training. The original "tuning knob menu" survives at the end of this section as deferred levers — only pull them if the validation rerun surfaces the conditions that justify them.
+#### 7.4a — Profiling, thread-count sweep, evaluator reuse (done)
 
-**Background — what the 7.2 run actually told us (read this before editing anything):**
+Atomic-bucket profiler in `blob_engine::profiling`, gated behind the `profile` subcommand. Sweep at 5×100 MCTS / fixed 5P7C / 5 games-per-thread:
 
-- Signal-quality bucketing of all 493K decisions in `checkpoints/7.2-run/decision_stats.jsonl` shows ~60% of MCTS sim cost lands in `num_legal ≤ 3` decisions where signal is already informative (p50 signal_ratio 0.20–0.49 at iter 10 across both phases). Cutting those buckets to floors is the single biggest wall-clock lever.
-- Forced moves (`num_legal == 1`) are 39% of all decisions and already cost 0 — no work to do there.
-- Mid (`num_legal 4–7`) buckets sit at p50 signal_ratio ~0.26–0.32 at iter 10 — not saturating, but also not collapsing. Trim modestly, not aggressively.
-- High (`num_legal 8+`) buckets remain the floor-binding case (p50 ~0.31–0.44 at iter 10). Leave at 5×100.
-- `num_epochs_run` collapsed to 2 by iter 2 because `epoch_early_stop_rel = 0.005` triggers too easily with the slow late-iter loss descent.
-- `value_head` grad norm reached 4.57 by iter 10 while every other group stayed under 1 — flag, not yet a fire, but worth pre-empting.
-- Eval cost was ~4.7× per-game self-play cost. At 200 games × 2 evals/run, that's ~3 h of an ~7 h training run — sequential stopping recovers most of it without hurting the gate.
+- 97–99% of thread time in `OnnxEvaluator::run_encoded::sess.run()`.
+- 32T loses to 16T by 34% on per-game wall-clock — 32 rayon workers oversubscribe the 16-core 7950X and contend for AVX/FP units (despite `intra_op_num_threads = 1`).
+- **16 threads is the local optimum** (validated 14/15/16/17/18 — see `logs/thread-sweep-2026-04-24/`).
+- `OnnxEvaluator` constructed once per worker via `rayon::map_init` instead of per game (~20 s/iter saved).
+- `with_inter_threads(1)` investigated and dropped — ORT defaults to `Sequential` execution, so the inter-op pool never spawns.
 
-#### 7.3a — Concrete edits to ship in this session
+Full data: `self-play-profile.md`.
 
-1. **Update `adaptive_budget()` floors per the 7.2 data** ([blob-engine/src/mcts.rs:457](blob-engine/src/mcts.rs#L457)). Replace the existing bucket arms with the schedule below. Determinization count never drops below 3 for non-forced decisions — belief averaging across opponent-hand assignments is what determinization buys, and you can't do that with a single tree.
+The two remaining levers — INT8 (7.4b) and batched MCTS (7.4c) — are independent and stack.
 
-   | `num_legal` | `(num_dets, sims_per_det)` | total sims | rationale |
-   |---|---|---|---|
-   | 1 | `(1, 0)` | 0 | forced — already short-circuited in `mcts_search` |
-   | 2 | `(3, 20)` | 60 | iter-10 p50 signal_ratio 0.24 (play) / 0.49 (bid); deep search adds nothing on a 2-wide branch |
-   | 3 | `(3, 30)` | 90 | iter-10 p50 ~0.28–0.33; modest budget keeps the third option honest |
-   | 4–6 | `(3, 100)` | 300 | iter-10 p50 ~0.26–0.32; `MctsConfig` baseline of 5 dets dropped to 3, sims kept at 100 |
-   | 7 | `(5, 100)` | 500 | unchanged — not saturating |
-   | 8+ | `(5, 100)` | 500 | unchanged; revisit upward to 5×150 only if 7.3b validation shows signal_ratio p50 < 0.15 here |
+#### 7.4b — INT8 quantization
 
-   Implementation note: `MctsConfig`'s `num_determinizations` and `sims_per_determinization` fields stay as the "default for buckets not otherwise specified" baseline — `adaptive_budget` enforces both floors and (new) ceilings per bucket. Do **not** silently let high `MctsConfig` values override the bucket cap; the whole point is that the table is the source of truth. Update the existing `adaptive_budget_respects_branching_floors` test to cover the new ceilings as well as floors. Keep the `min_sims_floor` safety net (currently 60) — it should never fire under the new schedule but is cheap insurance.
+**Why it should help.** The 1.63M-param FP32 model is ~6.5 MB of weights — fits L3 (64 MB shared) but not L2 (1 MB / core), so per-call cost at 16T is partly L3-bandwidth-bound. Zen 4 has full AVX-512 VNNI (`vpdpbusd`, 4× INT8 MAC per lane), and INT8 weights are 4× smaller. ORT INT8 on VNNI runs 2.9–6× on BERT-class transformers in Microsoft's published benchmarks; our `d_model = 128` shrinks the compute share of that gain but the memory share holds. **Expected: 1.5–2× per-iteration self-play speedup.** FP16 is *not* worth pursuing on Zen 4 — no native FP16 vector compute; ORT runs it through the FP32 ALUs.
 
-   Expected impact: total sims/iter drop from ~13.7M to ~6.2M (~55% reduction), self-play wall-clock drops from ~19 min/iter to ~9–10 min.
+**Implementation.**
 
-2. **Loosen `epoch_early_stop_rel` from `0.005` to `0.001`** in `blob-train/config.sample.toml`. Each iter ran 2 epochs in 7.2 instead of the configured 10; loosening the threshold (or deleting it entirely if the 0.001 setting still trips early) restores the budgeted training-pass count without raising any other cost. If after the 7.3b validation it's still tripping at <5 epochs/iter, drop the relative-stop check entirely and rely on the absolute `epochs_per_iteration = 10` cap.
+1. Extend `scripts/export_onnx.py` to emit `model.int8.onnx` alongside `model.onnx`:
+   - `onnxruntime.quantization.quantize_static`, `QuantFormat.QDQ`, `weight_type=QuantType.QInt8`, `activation_type=QuantType.QUInt8` (U8S8 path — 2× more MACs/cycle than U8U8 on VNNI), `CalibrationMethod.MinMax`.
+   - Calibration data: ~500 `EncodedState`s captured from a recent iter's `decision_stats.jsonl`-driven profile run, saved once as `calibration.npz` and reused.
+   - Exclude LayerNorm and Softmax nodes via `nodes_to_exclude` — they're not GEMMs and quantize poorly at this dimension.
+2. Add `[self_play] use_int8 = true` to `config.sample.toml`. Self-play loads `model.int8.onnx`; **eval stays on FP32** so the eval signal isn't fighting quantization noise on both sides.
+3. Validation gate (the existing 1e-5 element-wise gate is too tight — relax for this path only):
+   - On 1000 saved states: argmax-policy agreement INT8-vs-FP32 ≥ 95%, value-sign agreement 100%.
+   - 5-game self-play sanity at 5×100 — no panics, sane wall-clock.
+   - Re-profile at 16T: per-call ONNX < 0.9 ms (vs 1.30 ms today) means ship; < 0.7 ms confirms the bandwidth-bound theory.
 
-3. **Add a value-head learning-rate multiplier of 0.5** in `blob-nn`'s optimizer construction. The optimizer currently builds one parameter group; split into two — `value_head` parameters at `peak_lr * 0.5`, everything else at `peak_lr`. Watch `grad_norms.value_head` in `metrics.jsonl` over the 7.3b validation run; if it now stays comparable to `bid_head` (under 2.5), the multiplier did its job. If it keeps drifting up, drop to 0.25 in the extended run.
+**Pass condition:** ≥1.4× per-iteration speedup with no eval-win-rate regression vs FP32 at iter 5/10 of a 10-iter validation against 7.3c's iter-0 anchor.
 
-4. **Sequential evaluation, capped at 200 games**. Replace the unconditional 200-game loop in `blob-nn/src/eval.rs::evaluate_pair` with a sequential schedule:
+**Hold-back:** if INT8 silently degrades policy quality (eval win rate at iter 10 drops >5pp vs FP32), revert and run 7.5 on FP32. Quantization-aware training is out of scope.
 
-   - Play games in chunks of 50 (4 chunks → 200-game cap).
-   - After each chunk, recompute the Wilson 95% CI on the cumulative win-rate.
-   - **Stop early** if either: `lower95 ≥ 0.55` (clear improvement) or `upper95 ≤ 0.45` (clear regression). The 0.05 cushion above/below the 0.5 promotion gate prevents stopping on a coin-flip CI that just barely clears the line and would later widen back across it.
-   - **Maximum games is 200** — never run more, even if the CI hasn't separated. Inconclusive results at 200 games are a valid outcome; record `eval_inconclusive: true` in `strength.csv` for that row and let the promotion gate handle it (`win_rate_lower95 > 0.5` will simply fail).
-   - Add `eval_games_played: u32` and `eval_inconclusive: bool` columns to `strength.csv` so we can see post-hoc how often early-stop fired and at what chunk.
-   - Bid-success-rate stats are still reported on whatever sample size was actually played (Wilson CI scales with n).
-   - **Do not** parallelize across chunks — the early-stop check needs to see chunk N's result before deciding whether to launch chunk N+1. Within a chunk, the existing per-game parallelism stays.
-   - Expected savings: when models are clearly separated (early iterations vs heuristic, late iterations vs anchor) this stops at chunk 1 or 2. When they're close, it runs the full 200. Average over a 100-iter run: ~120–130 games per eval instead of 200.
+#### 7.4c — Batched MCTS leaves with virtual loss
 
-#### 7.3b — Validation rerun (20 iters fixed 5P7C)
+**Why it should help.** At batch=1 every transformer linear is a GEMV (memory-bound: each weight read once, used once). At batch B>1 they're GEMMs with weights re-used B times — more SIMD-efficient and bandwidth-amortized. ORT's MlasGemm path is much friendlier on the GEMM shape. With fewer rayon threads (less SMT contention as a side benefit), **expected: 2–3× alone, 3–4× combined with INT8.** This is the standard AlphaZero parallelization.
 
-Re-run the same `fixed_player_count = [5, 7]`, 118-game, batch-512 config from 7.2, but for **20 iterations** instead of 10, with all four 7.3a edits in place. This is a controlled comparison against the 7.2 run — same data distribution, only the budget table / early-stop / value-LR / eval logic have changed. Eval against the iter-0 anchor at iter 5/10/15/20 (every 5 iters as configured).
+Stage in two phases: cross-determinization first (free batch=5, no MCTS-correctness change), then virtual-loss within a tree (free batch up to ~16) only if stage 1 doesn't hit the target. Stage 2 is real complexity; do not pre-emptively bundle it.
 
-**Pass conditions (must all hold):**
+##### Stage 1 — Cross-determinization batching
 
-- Per-iter wall-clock at ~9–11 min (the predicted ~50% drop). Wall-clock more than 14 min/iter means the budget table didn't take effect; investigate.
-- `signal_p50_low` (the `nl ≤ 3` aggregate already in `IterationMetrics`) does **not** collapse to <0.10 at any iteration. Some drop from 7.2's iter-10 values is expected as the prior tightens, but a free-fall means the budget cut went too far.
-- `eval_win_rate_lower95` at iter 10 ≥ 0.65 (vs 7.2's 0.707) — small regression acceptable, large regression is not. Iter 20 should clear 0.75.
-- `bid_success_rate_current` at iter 20 ≥ 0.40 (vs 7.2's 0.35 at iter 10).
-- `num_epochs_run` averages ≥ 5 across iters 1–20 (was ~2 in 7.2).
-- `grad_norms.value_head` stays under 2.5 by iter 20 (was 4.57 in 7.2 at iter 10).
+The 5 determinizations per decision are already independent. They run sequentially per thread today; restructure them to advance in lockstep, sharing one batched `sess.run` per "step".
 
-**If any pass condition fails:**
+**API change.** Add to `Evaluator`:
 
-- Wall-clock high → check the budget table actually wires through `mcts_search`; print the `(num_dets, sims_per_det)` for a sample of decisions and confirm.
-- `signal_p50_low` collapse → walk the affected bucket back up by one tier (e.g. `nl=2` from 3×20 to 3×30, or 5×20).
-- Win-rate regression → most likely the value-head LR cut broke value learning; revert the multiplier to 1.0 and re-test.
-- Epoch count still low → drop `epoch_early_stop_rel` entirely.
+```rust
+fn evaluate_batch(&self, states: &[&BlobState]) -> Vec<(Vec<f32>, f32)>;
+```
 
-#### 7.3c — Extended run (100 iters, mixed player count)
+Default impl loops `evaluate`. `OnnxEvaluator::evaluate_batch` builds one `[B, S_max, FEAT_DIM]` tensor (zero-padded to the longest sequence in the batch; `attention_mask` already zeroes padded positions in attention) and one `sess.run`, then splits the outputs back per state.
 
-Once 7.3b validates, flip `fixed_player_count` to `None` to re-enable the n=4/5/6/7 mixture (Section 5.2 distribution: n=4 10%, n=5 60%, n=6 25%, n=7 5%) and run 100 iterations from a fresh init (not from the 7.3b checkpoint — mixed-player distribution shift would invalidate the value targets baked into the buffer). Keep all 7.3a settings.
+**MCTS change.** Replace the per-determinization loop in `mcts_search` ([blob-engine/src/mcts.rs:602](blob-engine/src/mcts.rs#L602)) with a lockstep driver. Allocate all 5 arenas up front; pseudocode:
 
-- Eval cadence stays every 5 iters; opponent rotates per the existing `eval_lookback = 20` rule.
-- Save iter-25 / iter-50 / iter-75 / iter-100 checkpoints permanently as fine-tuning candidates for Section 8.
-- Primary progress indicator: `eval_win_rate_lower95` vs the iter-20 anchor (mid-training reference, more discriminating than vs iter-0 once the network has learned the basics).
-- Watch for n=5 bid-success-rate regression vs the n=5-only 7.3b run — some regression is expected from the broader distribution; >5pp absolute drop is a problem and would suggest reverting to fixed n=5 for the base model and doing the multi-n stretch in Section 8.
-- Save the final iter-100 base model checkpoint as the input to Section 8 fine-tuning.
+```text
+for step in 1..=sims_per_det:
+    leaves = []                                    # (det_idx, leaf_state, path)
+    for det in 0..num_dets:
+        if dets[det].sims_done < sims_per_det:
+            walk root → unexpanded leaf  (same select_leaf as today)
+            leaves.push((det, leaf_state, path))
+    if leaves.is_empty(): break
+    results = eval.evaluate_batch(&leaves.iter().map(|l| &l.state).collect())
+    for ((det, _, path), (policy, value)) in leaves.zip(results):
+        expand(arenas[det], leaf, policy)
+        backprop(arenas[det], path, leaf_seat, value)
+```
 
-**Expected wall-clock:** 100 × ~10 min self-play+train + 20 evals × ~12 min (sequential-stop average) ≈ **~21 h**. Fit it in two overnight runs with a `--resume` checkpoint at iter 50.
+Forced-move dets that resolve in 1 sim simply stop contributing leaves on subsequent steps; the batch shrinks naturally over the last few sims. Visit-count distributions are bit-identical to the serial implementation on the same RNG seed (modulo arena allocation order across dets — pin a parity test on small `sims_per_det = 10` before merging).
 
-#### 7.3d — Deferred tuning knobs (only pull if 7.3b/7.3c surface the trigger)
+**Thread count.** Per-call cost rises from ~1.3 ms (B=1) toward ~3 ms (B=5) but does 5× the work, easing the per-thread bottleneck. Re-run `scripts/thread-sweep.sh` at B=5 — expect the optimum to drop to ~8 threads. Update `self-play-profile.md` and the default afterward.
 
-These were in the original 7.3 plan; they remain valid contingencies but are **not** part of the default 7.3 work. Each one carries a specific trigger; don't speculatively apply them.
+**Pass condition for stage 1:** ≥1.7× per-iteration speedup vs 7.3c, with policy-equivalence preserved (visit-count distributions match serial within Monte Carlo noise on 100 sample decisions). **If hit, ship and skip stage 2.**
 
-- **Temperature schedule** (new `MctsConfig::temperature_schedule` field + decision-index arg threaded into `mcts_search`): τ=1.0 for the first 15 decisions in a round, τ=0.1 for the remainder. *Trigger:* late-game `top1_visit_share_mean` < 0.5 (network can't commit to a play even when it should).
-- **Adaptive games per iteration**: *Trigger:* `policy_kl_divergence` drops below 0.05 within 3 iters → cut `num_games`. Stays above 0.15 by iter 30 → raise it.
-- **Learning rate**: *Trigger:* loss oscillates ±10% iteration-to-iteration → halve `peak_lr`. Loss plateaus while KL still > 0.1 → raise `peak_lr` 1.5× or double warmup length.
-- **c_puct tuning**: *Trigger:* `top1_visit_share_mean` > 0.85 sustained → raise to 2.0. < 0.25 sustained → drop to 1.0.
-- **Replay buffer sizing**: *Trigger:* loss drops then rises across iterations (stale-data overfitting) → reduce `buffer_capacity` from 500K to 250K. Slow improvement with KL still high → raise to 1M.
-- **CPU-side leaf batching within a determinization** (the held-in-reserve item from 6.3): *Trigger:* 7.3b wall-clock per iter > 12 min. This is implementation work, not a config flip — virtual-loss + queued forwards so each ort session sees batch>1.
+##### Stage 2 — Virtual loss within one tree
+
+Only add this if stage 1 alone doesn't hit ≥1.7×. Within a single det's tree, sims are serially dependent (each sim's UCB1 reads previous sims' visit counts). Decorate in-flight nodes with a temporary "pessimistic" visit so parallel descents pick different leaves:
+
+- Add `in_flight: u16` to `MctsNode`. Single-thread mutation only — one rayon worker owns the tree, no atomic needed.
+- During selection, replace UCB1's effective `(N, Q)` for the acting seat with:
+  - `N_eff = visit_count + in_flight`
+  - `Q_eff = (value_sums[acting] - vloss_weight * in_flight) / max(N_eff, 1)`
+  - `vloss_weight = 1.0` — assume in-flight leaves are losses until proven otherwise (standard AlphaZero choice).
+- Selection along a path increments `in_flight` at each visited node.
+- After batched eval, **decrement `in_flight` along each path before running the real `backprop`**. Order matters so virtual visits are replaced cleanly. Add `debug_assert!(node.in_flight == 0)` in `mcts_search`'s post-loop sanity check.
+
+**Search-loop change.** Generalize stage 1's lockstep driver to "queue N leaves, then eval", drawing from both cross-tree (5 dets) and inside-tree (virtual loss) sources:
+
+```text
+target_batch = 8                                   # tunable; 5..16 reasonable
+while any det has remaining sim budget:
+    leaves = []
+    while leaves.len() < target_batch and any det can descend further:
+        det = pick det with fewest sims-so-far     # round-robin
+        walk root → unexpanded leaf, ++in_flight along the path
+        leaves.push((det, leaf_state, path))
+    results = eval.evaluate_batch(&leaves.iter().map(|l| &l.state).collect())
+    for ((det, _, path), (policy, value)) in leaves.zip(results):
+        for n in &path: arenas[det].nodes[n].in_flight -= 1
+        expand(arenas[det], leaf, policy)
+        backprop(arenas[det], path, leaf_seat, value)
+```
+
+**Correctness considerations.**
+
+- Virtual loss biases selection toward less-explored siblings while a leaf is in flight. Visit-count distributions on identical seeds will *not* match serial MCTS exactly. This is fine for self-play (policy target is the visit distribution either way; softmax absorbs small biases), but pinned-visit-count tests must adjust or run with `target_batch = 1` to degenerate back to serial.
+- Each det owns its own `Xoshiro256PlusPlus`; the lockstep driver advances per-det, never shared, or determinism across batch sizes breaks.
+- Forced-move root short-circuit (`num_legal == 1`) unchanged.
+- Sequence-padding cost: at `target_batch = 8` with seq lengths 14–58, padding to S_max ≈ 58 costs roughly 2× the FLOPs of a perfect batch. Acceptable; bucketing by sequence length is a future optimization, not stage-2 scope.
+
+**Pass condition for stage 2:** ≥2.5× per-iteration speedup vs 7.3c, eval win rate at iter 5 within 3pp of 7.3c-baseline. Validate on a 5-iter run before committing to 7.5.
+
+**New tunable to record:** `target_batch` in `config.sample.toml`. Sweep `{5, 8, 12, 16}` on a 1-iter wall-clock benchmark, record the optimum, default to 8 if no clear winner.
+
+##### Combined 7.4 throughput target
+
+7.4a (done) + 7.4b INT8 + 7.4c-stage-1 → ~3× speedup over 7.3c → **~3 min/iter** at the right thread count. 7.5's 100-iter wall-clock budget assumes this hits.
+
+If 7.4b + 7.4c-stage-1 combined land below 2×, do stage 2 before 7.5 — committing to 100 iters at 9 min/iter is a 15-h training run that's awkward to checkpoint cleanly.
+
+#### 7.4d — Deferred tuning knobs (contingencies for 7.5)
+
+These were the original 7.3d list. Each carries a specific trigger; **do not** speculatively apply.
+
+- **Temperature schedule** (new `MctsConfig::temperature_schedule` + decision-index arg in `mcts_search`): τ=1.0 for first 15 decisions, τ=0.1 thereafter. *Trigger:* late-game `top1_visit_share_mean` < 0.5.
+- **Adaptive games per iteration** — *trigger:* `policy_kl_divergence` < 0.05 sustained → cut `num_games`. > 0.15 by iter 30 → raise.
+- **Learning rate** — *trigger:* loss oscillates ±10% iter-to-iter → halve `peak_lr`. Plateau with KL > 0.1 → raise 1.5× or extend warmup.
+- **c_puct** — *trigger:* `top1_visit_share_mean` > 0.85 sustained → 2.0. < 0.25 sustained → 1.0.
+- **Replay buffer sizing** — *trigger:* loss drops then rises across iterations → cut `buffer_capacity` to 250K. Slow improvement with KL high → raise to 1M.
+- **Muon optimizer for hidden 2D weights** — replace AdamW for `transformer.*` matrix params (QKV / out / FFN linears) with Muon (Newton-Schulz orthogonalized updates), keep AdamW for embeddings, the three heads, biases, and LayerNorm scales. The two-group plumbing in `build_optimizer` already supports the split. *Trigger:* 7.5 eval_win_rate_lower95 plateaus before iter 50 *and/or* per-head `grad_norms` drift >3× apart (the 7.2-style instability pattern). *Why it's worth pulling:* if Muon cuts iterations-to-target by ~25%, total run wall-clock drops the same — every saved iter is ~3 min of self-play. *Cost:* tch-rs has no built-in Muon; ~1–2 days to write the Newton-Schulz step (5 iterations of batched matmul per param group). *Caveat:* published gains are mostly on >100M-param models; at 1.63M with d_model=128 the win may be smaller or wash into noise — pull only when AdamW shows the trigger pattern, not speculatively.
+
+### Session 7.5 — Extended training run (100 iters, mixed player count)
+
+Once 7.4 lands and a 10-iter validation matches 7.3c's anchor trajectory, flip `fixed_player_count` to `None` (Section 5.2 distribution: n=4 10%, n=5 60%, n=6 25%, n=7 5%) and run **100 iterations from a fresh init** — not from a 7.3c checkpoint, since the fixed-5P7C value targets baked into the buffer don't transfer to the mixed distribution.
+
+- All 7.4 perf changes on, 7.4d knobs at default, MCTS at flat 5×100 (the 7.3c-validated config).
+- Eval cadence every 5 iters; opponent rotates per `eval_lookback = 20`.
+- Save iter-25/50/75/100 checkpoints as Section-8 fine-tuning candidates.
+- Primary indicator: `eval_win_rate_lower95` vs the iter-20 mid-training anchor (more discriminating than vs iter-0 once basics are learned).
+- Watch n=5 bid-success-rate vs the n=5-only 7.3c baseline. >5pp absolute drop suggests reverting to fixed n=5 for the base model and doing the multi-n stretch in Section 8.
+- Save iter-100 base model as Section-8 fine-tuning input.
+
+**Expected wall-clock:** at 7.4's target throughput (~3 min/iter), 100 iters + 20 evals ≈ **~7 h**. Resume-checkpoint at iter 50.
 
 ---
 
