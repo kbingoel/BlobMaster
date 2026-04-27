@@ -41,12 +41,25 @@ pub const VALUE_HEAD_GROUP: usize = 1;
 /// `7.3b-analysis.md` §7.2.
 pub const VALUE_HEAD_LR_SCALE: f64 = 1.0;
 
+/// Parameter-group id for the transformer's hidden 2D weight matrices —
+/// QKV / attn-out / FFN-fc1 / FFN-fc2 — which are updated by [`Muon`]
+/// rather than AdamW (Session 7.4d).
+///
+/// AdamW is configured with `lr = 0` for this group, so its step is a
+/// no-op (both the moment-driven term and the decoupled weight-decay
+/// term are scaled by `lr`). Muon applies the actual update.
+///
+/// [`Muon`]: crate::muon::Muon
+pub const MUON_GROUP: usize = 2;
+
 /// Apply `lr` to the default param group and `lr * VALUE_HEAD_LR_SCALE`
-/// to `VALUE_HEAD_GROUP`. Use this in the training loop instead of
-/// bare `optimizer.set_lr(lr)` so the multiplier stays in one place.
+/// to `VALUE_HEAD_GROUP`. The Muon group's AdamW LR is held at zero —
+/// see [`MUON_GROUP`]. Use this in the training loop instead of bare
+/// `optimizer.set_lr(lr)` so the multiplier stays in one place.
 pub fn set_schedule_lr(optimizer: &mut nn::Optimizer, lr: f64) {
     optimizer.set_lr(lr);
     optimizer.set_lr_group(VALUE_HEAD_GROUP, lr * VALUE_HEAD_LR_SCALE);
+    optimizer.set_lr_group(MUON_GROUP, 0.0);
 }
 
 /// Which head the batch targets. The value head always contributes.
@@ -179,6 +192,7 @@ pub fn build_optimizer(vs: &VarStore) -> Result<nn::Optimizer, tch::TchError> {
     }
     .build(vs, PEAK_LR)?;
     opt.set_lr_group(VALUE_HEAD_GROUP, PEAK_LR * VALUE_HEAD_LR_SCALE);
+    opt.set_lr_group(MUON_GROUP, 0.0);
     Ok(opt)
 }
 

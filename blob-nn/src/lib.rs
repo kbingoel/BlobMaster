@@ -18,6 +18,7 @@ pub mod model;
 pub mod self_play;
 pub mod engine;
 pub mod train;
+pub mod muon;
 pub mod training_loop;
 pub mod eval;
 
