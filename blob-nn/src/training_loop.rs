@@ -27,6 +27,7 @@ use crate::engine::{self_play_iteration, SelfPlayConfig};
 use crate::heads::NUM_BIDS;
 use crate::input::pad_batch;
 use crate::model::BlobNet;
+use crate::muon::Muon;
 use crate::self_play::{DecisionStat, TrainingExample};
 use crate::train::{
     build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint,
@@ -374,12 +375,16 @@ pub fn play_train_batch(batch: &PlayBatch, device: Device) -> Option<TrainBatch>
 ///
 /// Groups match the parameter layout in `BlobNet::new`:
 /// - `input/...`, `value_head/...`, `play_head/...`, `bid_head/...`
-/// - `transformer/layers/N/...` → one group per layer (catches a dead
-///   transformer layer instantly).
+/// - `transformer/layerN/...` → one group per layer (catches a dead
+///   transformer layer instantly). Note: the encoder builds children as
+///   `layer{i}` (no separator), so var names look like
+///   `transformer.layer0.attn.qkv.weight`.
 fn grad_norm_group(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("transformer.layers.") {
-        if let Some(layer) = rest.split('.').next() {
-            return format!("transformer.layer_{layer}");
+    if let Some(rest) = name.strip_prefix("transformer.layer") {
+        // Take the leading run of digits as the layer index.
+        let idx: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !idx.is_empty() {
+            return format!("transformer.layer_{idx}");
         }
     }
     for top in [
@@ -419,10 +424,20 @@ fn aggregate_grad_norms(vs: &nn::VarStore) -> Vec<(String, f64)> {
 
 /// One forward/backward/step. Returns losses **and** per-group gradient
 /// norms captured between `backward` and `step`.
+///
+/// Muon (Session 7.4d) updates the transformer's hidden 2D weight
+/// matrices, while AdamW handles the rest. Both run after a single
+/// global `clip_grad_norm`. AdamW's LR for the Muon param group is held
+/// at zero (see `train::MUON_GROUP`), so its step is a no-op for those
+/// params and the order of `muon.step` vs `optimizer.step` is not
+/// load-bearing — we run Muon first so that any future logging hook can
+/// inspect post-Muon weights before AdamW touches the rest.
 fn train_step_with_grad_norms(
     model: &BlobNet,
     vs: &nn::VarStore,
     optimizer: &mut nn::Optimizer,
+    muon: &mut Muon,
+    muon_lr: f64,
     batch: &TrainBatch,
 ) -> (f64, f64, f64, Vec<(String, f64)>) {
     let (policy_probs, value_pred) = match batch.phase {
@@ -437,6 +452,7 @@ fn train_step_with_grad_norms(
     total.backward();
     let grad_norms = aggregate_grad_norms(vs);
     optimizer.clip_grad_norm(GRAD_CLIP_MAX_NORM);
+    muon.step(muon_lr);
     optimizer.step();
 
     (
@@ -471,6 +487,7 @@ pub struct TrainingLoop {
     pub vs: nn::VarStore,
     pub model: BlobNet,
     pub optimizer: nn::Optimizer,
+    pub muon: Muon,
     pub buffer: ReplayBuffer,
     pub lr_schedule: LrSchedule,
     pub iteration: u64,
@@ -482,6 +499,7 @@ impl TrainingLoop {
         let vs = nn::VarStore::new(cfg.device);
         let model = BlobNet::new(&vs.root());
         let optimizer = build_optimizer(&vs).expect("build optimizer");
+        let muon = Muon::from_var_store(&vs);
         let buffer = ReplayBuffer::new(cfg.buffer_capacity);
         let lr_schedule = LrSchedule::new(cfg.total_iterations);
         Self {
@@ -489,6 +507,7 @@ impl TrainingLoop {
             vs,
             model,
             optimizer,
+            muon,
             buffer,
             lr_schedule,
             iteration: 0,
@@ -521,15 +540,27 @@ impl TrainingLoop {
         let (bid, play) = self.buffer.sample_batch(self.cfg.batch_size, rng);
 
         if let Some(tb) = bid_train_batch(&bid, self.cfg.device) {
-            let (pp, vl, _tot, gnorms) =
-                train_step_with_grad_norms(&self.model, &self.vs, &mut self.optimizer, &tb);
+            let (pp, vl, _tot, gnorms) = train_step_with_grad_norms(
+                &self.model,
+                &self.vs,
+                &mut self.optimizer,
+                &mut self.muon,
+                lr,
+                &tb,
+            );
             accumulators.add_bid(&self.model, &tb, pp, vl);
             accumulators.add_grad_norms(gnorms);
             self.global_step += 1;
         }
         if let Some(tb) = play_train_batch(&play, self.cfg.device) {
-            let (pp, vl, _tot, gnorms) =
-                train_step_with_grad_norms(&self.model, &self.vs, &mut self.optimizer, &tb);
+            let (pp, vl, _tot, gnorms) = train_step_with_grad_norms(
+                &self.model,
+                &self.vs,
+                &mut self.optimizer,
+                &mut self.muon,
+                lr,
+                &tb,
+            );
             accumulators.add_play(&self.model, &tb, pp, vl);
             accumulators.add_grad_norms(gnorms);
             self.global_step += 1;
@@ -954,8 +985,12 @@ mod tests {
 
     #[test]
     fn grad_norm_groups_split_transformer_layers() {
-        assert_eq!(grad_norm_group("transformer.layers.0.attn.qkv.weight"), "transformer.layer_0");
-        assert_eq!(grad_norm_group("transformer.layers.7.ffn.fc2.bias"), "transformer.layer_7");
+        // Real variable names from `TransformerEncoder::new`:
+        // path is `transformer/layer{i}/...`, no separator before the
+        // index, so the serialized form is `transformer.layer0...`.
+        assert_eq!(grad_norm_group("transformer.layer0.attn.qkv.weight"), "transformer.layer_0");
+        assert_eq!(grad_norm_group("transformer.layer7.ffn.fc2.bias"), "transformer.layer_7");
+        assert_eq!(grad_norm_group("transformer.layer3.ln1.weight"), "transformer.layer_3");
         assert_eq!(grad_norm_group("input.hand_proj.weight"), "input");
         assert_eq!(grad_norm_group("value_head.fc1.bias"), "value_head");
     }
