@@ -35,6 +35,18 @@ pub const DEFAULT_C_PUCT: f32 = 1.5;
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
 
+/// Default leaves-per-`evaluate_batch` target for the lockstep driver
+/// (Session 7.4c stage 2). 8 was the plan's pick of `{5, 8, 12, 16}` —
+/// big enough to hide ONNX per-call overhead inside one tree while
+/// keeping seq-length padding cost reasonable.
+pub const DEFAULT_TARGET_BATCH: usize = 8;
+
+/// Virtual-loss weight (Session 7.4c stage 2). Each in-flight leaf along
+/// a path subtracts this from `value_sums[acting]` during UCB1 selection,
+/// so concurrent descents in the same det's tree pick different leaves.
+/// 1.0 is the standard AlphaZero choice (assume in-flight = loss).
+pub const VIRTUAL_LOSS_WEIGHT: f32 = 1.0;
+
 /// Single MCTS tree node.
 ///
 /// - `visit_count`: total simulations that passed through this node. Used as
@@ -48,6 +60,14 @@ pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
 ///   node (populated at expansion).
 /// - `action`: phase-stable edge label (see module docs). Root stores `0`.
 /// - `children`: arena indices of child nodes; empty until expansion.
+/// - `in_flight`: number of currently-pending descents that hold this
+///   node on their path (Session 7.4c stage 2). Bumped along the path
+///   when a leaf is queued for a batched `evaluate` call and decremented
+///   right before that leaf's `expand`/`backprop` runs. UCB1 reads it as
+///   a temporary pessimistic visit so concurrent descents inside the
+///   same tree pick different leaves. Single-thread mutation only — one
+///   rayon worker owns the arena, no atomic needed. `u16` is enough to
+///   cover any plausible `target_batch` (default 8, plan limit 16).
 #[derive(Debug, Clone)]
 pub struct MctsNode {
     pub visit_count: u32,
@@ -56,6 +76,7 @@ pub struct MctsNode {
     pub prior: f32,
     pub action: u8,
     pub children: SmallVec<[u32; 14]>,
+    pub in_flight: u16,
 }
 
 impl MctsNode {
@@ -70,6 +91,7 @@ impl MctsNode {
             prior,
             action,
             children: SmallVec::new(),
+            in_flight: 0,
         }
     }
 
@@ -139,22 +161,46 @@ impl MctsArena {
     }
 }
 
-/// UCB1 score for `child` under `parent` from the acting player's viewpoint.
+/// UCB1 score for `child` under `parent` from the acting player's viewpoint,
+/// including virtual-loss decoration from in-flight descents.
+///
+/// Without any in-flight leaves (`child.in_flight == 0`) this is the standard
+/// AlphaZero score:
 ///
 /// `score = Q(acting) + c_puct * P * sqrt(N_parent) / (1 + N_child)`
 ///
-/// An unvisited child (`visit_count == 0`) returns `f32::INFINITY` so it is
-/// picked before any visited sibling, regardless of prior. This matches the
-/// AlphaZero convention and avoids starving low-prior moves entirely.
+/// where `Q(acting) = value_sums[acting] / value_counts[acting]` and an
+/// unvisited child (`visit_count == 0`) returns `f32::INFINITY` so it is
+/// picked before any visited sibling.
+///
+/// When `child.in_flight > 0` (Session 7.4c stage 2), virtual loss kicks in:
+/// the child's effective denominator becomes `value_counts[acting] +
+/// in_flight`, the numerator subtracts `VIRTUAL_LOSS_WEIGHT * in_flight`
+/// (treat each pending leaf as a loss until the real value lands), and the
+/// exploration term divides by `1 + visit_count + in_flight` so paths that
+/// already have queued descents look more thoroughly explored. This
+/// degenerates exactly to the no-VL formula at `in_flight == 0`, so callers
+/// that never decorate paths (`run_search`, the parity tests) keep their
+/// existing behavior bit-for-bit.
 #[inline]
 pub fn ucb1_score(parent: &MctsNode, child: &MctsNode, acting: u8, c_puct: f32) -> f32 {
-    if child.visit_count == 0 {
+    let in_flight = child.in_flight as u32;
+    if child.visit_count == 0 && in_flight == 0 {
         return f32::INFINITY;
     }
-    let q = child.q(acting);
+    let value_n = child.value_counts[acting as usize] + in_flight;
+    let q_eff = if value_n == 0 {
+        // Visited via path-throughs but never as the acting seat's leaf,
+        // and not in-flight: fall back to Q = 0 (existing `q()` semantics).
+        0.0
+    } else {
+        let vloss = VIRTUAL_LOSS_WEIGHT * in_flight as f32;
+        (child.value_sums[acting as usize] - vloss) / value_n as f32
+    };
     let n_parent = parent.visit_count.max(1) as f32;
-    let explore = c_puct * child.prior * n_parent.sqrt() / (1.0 + child.visit_count as f32);
-    q + explore
+    let n_child_eff = child.visit_count + in_flight;
+    let explore = c_puct * child.prior * n_parent.sqrt() / (1.0 + n_child_eff as f32);
+    q_eff + explore
 }
 
 /// Pick the child of `parent_idx` with the highest UCB1 score. Ties go to
@@ -363,36 +409,72 @@ pub fn select_leaf_state(
     (idx, path, state)
 }
 
-/// Lockstep search across multiple independent determinization trees.
+/// Generalized lockstep search across multiple determinization trees with
+/// a configurable per-`evaluate_batch` target leaf count.
 ///
-/// At each of `num_simulations` "steps", every det that still has sims to
-/// run contributes one leaf descent. Non-terminal leaves are batched into
-/// a single `Evaluator::evaluate_batch` call; terminal leaves backprop
-/// `v=0` immediately. After the batch returns, each pending leaf is
-/// expanded and backpropagated in order.
+/// Stage 1 (Session 7.4c) batched leaves *across* dets only: one descent per
+/// det per step, batch size capped at `num_dets`. Stage 2 (this function)
+/// raises the cap to `target_batch`, queueing additional descents *within*
+/// the same det's tree behind a virtual-loss decoration so concurrent
+/// descents pick different leaves.
 ///
-/// Within any single det, the sequence of `select_leaf → eval → expand →
-/// backprop` events is identical to `run_search` on that det's
-/// `(arena, root_state)` pair, so per-det visit-count distributions and
-/// arena allocation order are bit-identical to the serial driver on the
-/// same RNG seed (no MCTS-correctness change, just one batched inference
-/// in place of `num_dets` serial ones per step).
+/// Driver loop:
+///
+/// 1. Round-robin pick the not-yet-exhausted det with the fewest
+///    sims-so-far. Tie break on lowest det index, so with
+///    `target_batch >= num_dets` the first batch fills as
+///    `[det 0, det 1, …, det num_dets-1, det 0, det 1, …]` — the same
+///    order Stage 1 used.
+/// 2. Walk root → unexpanded leaf using the standard UCB1 scorer, which
+///    already reads `MctsNode::in_flight` so descents already in this
+///    batch bias subsequent descents away from their paths.
+/// 3. Terminal leaves backprop `v=0` immediately (no eval, no
+///    `in_flight` decoration), matching `run_search`.
+/// 4. Non-terminal leaves: increment `in_flight` along the path and push
+///    onto the pending batch.
+/// 5. **Cold-start duplicate guard.** If a fresh descent lands on a leaf
+///    whose `in_flight > 0` (only possible while a det's root is still
+///    unexpanded — virtual loss can't redirect *through* an unexpanded
+///    node), mark that det blocked for this batch and try the next. The
+///    blocked det is unblocked once eval runs and its root is expanded.
+/// 6. When `pending.len() == target_batch` (or every eligible det is
+///    exhausted/blocked), call `evaluate_batch`, decrement `in_flight`
+///    along each pending path, expand, and backprop in queue order.
+///
+/// **Special cases for callers / tests:**
+/// - `target_batch = 1`: only one descent in flight at a time, so
+///   virtual loss never engages and the per-det node sequence matches
+///   `run_search` bit-for-bit on the same inputs (pinned by
+///   `target_batch_one_matches_serial_per_det`).
+/// - `target_batch = num_dets`: at most one descent per det per outer
+///   iteration, so virtual loss again never engages and behavior matches
+///   the pre-stage-2 cross-det driver bit-for-bit (pinned by
+///   `lockstep_search_matches_serial_per_det`).
+/// - `target_batch > num_dets`: virtual loss biases concurrent descents
+///   inside the same det's tree away from each other. Visit-count
+///   distributions on identical inputs will *not* match serial MCTS — the
+///   policy target is the visit distribution either way and softmax
+///   absorbs small biases (plan §7.4c stage 2).
+///
+/// Post-condition: every node in every arena has `in_flight == 0` (every
+/// path that incremented it ran the matching decrement before backprop).
+/// `debug_assert!`ed at the end so a future bug in path bookkeeping fails
+/// loudly in tests.
 pub fn run_lockstep_search<E: Evaluator + ?Sized>(
     arenas: &mut [MctsArena],
     root_states: &[BlobState],
     eval: &E,
     num_simulations: u32,
     c_puct: f32,
+    target_batch: usize,
 ) {
     debug_assert_eq!(arenas.len(), root_states.len());
     let num_dets = arenas.len();
     if num_dets == 0 || num_simulations == 0 {
         return;
     }
+    let target_batch = target_batch.max(1);
 
-    // Reused across steps to avoid per-step allocation churn. `pending`
-    // holds the non-terminal leaves to evaluate; `pending_states` is the
-    // by-reference view passed to `evaluate_batch`.
     struct Pending {
         det: usize,
         leaf_idx: u32,
@@ -401,35 +483,80 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
         leaf_seat: u8,
     }
 
-    let mut pending: Vec<Pending> = Vec::with_capacity(num_dets);
+    let mut pending: Vec<Pending> = Vec::with_capacity(target_batch);
+    let mut sims_done = vec![0u32; num_dets];
+    let mut blocked = vec![false; num_dets];
 
-    for _ in 0..num_simulations {
+    loop {
+        if sims_done.iter().all(|&n| n >= num_simulations) {
+            break;
+        }
         pending.clear();
+        for b in blocked.iter_mut() {
+            *b = false;
+        }
 
-        for det in 0..num_dets {
+        // Fill one batch.
+        loop {
+            if pending.len() >= target_batch {
+                break;
+            }
+            // Round-robin: pick the lowest-sims_done det that's neither
+            // exhausted nor blocked-this-batch. `min_by_key` ties on the
+            // first match, which gives det-index-ascending order at any
+            // tied sims count — preserving the legacy Stage 1 fill order.
+            let next_det = (0..num_dets)
+                .filter(|&d| sims_done[d] < num_simulations && !blocked[d])
+                .min_by_key(|&d| sims_done[d]);
+            let Some(det) = next_det else {
+                break;
+            };
+
             let (leaf_idx, path, leaf_state) =
                 select_leaf_state(&arenas[det], &root_states[det], c_puct);
             let leaf_seat = leaf_state.current_player;
+
             if is_terminal(&leaf_state) {
-                // Terminal leaves don't need eval or expand; backprop the
-                // canonical v=0 immediately, matching `run_search`.
+                // Terminal leaves never need eval or expand; backprop the
+                // canonical v=0 immediately, matching `run_search`. No
+                // `in_flight` decoration since nothing is queued.
                 backprop(&mut arenas[det], &path, leaf_seat, 0.0);
-            } else {
-                pending.push(Pending {
-                    det,
-                    leaf_idx,
-                    path,
-                    leaf_state,
-                    leaf_seat,
-                });
+                sims_done[det] += 1;
+                continue;
             }
+
+            // Cold-start duplicate: an unexpanded root is reachable
+            // through itself (the descent loop bails at the first
+            // unexpanded node), so a second descent into the same det
+            // before its root expansion lands on the same leaf. UCB1's
+            // virtual-loss bias only redirects *between expanded
+            // siblings*, so the only fix is to skip this det until the
+            // pending batch flushes and its root is expanded. (Once the
+            // first batch returns, every root is expanded and the
+            // descent loop can use VL bias to diverge.)
+            if arenas[det].node(leaf_idx).in_flight > 0 {
+                blocked[det] = true;
+                continue;
+            }
+
+            for &n in &path {
+                arenas[det].node_mut(n).in_flight += 1;
+            }
+            pending.push(Pending {
+                det,
+                leaf_idx,
+                path,
+                leaf_state,
+                leaf_seat,
+            });
+            sims_done[det] += 1;
         }
 
         if pending.is_empty() {
-            // Every det's tree is exhausted of non-terminal leaves; no
-            // remaining sim can produce useful work. Continue ticking the
-            // counter to preserve `num_simulations` semantics — each tick
-            // is just a no-op walk-and-backprop on terminal paths above.
+            // Either every det is exhausted (outer `break` next iter) or
+            // every fill attempt this round resolved to a terminal leaf
+            // (sims_done already advanced by those). Either way, no eval
+            // call needed.
             continue;
         }
 
@@ -438,10 +565,26 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
         debug_assert_eq!(results.len(), pending.len());
 
         for (p, (policy, value)) in pending.drain(..).zip(results.into_iter()) {
+            // Decrement in_flight *before* expand+backprop so the real
+            // visit replaces the virtual one cleanly. Order matters: the
+            // arenas being mutated are owned single-threaded so there is
+            // no race, but a future reader stepping through expansion
+            // order should see consistent counters.
+            for &n in &p.path {
+                arenas[p.det].node_mut(n).in_flight -= 1;
+            }
             expand(&mut arenas[p.det], p.leaf_idx, &p.leaf_state, &policy);
             backprop(&mut arenas[p.det], &p.path, p.leaf_seat, value);
         }
     }
+
+    // Sanity: every virtual visit must have a matching decrement.
+    debug_assert!(
+        arenas
+            .iter()
+            .all(|a| a.nodes.iter().all(|n| n.in_flight == 0)),
+        "lockstep search left non-zero in_flight on some node",
+    );
 }
 
 /// Action probabilities over the root's children, sharpened/flattened by
@@ -504,6 +647,10 @@ pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
         .collect()
 }
 
+fn default_target_batch() -> usize {
+    DEFAULT_TARGET_BATCH
+}
+
 /// Search-time configuration threaded through `mcts_search`.
 ///
 /// Defaults match the plan's target budget (`5 × 100 = 500 sims`) with
@@ -523,6 +670,17 @@ pub struct MctsConfig {
     pub min_sims_floor: u32,
     pub temperature: f32,
     pub arena_capacity: usize,
+    /// Session 7.4c stage 2: target leaves per batched `evaluate` call.
+    /// The lockstep driver fills each batch round-robin from all dets,
+    /// using virtual loss to redirect concurrent descents inside the
+    /// same det's tree away from each other. `1` degenerates to fully
+    /// serial MCTS (one leaf per eval, no VL bias possible — pinned by
+    /// `target_batch_one_matches_serial_per_det`). `num_determinizations`
+    /// reproduces stage 1 (cross-det only). Plan suggests 5..=16; 8 is
+    /// the default. `#[serde(default)]` so existing TOMLs without this
+    /// field keep working.
+    #[serde(default = "default_target_batch")]
+    pub target_batch: usize,
 }
 
 impl Default for MctsConfig {
@@ -534,6 +692,7 @@ impl Default for MctsConfig {
             min_sims_floor: 60,
             temperature: 1.0,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
+            target_batch: DEFAULT_TARGET_BATCH,
         }
     }
 }
@@ -701,16 +860,17 @@ where
         let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
         let voids = void_suits(state);
 
-        // Session 7.4c stage-1: cross-determinization batching.
+        // Session 7.4c stage-2: target_batch lockstep with virtual loss.
         //
         // Allocate every det's state and arena up front, then drive in
-        // lockstep — each "step" walks one leaf per det and submits the
-        // (up to `num_dets`) non-terminal leaves in a single
-        // `evaluate_batch` call. Terminal leaves are backpropagated
-        // immediately with v=0 (no expand needed). Within a single det the
-        // sequence of `select_leaf → expand → backprop` events is identical
-        // to the old serial driver, so per-det visit-count distributions
-        // are bit-identical on the same RNG seed.
+        // lockstep — each batch fills up to `cfg.target_batch` leaves
+        // round-robin across dets, using virtual loss to redirect
+        // multiple descents inside the same det's tree away from each
+        // other. Terminal leaves are backpropagated immediately with v=0
+        // (no expand needed, no in_flight decoration). At
+        // `target_batch == cfg.num_determinizations` this degenerates to
+        // stage 1 (one descent per det per batch, no VL engagement); at
+        // `target_batch == 1` it degenerates to fully serial MCTS.
         let mut det_states: Vec<BlobState> = Vec::with_capacity(num_dets as usize);
         let mut arenas: Vec<MctsArena> = Vec::with_capacity(num_dets as usize);
         for _ in 0..num_dets {
@@ -720,7 +880,14 @@ where
             arenas.push(MctsArena::with_capacity(perspective, cfg.arena_capacity));
         }
 
-        run_lockstep_search(&mut arenas, &det_states, eval, sims_per, cfg.c_puct);
+        run_lockstep_search(
+            &mut arenas,
+            &det_states,
+            eval,
+            sims_per,
+            cfg.c_puct,
+            cfg.target_batch,
+        );
 
         let mut agg_visits = vec![0u64; policy_len];
         let mut total_visits: u32 = 0;
@@ -1229,7 +1396,10 @@ mod tests {
             run_search(arena, state, &DummyEvaluator, sims, DEFAULT_C_PUCT);
         }
 
-        // Lockstep driver.
+        // Lockstep driver. target_batch = num_dets keeps the driver in
+        // pure cross-det mode (Stage 1) — at most one descent per det per
+        // outer iteration, so virtual loss never engages and per-det
+        // node sequences match `run_search` bit-for-bit.
         let mut lockstep_arenas: Vec<MctsArena> = states
             .iter()
             .map(|s| MctsArena::new(s.current_player))
@@ -1241,6 +1411,7 @@ mod tests {
             &DummyEvaluator,
             sims,
             DEFAULT_C_PUCT,
+            states.len(),
         );
 
         // Each det's arena must match: same node count, same per-node
@@ -1273,6 +1444,151 @@ mod tests {
                         nb.value_sums[seat],
                     );
                 }
+            }
+        }
+    }
+
+    /// Session 7.4c stage-2 parity: at `target_batch = 1` the lockstep
+    /// driver only ever has one descent in flight, so virtual loss never
+    /// engages and per-det node sequences match `run_search` bit-for-bit
+    /// — the same parity guarantee Stage 1 provided at
+    /// `target_batch = num_dets` (pinned by
+    /// `lockstep_search_matches_serial_per_det`), now extended to the
+    /// degenerate batch=1 setting that downstream callers can use to
+    /// disable VL entirely without touching the search code.
+    #[test]
+    fn target_batch_one_matches_serial_per_det() {
+        let states = [
+            playing_state(101),
+            playing_state(202),
+            playing_state(303),
+        ];
+        let sims = 80u32;
+
+        let mut serial_arenas: Vec<MctsArena> = states
+            .iter()
+            .map(|s| MctsArena::new(s.current_player))
+            .collect();
+        for (arena, state) in serial_arenas.iter_mut().zip(states.iter()) {
+            run_search(arena, state, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+        }
+
+        let mut tb1_arenas: Vec<MctsArena> = states
+            .iter()
+            .map(|s| MctsArena::new(s.current_player))
+            .collect();
+        let states_vec: Vec<BlobState> = states.to_vec();
+        run_lockstep_search(
+            &mut tb1_arenas,
+            &states_vec,
+            &DummyEvaluator,
+            sims,
+            DEFAULT_C_PUCT,
+            1,
+        );
+
+        for (i, (a, b)) in serial_arenas.iter().zip(tb1_arenas.iter()).enumerate() {
+            assert_eq!(
+                a.nodes.len(),
+                b.nodes.len(),
+                "det {i}: node count differs",
+            );
+            for (j, (na, nb)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+                assert_eq!(na.visit_count, nb.visit_count, "det {i} node {j} visit_count");
+                assert_eq!(na.action, nb.action, "det {i} node {j} action");
+                assert_eq!(
+                    na.children.as_slice(),
+                    nb.children.as_slice(),
+                    "det {i} node {j} children",
+                );
+                for seat in 0..MAX_PLAYERS {
+                    assert_eq!(
+                        na.value_counts[seat], nb.value_counts[seat],
+                        "det {i} node {j} value_counts[{seat}]"
+                    );
+                    assert!(
+                        (na.value_sums[seat] - nb.value_sums[seat]).abs() < 1e-6,
+                        "det {i} node {j} value_sums[{seat}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stage 2 sanity: every virtual visit decoration must be undone by
+    /// the matching expand/backprop step. A non-zero `in_flight` left
+    /// over after search would corrupt subsequent UCB1 reads (the next
+    /// search reuses the same arena layout via `MctsArena::with_capacity`
+    /// only if the tree is freshly allocated, but the invariant is still
+    /// load-bearing for any future caller that recycles arenas — and
+    /// it's the simplest tripwire if a path-bookkeeping bug slips into
+    /// the driver).
+    #[test]
+    fn lockstep_search_clears_in_flight_at_target_batch_above_num_dets() {
+        let states = [
+            playing_state(11),
+            playing_state(22),
+            playing_state(33),
+        ];
+        let sims = 60u32;
+        let mut arenas: Vec<MctsArena> = states
+            .iter()
+            .map(|s| MctsArena::new(s.current_player))
+            .collect();
+        let states_vec: Vec<BlobState> = states.to_vec();
+        // target_batch > num_dets exercises the intra-det virtual-loss
+        // path; if the decrement step misses any path entry the assert
+        // below trips.
+        run_lockstep_search(
+            &mut arenas,
+            &states_vec,
+            &DummyEvaluator,
+            sims,
+            DEFAULT_C_PUCT,
+            8,
+        );
+        for (i, arena) in arenas.iter().enumerate() {
+            for (j, n) in arena.nodes.iter().enumerate() {
+                assert_eq!(
+                    n.in_flight, 0,
+                    "det {i} node {j} left with in_flight={}",
+                    n.in_flight,
+                );
+            }
+        }
+    }
+
+    /// Stage 2 budget invariant: regardless of `target_batch`, each det's
+    /// root must end the search with exactly `num_simulations` total
+    /// visits (visit_count grows by 1 per descent, terminal or not).
+    /// This is the contract the policy aggregator in `mcts_search`
+    /// relies on — if a det undercounts visits, its share of the
+    /// aggregated visit distribution is wrong.
+    #[test]
+    fn lockstep_search_root_visit_count_matches_sim_budget() {
+        let states = [playing_state(7), playing_state(13)];
+        let sims = 50u32;
+        let states_vec: Vec<BlobState> = states.to_vec();
+
+        for &target_batch in &[1usize, 2, 5, 8] {
+            let mut arenas: Vec<MctsArena> = states
+                .iter()
+                .map(|s| MctsArena::new(s.current_player))
+                .collect();
+            run_lockstep_search(
+                &mut arenas,
+                &states_vec,
+                &DummyEvaluator,
+                sims,
+                DEFAULT_C_PUCT,
+                target_batch,
+            );
+            for (i, arena) in arenas.iter().enumerate() {
+                assert_eq!(
+                    arena.root().visit_count,
+                    sims,
+                    "target_batch={target_batch} det {i}: root visits != sims",
+                );
             }
         }
     }

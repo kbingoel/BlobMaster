@@ -47,7 +47,7 @@ arena_capacity = 4096
 # cross-det only (no virtual loss); larger values raise the GEMM batch
 # beyond `num_determinizations`. Plan suggests `{5, 8, 12, 16}` — sweep
 # on a 1-iter wall-clock benchmark and pick the optimum, default 8.
-target_batch = 8
+target_batch = 12
 
 [eval]
 # 192 = 6 × 32-thread batches. Under the parallel eval harness the Wilson
