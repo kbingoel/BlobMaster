@@ -235,6 +235,7 @@ mod tests {
             min_sims_floor: 1,
             temperature: 1.0,
             arena_capacity: blob_engine::mcts::DEFAULT_ARENA_CAPACITY,
+            target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
         };
         let cfg = SelfPlayConfig {
             num_games: 2,
