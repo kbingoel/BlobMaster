@@ -772,6 +772,37 @@ while any det has remaining sim budget:
 
 **New tunable to record:** `target_batch` in `config.sample.toml`. Sweep `{5, 8, 12, 16}` on a 1-iter wall-clock benchmark, record the optimum, default to 8 if no clear winner.
 
+**Status (2026-04-27): plumbing landed, sweep run, speed gate failed.** Code:
+
+- `MctsNode.in_flight: u16` field; UCB1 selection extended with `N_eff = visit_count + in_flight`, `Q_eff = (value_sums[acting] - VIRTUAL_LOSS_WEIGHT * in_flight) / max(value_counts[acting] + in_flight, 1)`. Degenerates exactly to the original at `in_flight = 0` ([blob-engine/src/mcts.rs](blob-engine/src/mcts.rs)).
+- `run_lockstep_search` generalized to take `target_batch`; round-robin fills each `evaluate_batch` from the lowest-`sims_done` non-blocked det, increments `in_flight` along each pending path, decrements before `expand`+`backprop`. Cold-start duplicate guard skips a det whose unexpanded root would be revisited (VL can't redirect through an unexpanded node). Final `debug_assert!` checks every node's `in_flight == 0` post-search.
+- `MctsConfig.target_batch: usize` (`#[serde(default)]`); `DEFAULT_TARGET_BATCH` and `VIRTUAL_LOSS_WEIGHT` constants exposed. Three full-literal `MctsConfig {…}` sites in [blob-nn/{eval,self_play,engine}.rs](blob-nn/) updated.
+- Tests pinned: `target_batch_one_matches_serial_per_det` (tb=1 ⇒ bit-identical to old serial driver), `lockstep_search_clears_in_flight_at_target_batch_above_num_dets` (intra-det VL path exercised, all `in_flight == 0` after search), `lockstep_search_root_visit_count_matches_sim_budget` (root visits == sims for tb ∈ {1, 2, 5, 8}). Stage-1 parity test updated to pass `target_batch = num_dets`.
+
+**`target_batch` sweep at T=32, plus T=16 SMT cross-check** (full table in [self-play-profile.md](self-play-profile.md), §"Follow-ups (2026-04-27)"). Speedups vs B=1 T=16 7.3c baseline (7.250 s/game):
+
+| T | target_batch | per-game (s) | onnx_avg (µs) | speedup |
+|--:|--:|--:|--:|--:|
+| **32** | **5** | **4.696** | **8,378** | **1.544×** |
+| 32 | 8 | 4.793 | 13,488 | 1.513× |
+| 32 | 12 | 5.542 | 22,200 | 1.308× |
+| 32 | 16 | 6.932 | 36,312 | 1.046× |
+| 16 | 8 | 5.289 | 7,328 | 1.371× |
+
+**Speed gate (≥2.5×) FAILS by a wide margin.** The best configuration is `target_batch = num_determinizations = 5` at 1.544×, only +1.6% over Stage-1's T=32 row (within run-to-run noise). Notably, `target_batch = 5` is the *degenerate* case for virtual loss: round-robin already keeps every path at `in_flight ≤ 1`, the per-det arenas mean cross-det in-flight bumps don't enter UCB1 selections, and the VL bias term never affects a real branching choice.
+
+Going past `num_dets` actively regresses on this hardware:
+- Per-call ONNX cost rises **super-linearly** with batch (tb=5→16 is 3.2× more work but 4.3× more wall-time, 8.38 → 36.31 ms). At T=32 the CPU is already saturated by 32 concurrent batched forwards; padding more in-flight leaves into each call stretches per-call latency without raising aggregate throughput. The fatter-GEMM/SMT-friendly story from Stage 1's T=20→32 curve does not generalize when the GEMM grows along the *batch* dimension instead of the *thread* dimension.
+- VL bias is a small extra tax: tb=8 regresses 2% vs tb=5 because redirected descents land on lower-prior siblings whose subtrees expand a slightly less-on-policy slice of the search.
+- SMT direction unchanged: T=32 still beats T=16 by +10% at tb=8.
+
+**Decision: ship Stage 1 only; lower `DEFAULT_TARGET_BATCH` from 8 → 5.** Stage-2 plumbing stays in tree (correct, tested, ~200 lines + one `u16` per node) as a parked escape hatch — re-arms automatically if `num_determinizations` grows or the model widens to d_model ≥ 256 where the GEMM regime tips toward genuinely batch-bound. The 5-iter eval-win-rate run from the original pass condition was skipped: with the speed gate failing, training compute on a config we won't ship is wasted.
+
+For 7.5 wall-clock headroom, the remaining real levers (in expected-ROI order):
+1. **Bigger `num_determinizations`** (e.g. 8). Raises the "free" cross-tree batch ceiling without VL bias; needs a quality study (more dets at fewer sims-per-det vs current 5×100).
+2. **Revisit 7.4b INT8** with the deferred levers (S8S8 activations, entropy calibration, sensitivity-driven body exclusions). 1.40× on top of Stage 1's 1.52× → ~2.13× combined, the cheapest path back toward the original 7.4 throughput target.
+3. **`target_batch > num_dets`** stays parked unless the model grows.
+
 ##### Combined 7.4 throughput target
 
 7.4a (done) + 7.4b INT8 + 7.4c-stage-1 → ~3× speedup over 7.3c → **~3 min/iter** at the right thread count. 7.5's 100-iter wall-clock budget assumes this hits.

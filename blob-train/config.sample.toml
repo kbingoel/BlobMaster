@@ -45,9 +45,12 @@ arena_capacity = 4096
 # concurrent descents inside the same tree away from each other. `1` is
 # fully serial (one leaf per eval); `num_determinizations` is stage-1
 # cross-det only (no virtual loss); larger values raise the GEMM batch
-# beyond `num_determinizations`. Plan suggests `{5, 8, 12, 16}` — sweep
-# on a 1-iter wall-clock benchmark and pick the optimum, default 8.
-target_batch = 8
+# beyond `num_determinizations`. The 2026-04-27 sweep (T=32, B∈{5,8,12,16})
+# put the optimum at `target_batch = num_determinizations = 5` — per-call
+# ONNX cost rises super-linearly past 5 on this hardware/model. Keep 5
+# as the default; revisit only if `num_determinizations` grows or the
+# model widens to d_model ≥ 256.
+target_batch = 5
 
 [eval]
 # 192 = 6 × 32-thread batches. Under the parallel eval harness the Wilson
