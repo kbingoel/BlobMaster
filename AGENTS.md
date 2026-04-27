@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project State
 
-The Rust rewrite has not started yet. This repository currently contains only planning documents and archived Python reference code. **No Rust source exists.** The next step is creating the Rust workspace and beginning Phase 1 (game engine).
+The Rust rewrite is well underway. Sections 1–6 of [development-plan.md](development-plan.md) (game engine, encoder, transformer, MCTS, training, evaluation) are complete. Section 7 (training) is at **Session 7.4c stage 2** as of 2026-04-27 — Stage 2 (within-tree virtual-loss batching) is implemented but the ≥2.5× speed gate failed; ship config is Stage 1 only. Section 7.5 (100-iter mixed-player run) and Section 8 (fine-tuning) are next. See [development-plan.md](development-plan.md) for session-by-session status and [self-play-profile.md](self-play-profile.md) for performance baselines.
 
 ## Planning Documents
 
@@ -39,7 +39,7 @@ BlobState (stack, ~410 bytes)
 - Played card tokens additionally index a learned chronological embedding table (`nn::Embedding(52, 128)`), added on top of the input projection
 - The encoder takes a `perspective: u8` argument; MCTS always passes `state.current_player`
 
-**MCTS** uses determinization: sample N consistent opponent hand assignments, run full tree search on each, aggregate visit counts. Arena-allocate nodes as contiguous `Vec<MctsNode>`. Start at **5×100 sims/move minimum** — fewer produces uniform visit distributions and zero learning signal (the root cause of the Python failure).
+**MCTS** uses determinization: sample N consistent opponent hand assignments, run full tree search on each, aggregate visit counts. Arena-allocate nodes as contiguous `Vec<MctsNode>`. Start at **5×100 sims/move minimum** — fewer produces uniform visit distributions and zero learning signal (the root cause of the Python failure). MCTS leaf eval uses cross-determinization batching (Session 7.4c stage 1): the lockstep driver in [blob-engine/src/mcts.rs](blob-engine/src/mcts.rs) round-robins across all 5 dets and issues one `evaluate_batch(B=5)` per outer step. Within-tree virtual-loss batching (`target_batch > num_dets`) is implemented but parked — the 2026-04-27 sweep showed per-call ONNX cost rises super-linearly past `num_dets` on the 7950X, making `target_batch = num_determinizations = 5` the per-game-wall optimum. See [self-play-profile.md](self-play-profile.md) for the performance breakdown driving these defaults.
 
 **Training loop**: self-play via `rayon` thread pool → replay buffer (3× contiguous `Vec<f32>`) → gradient updates. Value target is z-scored final score: `clip((my_score − mean) / std_dev, −1, 1)`.
 
@@ -72,7 +72,7 @@ Before considering a phase complete:
 - Game engine: all 143 ported tests pass (adjusted for round-structure correction); `BlobState` copy benchmarks at ~100ns (~410 B across ~6 cache lines)
 - MCTS: with 5×100 sims, top action has >2× average visit count (non-uniform signal)
 - Training: policy loss drops below `ln(avg_legal_actions)` within 10 iterations; win rate vs random > 55% within 20 iterations
-- Performance: full iteration (self-play + training, ~177 games × 10 epochs) completes in <5 minutes on 32 threads; 32-thread self-play >80% scaling efficiency; ONNX inference <0.2 ms (batch=1, ort CPU); ONNX ↔ tch output agreement within 1e-5. (The earlier "<60 seconds" figure was a small-game sanity target; Session 6.3 reconciled it with the realistic full-iteration budget in `development-plan.md` and the benches under `blob-engine/benches/`.)
+- Performance: ONNX inference <0.2 ms (batch=1, ort CPU, 1T); ONNX ↔ tch output agreement within 1e-5. The original "32-thread >80% scaling efficiency" gate proved unachievable on the 7950X — Session 7.4 measurements show 16T at 59% scaling and 32T at 22% under FP32 batch=1, with each ONNX call slowing 1.7×–4.5× as concurrent workers contend for AVX/cache. Realistic post-7.4 targets: 16T self-play >55% efficiency at batch=1 (Stage-1 cross-det batching B=5 changes the regime — at B=5 the GEMM is fatter and SMT helps, putting T=32 ahead of T=16 by ~10%, see [self-play-profile.md](self-play-profile.md)). Iteration wall-clock at 7.4c Stage 1 (T=32, target_batch=5): ~4.7 s/game × 118 games ≈ ~9 min/iter.
 
 ## Hardware Target
 

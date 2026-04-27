@@ -35,11 +35,18 @@ pub const DEFAULT_C_PUCT: f32 = 1.5;
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
 
-/// Default leaves-per-`evaluate_batch` target for the lockstep driver
-/// (Session 7.4c stage 2). 8 was the plan's pick of `{5, 8, 12, 16}` —
-/// big enough to hide ONNX per-call overhead inside one tree while
-/// keeping seq-length padding cost reasonable.
-pub const DEFAULT_TARGET_BATCH: usize = 8;
+/// Default leaves-per-`evaluate_batch` target for the lockstep driver.
+/// Set to `num_determinizations` (5) — the 2026-04-27 sweep
+/// (`{5, 8, 12, 16}` at T=32, see [self-play-profile.md]) showed this is
+/// the per-game-wall optimum on the 7950X / 1.63M-param transformer; per-
+/// call ONNX cost rises super-linearly past `num_dets` because the CPU
+/// is already saturated by 32 concurrent batched forwards. At
+/// `target_batch == num_determinizations` the round-robin keeps every
+/// path's `in_flight` ≤ 1, so the virtual-loss term in UCB1 is dormant
+/// and the search behaves as Stage-1 cross-determinization batching.
+/// Raising past `num_dets` is parked behind a model-size revisit
+/// (d_model ≥ 256 would tip the GEMM regime to genuinely batch-bound).
+pub const DEFAULT_TARGET_BATCH: usize = 5;
 
 /// Virtual-loss weight (Session 7.4c stage 2). Each in-flight leaf along
 /// a path subtracts this from `value_sums[acting]` during UCB1 selection,

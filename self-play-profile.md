@@ -1,4 +1,39 @@
-# Self-play profiling — 2026-04-24
+# Self-play profiling
+
+## Current optimum (2026-04-27, post Session 7.4c)
+
+| knob | value | source |
+|---|---|---|
+| `self_play.num_threads` | **32** | Stage-1 B=5 thread sweep (T=4..32 → T=32 wins at 4.770 s/game) |
+| `mcts.num_determinizations` | **5** | Section 4 baseline (unchanged) |
+| `mcts.sims_per_determinization` | **100** | 7.3c-validated |
+| `mcts.target_batch` | **5** = `num_determinizations` | Stage-2 sweep (B∈{5,8,12,16}) — tb=5 is the bowl bottom |
+| `self_play.use_int8` | **false** | 7.4b INT8 quality gate failed; deferred levers parked |
+
+This config gives **4.696 s/game** on the iter_000014 model (5P7C, flat 5×100 MCTS) — **1.544× faster** than the B=1 T=16 7.3c reference (7.250 s/game) and the post-Session-7.4 ship target. Headline wall-clock at 118 games/iter ≈ **9.2 min/iter**.
+
+The remaining 7.5-headroom levers, in expected-ROI order: (1) raise `num_determinizations` (cross-det batching free, needs a quality study), (2) revisit 7.4b INT8 with the deferred levers (S8S8 / entropy calibration / sensitivity-driven body exclusions; ~1.4× on top), (3) `target_batch > num_dets` only if the model widens to d_model ≥ 256.
+
+Reproduce the current optimum:
+
+```bash
+LIBTORCH_DIR="$(find target/release/build -maxdepth 6 -type d -name lib -path '*/libtorch/libtorch/lib' | head -n1)"
+LD_LIBRARY_PATH="$LIBTORCH_DIR:${LD_LIBRARY_PATH:-}" \
+RUST_LOG=info \
+./target/release/blobmaster-train profile \
+  --model checkpoints/7.3c-run/iter_000014/model.onnx \
+  --config blob-train/config.sample.toml \
+  --games-per-thread 5 \
+  --num-threads 32 \
+  --num-players 5 \
+  --cards-dealt 7
+```
+
+Detailed run history follows.
+
+---
+
+## Initial profiling — 2026-04-24
 
 ## Setup
 
@@ -197,4 +232,33 @@ Script: [scripts/thread-sweep-b5.sh](scripts/thread-sweep-b5.sh) (T=4..16) and t
 - The curve from T=20 → T=24 is essentially flat (1.384× → 1.395×, +0.8%); T=32 picks up a real but modest +9% on top via SMT. Throughput is converging, not still climbing.
 - **The 1.52× ceiling falls short of the stage-1 pass condition (≥1.7×).** Per the development-plan branch, stage-2 (virtual loss within one tree) is the next lever — `target_batch ∈ {5, 8, 12, 16}` raises B further per call without adding more dets. With INT8 also held back ([Session 7.4b](#follow-ups-2026-04-26--int8-quantization-session-74b) above), getting 7.5's wall-clock budget under control likely needs both stage-2 and a revisit of INT8 with the deferred levers (S8S8 / entropy calibration / sensitivity-driven exclusions).
 - Visit-count parity vs the serial driver is verified by `mcts::tests::lockstep_search_matches_serial_per_det`; ORT batched-vs-serial parity by `onnx::tests::evaluate_batch_matches_serial`. Numbers above are pure throughput, not a quality regression.
+
+## Follow-ups (2026-04-27) — `target_batch` sweep (Session 7.4c stage-2)
+
+After landing the within-tree virtual-loss driver in [blob-engine/src/mcts.rs](blob-engine/src/mcts.rs) (the `target_batch` knob raises in-flight leaves per `evaluate_batch` past `num_determinizations` by queueing concurrent descents inside one det's tree, with `in_flight: u16` decorating each path's UCB1 selection), swept `target_batch ∈ {5, 8, 12, 16}` at **T=32** (the Stage-1 B=5 optimum) plus a **T=16 / target_batch=8** row to re-confirm SMT direction at Stage 2. Same workload as the prior Stage-1 sweep: 5 games per thread, fixed 5P7C, `iter_000014/model.onnx`, MCTS at flat 5×100. Speedup column compares per-game wall against the B=1 T=16 baseline (7.250 s/game from [logs/thread-sweep-2026-04-24/results.csv](logs/thread-sweep-2026-04-24/results.csv)).
+
+Script: [scripts/target-batch-sweep.sh](scripts/target-batch-sweep.sh); per-config TOMLs and raw logs in [logs/target-batch-sweep-2026-04-27/](logs/target-batch-sweep-2026-04-27/).
+
+| threads | target_batch | total games | wall (s) | per-game wall (s) | per-decision (ms) | onnx_inference avg (µs) | speedup vs B=1 16T |
+|--------:|-------------:|------------:|---------:|------------------:|------------------:|------------------------:|-------------------:|
+| **32** | **5** | **160** | **751.3** | **4.696** | **395.4** | **8,378** | **1.544×** |
+| 32 | 8 | 160 | 766.8 | 4.793 | 403.6 | 13,488 | 1.513× |
+| 32 | 12 | 160 | 886.8 | 5.542 | 466.7 | 22,200 | 1.308× |
+| 32 | 16 | 160 | 1,109.1 | 6.932 | 583.8 | 36,312 | 1.046× |
+| 16 | 8 | 80 | 423.1 | 5.289 | 222.7 | 7,328 | 1.371× |
+
+**Stage-2 pass condition (≥2.5× per-iter speedup) FAILS — by a wide margin.** The best config is T=32 / target_batch=5 at 1.544×, only +1.6% over Stage-1's T=32 row (4.770 s/game, 1.520×) and below typical run-to-run noise. Notably, **`target_batch = 5 = num_determinizations` is the *degenerate* case for virtual loss**: round-robin already lands one descent on each det per outer step, so `in_flight` along any path stays at 1 and the VL bias term has no neighbouring sibling to redirect to. The "best" stage-2 config is functionally Stage 1, re-measured.
+
+Going past `num_determinizations` actively hurts throughput on this hardware:
+
+- **Per-call ONNX cost rises super-linearly with `target_batch`.** From tb=5 → 16 the batch grows 3.2×, but `onnx_inference avg` grows 4.3× (8.38 → 36.31 ms). At T=32 the CPU is already saturated by 32 concurrent batched forwards; padding more in-flight leaves into each call stretches per-call latency without raising aggregate throughput. The fatter-GEMM/SMT-friendly story from Stage 1's T=20→32 curve does not generalize when the GEMM grows along the *batch* dimension instead of the *thread* dimension — at tb>5 each thread's working set spills more L1/L2 weight cache between phases.
+- **Virtual loss bias is a real-but-tiny tax.** tb=8 (3 in-flight leaves redirected by VL out of 8) regresses 2.0% vs tb=5 (1.513× vs 1.544×). VL pushes concurrent descents to lower-prior siblings; those leaves expand a slightly less-on-policy slice of the tree, the search visits the same nodes at a slightly worse MCTS-quality-per-sim ratio, and you pay both the GEMM-batch tax *and* the search-quality tax. tb=12 / tb=16 amplify both.
+- **SMT direction unchanged at Stage 2.** T=16 vs T=32 at tb=8: 5.29 → 4.79 s/game, T=32 is +10% faster. Stage 1's "second hyperthread fills GEMM memory-stall slots" finding holds — Stage-2 in-flight pressure does not flip the sign.
+
+**Recommendation: ship Stage 1 only. Lower the default `target_batch` from 8 → `num_determinizations` (5) and treat `target_batch > num_determinizations` as a future revisit, not a 7.5 input.** The within-tree VL plumbing is correct (visit-count budget invariant pinned by `lockstep_search_root_visit_count_matches_sim_budget`, in-flight clears pinned by `lockstep_search_clears_in_flight_at_target_batch_above_num_dets`, serial parity at tb=1 by `target_batch_one_matches_serial_per_det`), but at d_model=128 / 5 dets / batch ≤16 the cost model doesn't favour any value past `num_determinizations`. The eval-win-rate gate (5-iter parity) wasn't run because the speed gate failed — no need to spend training compute on a config we won't ship.
+
+For 7.5 wall-clock headroom the remaining levers, in order of expected ROI:
+- **Bigger `num_determinizations`** (e.g. 8). Raises the "free" cross-tree batch ceiling, doesn't add VL bias, costs more per-decision wall but more sims-per-decision is a quality win — needs a separate quality study.
+- **INT8 revisit** (Session 7.4b deferred levers: S8S8 activations, entropy calibration, sensitivity-driven body exclusions). 1.40× on top of Stage 1's 1.52× → 2.13× combined, a real path to the original 7.4 throughput target.
+- **`target_batch > num_dets`** stays parked unless the model grows (d_model ≥ 256 would tip the GEMM regime to actually-batch-bound, where the math finally works).
 
