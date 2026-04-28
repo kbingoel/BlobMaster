@@ -1,0 +1,2 @@
+iteration,opponent,win_rate,win_rate_lower95,win_rate_upper95,score_differential,bid_success_rate_current,bid_success_rate_opponent,policy_loss,value_loss,visit_entropy,kl_divergence,eval_games_played,eval_inconclusive
+5,iter_000000,0.5416666666666666,0.4710611141973901,0.6106376236050993,4.630208333333333,0.3743872549019608,0.34650735294117646,0.43445904535939034,0.31522499881826427,0.4777830897460254,0.04484710320582465,192,true

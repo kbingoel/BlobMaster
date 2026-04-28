@@ -31,7 +31,7 @@ use crate::muon::Muon;
 use crate::self_play::{DecisionStat, TrainingExample};
 use crate::train::{
     build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint,
-    set_schedule_lr, value_mse, LrSchedule, Phase, TrainBatch, VALUE_LOSS_COEF,
+    set_schedule_lr, value_mse, LrSchedule, Phase, TrainBatch, MUON_GROUP, VALUE_LOSS_COEF,
     GRAD_CLIP_MAX_NORM,
 };
 
@@ -48,6 +48,10 @@ pub const EVAL_CHECKPOINT_EVERY: u64 = 5;
 
 fn default_total_iterations() -> u64 {
     1
+}
+
+fn default_enable_muon() -> bool {
+    true
 }
 
 /// Configuration for one training run.
@@ -70,6 +74,15 @@ pub struct TrainingLoopConfig {
     /// tag (`"cpu"` / `"cuda"` / `"cuda:N"` / `"mps"`).
     #[serde(with = "device_serde")]
     pub device: Device,
+    /// Session 7.4d: when `false`, the Muon optimizer's `step` is skipped
+    /// and AdamW updates the [`MUON_GROUP`] params at the regular schedule
+    /// LR (instead of the Muon-on default of zero). Used for Muon vs no-Muon
+    /// trajectory comparisons. Defaults to `true` so existing configs keep
+    /// the 7.4d Muon behaviour without an explicit knob.
+    ///
+    /// [`MUON_GROUP`]: crate::train::MUON_GROUP
+    #[serde(default = "default_enable_muon")]
+    pub enable_muon: bool,
 }
 
 mod device_serde {
@@ -120,6 +133,7 @@ impl Default for TrainingLoopConfig {
             epoch_early_stop_rel: 0.005,
             total_iterations: 1,
             device: Device::Cpu,
+            enable_muon: true,
         }
     }
 }
@@ -432,12 +446,18 @@ fn aggregate_grad_norms(vs: &nn::VarStore) -> Vec<(String, f64)> {
 /// params and the order of `muon.step` vs `optimizer.step` is not
 /// load-bearing — we run Muon first so that any future logging hook can
 /// inspect post-Muon weights before AdamW touches the rest.
+///
+/// When `enable_muon` is `false`, `muon.step` is skipped; the caller is
+/// responsible for having set the `MUON_GROUP` AdamW LR to a non-zero
+/// value beforehand (see `TrainingLoop::train_one_step`) so AdamW updates
+/// the transformer matrices itself. This is the Session 7.4d revert path.
 fn train_step_with_grad_norms(
     model: &BlobNet,
     vs: &nn::VarStore,
     optimizer: &mut nn::Optimizer,
     muon: &mut Muon,
     muon_lr: f64,
+    enable_muon: bool,
     batch: &TrainBatch,
 ) -> (f64, f64, f64, Vec<(String, f64)>) {
     let (policy_probs, value_pred) = match batch.phase {
@@ -452,7 +472,9 @@ fn train_step_with_grad_norms(
     total.backward();
     let grad_norms = aggregate_grad_norms(vs);
     optimizer.clip_grad_norm(GRAD_CLIP_MAX_NORM);
-    muon.step(muon_lr);
+    if enable_muon {
+        muon.step(muon_lr);
+    }
     optimizer.step();
 
     (
@@ -535,6 +557,13 @@ impl TrainingLoop {
         }
         let lr = self.lr_schedule.lr(self.iteration, self.global_step);
         set_schedule_lr(&mut self.optimizer, lr);
+        // Session 7.4d revert path: when Muon is disabled, AdamW must update
+        // the Muon param group itself. `set_schedule_lr` always pins
+        // MUON_GROUP to 0 (the Muon-on default); override here so the
+        // transformer matrices receive the same LR as the default group.
+        if !self.cfg.enable_muon {
+            self.optimizer.set_lr_group(MUON_GROUP, lr);
+        }
         accumulators.last_lr = lr;
 
         let (bid, play) = self.buffer.sample_batch(self.cfg.batch_size, rng);
@@ -546,6 +575,7 @@ impl TrainingLoop {
                 &mut self.optimizer,
                 &mut self.muon,
                 lr,
+                self.cfg.enable_muon,
                 &tb,
             );
             accumulators.add_bid(&self.model, &tb, pp, vl);
@@ -559,6 +589,7 @@ impl TrainingLoop {
                 &mut self.optimizer,
                 &mut self.muon,
                 lr,
+                self.cfg.enable_muon,
                 &tb,
             );
             accumulators.add_play(&self.model, &tb, pp, vl);
@@ -1021,6 +1052,7 @@ mod tests {
             epoch_early_stop_rel: -1.0, // never stop early
             total_iterations: 1,
             device: Device::Cpu,
+            enable_muon: true,
         };
         let mut tl = TrainingLoop::new(cfg);
         tl.optimizer.set_lr(3e-3);

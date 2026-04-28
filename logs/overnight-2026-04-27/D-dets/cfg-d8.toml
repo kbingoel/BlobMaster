@@ -1,0 +1,8 @@
+[mcts]
+c_puct = 1.5
+num_determinizations = 8
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 8

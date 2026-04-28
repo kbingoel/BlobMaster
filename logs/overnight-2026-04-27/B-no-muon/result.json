@@ -1,0 +1,9 @@
+{
+  "block": "B",
+  "status": "ok",
+  "elapsed_s": 8251,
+  "iter5_win_rate": 0.5416666666666666,
+  "iter5_lower95": 0.4710611141973901,
+  "iter10_win_rate": null,
+  "iter10_lower95": null
+}
