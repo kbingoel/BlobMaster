@@ -109,4 +109,81 @@ mod tests {
         let s = cfg.to_toml_string().unwrap();
         assert!(s.contains("device = \"cpu\""), "got:\n{s}");
     }
+
+    /// Session 7.4d: the optional `temperature_schedule` block must
+    /// parse out of the snake-case `kind = "hard_step"` form documented
+    /// in `config.sample.toml`, and `MctsConfig::temperature_at` must
+    /// reflect the parsed values. Also verifies that omitting the block
+    /// leaves the schedule as `None` (constant `temperature` regime).
+    #[test]
+    fn temperature_schedule_round_trips_through_toml() {
+        use blob_engine::mcts::TemperatureSchedule;
+
+        let toml = r#"
+            [training]
+            checkpoint_dir = "checkpoints"
+            buffer_capacity = 500000
+            batch_size = 512
+            epochs_per_iteration = 10
+            epoch_early_stop_rel = 0.005
+            total_iterations = 15
+            device = "cpu"
+
+            [self_play]
+            num_games = 4
+            num_threads = 1
+            iteration = 0
+            show_progress = false
+
+            [mcts]
+            c_puct = 1.5
+            num_determinizations = 5
+            sims_per_determinization = 100
+            min_sims_floor = 60
+            temperature = 1.0
+            arena_capacity = 4096
+            target_batch = 5
+
+            [mcts.temperature_schedule]
+            kind = "hard_step"
+            early = 1.0
+            late = 0.1
+            switch_at = 15
+
+            [eval]
+            eval_games = 192
+            eval_interval = 5
+            eval_lookback = 20
+            bid_success_promotion_delta = 0.02
+        "#;
+
+        let cfg = TrainingConfig::from_toml_str(toml).expect("parse with schedule");
+        match cfg.mcts.temperature_schedule {
+            Some(TemperatureSchedule::HardStep {
+                early,
+                late,
+                switch_at,
+            }) => {
+                assert!((early - 1.0).abs() < 1e-6);
+                assert!((late - 0.1).abs() < 1e-6);
+                assert_eq!(switch_at, 15);
+            }
+            None => panic!("expected HardStep schedule, got None"),
+        }
+        assert!((cfg.mcts.temperature_at(0) - 1.0).abs() < 1e-6);
+        assert!((cfg.mcts.temperature_at(15) - 0.1).abs() < 1e-6);
+
+        // Round-trip preserves the schedule.
+        let serialized = cfg.to_toml_string().unwrap();
+        let back = TrainingConfig::from_toml_str(&serialized).expect("re-parse");
+        assert!(matches!(
+            back.mcts.temperature_schedule,
+            Some(TemperatureSchedule::HardStep { switch_at: 15, .. })
+        ));
+
+        // Default config has no schedule and falls back to constant.
+        let default_cfg = TrainingConfig::default();
+        assert!(default_cfg.mcts.temperature_schedule.is_none());
+        assert!((default_cfg.mcts.temperature_at(50) - default_cfg.mcts.temperature).abs() < 1e-6);
+    }
 }

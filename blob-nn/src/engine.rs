@@ -234,6 +234,7 @@ mod tests {
             sims_per_determinization: 1,
             min_sims_floor: 1,
             temperature: 1.0,
+            temperature_schedule: None,
             arena_capacity: blob_engine::mcts::DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
         };

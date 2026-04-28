@@ -131,6 +131,10 @@ fn play_eval_game_until<R: Rng + ?Sized>(
         rounds: SmallVec::new(),
     };
 
+    // Session 7.4d: same global decision counter as self-play. Eval
+    // honours `mcts_cfg.temperature_schedule`, so the eval rollouts match
+    // the τ regime each agent saw at training time.
+    let mut decision_index: usize = 0;
     while !is_game_over(&state) {
         if abort.load(Ordering::Relaxed) {
             return None;
@@ -140,7 +144,8 @@ fn play_eval_game_until<R: Rng + ?Sized>(
                 let seat = state.current_player as usize;
                 let eval = seats.0[seat].expect("seat evaluator for active seat");
                 let wrapper = DynEval(eval);
-                let result = mcts_search(&state, &wrapper, mcts_cfg, rng);
+                let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
+                decision_index += 1;
                 let action = sample_from_policy(&result.policy, rng) as u8;
                 apply_bid(&mut state, action);
             }
@@ -150,7 +155,8 @@ fn play_eval_game_until<R: Rng + ?Sized>(
                 let hand_cards: Vec<u8> =
                     Hand::new(state.hands[seat]).iter().map(|c| c.index()).collect();
                 let wrapper = DynEval(eval);
-                let result = mcts_search(&state, &wrapper, mcts_cfg, rng);
+                let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
+                decision_index += 1;
                 let pos = sample_from_policy(&result.policy, rng);
                 let card_idx = hand_cards[pos];
                 apply_play(&mut state, card_idx);
@@ -662,6 +668,7 @@ mod tests {
             sims_per_determinization: 1,
             min_sims_floor: 1,
             temperature: 1.0,
+            temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
         }

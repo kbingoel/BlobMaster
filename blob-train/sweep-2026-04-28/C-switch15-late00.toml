@@ -1,0 +1,46 @@
+# Session 7.4d temperature-schedule sweep — ARM C: full-greedy late.
+# Mixed-player. switch_at=15 (same as arm A) but late τ=0.0 → pure argmax
+# after decision 15. Late-game training targets become strict one-hot,
+# which sharpens the policy-head commit signal at exactly the positions
+# where MCTS visit counts are highest-signal. Compares against arm A to
+# test whether the residual stochasticity at τ=0.1 is helpful (buffer
+# diversity) or noisy (training-target ambiguity).
+
+[training]
+checkpoint_dir = "checkpoints/sweep-2026-04-28-C"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 16
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+
+[mcts.temperature_schedule]
+kind = "hard_step"
+early = 1.0
+late = 0.0
+switch_at = 15
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32

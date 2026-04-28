@@ -1,0 +1,46 @@
+# Session 7.4d temperature-schedule sweep — ANCHOR arm (no schedule).
+# Mixed-player distribution. 16 iters processed (iters 0..15), so in-loop
+# eval rows fire at iter 5, 10, 15 (eval triggers when
+# `iter > anchor_iter && iter % eval_interval == 0`; AGENTS.md off-by-one
+# trap: `total_iterations` is the *count*, not the absolute target — to
+# get an eval row at iter K, set `total_iterations = K + 1`).
+#
+# Saved-on-disk after the run: iter_000015. That checkpoint feeds the
+# overnight resume (scripts/sweep-2026-04-28-resume.sh) if this arm wins.
+
+[training]
+checkpoint_dir = "checkpoints/sweep-2026-04-28-anchor"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 16
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+# Mixed Section-5.2 distribution (n=4 10%, n=5 60%, n=6 25%, n=7 5%) by
+# omitting `fixed_player_count` — matches the planned 7.5 stack.
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+# No [mcts.temperature_schedule] block: the constant `temperature = 1.0`
+# applies to every decision. This is the control arm.
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32

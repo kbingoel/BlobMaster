@@ -47,6 +47,21 @@ num_determinizations = 5
 sims_per_determinization = 100
 min_sims_floor = 60
 temperature = 1.0
+# Session 7.4d: optional per-decision temperature schedule. When the
+# `[mcts.temperature_schedule]` block is present it overrides the constant
+# `temperature` above; remove or comment out the block to fall back to the
+# constant. Only a hard-step schedule is implemented (AlphaZero-style):
+# `early` τ for `decision_index < switch_at`, then `late` τ thereafter.
+# `decision_index` is a global counter — one increment per `mcts_search`
+# call across all seats, both bid and play. For 5P7C ≈ 225 decisions/game,
+# so `switch_at = 15` matches the dev-plan §7.4d default proposal (first
+# ~7% exploratory, rest near-greedy). Late τ=0.1 keeps a sliver of
+# stochasticity; set to 0.0 for pure argmax.
+# [mcts.temperature_schedule]
+# kind = "hard_step"
+# early = 1.0
+# late = 0.1
+# switch_at = 15
 arena_capacity = 4096
 # Session 7.4c stage 2: leaves per batched ONNX call. Round-robin filled
 # across `num_determinizations` trees, with virtual loss redirecting

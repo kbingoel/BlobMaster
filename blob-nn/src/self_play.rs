@@ -102,8 +102,11 @@ pub struct DecisionStat {
 /// Play one complete game and return the decision-point examples.
 ///
 /// MCTS is driven by `eval` + `cfg`; actions are sampled from the MCTS
-/// policy (temperature is already applied inside `mcts_search`). Value
-/// targets are computed once the game ends — see `backfill_values`.
+/// policy (temperature is already applied inside `mcts_search`). The
+/// `decision_index` argument advances once per `mcts_search` call so
+/// `cfg.temperature_schedule` (Session 7.4d) can sharpen τ as the game
+/// progresses. Value targets are computed once the game ends — see
+/// `backfill_values`.
 pub fn play_one_game<E, R>(
     num_players: u8,
     start_cards: u8,
@@ -139,13 +142,20 @@ where
 
         let mut examples: Vec<TrainingExample> = Vec::new();
         let mut stats: Vec<DecisionStat> = Vec::new();
+        // Session 7.4d: global decision counter, one increment per
+        // `mcts_search` call. Drives `cfg.temperature_schedule`. Counts
+        // bids and plays of every seat (forced moves do not call
+        // `mcts_search` here, so they are not counted — but `mcts_search`
+        // itself short-circuits forced moves regardless of τ).
+        let mut decision_index: usize = 0;
 
         while !is_game_over(&state) {
             match state.phase() {
                 GamePhase::Bidding => {
                     let num_legal = legal_bids(&state).count_ones() as usize;
                     let (dets, sims) = adaptive_budget(num_legal, cfg);
-                    let result = mcts_search(&state, eval, cfg, rng);
+                    let result = mcts_search(&state, eval, cfg, rng, decision_index);
+                    decision_index += 1;
                     debug_assert_eq!(result.policy.len(), MAX_BID_ACTIONS);
                     let perspective = state.current_player;
                     let sparse = dense_to_sparse(&result.policy);
@@ -174,7 +184,8 @@ where
                         .collect();
                     let num_legal = legal_plays(&state).count_ones() as usize;
                     let (dets, sims) = adaptive_budget(num_legal, cfg);
-                    let result = mcts_search(&state, eval, cfg, rng);
+                    let result = mcts_search(&state, eval, cfg, rng, decision_index);
+                    decision_index += 1;
                     debug_assert_eq!(result.policy.len(), hand_cards.len());
                     let sparse = dense_to_sparse(&result.policy);
                     let snapshot = state;
@@ -256,6 +267,7 @@ mod tests {
             sims_per_determinization: 1,
             min_sims_floor: 1,
             temperature: 1.0,
+            temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
         }
