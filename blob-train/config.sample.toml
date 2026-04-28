@@ -15,6 +15,14 @@ epochs_per_iteration = 10
 epoch_early_stop_rel = 0.005
 total_iterations = 15
 device = "cuda:0"
+# Session 7.4d / overnight 2026-04-28: Muon vs AdamW-only converged to
+# identical eval strength by iter 9 on this 1.63M / d_model=128 model
+# (paired iter-9 evals: 117/192 wins on both, see
+# logs/overnight-2026-04-27/SUMMARY.md). Defaulted off; the Rust default
+# in [TrainingLoopConfig] also sets this to false, so omitting the knob
+# is equivalent. Set to true only for architecture stretches (≥100M params)
+# where the published Muon literature predicts a measurable win.
+enable_muon = false
 
 [self_play]
 # 118 × ~680 decisions ≈ 80K examples/iter (matches Section 5/6 downstream
