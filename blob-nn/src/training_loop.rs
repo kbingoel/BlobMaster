@@ -51,7 +51,13 @@ fn default_total_iterations() -> u64 {
 }
 
 fn default_enable_muon() -> bool {
-    true
+    // 2026-04-28 paired 10-iter validation showed Muon converges to
+    // identical strength as AdamW-only at 1.63M / d_model=128 (overnight
+    // battery, [logs/overnight-2026-04-27/SUMMARY.md]). Default off; the
+    // plumbing remains for future architecture stretches where Muon's
+    // singular-value-balancing behaviour starts to pay (≥100M params per
+    // the published Muon literature).
+    false
 }
 
 /// Configuration for one training run.
@@ -133,7 +139,7 @@ impl Default for TrainingLoopConfig {
             epoch_early_stop_rel: 0.005,
             total_iterations: 1,
             device: Device::Cpu,
-            enable_muon: true,
+            enable_muon: false,
         }
     }
 }
