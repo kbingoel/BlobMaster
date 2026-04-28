@@ -65,7 +65,7 @@ fn bench_mcts_100_sims(c: &mut Criterion) {
     };
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
     c.bench_function("mcts_1det_100sims", |b| {
-        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg, &mut rng)))
+        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg, &mut rng, 0)))
     });
 
     let cfg_full = MctsConfig {
@@ -75,7 +75,7 @@ fn bench_mcts_100_sims(c: &mut Criterion) {
         ..MctsConfig::default()
     };
     c.bench_function("mcts_full_move_5x100", |b| {
-        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg_full, &mut rng)))
+        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg_full, &mut rng, 0)))
     });
 }
 

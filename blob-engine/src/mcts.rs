@@ -658,6 +658,52 @@ fn default_target_batch() -> usize {
     DEFAULT_TARGET_BATCH
 }
 
+/// Per-decision temperature schedule (Session 7.4d). When set, the
+/// effective τ used by `mcts_search` to convert root visit counts into
+/// `MctsResult.policy` depends on the global decision index within the
+/// game (one increment per `mcts_search` call, covering both bid and
+/// play decisions of every seat).
+///
+/// Note: `MctsResult.policy` is fused — the same vector serves both the
+/// training target and the action-sampling distribution in self-play.
+/// At τ → 0 the late-game training target collapses to one-hot on the
+/// argmax-visit action, which is intentional: late-game positions are
+/// where MCTS visit counts are highest-signal and we want the policy
+/// head to commit. If you need a τ=1 training target with τ→0 sampling
+/// (canonical AlphaZero), split `MctsResult` into separate `policy_target`
+/// and `policy_sampling` fields — out of scope for 7.4d.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TemperatureSchedule {
+    /// τ = `early` for `decision_index < switch_at`, otherwise `late`.
+    /// Dev-plan §7.4d default proposal: `early = 1.0`, `late = 0.1`,
+    /// `switch_at = 15`. AlphaZero-style hard step.
+    HardStep {
+        early: f32,
+        late: f32,
+        switch_at: usize,
+    },
+}
+
+impl TemperatureSchedule {
+    /// Resolve the effective τ for a given global decision index.
+    pub fn temperature_at(&self, decision_index: usize) -> f32 {
+        match *self {
+            TemperatureSchedule::HardStep {
+                early,
+                late,
+                switch_at,
+            } => {
+                if decision_index < switch_at {
+                    early
+                } else {
+                    late
+                }
+            }
+        }
+    }
+}
+
 /// Search-time configuration threaded through `mcts_search`.
 ///
 /// Defaults match the plan's target budget (`5 × 100 = 500 sims`) with
@@ -675,7 +721,17 @@ pub struct MctsConfig {
     /// Python post-mortem showed that starving MCTS produces no
     /// learning signal — this floor blocks that failure mode.
     pub min_sims_floor: u32,
+    /// Constant temperature, used when `temperature_schedule` is `None`.
+    /// Pre-7.4d call sites continue to read this directly via
+    /// `MctsConfig::temperature_at`.
     pub temperature: f32,
+    /// Optional per-decision schedule (Session 7.4d). When `Some`,
+    /// overrides `temperature` and `mcts_search` resolves τ from the
+    /// schedule using the `decision_index` argument.
+    /// `#[serde(default)]` so existing TOMLs without this field keep
+    /// working.
+    #[serde(default)]
+    pub temperature_schedule: Option<TemperatureSchedule>,
     pub arena_capacity: usize,
     /// Session 7.4c stage 2: target leaves per batched `evaluate` call.
     /// The lockstep driver fills each batch round-robin from all dets,
@@ -690,6 +746,17 @@ pub struct MctsConfig {
     pub target_batch: usize,
 }
 
+impl MctsConfig {
+    /// Effective τ at a given decision index. Falls back to the constant
+    /// `temperature` field when no schedule is configured.
+    pub fn temperature_at(&self, decision_index: usize) -> f32 {
+        match self.temperature_schedule {
+            Some(s) => s.temperature_at(decision_index),
+            None => self.temperature,
+        }
+    }
+}
+
 impl Default for MctsConfig {
     fn default() -> Self {
         Self {
@@ -698,6 +765,7 @@ impl Default for MctsConfig {
             sims_per_determinization: 100,
             min_sims_floor: 60,
             temperature: 1.0,
+            temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: DEFAULT_TARGET_BATCH,
         }
@@ -802,6 +870,7 @@ pub fn mcts_search<E, R>(
     eval: &E,
     cfg: &MctsConfig,
     rng: &mut R,
+    decision_index: usize,
 ) -> MctsResult
 where
     E: Evaluator + ?Sized,
@@ -922,10 +991,11 @@ where
         }
 
         // Temperature-applied policy over aggregated visits.
+        let tau = cfg.temperature_at(decision_index);
         let mut policy = vec![0.0f32; policy_len];
         let sum_visits: u64 = agg_visits.iter().sum();
         if sum_visits > 0 {
-            if cfg.temperature < 1e-3 {
+            if tau < 1e-3 {
                 let (best_i, _) = agg_visits
                     .iter()
                     .enumerate()
@@ -933,7 +1003,7 @@ where
                     .unwrap();
                 policy[best_i] = 1.0;
             } else {
-                let inv_tau = 1.0 / cfg.temperature;
+                let inv_tau = 1.0 / tau;
                 let weights: Vec<f32> = agg_visits
                     .iter()
                     .map(|&v| (v as f32).powf(inv_tau))
@@ -1292,7 +1362,7 @@ mod tests {
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
         let cfg = MctsConfig::default();
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
         assert_eq!(r.policy.len(), NUM_BIDS);
         assert!((r.policy[0] - 1.0).abs() < 1e-6);
         assert_eq!(r.total_visits, 0);
@@ -1313,7 +1383,7 @@ mod tests {
             min_sims_floor: 60,
             ..MctsConfig::default()
         };
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
         assert_eq!(r.policy.len(), NUM_BIDS);
         let sum: f32 = r.policy.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
@@ -1347,7 +1417,7 @@ mod tests {
             min_sims_floor: 60,
             ..MctsConfig::default()
         };
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng);
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
         assert_eq!(r.policy.len(), enc.hand_card_indices.len());
         let sum: f32 = r.policy.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
@@ -1360,6 +1430,76 @@ mod tests {
                 assert_eq!(r.policy[pos], 0.0, "illegal pos {pos} has nonzero policy");
             }
         }
+    }
+
+    #[test]
+    fn temperature_schedule_hard_step_resolves_correctly() {
+        let sched = TemperatureSchedule::HardStep {
+            early: 1.0,
+            late: 0.1,
+            switch_at: 15,
+        };
+        assert_eq!(sched.temperature_at(0), 1.0);
+        assert_eq!(sched.temperature_at(14), 1.0);
+        assert_eq!(sched.temperature_at(15), 0.1);
+        assert_eq!(sched.temperature_at(100), 0.1);
+
+        // MctsConfig falls back to constant temperature when schedule is None.
+        let cfg = MctsConfig {
+            temperature: 0.5,
+            temperature_schedule: None,
+            ..MctsConfig::default()
+        };
+        assert_eq!(cfg.temperature_at(0), 0.5);
+        assert_eq!(cfg.temperature_at(50), 0.5);
+
+        let cfg = MctsConfig {
+            temperature: 1.0,
+            temperature_schedule: Some(sched),
+            ..MctsConfig::default()
+        };
+        assert_eq!(cfg.temperature_at(0), 1.0);
+        assert_eq!(cfg.temperature_at(15), 0.1);
+    }
+
+    /// Late-game τ→0 with a hard-step schedule must collapse the policy to
+    /// one-hot on the argmax-visit action; early-game τ=1 must spread mass
+    /// across all visited children. Same state, same seed, two different
+    /// `decision_index` arguments — verifies the schedule actually wires
+    /// through `mcts_search`.
+    #[test]
+    fn mcts_search_honors_temperature_schedule() {
+        let s = playing_state(123);
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 60,
+            min_sims_floor: 60,
+            temperature: 1.0,
+            temperature_schedule: Some(TemperatureSchedule::HardStep {
+                early: 1.0,
+                late: 0.0,
+                switch_at: 15,
+            }),
+            ..MctsConfig::default()
+        };
+
+        let mut rng_a = Xoshiro256PlusPlus::seed_from_u64(7);
+        let r_early = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng_a, 0);
+        let mut rng_b = Xoshiro256PlusPlus::seed_from_u64(7);
+        let r_late = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng_b, 50);
+
+        // Early: τ=1 → at least two non-zero entries (some spread).
+        let nonzero_early = r_early.policy.iter().filter(|&&p| p > 0.0).count();
+        assert!(
+            nonzero_early >= 2,
+            "early τ=1 should spread mass; nonzero={nonzero_early}"
+        );
+
+        // Late: τ→0 → exactly one entry == 1.0, rest == 0.0.
+        let max_late = r_late.policy.iter().cloned().fold(0.0f32, f32::max);
+        assert!((max_late - 1.0).abs() < 1e-6, "late argmax mass={max_late}");
+        let nonzero_late = r_late.policy.iter().filter(|&&p| p > 0.0).count();
+        assert_eq!(nonzero_late, 1, "late τ→0 must be one-hot");
     }
 
     #[test]
