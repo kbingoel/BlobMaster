@@ -1,0 +1,31 @@
+[training]
+checkpoint_dir = "ignored"
+buffer_capacity = 1
+batch_size = 1
+epochs_per_iteration = 1
+epoch_early_stop_rel = 0.0
+total_iterations = 1
+device = "cpu"
+
+[self_play]
+num_games = 1
+num_threads = 1
+iteration = 0
+show_progress = false
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32

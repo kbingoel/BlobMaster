@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project State
 
-The Rust rewrite is well underway. Sections 1–6 of [development-plan.md](development-plan.md) (game engine, encoder, transformer, MCTS, training, evaluation) are complete. Section 7 (training) is at **Session 7.4c stage 2** as of 2026-04-27 — Stage 2 (within-tree virtual-loss batching) is implemented but the ≥2.5× speed gate failed; ship config is Stage 1 only. Section 7.5 (100-iter mixed-player run) and Section 8 (fine-tuning) are next. See [development-plan.md](development-plan.md) for session-by-session status and [self-play-profile.md](self-play-profile.md) for performance baselines.
+The Rust rewrite is well underway. Sections 1–6 of [development-plan.md](development-plan.md) (game engine, encoder, transformer, MCTS, training, evaluation) are complete. Section 7 (training) is at **Session 7.4 closed** as of 2026-04-28 — the 2026-04-27 overnight battery ruled out the three remaining 7.4-class levers (Muon optimizer converges to AdamW-only by iter 9; INT8 fails by 5–11pp across all 10 calibration variants; `num_determinizations > 5` is flat-to-regressive). 7.5 ships with FP32 / Stage-1 batched MCTS / AdamW / `enable_muon = false` / `target_batch = num_determinizations = 5` at ~9 min/iter ⇒ ~15 h for the 100-iter mixed-player run. Section 8 (fine-tuning) is next. See [development-plan.md](development-plan.md) for session-by-session status and [self-play-profile.md](self-play-profile.md) for performance baselines.
 
 ## Planning Documents
 
@@ -82,9 +82,10 @@ Training: Ubuntu 24.04, Ryzen 9 7950X (16C/32T), RTX 4060 8GB, 128GB DDR5. Futur
 
 All long training runs go through `./target/release/blobmaster-train train ...` and need three things lined up. Skip any of them and you either get a "missing shared library" abort at startup, a silent CPU fallback, or `scripts/export_onnx.py` blowing up with `ModuleNotFoundError: torch`.
 
-- **Pinned Python venv**: `.venv/` at the repo root, pinned to `torch==2.5.1+cu124`. `scripts/export_onnx.py` is invoked as `python3` by [blob-train/src/main.rs](blob-train/src/main.rs) each iteration, so the venv must be first on `PATH` — `python3 -c "import torch"` against system Python has no torch.
-- **Downloaded libtorch**: `tch` + `download-libtorch` drops a libtorch tree under `target/<profile>/build/torch-sys-*/out/libtorch/libtorch/lib`. The `torch-sys-*` hash changes whenever `tch` rebuilds, so re-resolve the directory with `find` rather than hard-coding.
-- **CUDA preload**: without `LD_PRELOAD=libtorch_cuda.so`, libtorch loads CPU-only and the run silently falls back. Without `LD_LIBRARY_PATH=$LIBTORCH_DIR`, the binary fails to load at all.
+- **Pinned Python venv**: `.venv/` at the repo root, **Python 3.12.3** with `torch==2.5.1+cu124`, `onnxruntime==1.24.4`, `onnx==1.21.0`, `numpy==2.4.4`. System Python (`/usr/bin/python3`, also 3.12.3) has none of these — `scripts/export_onnx.py` is invoked as `python3` by [blob-train/src/main.rs](blob-train/src/main.rs) each iteration, so the venv must be first on `PATH`.
+- **Downloaded libtorch**: `tch` + `download-libtorch` drops a libtorch tree under `target/<profile>/build/torch-sys-*/out/libtorch/libtorch/lib`. The `torch-sys-*` hash changes whenever `tch` rebuilds, so re-resolve the directory with `find` rather than hard-coding. Pinned `tch = 0.20.0` (Cargo.lock); ships libtorch 2.4-class, CUDA 12.x runtime.
+- **CUDA preload**: without `LD_PRELOAD=libtorch_cuda.so`, libtorch loads CPU-only and the run silently falls back. Without `LD_LIBRARY_PATH=$LIBTORCH_DIR`, the binary fails to load at all. CUDA driver on box: 580.x; runtime carried by libtorch (12.4 per `torch.version.cuda`); `nvcc` is **not installed system-wide** — don't reach for it, the CUDA toolkit lives inside the libtorch and PyPI wheels.
+- **Do NOT let `LD_PRELOAD` bleed into Python subshells.** Tch's vendored libtorch (~2.4) has a different C++ ABI than the venv's `torch==2.5.1+cu124` wheel; preloading the tch copy into Python crashes `import torch` with `undefined symbol: ...torch::jit::Graph::toString...`. When a script needs both the Rust binary (CUDA-preloaded) and Python helpers (e.g. `scripts/export_onnx.py`, `scripts/int8_levers.py`), wrap python invocations in `( unset LD_PRELOAD; python3 ... )`. The training driver itself is fine — `blobmaster-train` invokes the venv python without inheriting LD_PRELOAD because the export call goes through `Command::new` which builds its env explicitly.
 
 Canonical launch template:
 
@@ -101,3 +102,9 @@ RUST_LOG=info \
 ```
 
 `scripts/README.md` has the same incantation; keep them in sync when re-rooting. GPU on this box is a single RTX 4060 (`cuda:0`); `nvidia-smi --query-gpu=memory.used,memory.total --format=csv` before launching if another run might be resident.
+
+## `total_iterations` off-by-one (eval cadence trap)
+
+[blob-train/src/main.rs](blob-train/src/main.rs) runs the train loop `for _ in 0..total_iterations`, processing iters `0..N-1`. Eval triggers when `iter > anchor_iter && iter % eval_interval == 0`. **Consequence: to get an eval row at "iter K", set `total_iterations = K + 1`.** With `total_iterations = 10` and `eval_interval = 5` the only eval-triggering iter inside the range is iter=5 — iter=10 is never reached, and the saved-on-disk model is `iter_000009/` (the rolling latest). The 7.3c run set `total_iterations = 15` and got eval rows at iter 5 and iter 10 because iter=10 fell inside `0..14`.
+
+When validating a planned-iter-K trajectory, either (a) set `total_iterations = K + 1` up front, or (b) finish the run as planned and call `blobmaster-train evaluate` directly on `iter_K/model.onnx` vs the anchor — `--resume`'ing for one extra iter does *not* reproduce the in-loop eval cleanly because `try_resume` sets `anchor_iter = tl.iteration`, so the next eval-trigger boundary becomes the iter *after* the resume point, not the resume point itself.

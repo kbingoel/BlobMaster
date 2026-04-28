@@ -1,18 +1,19 @@
 # Self-play profiling
 
-## Current optimum (2026-04-27, post Session 7.4c)
+## Current optimum (2026-04-28, post overnight battery, ready for 7.5)
 
 | knob | value | source |
 |---|---|---|
 | `self_play.num_threads` | **32** | Stage-1 B=5 thread sweep (T=4..32 → T=32 wins at 4.770 s/game) |
-| `mcts.num_determinizations` | **5** | Section 4 baseline (unchanged) |
+| `mcts.num_determinizations` | **5** | dets=6 within noise of dets=5, dets≥8 regresses (overnight 2026-04-28) |
 | `mcts.sims_per_determinization` | **100** | 7.3c-validated |
 | `mcts.target_batch` | **5** = `num_determinizations` | Stage-2 sweep (B∈{5,8,12,16}) — tb=5 is the bowl bottom |
-| `self_play.use_int8` | **false** | 7.4b INT8 quality gate failed; deferred levers parked |
+| `self_play.use_int8` | **false** | 7.4b U8S8 + all 10 deferred levers (overnight 2026-04-28) fail static gate |
+| `training.enable_muon` | **false** | Muon and AdamW-only converge to identical strength by iter 9 (overnight 2026-04-28) |
 
-This config gives **4.696 s/game** on the iter_000014 model (5P7C, flat 5×100 MCTS) — **1.544× faster** than the B=1 T=16 7.3c reference (7.250 s/game) and the post-Session-7.4 ship target. Headline wall-clock at 118 games/iter ≈ **9.2 min/iter**.
+This config gives **4.696 s/game** on the iter_000014 model (5P7C, flat 5×100 MCTS) — **1.544× faster** than the B=1 T=16 7.3c reference (7.250 s/game) and the post-Session-7.4 ship target. Headline wall-clock at 118 games/iter ≈ **9.2 min/iter**; 100-iter 7.5 ≈ **~15 h**.
 
-The remaining 7.5-headroom levers, in expected-ROI order: (1) raise `num_determinizations` (cross-det batching free, needs a quality study), (2) revisit 7.4b INT8 with the deferred levers (S8S8 / entropy calibration / sensitivity-driven body exclusions; ~1.4× on top), (3) `target_batch > num_dets` only if the model widens to d_model ≥ 256.
+**All 7.4-class levers are now exhausted.** The 2026-04-28 overnight battery ruled out the three remaining contingencies (bigger `num_determinizations`, INT8 deferred levers, Muon). 7.5 ships with the table above and the existing FP32 / Stage-1 batched MCTS / AdamW stack.
 
 Reproduce the current optimum:
 
@@ -261,4 +262,121 @@ For 7.5 wall-clock headroom the remaining levers, in order of expected ROI:
 - **Bigger `num_determinizations`** (e.g. 8). Raises the "free" cross-tree batch ceiling, doesn't add VL bias, costs more per-decision wall but more sims-per-decision is a quality win — needs a separate quality study.
 - **INT8 revisit** (Session 7.4b deferred levers: S8S8 activations, entropy calibration, sensitivity-driven body exclusions). 1.40× on top of Stage 1's 1.52× → 2.13× combined, a real path to the original 7.4 throughput target.
 - **`target_batch > num_dets`** stays parked unless the model grows (d_model ≥ 256 would tip the GEMM regime to actually-batch-bound, where the math finally works).
+
+## Follow-ups (2026-04-28) — overnight battery rules out the remaining 7.4 levers
+
+Six-block overnight battery the night before 7.5 launch:
+[scripts/overnight-2026-04-27.sh](scripts/overnight-2026-04-27.sh), full
+table + paired iter-9 evals in
+[logs/overnight-2026-04-27/SUMMARY.md](logs/overnight-2026-04-27/SUMMARY.md).
+Three out of three contingent levers fail; only Muon's quality status
+involved a training run.
+
+### `num_determinizations` sweep at T=32 (profile-only)
+
+Same workload as the prior B=5 / target-batch sweeps: 5 games per
+thread, fixed 5P7C, `iter_000014/model.onnx`, MCTS at flat
+`num_dets×100`. `target_batch = num_determinizations` for every row
+(Stage-1 cross-det batching, no virtual loss). Speedup column compares
+per-game wall against the B=1 T=16 7.3c baseline (7.250 s/game).
+
+| num_dets | per-game (s) | per-decision (ms) | onnx_inference avg (µs) | speedup vs B=1 16T |
+|---:|---:|---:|---:|---:|
+| 5 (current default) | 4.750 | 399.97 | 8,468 | 1.526× |
+| **6** | **4.738** | 398.96 | 10,113 | **1.530×** |
+| 8 | 4.843 | 407.79 | 13,572 | 1.497× |
+| 10 | 4.998 | 420.92 | 17,247 | 1.450× |
+
+**Optimum: dets=6 at 4.738 s/game — 0.25% faster than dets=5, well
+inside run-to-run noise.** dets=8 regresses 2%; dets=10 regresses 5%.
+Per-call ONNX cost grows almost linearly with batch (8.47 → 17.25 µs
+across the row, 2.04× growth for 2× more in-flight leaves), but
+per-decision wall is flat-to-rising — at T=32 the CPU is already
+saturated by 32 concurrent batched forwards, and fattening the batch
+along the *determinization* axis runs into the same super-linear
+per-call cost growth Stage 2 hit along the *target-batch* axis. The
+"raise num_dets to widen the free batch" recommendation from the
+2026-04-27 entry above does not pay out on this hardware/model combo.
+**Decision: keep `num_determinizations = 5`. Park as-is.**
+
+### INT8 revisit — three deferred levers from Session 7.4b
+
+Re-quantized `iter_000014/model.onnx` against the existing 500-state
+BCAL calibration with each of the three deferred levers, using
+[scripts/int8_levers.py](scripts/int8_levers.py) (re-uses
+`scripts/export_onnx.quantize_int8`'s pre-process path; only the
+`activation_type`, `calibrate_method`, and `nodes_to_exclude` arguments
+differ per lever). Static-gate ran on every quantized graph.
+
+| lever | bid-argmax | play-argmax | value-sign | static gate |
+|---|---:|---:|---:|:---:|
+| 7.4b U8S8 baseline (for reference) | 0.848 | 0.960 | 0.942 | ❌ |
+| **s8s8** (`activation_type=QInt8`) | 0.842 | 0.960 | 0.938 | ❌ |
+| **entropy** (`CalibrationMethod.Entropy`) | 0.848 | 0.960 | 0.942 | ❌ |
+| exclude-block-0 | 0.852 | 0.950 | 0.932 | ❌ |
+| exclude-block-1 | 0.846 | 0.964 | 0.938 | ❌ |
+| exclude-block-2 | 0.848 | 0.960 | 0.938 | ❌ |
+| exclude-block-3 | 0.850 | 0.954 | 0.940 | ❌ |
+| exclude-block-4 | 0.852 | 0.966 | 0.940 | ❌ |
+| exclude-block-5 | 0.846 | 0.956 | 0.940 | ❌ |
+| exclude-block-6 | 0.848 | 0.962 | 0.944 | ❌ |
+| exclude-block-7 | 0.844 | 0.962 | 0.942 | ❌ |
+
+Static-gate bars: bid-argmax ≥ 0.95, value-sign = 1.00.
+
+**Spread across all 10 variants is < 1pp on bid-argmax and < 1.2pp on
+value-sign; nothing approaches the gates.** Per-block exclusion at any
+depth (input, mid, output) moves bid-argmax by 0–0.4pp — entirely
+within calibration noise. The heads are already FP32 in every variant,
+so the residual error has to live in the trunk; the cumulative
+quantization error through 8 transformer layers at d_model=128 is the
+limiting factor exactly as the 7.4b dev-plan note flagged. **Decision:
+INT8 is ruled out for this architecture, not parked.** The deferred-
+levers list ("S8S8 / entropy / sensitivity-driven body exclusions") is
+exhausted; the only remaining paths are quantization-aware training
+(out of scope) or a wider model (d_model ≥ 256 — out of 7.5 scope).
+
+### Muon optimizer (Session 7.4d) — paired 10-iter validation
+
+Two paired 10-iter runs at fixed 5P7C / 5×100 MCTS / T=32 / target_batch=5
+/ 118 games-per-iter, identical config except for the new
+`[training] enable_muon` knob. Eval at iter 5 fired in-loop; iter-9 row
+captured by direct `blobmaster-train evaluate iter_000009 vs
+iter_000000` (the train-loop config had `total_iterations = 10`, which
+processes iters 0..9 — see the off-by-one note in
+[AGENTS.md:106-108](AGENTS.md#L106-L108)).
+
+| | iter-5 wr | iter-5 CI | iter-9 wr | iter-9 CI | iter-9 bid-success (current vs opp) |
+|---|---:|---|---:|---|---:|
+| **A — Muon-on**  | 0.604 | [0.534, 0.671] | 0.609 | [0.539, 0.676] | 0.358 vs 0.315 |
+| **B — Muon-off** | 0.542 | [0.471, 0.611] | 0.609 | [0.539, 0.676] | 0.380 vs 0.339 |
+| Δ (A − B)        | +0.062 | (CIs overlap)  | **0.000** | **(identical)** | −0.022 |
+
+**Muon and no-Muon converge to identical strength by iter 9 (117/192
+wins on both sides, score Δ also matched at +6.99 vs +6.96).** The
++6pp iter-5 gap was inside Wilson noise (CIs already overlapped) and
+washed out as both runs reached their iter-9 plateau. The only
+persistent signal is bid-success: Muon-off is +2.2pp ahead at both
+checkpoints. **Decision: ship 7.5 with `enable_muon = false`.** The
+dev-plan §7.4d hold-back trigger ("> 5pp drop at iter 10") does not
+fire, but the validation criterion was "Muon helps" and the answer is
+"Muon does nothing measurable at 1.63M / d_model=128 / ≤10 iters" —
+the published-Muon-gains caveat is confirmed empirically. The
+[`enable_muon`](blob-nn/src/training_loop.rs) plumbing stays in tree
+as a parked escape hatch for any future architecture stretch.
+
+### What 7.5 ships with
+
+| 7.4 lever | outcome | 7.5 default |
+|---|---|---|
+| Self-play threads | (settled 2026-04-26) | **32** |
+| `target_batch` | (settled 2026-04-27, Stage-2 sweep) | **5** |
+| `num_determinizations` | dets=6 within noise of dets=5; ≥8 regresses | **5** |
+| INT8 quantization | all 10 calibration variants 5–11pp below static gate | **FP32** |
+| Muon optimizer | converges to AdamW-only by iter 9 | **off** |
+| Mixed-player self-play | 5-iter smoke clean (loss 2.57 → 1.29 across n∈{4,5,6,7}) | **on** |
+
+Throughput stays at the post-7.4c-Stage-1 number: **~4.7 s/game ×
+118 games ≈ ~9 min/iter** ⇒ 100-iter 7.5 run ≈ **~15 h** wall-clock.
+No remaining 7.4-class lever to chase before launch.
 
