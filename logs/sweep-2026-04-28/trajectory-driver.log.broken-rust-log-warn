@@ -1,0 +1,7 @@
+[09:02:40] starting: iter_29 vs iter_0  (full trajectory)
+[09:05:13] done: iter_29 vs iter_0  (full trajectory)  → wr=? lo95=? (150s)
+[09:05:13] starting: iter_25 vs iter_0  (recover skipped in-loop)
+[09:07:51] done: iter_25 vs iter_0  (recover skipped in-loop)  → wr=? lo95=? (154s)
+[09:07:51] starting: iter_20 vs iter_0  (recover skipped in-loop)
+[09:10:27] done: iter_20 vs iter_0  (recover skipped in-loop)  → wr=? lo95=? (153s)
+[09:10:27] starting: iter_29 vs iter_15 (resume-window gain)

@@ -373,6 +373,71 @@ mod tests {
         assert_eq!(s.lr(1, 0), s.lr(1, 10_000));
     }
 
+    /// Regression: bug observed on the sweep-2026-04-28 anchor resume.
+    /// The resume TOML had `total_iterations = 14` (count of iters to
+    /// run this session), but `LrSchedule::new(14)` sets a cosine span
+    /// of [0, 13]. The absolute iteration counter started at 16 (= K+1
+    /// after `try_resume` from iter_15), so `t = 16/13 > 1.0` → clamped
+    /// to t=1 → cos=0 → LR pinned at MIN_LR for all 14 iters. Model
+    /// effectively frozen; iter_29 vs iter_15 head-to-head was 0.484
+    /// win rate (no learning).
+    ///
+    /// The fix is at the call-site (`main.rs` switched to absolute-target
+    /// semantics: `total_iterations` is the cosine span, the loop runs
+    /// `while tl.iteration < total`). This test documents what the LR
+    /// schedule produces under correct usage so we never re-enable the
+    /// failure mode by accident.
+    #[test]
+    fn lr_schedule_continuous_across_resume_with_absolute_target() {
+        // 100-iter run (absolute target). Resume from iter 15 → loop
+        // processes iters 16..99. The schedule must give a sensible
+        // mid-cosine LR at iter 16, not MIN_LR.
+        let s = LrSchedule {
+            warmup_steps: 1000,
+            total_iterations: 100,
+            peak_lr: 3e-4,
+            min_lr: 1e-5,
+        };
+
+        let lr_16 = s.lr(16, 0);
+        // Hand-computed: t = 16 / 99 = 0.1616, cos(π·t) ≈ 0.872,
+        //   schedule = 0.5 * (1 + 0.872) = 0.936,
+        //   lr ≈ 1e-5 + 2.9e-4 * 0.936 ≈ 2.72e-4.
+        assert!(
+            lr_16 > 2.5e-4,
+            "iter 16 LR should be near peak under 100-target cosine; got {lr_16:.3e}"
+        );
+        assert!(
+            lr_16 < s.peak_lr,
+            "iter 16 LR should be strictly below peak; got {lr_16:.3e}"
+        );
+
+        // Mid-run (iter 50) is the cosine midpoint.
+        let lr_50 = s.lr(50, 0);
+        assert!(lr_50 > s.min_lr * 5.0 && lr_50 < lr_16);
+
+        // Final iter (99 — the last processed under `while iter < 100`)
+        // sits at MIN_LR — that's the cosine cooldown by design.
+        assert!((s.lr(99, 0) - s.min_lr).abs() < 1e-9);
+
+        // Sanity: the buggy configuration from sweep-2026-04-28 (span=14
+        // but resume starts at iter 16) does in fact clamp to MIN_LR.
+        // Documented here as the failure mode we're guarding against.
+        let buggy = LrSchedule {
+            warmup_steps: 1000,
+            total_iterations: 14,
+            peak_lr: 3e-4,
+            min_lr: 1e-5,
+        };
+        for iter in 16u64..30 {
+            let lr = buggy.lr(iter, 0);
+            assert!(
+                (lr - buggy.min_lr).abs() < 1e-12,
+                "buggy span=14 schedule should clamp at iter {iter}; got {lr:.3e}"
+            );
+        }
+    }
+
     #[test]
     fn train_step_reduces_loss_on_fixed_batch() {
         tch::manual_seed(42);

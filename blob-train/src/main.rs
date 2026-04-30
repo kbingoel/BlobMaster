@@ -299,14 +299,57 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
     cfg.self_play.iteration = tl.iteration;
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xB10B_5EED ^ tl.iteration);
+    // Session 7.4d-followup (2026-04-29): `total_iterations` is the
+    // *absolute target* iter count. The loop runs while
+    // `tl.iteration < total`, so a fresh run with `total = N` processes
+    // iters 0..N-1 (same observable as the old `for _ in 0..total`),
+    // but a resume from iter K with `total = M` processes iters K..M-1
+    // and the LR schedule's cosine span (= `total`) lines up with the
+    // absolute iteration counter that `LrSchedule::lr` reads. The
+    // previous count-semantics caused the LR to clamp to `MIN_LR`
+    // immediately after every resume because `iteration / (count - 1)`
+    // was always > 1 — observed on the sweep-2026-04-28 anchor resume,
+    // which spent 14 iters at lr=1e-5 (peak=3e-4) and produced no
+    // measurable strength gain (iter_29 vs iter_15 = 0.484 win rate).
     let total = cfg.training.total_iterations;
+    if tl.iteration >= total {
+        tracing::warn!(
+            current_iter = tl.iteration,
+            total_iterations = total,
+            "training already at or past total_iterations — nothing to do; \
+             increase `[training] total_iterations` to extend the run"
+        );
+        return Ok(());
+    }
+    // Graceful-exit hook (2026-04-29): user creates this file to ask the
+    // loop to exit cleanly *after* the current iteration finishes its
+    // checkpoint save. The check fires at every iteration boundary, so
+    // worst-case wait between `touch STOP` and process exit is one
+    // iteration's wall-clock (~35-45 min on this stack). The file is
+    // consumed (deleted) on detection so the next `--resume` doesn't
+    // immediately stop again. Ctrl-C / SIGTERM still hard-kills mid-iter
+    // and loses the in-flight iteration's compute — use the STOP file if
+    // you care about that work.
+    let stop_file = cfg.training.checkpoint_dir.join("STOP");
     tracing::info!(
-        iterations = total,
+        target_iter = total,
         start = tl.iteration,
+        iters_to_run = total - tl.iteration,
+        ?stop_file,
         ?onnx_path,
         "train — starting driver loop"
     );
-    for _ in 0..total {
+    while tl.iteration < total {
+        if stop_file.exists() {
+            let _ = std::fs::remove_file(&stop_file);
+            tracing::info!(
+                ?stop_file,
+                next_iter = tl.iteration,
+                "STOP file detected — exiting cleanly before next iteration; \
+                 resume with `--resume` to continue"
+            );
+            break;
+        }
         let iter = tl.iteration;
         cfg.self_play.iteration = iter;
         let started = std::time::Instant::now();
@@ -325,10 +368,16 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
         tracing::info!(
             iteration = iter,
             wall_clock_secs = elapsed.as_secs_f64(),
+            // 2026-04-29: surface LR in the live log so a frozen-at-MIN_LR
+            // resume is obvious without grepping metrics.jsonl after the
+            // fact. The sweep-2026-04-28 anchor resume burned 14 iters at
+            // lr=1e-5 silently because nothing in the live tracing showed it.
+            learning_rate = metrics.learning_rate,
             bid_policy_loss = metrics.bid_policy_loss,
             play_policy_loss = metrics.play_policy_loss,
             value_loss = metrics.value_loss,
             combined_loss = metrics.combined_loss,
+            policy_kl_divergence = metrics.policy_kl_divergence,
             visit_entropy_mean = metrics.visit_entropy_mean,
             examples = metrics.examples_generated,
             decisions = metrics.num_decisions,
