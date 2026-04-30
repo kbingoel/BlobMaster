@@ -89,6 +89,22 @@ pub struct TrainingLoopConfig {
     /// [`MUON_GROUP`]: crate::train::MUON_GROUP
     #[serde(default = "default_enable_muon")]
     pub enable_muon: bool,
+    /// Cap on `epochs_per_iteration` while the replay buffer is still
+    /// refilling **after a resume**. Mitigates the Run-3 regression
+    /// observed 2026-04-29 on `sweep-2026-04-28-anchor`: post-resume cold
+    /// buffer + peak LR + 10 epochs caused the model to overfit the small
+    /// fresh-self-play distribution, collapsing value loss while degrading
+    /// policy loss and head-to-head strength. Active only when
+    /// `resumed_from_iter.is_some()` AND `buffer.len() < buffer_capacity`;
+    /// once the buffer fills (~9 iters at default capacity / ~54k
+    /// examples-per-iter) the regular `epochs_per_iteration` resumes.
+    /// Set equal to or above `epochs_per_iteration` to disable.
+    #[serde(default = "default_cold_buffer_post_resume_epochs")]
+    pub cold_buffer_post_resume_epochs: usize,
+}
+
+fn default_cold_buffer_post_resume_epochs() -> usize {
+    2
 }
 
 mod device_serde {
@@ -140,6 +156,7 @@ impl Default for TrainingLoopConfig {
             total_iterations: 1,
             device: Device::Cpu,
             enable_muon: false,
+            cold_buffer_post_resume_epochs: default_cold_buffer_post_resume_epochs(),
         }
     }
 }
@@ -520,6 +537,14 @@ pub struct TrainingLoop {
     pub lr_schedule: LrSchedule,
     pub iteration: u64,
     pub global_step: i64,
+    /// On-disk iter we loaded weights from, set by `resume_from_latest`.
+    /// `prune_checkpoints` additionally retains `iter_<K>` and
+    /// `iter_<K+1>` so the resume baseline (which `main.rs` captures as
+    /// `anchor_iter = K + 1` and reads back at every in-loop eval) doesn't
+    /// vanish at the end of iter K+2 just because `K+1 % EVAL_CHECKPOINT_EVERY
+    /// != 0`. `None` for fresh runs. Reset on each `resume_from_latest` call,
+    /// so a chain of resumes only retains the most recent baseline.
+    pub resumed_from_iter: Option<u64>,
 }
 
 impl TrainingLoop {
@@ -540,6 +565,7 @@ impl TrainingLoop {
             lr_schedule,
             iteration: 0,
             global_step: 0,
+            resumed_from_iter: None,
         }
     }
 
@@ -625,7 +651,16 @@ impl TrainingLoop {
 
         let mut prev_epoch_loss = f64::INFINITY;
         let mut epochs_run = 0usize;
-        for _epoch in 0..self.cfg.epochs_per_iteration {
+        let max_epochs = if self.resumed_from_iter.is_some()
+            && self.buffer.len() < self.cfg.buffer_capacity
+        {
+            self.cfg
+                .cold_buffer_post_resume_epochs
+                .min(self.cfg.epochs_per_iteration)
+        } else {
+            self.cfg.epochs_per_iteration
+        };
+        for _epoch in 0..max_epochs {
             let start_combined = acc.combined_count;
             let start_combined_sum = acc.combined_sum;
             for _ in 0..steps_per_epoch {
@@ -686,13 +721,24 @@ impl TrainingLoop {
         let dir = self.iteration_dir(self.iteration);
         save_model_checkpoint(&self.vs, self.iteration, &dir)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        // 2026-04-29: persist the replay buffer next to the model so
+        // `resume_from_latest` can restore it. Without this, every resume
+        // starts with a cold buffer; combined with peak-LR cosine and
+        // multi-epoch training that produced the iter_15→iter_29
+        // overfit/strength-stall on `sweep-2026-04-28-anchor`.
+        if let Err(e) = self.buffer.save(dir.join("buffer.bin")) {
+            tracing::warn!(error = %e, dir = %dir.display(), "failed to save replay buffer");
+        }
         self.append_metrics_line(&metrics)?;
         self.append_decision_stats(&decision_stats)?;
 
         let new_onnx_path = dir.join("model.onnx");
         on_export(&dir.join("model.ot"), &new_onnx_path)?;
 
-        self.prune_checkpoints()?;
+        // Checkpoint pruning disabled 2026-04-29: ~11 MB per iter is cheap
+        // and full history is needed for weight-evolution analysis (see
+        // scripts/visualize_weight_evolution.py).
+        // self.prune_checkpoints()?;
         self.iteration += 1;
         Ok(metrics)
     }
@@ -746,6 +792,7 @@ impl TrainingLoop {
     /// Keep every-5th checkpoint permanently and the most recent rolling
     /// one; delete previous rolling checkpoints. "Every-5th" here means
     /// `iteration % EVAL_CHECKPOINT_EVERY == 0`.
+    #[allow(dead_code)] // call site disabled 2026-04-29; tests still cover behavior.
     fn prune_checkpoints(&self) -> std::io::Result<()> {
         let dir = &self.cfg.checkpoint_dir;
         if !dir.exists() {
@@ -767,6 +814,18 @@ impl TrainingLoop {
             }
             if iter_num % EVAL_CHECKPOINT_EVERY == 0 {
                 continue; // evaluated — keep permanently
+            }
+            if let Some(k) = self.resumed_from_iter {
+                // Retain the on-disk iter we resumed from (= K) and the
+                // resume baseline (= K + 1, which `main.rs` captures as
+                // `anchor_iter`). Without this, in-loop evals after the
+                // resume fail with "missing ONNX" the first time the rule
+                // above prunes the baseline — observed 2026-04-29 on the
+                // sweep-2026-04-28 anchor resume (K=15, baseline=16,
+                // pruned at end of iter 17, eval at iter 20 skipped).
+                if iter_num == k || iter_num == k + 1 {
+                    continue;
+                }
             }
             let _ = fs::remove_dir_all(&path);
         }
@@ -807,7 +866,42 @@ impl TrainingLoop {
         self.vs
             .load(path.join("model.ot"))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let buffer_path = path.join("buffer.bin");
+        if buffer_path.exists() {
+            match ReplayBuffer::load(&buffer_path) {
+                Ok(b) => {
+                    if b.capacity() != self.cfg.buffer_capacity {
+                        tracing::warn!(
+                            saved = b.capacity(),
+                            configured = self.cfg.buffer_capacity,
+                            "replay buffer capacity changed across resume; honoring saved capacity",
+                        );
+                    }
+                    tracing::info!(
+                        len = b.len(),
+                        capacity = b.capacity(),
+                        path = %buffer_path.display(),
+                        "resumed replay buffer",
+                    );
+                    self.buffer = b;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %buffer_path.display(),
+                        "buffer.bin present but failed to deserialize; starting cold",
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                dir = %path.display(),
+                "no buffer.bin found alongside checkpoint; starting with empty replay buffer \
+                 (epochs will be capped to cold_buffer_post_resume_epochs until refilled)",
+            );
+        }
         self.iteration = iter + 1;
+        self.resumed_from_iter = Some(iter);
         Ok(Some(iter))
     }
 }
@@ -1059,6 +1153,7 @@ mod tests {
             total_iterations: 1,
             device: Device::Cpu,
             enable_muon: true,
+            cold_buffer_post_resume_epochs: 4,
         };
         let mut tl = TrainingLoop::new(cfg);
         tl.optimizer.set_lr(3e-3);
@@ -1120,6 +1215,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Regression: before this fix the resume baseline (K+1, where K is
+    /// the resumed-from iter) got pruned at the end of iter K+2 because it
+    /// matched neither `iter_num == self.iteration` (rolling) nor
+    /// `iter_num % EVAL_CHECKPOINT_EVERY == 0` (eval-aligned). The in-loop
+    /// eval at iter K+5 (the next eval-cadence trigger) then bailed out
+    /// with `missing ONNX; skipping anchor_onnx=iter_<K+1>/model.onnx` —
+    /// observed on the sweep-2026-04-28 anchor resume (K=15, K+1=16).
+    /// Setting `resumed_from_iter` makes prune retain both K and K+1.
+    #[test]
+    fn checkpoint_retention_keeps_resume_baseline() {
+        let tmp = std::env::temp_dir().join(format!("blob-tl-resume-ret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Resume from iter_15, processed iters 16..18 → simulates the
+        // prune state right after iter 18 finishes.
+        for i in [0u64, 5, 10, 15, 16, 17, 18] {
+            std::fs::create_dir_all(tmp.join(format!("iter_{i:06}"))).unwrap();
+        }
+        let cfg = TrainingLoopConfig {
+            checkpoint_dir: tmp.clone(),
+            ..Default::default()
+        };
+        let mut tl = TrainingLoop::new(cfg);
+        tl.iteration = 18; // current rolling iter
+        tl.resumed_from_iter = Some(15);
+        tl.prune_checkpoints().unwrap();
+
+        let mut kept: Vec<u64> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|n| n.strip_prefix("iter_").and_then(|s| s.parse::<u64>().ok()))
+            })
+            .collect();
+        kept.sort();
+        // Expected: 0, 5, 10 (eval-aligned), 15 (resumed-from = K, also
+        // happens to be eval-aligned), 16 (resume baseline = K+1, retained
+        // by the new rule), 18 (rolling). 17 pruned (no rule keeps it).
+        assert_eq!(kept, vec![0, 5, 10, 15, 16, 18]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Same retention rule should also fire when K itself isn't
+    /// eval-aligned (resumed from a rolling-latest checkpoint mid-run).
+    /// E.g. K=29 → retain 29 and 30; without `resumed_from_iter` set,
+    /// 29 would be pruned the iter after we resume.
+    #[test]
+    fn checkpoint_retention_keeps_resume_baseline_off_grid() {
+        let tmp =
+            std::env::temp_dir().join(format!("blob-tl-resume-ret-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for i in [0u64, 5, 10, 15, 20, 25, 29, 30, 31, 32] {
+            std::fs::create_dir_all(tmp.join(format!("iter_{i:06}"))).unwrap();
+        }
+        let cfg = TrainingLoopConfig {
+            checkpoint_dir: tmp.clone(),
+            ..Default::default()
+        };
+        let mut tl = TrainingLoop::new(cfg);
+        tl.iteration = 32;
+        tl.resumed_from_iter = Some(29);
+        tl.prune_checkpoints().unwrap();
+
+        let mut kept: Vec<u64> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|n| n.strip_prefix("iter_").and_then(|s| s.parse::<u64>().ok()))
+            })
+            .collect();
+        kept.sort();
+        // Expected: 0/5/10/15/20/25/30 (eval-aligned), 29 (resumed-from K),
+        // 32 (rolling). 31 pruned. Note: 30 already eval-aligned, so the
+        // K+1 retention is redundant here — that's fine, the rule stacks.
+        assert_eq!(kept, vec![0, 5, 10, 15, 20, 25, 29, 30, 32]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn resume_picks_highest_iteration() {
         let tmp = std::env::temp_dir().join(format!("blob-tl-res-{}", std::process::id()));
@@ -1128,17 +1310,127 @@ mod tests {
             checkpoint_dir: tmp.clone(),
             ..Default::default()
         };
-        // No checkpoints yet → None.
+        // No checkpoints yet → None and resumed_from_iter stays unset.
         let mut tl = TrainingLoop::new(cfg.clone());
         assert_eq!(tl.resume_from_latest().unwrap(), None);
+        assert_eq!(tl.resumed_from_iter, None);
 
-        // Save at iter 3 and 7; resume should pick 7.
+        // Save at iter 3 and 7; resume should pick 7 and record it as the
+        // resume baseline so the next prune call retains iter_7 and iter_8.
         save_model_checkpoint(&tl.vs, 3, tmp.join("iter_000003")).unwrap();
         save_model_checkpoint(&tl.vs, 7, tmp.join("iter_000007")).unwrap();
         let mut tl2 = TrainingLoop::new(cfg);
         let resumed = tl2.resume_from_latest().unwrap();
         assert_eq!(resumed, Some(7));
         assert_eq!(tl2.iteration, 8);
+        assert_eq!(tl2.resumed_from_iter, Some(7));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Buffer persistence round-trip across resume. Saves a checkpoint
+    /// with a populated buffer, constructs a fresh `TrainingLoop`, calls
+    /// `resume_from_latest`, and asserts the buffer state was restored.
+    /// Also asserts that resuming with no `buffer.bin` next to the latest
+    /// checkpoint leaves the buffer empty (the cold-buffer fallback).
+    #[test]
+    fn resume_restores_replay_buffer_when_present() {
+        let tmp = std::env::temp_dir().join(format!("blob-tl-bufres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg = TrainingLoopConfig {
+            checkpoint_dir: tmp.clone(),
+            buffer_capacity: 32,
+            ..Default::default()
+        };
+        let mut tl1 = TrainingLoop::new(cfg.clone());
+        for i in 0..5u64 {
+            let ex = dummy_play_example(i);
+            tl1.buffer.push(ex.state, ex.policy, ex.value, ex.phase);
+        }
+        for i in 0..3u64 {
+            let ex = dummy_bid_example(100 + i);
+            tl1.buffer.push(ex.state, ex.policy, ex.value, ex.phase);
+        }
+        let saved_len = tl1.buffer.len();
+        let saved_capacity = tl1.buffer.capacity();
+        assert_eq!(saved_len, 8);
+
+        // Save the model and the buffer at iter 4. Mirrors what
+        // `run_iteration` does on disk.
+        let dir4 = tmp.join("iter_000004");
+        save_model_checkpoint(&tl1.vs, 4, &dir4).unwrap();
+        tl1.buffer.save(dir4.join("buffer.bin")).unwrap();
+
+        let mut tl2 = TrainingLoop::new(cfg.clone());
+        assert_eq!(tl2.buffer.len(), 0, "fresh TrainingLoop has empty buffer");
+        let resumed = tl2.resume_from_latest().unwrap();
+        assert_eq!(resumed, Some(4));
+        assert_eq!(tl2.buffer.len(), saved_len);
+        assert_eq!(tl2.buffer.capacity(), saved_capacity);
+
+        // Cold-buffer fallback: another checkpoint dir with model but no
+        // `buffer.bin` should still resume cleanly with an empty buffer.
+        let dir9 = tmp.join("iter_000009");
+        save_model_checkpoint(&tl1.vs, 9, &dir9).unwrap();
+        let mut tl3 = TrainingLoop::new(cfg);
+        let resumed3 = tl3.resume_from_latest().unwrap();
+        assert_eq!(resumed3, Some(9));
+        assert_eq!(tl3.buffer.len(), 0, "missing buffer.bin → empty buffer");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `train_phase` caps epochs to `cold_buffer_post_resume_epochs` while
+    /// the buffer hasn't refilled after a resume. Once the buffer reaches
+    /// `buffer_capacity` (or for non-resumed runs), the regular
+    /// `epochs_per_iteration` applies. Guards the iter_15→iter_29 regression
+    /// from 2026-04-29.
+    #[test]
+    fn cold_buffer_post_resume_epoch_cap() {
+        let tmp = std::env::temp_dir().join(format!("blob-tl-coldcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg = TrainingLoopConfig {
+            checkpoint_dir: tmp.clone(),
+            buffer_capacity: 32,
+            batch_size: 4,
+            epochs_per_iteration: 8,
+            epoch_early_stop_rel: -1.0, // never stop early on improvement
+            cold_buffer_post_resume_epochs: 2,
+            total_iterations: 10,
+            device: Device::Cpu,
+            enable_muon: true,
+        };
+        let mut tl = TrainingLoop::new(cfg.clone());
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0);
+
+        // Half-full buffer.
+        let mut examples = Vec::new();
+        for i in 0..16u64 {
+            let ex = dummy_play_example(i);
+            tl.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
+            examples.push(ex);
+        }
+
+        // Fresh run (resumed_from_iter = None) → full epochs even on
+        // partial buffer.
+        let m_fresh = tl.train_phase(&mut rng, &examples);
+        assert_eq!(m_fresh.num_epochs_run, cfg.epochs_per_iteration);
+
+        // Mark the loop as resumed and re-run with a still-not-full buffer
+        // → cap kicks in.
+        tl.resumed_from_iter = Some(3);
+        let m_resumed_cold = tl.train_phase(&mut rng, &examples);
+        assert_eq!(m_resumed_cold.num_epochs_run, cfg.cold_buffer_post_resume_epochs);
+
+        // Top up the buffer to capacity → cap releases.
+        for i in 16..32u64 {
+            let ex = dummy_play_example(i);
+            tl.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
+            examples.push(ex);
+        }
+        assert_eq!(tl.buffer.len(), cfg.buffer_capacity);
+        let m_resumed_warm = tl.train_phase(&mut rng, &examples);
+        assert_eq!(m_resumed_warm.num_epochs_run, cfg.epochs_per_iteration);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

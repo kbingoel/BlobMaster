@@ -1,9 +1,10 @@
 # Session 7.4d temperature-schedule sweep — ANCHOR arm (no schedule).
-# Mixed-player distribution. 16 iters processed (iters 0..15), so in-loop
-# eval rows fire at iter 5, 10, 15 (eval triggers when
-# `iter > anchor_iter && iter % eval_interval == 0`; AGENTS.md off-by-one
-# trap: `total_iterations` is the *count*, not the absolute target — to
-# get an eval row at iter K, set `total_iterations = K + 1`).
+# Mixed-player distribution. `total_iterations = 16` is the *absolute
+# target iter* (loop runs `while iter < 16`), so iters 0..15 are
+# processed and in-loop eval rows fire at iter 5, 10, 15 (eval triggers
+# when `iter > anchor_iter && iter % eval_interval == 0`). To get an
+# eval row at iter K, set `total_iterations = K + 1` — same K+1 rule
+# pre/post 2026-04-29 absolute-target switch; see AGENTS.md.
 #
 # Saved-on-disk after the run: iter_000015. That checkpoint feeds the
 # overnight resume (scripts/sweep-2026-04-28-resume.sh) if this arm wins.

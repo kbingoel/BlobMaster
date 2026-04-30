@@ -50,5 +50,9 @@ flamegraph.svg
 *.safetensors
 *.ot
 
+# Training replay buffers and decision logs (too large for GitHub)
+**/buffer.bin
+**/decision_stats.jsonl
+
 # Claude Code local state
 .claude/scheduled_tasks.lock

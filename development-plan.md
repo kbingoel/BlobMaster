@@ -878,7 +878,7 @@ Fine-tune the base model into player-count-specific models.
 
 ### Session 9.1+ — Web backend and game UI
 
-Build a web interface for human vs AI play and training visualization.
+Build a web interface or a web app for human vs AI play and training visualization.
 
 - Backend: Axum or Actix-web serving REST/WebSocket API
 - Endpoints: `/new-game`, `/make-move`, `/get-state`, `/ai-move`
