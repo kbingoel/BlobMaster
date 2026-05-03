@@ -239,6 +239,59 @@ pub enum AiSuggestion {
     },
 }
 
+// ---- persisted app settings ---------------------------------------------
+
+/// One row of the players list. Order in `AppSettings.players` is play
+/// order — the row at index 0 plays first in trick 1 and bids first; the
+/// last row is implicitly the dealer (bids last, deals the next round).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PlayerConfig {
+    pub name: String,
+    /// Exactly one row in the list has this set. Marks the human seat for
+    /// the GUI so AI suggestions and hand entry know which seat is yours.
+    pub is_human: bool,
+}
+
+/// Form values persisted to `~/.blobmaster/settings.json` so the setup
+/// screen survives across launches.
+///
+/// The players list is the single source of truth for seating: its length
+/// is `num_players`, its order is play order, and the last entry is the
+/// dealer. The "D" affordance in the UI re-orders the list so the chosen
+/// dealer ends up at the bottom; the engine then computes first-to-play =
+/// `(dealer + 1) % n` which is always seat 0 (the top row).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AppSettings {
+    pub start_cards: u8,
+    pub trump_mode: TrumpMode,
+    /// 4..=7 entries. Position = seat index for the engine.
+    pub players: Vec<PlayerConfig>,
+    pub engine_settings: EngineSettings,
+    /// Path of the most recently loaded model, if any. The setup screen
+    /// pre-selects it on launch (and silently ignores it if the file is
+    /// gone).
+    pub last_model_path: Option<PathBuf>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        let players = vec![
+            PlayerConfig { name: "You".into(), is_human: true },
+            PlayerConfig { name: "P1".into(), is_human: false },
+            PlayerConfig { name: "P2".into(), is_human: false },
+            PlayerConfig { name: "P3".into(), is_human: false },
+            PlayerConfig { name: "P4".into(), is_human: false },
+        ];
+        Self {
+            start_cards: 7,
+            trump_mode: TrumpMode::AutoRotate,
+            players,
+            engine_settings: EngineSettings::default(),
+            last_model_path: None,
+        }
+    }
+}
+
 // ---- event log -----------------------------------------------------------
 
 /// Reversible session-level event. Kept on `GameSession.event_log` to power

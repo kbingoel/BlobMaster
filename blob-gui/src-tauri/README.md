@@ -73,6 +73,21 @@ is a tagged enum (see [`types.rs`](src/types.rs)) so the frontend can
 discriminate on `kind` instead of parsing strings. `?` from `std::io::Error`
 maps automatically.
 
+## Persisted state (Session 9.3)
+
+Two JSON files under the user's home directory survive across launches:
+
+- `~/.blobmaster/settings.json` — setup-screen form values (`AppSettings`).
+  Read on mount via `commands.loadAppSettings()`, written by
+  `commands.saveAppSettings(form)` when **Start Game** is clicked.
+- `~/.blobmaster/recents.json` — recently loaded model paths, most-recent
+  first, capped at 10 entries. `commands.loadModel(path)` auto-bumps;
+  `commands.listRecentModels()` reads (and silently drops missing files).
+
+The setup screen sources its model picker from three places: a Tauri file
+dialog (filtered to `*.onnx`), the recents list, and a scan of
+`<workspace>/checkpoints/`.
+
 ## Layout
 
 ```

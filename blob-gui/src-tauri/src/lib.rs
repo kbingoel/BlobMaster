@@ -11,8 +11,9 @@ use std::sync::Mutex;
 use tauri_specta::{collect_commands, Builder as SpectaBuilder};
 
 use crate::commands::{
-    engine_version, list_models, load_model, load_session, new_game, record_card_played,
-    request_ai_suggestion, save_session, set_human_hand, submit_bid, undo_last_event,
+    add_recent_model, engine_version, list_models, list_recent_models, load_app_settings,
+    load_model, load_session, new_game, record_card_played, request_ai_suggestion,
+    save_app_settings, save_session, set_human_hand, submit_bid, undo_last_event,
     update_engine_settings, AppState,
 };
 
@@ -23,7 +24,9 @@ pub fn build_specta_builder() -> SpectaBuilder<tauri::Wry> {
     SpectaBuilder::<tauri::Wry>::new().commands(collect_commands![
         engine_version,
         list_models,
+        list_recent_models,
         load_model,
+        add_recent_model,
         new_game,
         set_human_hand,
         submit_bid,
@@ -33,6 +36,8 @@ pub fn build_specta_builder() -> SpectaBuilder<tauri::Wry> {
         undo_last_event,
         save_session,
         load_session,
+        load_app_settings,
+        save_app_settings,
     ])
 }
 
@@ -56,6 +61,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(app_state)
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(

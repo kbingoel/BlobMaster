@@ -16,8 +16,8 @@ use tauri::State;
 
 use crate::session::{indices_to_hand, GameSession};
 use crate::types::{
-    AiSuggestion, EngineSettings, GameConfig, GameEvent, GuiError, GuiResult, ModelInfo,
-    SessionSnapshot,
+    AiSuggestion, AppSettings, EngineSettings, GameConfig, GameEvent, GuiError, GuiResult,
+    ModelInfo, SessionSnapshot,
 };
 
 /// `tauri::State` payload. `Mutex` is fine for our single-user GUI — every
@@ -68,6 +68,63 @@ fn modified_unix_secs(meta: &std::fs::Metadata) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// `~/.blobmaster/`. Created on first write.
+fn config_dir() -> GuiResult<PathBuf> {
+    let base = dirs::home_dir()
+        .ok_or_else(|| GuiError::Io("could not resolve user home directory".into()))?;
+    Ok(base.join(".blobmaster"))
+}
+
+fn settings_path() -> GuiResult<PathBuf> {
+    Ok(config_dir()?.join("settings.json"))
+}
+
+fn recents_path() -> GuiResult<PathBuf> {
+    Ok(config_dir()?.join("recents.json"))
+}
+
+/// Build a `ModelInfo` from a path. Returns `None` if the file is missing
+/// or unreadable (used for filtering recents whose target was deleted).
+fn model_info_for(path: &Path) -> Option<ModelInfo> {
+    let meta = std::fs::metadata(path).ok()?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(ModelInfo {
+        path: path.to_path_buf(),
+        file_name,
+        size_bytes: meta.len(),
+        modified_unix_secs: modified_unix_secs(&meta),
+        d_model: None,
+        n_layers: None,
+        n_heads: None,
+    })
+}
+
+/// Read the recents list (most-recent first), dropping entries whose file
+/// no longer exists.
+fn read_recents() -> Vec<PathBuf> {
+    let Ok(p) = recents_path() else { return Vec::new() };
+    let Ok(buf) = std::fs::read_to_string(&p) else { return Vec::new() };
+    serde_json::from_str::<Vec<PathBuf>>(&buf).unwrap_or_default()
+}
+
+fn write_recents(paths: &[PathBuf]) -> GuiResult<()> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let p = recents_path()?;
+    let buf = serde_json::to_string_pretty(paths)
+        .map_err(|e| GuiError::Io(format!("serialize recents: {e}")))?;
+    std::fs::write(&p, buf)?;
+    Ok(())
+}
+
+/// Cap the recents list at this many entries. The setup screen only shows
+/// a handful, and the file is meant to stay human-skimmable.
+const RECENTS_CAP: usize = 10;
+
 // ---- commands ------------------------------------------------------------
 
 /// Smoke command from Session 9.1 — kept alive so the existing
@@ -84,10 +141,9 @@ pub fn engine_version() -> String {
     )
 }
 
-/// Scan `checkpoints/` for `*.onnx` files plus the recents list.
-///
-/// Stub: just enumerates files in the workspace `checkpoints/` directory.
-/// The recents-list integration lands in Session 9.3.
+/// Scan `checkpoints/` for `*.onnx` files. Sorted by modified-time, newest
+/// first. The recents list is queried separately via [`list_recent_models`]
+/// so the setup screen can render the two in distinct sections.
 #[tauri::command]
 #[specta::specta]
 pub fn list_models() -> GuiResult<Vec<ModelInfo>> {
@@ -102,59 +158,68 @@ pub fn list_models() -> GuiResult<Vec<ModelInfo>> {
         if path.extension().and_then(|s| s.to_str()) != Some("onnx") {
             continue;
         }
-        let meta = entry.metadata()?;
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
-        out.push(ModelInfo {
-            path: path.clone(),
-            file_name,
-            size_bytes: meta.len(),
-            modified_unix_secs: modified_unix_secs(&meta),
-            d_model: None,
-            n_layers: None,
-            n_heads: None,
-        });
+        if let Some(info) = model_info_for(&path) {
+            out.push(info);
+        }
     }
     out.sort_by(|a, b| b.modified_unix_secs.cmp(&a.modified_unix_secs));
     Ok(out)
 }
 
-/// Load an ONNX model into the active session.
+/// Recently loaded models, most-recent first. Entries whose underlying
+/// file is missing are silently dropped.
+#[tauri::command]
+#[specta::specta]
+pub fn list_recent_models() -> GuiResult<Vec<ModelInfo>> {
+    let mut out = Vec::new();
+    for p in read_recents() {
+        if let Some(info) = model_info_for(&p) {
+            out.push(info);
+        }
+    }
+    Ok(out)
+}
+
+/// Promote `path` to the head of the recents list. Idempotent — calling
+/// with the same path twice doesn't duplicate it.
+#[tauri::command]
+#[specta::specta]
+pub fn add_recent_model(path: PathBuf) -> GuiResult<Vec<ModelInfo>> {
+    let mut paths = read_recents();
+    paths.retain(|p| p != &path);
+    paths.insert(0, path);
+    paths.truncate(RECENTS_CAP);
+    write_recents(&paths)?;
+    list_recent_models()
+}
+
+/// Load an ONNX model. Validates the file by constructing an
+/// `OnnxEvaluator`; on success it's installed onto the active session
+/// (if any) and the path is promoted to the head of the recents list.
 ///
-/// `OnnxEvaluator::from_file` does the real work; on success the session's
-/// `evaluator` slot is populated and subsequent `request_ai_suggestion`
-/// calls have a model to use. If no session exists yet, the load still
-/// happens and the model is dropped — the next `new_game` will need to
-/// reload. (Session 9.3 will refactor this so the model lives outside the
-/// session.)
+/// Architecture metadata (`d_model`, `n_layers`, `n_heads`) is not derivable
+/// from the public ONNX I/O contract — those dims live in initializer
+/// shapes the `ort` crate doesn't surface. Returned as `None`; the setup
+/// screen displays only the file size + modified time when they are.
 #[tauri::command]
 #[specta::specta]
 pub fn load_model(state: State<'_, AppState>, path: PathBuf) -> GuiResult<ModelInfo> {
     let evaluator = OnnxEvaluator::from_file(&path)
         .map_err(|e| GuiError::ModelLoadFailed(e.to_string()))?;
-    let meta = std::fs::metadata(&path)?;
-    let info = ModelInfo {
-        file_name: path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string(),
-        path: path.clone(),
-        size_bytes: meta.len(),
-        modified_unix_secs: modified_unix_secs(&meta),
-        // Session-shape introspection lands in Session 9.3.
-        d_model: None,
-        n_layers: None,
-        n_heads: None,
-    };
+    let info = model_info_for(&path)
+        .ok_or_else(|| GuiError::Io(format!("could not stat {}", path.display())))?;
     if let Ok(mut guard) = state.lock() {
         if let Some(session) = guard.as_mut() {
             session.evaluator = Some(evaluator);
         }
     }
+    // Best-effort recents update — failure to write the file shouldn't
+    // block the user from playing.
+    let mut paths = read_recents();
+    paths.retain(|p| p != &path);
+    paths.insert(0, path);
+    paths.truncate(RECENTS_CAP);
+    let _ = write_recents(&paths);
     Ok(info)
 }
 
@@ -344,6 +409,34 @@ pub fn load_session(_path: PathBuf) -> GuiResult<SessionSnapshot> {
     Err(GuiError::NotImplemented(
         "load_session — wired in Session 9.8".into(),
     ))
+}
+
+/// Load persisted setup-screen form values from
+/// `~/.blobmaster/settings.json`. Missing or corrupt files yield
+/// [`AppSettings::default`] without erroring — first launch is the common
+/// case.
+#[tauri::command]
+#[specta::specta]
+pub fn load_app_settings() -> GuiResult<AppSettings> {
+    let p = settings_path()?;
+    let Ok(buf) = std::fs::read_to_string(&p) else {
+        return Ok(AppSettings::default());
+    };
+    Ok(serde_json::from_str(&buf).unwrap_or_default())
+}
+
+/// Persist setup-screen form values. Creates `~/.blobmaster/` on first
+/// write.
+#[tauri::command]
+#[specta::specta]
+pub fn save_app_settings(settings: AppSettings) -> GuiResult<()> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let p = settings_path()?;
+    let buf = serde_json::to_string_pretty(&settings)
+        .map_err(|e| GuiError::Io(format!("serialize settings: {e}")))?;
+    std::fs::write(&p, buf)?;
+    Ok(())
 }
 
 // ---- internal helpers (currently unused — will land with later sessions)

@@ -22,6 +22,8 @@ log = "0.4"
 thiserror = "2"
 tauri = { version = "2.11.0", features = [] }
 tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+dirs = "5"
 blob-engine = { path = "../../blob-engine" }
 specta = "=2.0.0-rc.22"
 specta-typescript = "=0.0.9"
