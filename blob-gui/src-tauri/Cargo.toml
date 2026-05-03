@@ -1,0 +1,38 @@
+[package]
+name = "blob-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BlobMaster GUI — Tauri shell around the blob-engine RL core"
+rust-version = "1.77.2"
+autobins = false
+default-run = "blob-gui"
+
+[lib]
+name = "blob_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.0", features = [] }
+
+[dependencies]
+serde_json = "1"
+serde = { workspace = true }
+log = "0.4"
+thiserror = "2"
+tauri = { version = "2.11.0", features = [] }
+tauri-plugin-log = "2"
+blob-engine = { path = "../../blob-engine" }
+specta = "=2.0.0-rc.22"
+specta-typescript = "=0.0.9"
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
+
+[[bin]]
+name = "blob-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "export-bindings"
+path = "src/bin/export_bindings.rs"

@@ -5,6 +5,7 @@ members = [
     "blob-nn",
     "blob-bin",
     "blob-train",
+    "blob-gui/src-tauri",
 ]
 
 [workspace.package]
