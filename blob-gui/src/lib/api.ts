@@ -13,10 +13,9 @@ async engineVersion() : Promise<string> {
     return await TAURI_INVOKE("engine_version");
 },
 /**
- * Scan `checkpoints/` for `*.onnx` files plus the recents list.
- * 
- * Stub: just enumerates files in the workspace `checkpoints/` directory.
- * The recents-list integration lands in Session 9.3.
+ * Scan `checkpoints/` for `*.onnx` files. Sorted by modified-time, newest
+ * first. The recents list is queried separately via [`list_recent_models`]
+ * so the setup screen can render the two in distinct sections.
  */
 async listModels() : Promise<Result<ModelInfo[], GuiError>> {
     try {
@@ -27,18 +26,42 @@ async listModels() : Promise<Result<ModelInfo[], GuiError>> {
 }
 },
 /**
- * Load an ONNX model into the active session.
+ * Recently loaded models, most-recent first. Entries whose underlying
+ * file is missing are silently dropped.
+ */
+async listRecentModels() : Promise<Result<ModelInfo[], GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_recent_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Load an ONNX model. Validates the file by constructing an
+ * `OnnxEvaluator`; on success it's installed onto the active session
+ * (if any) and the path is promoted to the head of the recents list.
  * 
- * `OnnxEvaluator::from_file` does the real work; on success the session's
- * `evaluator` slot is populated and subsequent `request_ai_suggestion`
- * calls have a model to use. If no session exists yet, the load still
- * happens and the model is dropped — the next `new_game` will need to
- * reload. (Session 9.3 will refactor this so the model lives outside the
- * session.)
+ * Architecture metadata (`d_model`, `n_layers`, `n_heads`) is not derivable
+ * from the public ONNX I/O contract — those dims live in initializer
+ * shapes the `ort` crate doesn't surface. Returned as `None`; the setup
+ * screen displays only the file size + modified time when they are.
  */
 async loadModel(path: string) : Promise<Result<ModelInfo, GuiError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_model", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Promote `path` to the head of the recents list. Idempotent — calling
+ * with the same path twice doesn't duplicate it.
+ */
+async addRecentModel(path: string) : Promise<Result<ModelInfo[], GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_recent_model", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -154,6 +177,32 @@ async loadSession(path: string) : Promise<Result<SessionSnapshot, GuiError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Load persisted setup-screen form values from
+ * `~/.blobmaster/settings.json`. Missing or corrupt files yield
+ * [`AppSettings::default`] without erroring — first launch is the common
+ * case.
+ */
+async loadAppSettings() : Promise<Result<AppSettings, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_app_settings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist setup-screen form values. Creates `~/.blobmaster/` on first
+ * write.
+ */
+async saveAppSettings(settings: AppSettings) : Promise<Result<null, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_app_settings", { settings }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -171,6 +220,27 @@ async loadSession(path: string) : Promise<Result<SessionSnapshot, GuiError>> {
  * Reply from `request_ai_suggestion`. Either bidding or playing.
  */
 export type AiSuggestion = { phase: "bidding"; policy: number[]; recommended_bid: number; value_estimate: number } | { phase: "playing"; per_card: CardEval[]; recommended_card: number; value_estimate: number; sims_completed: number; depth: number }
+/**
+ * Form values persisted to `~/.blobmaster/settings.json` so the setup
+ * screen survives across launches.
+ * 
+ * The players list is the single source of truth for seating: its length
+ * is `num_players`, its order is play order, and the last entry is the
+ * dealer. The "D" affordance in the UI re-orders the list so the chosen
+ * dealer ends up at the bottom; the engine then computes first-to-play =
+ * `(dealer + 1) % n` which is always seat 0 (the top row).
+ */
+export type AppSettings = { start_cards: number; trump_mode: TrumpMode; 
+/**
+ * 4..=7 entries. Position = seat index for the engine.
+ */
+players: PlayerConfig[]; engine_settings: EngineSettings; 
+/**
+ * Path of the most recently loaded model, if any. The setup screen
+ * pre-selects it on launch (and silently ignores it if the file is
+ * gone).
+ */
+last_model_path: string | null }
 /**
  * Per-card eval annotation rendered on the bottom-left magnified hand and,
  * optionally, on the right CardGrid (Session 9.7).
@@ -273,6 +343,17 @@ export type ModelInfo = { path: string; file_name: string; size_bytes: number;
  * filesystem doesn't expose it (rare on Windows/Linux/macOS).
  */
 modified_unix_secs: number | null; d_model: number | null; n_layers: number | null; n_heads: number | null }
+/**
+ * One row of the players list. Order in `AppSettings.players` is play
+ * order — the row at index 0 plays first in trick 1 and bids first; the
+ * last row is implicitly the dealer (bids last, deals the next round).
+ */
+export type PlayerConfig = { name: string; 
+/**
+ * Exactly one row in the list has this set. Marks the human seat for
+ * the GUI so AI suggestions and hand entry know which seat is yours.
+ */
+is_human: boolean }
 /**
  * Frontend-facing view of a `GameSession`. Authoritative state lives in
  * Rust — this struct is rebuilt on every state-mutating command and the
