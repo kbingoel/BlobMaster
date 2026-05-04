@@ -313,6 +313,25 @@ Turn the bottom-left pane into a chess-engine evaluation readout. Eval lives **p
 - Engine-settings live editor: compact form in the bottom-left pane footer (collapsible) — temperature, MCTS sims, determinization samples, eval-display mode. Changes apply to the next call.
 - **Done when**: on every snapshot change with the human active, every card in the magnified hand shows live two-line eval; the inference status row streams updates as MCTS progresses; Enter plays the recommended card; eval-display mode cycles via `E`; mid-game suggestion completes in < 1.5s.
 
+Update 04.05.2026
+What landed
+
+Backend (blob-gui/src-tauri/src/commands.rs) — replaced the stubbed request_ai_suggestion with a real implementation:
+
+Picks OnnxEvaluator if loaded, else HeuristicEvaluator
+For Bidding: evaluator policy projected onto legal_bids, renormalized
+For Playing: per-card metrics aggregated across determinization_samples belief samples — visits summed, mcts-value/policy averaged, win-rate derived from per-card MCTS Q (or root value when sims=0), recommended card by visit count
+Uses blob_engine::mcts::run_search per determinization so per-card root-child stats stay accessible; depth measured from the deepest reached node
+Added show_grid_eval boolean to EngineSettings
+Frontend:
+
+New evalUtils.ts — display cycle, primary/secondary metric formatters, win-rate→color tint
+MyHandPanel.svelte — two-line eval below each hand card, win-rate gradient tint, live inference-status row (MCTS / depth / v / round±delta / mode), E to cycle eval display, collapsible engine-settings footer (temperature, MCTS sims, determinizations, eval mode, show-grid-eval)
+CardGrid.svelte — optional secondary eval annotation in the bottom-right corner of legal cells, hidden by default and toggled on via "show eval on master grid"
+play/+page.svelte — owns the live engineSettings state, pushes changes to the engine via update_engine_settings, refreshes the suggestion when the human is active, threads perCardEvals + evalMode to the right grid
+Deferred (called out in spec but skipped this pass — none NN-dependent):
+
+True streaming ai-thinking events mid-search and CancellationToken (would need an async-task split; the heuristic path completes synchronously in well under the 1.5 s budget so the status row already shows live final values)
 ---
 
 ## Session 9.8 — Multi-round flow, scoring, save/resume

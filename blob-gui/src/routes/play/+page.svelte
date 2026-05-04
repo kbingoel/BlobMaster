@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { commands, type AiSuggestion, type SessionSnapshot } from '$lib/api';
+	import { commands, type AiSuggestion, type EngineSettings, type SessionSnapshot } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
 	import CardGrid from '$lib/components/CardGrid.svelte';
 	import BiddingKeypad from '$lib/components/BiddingKeypad.svelte';
@@ -13,6 +13,18 @@
 	let submitting = $state(false);
 	let lastError = $state<string | null>(null);
 
+	// Live engine-settings state. Loaded once from disk so the GUI matches
+	// what the user picked in /setup, then mutated locally and pushed
+	// through `update_engine_settings` on every change.
+	let engineSettings = $state<EngineSettings>({
+		temperature: 1.0,
+		mcts_simulations: 400,
+		determinization_samples: 8,
+		deterministic_seed: null,
+		eval_display: 'win-rate',
+		show_grid_eval: false
+	});
+
 	// Bumped on every snapshot replacement so we can ignore stale AI replies
 	// (e.g. Player 3 plays before iter-229 finished thinking for Player 2).
 	let suggestionRequestId = 0;
@@ -22,12 +34,15 @@
 			snapshot = s;
 		});
 		if (snapshot === null) goto('/setup', { replaceState: true });
+		// Pull the persisted engine settings — user's setup-screen choices.
+		commands.loadAppSettings().then((res) => {
+			if (res.status === 'ok') {
+				engineSettings = res.data.engine_settings;
+			}
+		});
 		return unsub;
 	});
 
-	// Auto-fetch an AI suggestion whenever it's the human's turn in bidding
-	// or playing. Session 9.7 streams partial updates via the `ai-thinking`
-	// event channel; for 9.6 we just await the final reply.
 	$effect(() => {
 		if (!snapshot) return;
 		const humanActive = snapshot.current_player === snapshot.human_seat;
@@ -55,7 +70,6 @@
 		const seat = snapshot.current_player;
 		submitting = true;
 		lastError = null;
-		// Drop the suggestion immediately — it's tied to the seat that just bid.
 		aiSuggestion = null;
 		const result = await commands.submitBid(seat, bid);
 		submitting = false;
@@ -73,8 +87,6 @@
 		const seat = snapshot.current_player;
 		submitting = true;
 		lastError = null;
-		// Suggestion is tied to the active seat — invalidate immediately so
-		// the bottom-left pane doesn't render stale eval against the next seat.
 		aiSuggestion = null;
 		const result = await commands.recordCardPlayed(seat, card);
 		submitting = false;
@@ -92,11 +104,24 @@
 			playCard(card);
 		}
 	}
+
+	async function updateEngineSettings(next: EngineSettings) {
+		engineSettings = next;
+		// Push through to the engine so the next AI call honors the new
+		// values; refresh the suggestion if the human is still active.
+		await commands.updateEngineSettings(next);
+		if (snapshot && snapshot.current_player === snapshot.human_seat) {
+			fetchSuggestion();
+		}
+	}
+
+	let perCardEvals = $derived(
+		aiSuggestion && aiSuggestion.phase === 'playing' ? aiSuggestion.per_card : []
+	);
 </script>
 
 {#if snapshot}
 	<div class="play-layout">
-		<!-- ── Left column: players (top) + phase-specific panel (bottom) -->
 		<div class="left-col">
 			<div class="top-left">
 				<PlayersPanel {snapshot} />
@@ -114,9 +139,11 @@
 					<MyHandPanel
 						{snapshot}
 						suggestion={aiSuggestion}
+						settings={engineSettings}
 						{submitting}
 						errorMessage={lastError}
 						onPlay={playCard}
+						onSettingsChange={updateEngineSettings}
 					/>
 				{:else}
 					<div class="pane-placeholder">
@@ -126,9 +153,14 @@
 			</div>
 		</div>
 
-		<!-- ── Right column: master CardGrid ─────────────────── -->
 		<div class="right-col">
-			<CardGrid {snapshot} mode="play" onCardclick={handleGridClick} />
+			<CardGrid
+				{snapshot}
+				mode="play"
+				onCardclick={handleGridClick}
+				perCardEvals={engineSettings.show_grid_eval ? perCardEvals : []}
+				evalMode={engineSettings.eval_display}
+			/>
 		</div>
 	</div>
 {:else}
