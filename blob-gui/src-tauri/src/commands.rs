@@ -7,8 +7,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use blob_engine::bidding::{apply_bid, legal_bids};
+use blob_engine::card::NUM_CARDS;
 use blob_engine::dealing::start_round;
 use blob_engine::onnx::OnnxEvaluator;
+use blob_engine::playing::{apply_play, legal_plays};
 use blob_engine::state::GamePhase as EnginePhase;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -310,9 +312,12 @@ pub fn submit_bid(
 /// Record a card played by `seat`. Public-state-only wrapper around
 /// [`apply_play`].
 ///
-/// **Stub** — the public-state-only variant of `apply_play` lands in
-/// Session 9.6. For now this surfaces a structured `NotImplemented` error
-/// so the frontend can wire the call site without crashing.
+/// For the human seat we hold the real hand and the engine's `legal_plays`
+/// mask is authoritative. For opponents we don't know their hand at all —
+/// we synthesize a one-card hand consisting of just the played card so
+/// `apply_play` can run its trick bookkeeping uniformly. The card is
+/// validated against public knowledge (not already played, not in the
+/// human's hand, in range) before being recorded.
 #[tauri::command]
 #[specta::specta]
 pub fn record_card_played(
@@ -320,10 +325,65 @@ pub fn record_card_played(
     seat: u8,
     card: u8,
 ) -> GuiResult<SessionSnapshot> {
-    with_session(&state, |_session| {
-        Err(GuiError::NotImplemented(format!(
-            "record_card_played(seat={seat}, card={card}) — wired in Session 9.6"
-        )))
+    with_session(&state, |session| {
+        if session.state.phase() != EnginePhase::Playing {
+            return Err(GuiError::WrongPhase(format!(
+                "phase is {:?}, not Playing",
+                session.state.phase()
+            )));
+        }
+        if seat != session.state.current_player {
+            return Err(GuiError::IllegalAction(format!(
+                "seat {seat} played out of turn (current={})",
+                session.state.current_player
+            )));
+        }
+        if card >= NUM_CARDS {
+            return Err(GuiError::IllegalAction(format!(
+                "card index {card} out of range (0..{NUM_CARDS})"
+            )));
+        }
+        let bit = 1u64 << card;
+        if session.state.played_this_round & bit != 0 {
+            return Err(GuiError::IllegalAction(format!(
+                "card {card} already played this round"
+            )));
+        }
+
+        let is_human = seat == session.human_seat;
+        if is_human {
+            if session.human_hand & bit == 0 {
+                return Err(GuiError::IllegalAction(format!(
+                    "card {card} not in human's hand"
+                )));
+            }
+            let mask = legal_plays(&session.state);
+            if (mask >> card) & 1 == 0 {
+                return Err(GuiError::IllegalAction(format!(
+                    "card {card} fails follow-suit constraint"
+                )));
+            }
+        } else {
+            // Opponent's play: card cannot be one the human is known to hold.
+            if session.human_hand & bit != 0 {
+                return Err(GuiError::IllegalAction(format!(
+                    "card {card} is in the human's hand"
+                )));
+            }
+            // Synthesize a single-card hand so apply_play's debug_assert
+            // and legal_plays accept the move uniformly.
+            session.state.hands[seat as usize] = bit;
+        }
+
+        apply_play(&mut session.state, card);
+
+        if is_human {
+            session.human_hand &= !bit;
+        }
+        // Opponent hand is now 0 again (apply_play removed the bit).
+
+        session.event_log.push(GameEvent::Play { seat, card });
+        Ok(session.snapshot())
     })
 }
 

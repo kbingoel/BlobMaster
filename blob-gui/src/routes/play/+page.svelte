@@ -6,6 +6,7 @@
 	import CardGrid from '$lib/components/CardGrid.svelte';
 	import BiddingKeypad from '$lib/components/BiddingKeypad.svelte';
 	import PlayersPanel from '$lib/components/PlayersPanel.svelte';
+	import MyHandPanel from '$lib/components/MyHandPanel.svelte';
 
 	let snapshot = $state<SessionSnapshot | null>(null);
 	let aiSuggestion = $state<AiSuggestion | null>(null);
@@ -25,7 +26,8 @@
 	});
 
 	// Auto-fetch an AI suggestion whenever it's the human's turn in bidding
-	// (or playing — Session 9.7 expands this surface).
+	// or playing. Session 9.7 streams partial updates via the `ai-thinking`
+	// event channel; for 9.6 we just await the final reply.
 	$effect(() => {
 		if (!snapshot) return;
 		const humanActive = snapshot.current_player === snapshot.human_seat;
@@ -64,6 +66,32 @@
 			lastError = 'message' in err ? err.message : err.kind;
 		}
 	}
+
+	async function playCard(card: number) {
+		if (!snapshot || submitting) return;
+		if (snapshot.phase !== 'playing') return;
+		const seat = snapshot.current_player;
+		submitting = true;
+		lastError = null;
+		// Suggestion is tied to the active seat — invalidate immediately so
+		// the bottom-left pane doesn't render stale eval against the next seat.
+		aiSuggestion = null;
+		const result = await commands.recordCardPlayed(seat, card);
+		submitting = false;
+		if (result.status === 'ok') {
+			sessionStore.set(result.data);
+		} else {
+			const err = result.error;
+			lastError = 'message' in err ? err.message : err.kind;
+		}
+	}
+
+	function handleGridClick(card: number) {
+		if (!snapshot) return;
+		if (snapshot.phase === 'playing') {
+			playCard(card);
+		}
+	}
 </script>
 
 {#if snapshot}
@@ -83,10 +111,13 @@
 						onSubmit={submitBid}
 					/>
 				{:else if snapshot.phase === 'playing'}
-					<div class="pane-placeholder">
-						<p class="placeholder-label">Hand panel</p>
-						<p class="placeholder-sub">Session 9.6</p>
-					</div>
+					<MyHandPanel
+						{snapshot}
+						suggestion={aiSuggestion}
+						{submitting}
+						errorMessage={lastError}
+						onPlay={playCard}
+					/>
 				{:else}
 					<div class="pane-placeholder">
 						<p class="placeholder-label">Phase: {snapshot.phase}</p>
@@ -97,7 +128,7 @@
 
 		<!-- ── Right column: master CardGrid ─────────────────── -->
 		<div class="right-col">
-			<CardGrid {snapshot} mode="play" />
+			<CardGrid {snapshot} mode="play" onCardclick={handleGridClick} />
 		</div>
 	</div>
 {:else}
@@ -144,12 +175,6 @@
 	.placeholder-label {
 		font-size: 0.875rem;
 		color: #94a3b8;
-		margin: 0;
-	}
-
-	.placeholder-sub {
-		font-size: 0.75rem;
-		color: #cbd5e1;
 		margin: 0;
 	}
 

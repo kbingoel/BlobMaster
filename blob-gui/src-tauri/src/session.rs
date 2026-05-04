@@ -105,8 +105,13 @@ impl GameSession {
         } else {
             None
         };
-        let legal_plays_vec = if human_active && phase == EnginePhase::Playing {
-            Some(mask_to_indices_u64(legal_plays(&self.state)))
+        let legal_plays_vec = if phase == EnginePhase::Playing {
+            let mask = if human_active {
+                legal_plays(&self.state)
+            } else {
+                opponent_legal_mask(&self.state, self.human_hand)
+            };
+            Some(mask_to_indices_u64(mask))
         } else {
             None
         };
@@ -185,6 +190,17 @@ fn validate_config(c: &GameConfig) -> GuiResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Opponent legality from the GUI's public-knowledge perspective. We don't
+/// know the opponent's hand, so any card not yet played and not in the
+/// human's hand is potentially in theirs. The engine's strict
+/// follow-suit mask isn't reachable without belief sampling — and the
+/// user (who can see the table) is the source of truth for the opponent's
+/// actual play. We surface the permissive mask and trust the click.
+fn opponent_legal_mask(s: &BlobState, human_hand: u64) -> u64 {
+    let all = (1u64 << NUM_CARDS) - 1;
+    all & !s.played_this_round & !human_hand
 }
 
 fn mask_to_indices_u16(mask: u16) -> Vec<u8> {
