@@ -219,7 +219,7 @@ Build the pre-game configuration UI. This is the first screen the user sees.
 Build the central CardGrid once. Every subsequent session reuses it.
 
 - `lib/components/CardGrid.svelte`: 4-column × 13-row CSS grid. Columns are suits ♠ ♥ ♣ ♦ (left → right), rows are ranks A → 2 (top → bottom). No header/label rows — the suit/rank are visible inside each cell. No SVG, no card images.
-- Cell content: rank text (2–9, T, J, Q, K, A) and suit glyph (♠ U+2660, ♥ U+2665, ♣ U+2663, ♦ U+2666) rendered together in the suit color (red for ♥/♦, near-black for ♠/♣). Compact two-line layout: rank on top, suit below.
+- Cell content: rank text (2–10, J, Q, K, A) and suit glyph (♠ U+2660, ♥ U+2665, ♣ U+2663, ♦ U+2666) rendered together in the suit color (red for ♥/♦, near-black for ♠/♣). Compact two-line layout: rank on top, suit below.
 - Cell-state derivation: a single `cellState(card_index, snapshot, mode)` pure function returns one of `in-hand | legal | played | illegal | empty`. Drives a class binding; CSS does the rest.
 - Mode prop: `"hand-entry" | "play" | "review"`. Click handler is mode-dependent, emitted as a typed Svelte event `on:cardclick={ detail: { card_index } }`.
 - Played-cell annotation: greyed background, footer line with seat (`P3`) and round-trick index (`R7.t3`) so the full played history is visible at a glance.
@@ -227,7 +227,7 @@ Build the central CardGrid once. Every subsequent session reuses it.
 - Route: `/hand-entry` is a special full-screen layout — the CardGrid takes the full window in `"hand-entry"` mode (no three-pane split during hand entry).
   - Click toggles `in-hand`. Counter shows `selected / cards_dealt`. Submit disabled until equal.
   - Sticky strip at top: round number, trump suit symbol, dealer indicator, cards-this-round.
-  - Keyboard: rank keys 2–9, T, J, Q, K, A pre-arm a rank (highlights the row); suit keys S/H/C/D toggle the cell at the intersection. Esc clears the pre-arm.
+  - Keyboard: rank keys 2–10, J, Q, K, A pre-arm a rank (highlights the row); suit keys S/H/C/D toggle the cell at the intersection. Esc clears the pre-arm.
 - "Confirm hand" calls `set_human_hand`. On success navigate to `/play` (three-pane layout).
 - "Back to setup" link discards the not-yet-started game.
 - **Important**: hand-entry is reused at every round transition (Session 9.8) since `cards_dealt` changes round-to-round.

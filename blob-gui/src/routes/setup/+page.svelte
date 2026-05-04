@@ -12,6 +12,7 @@
 		type PlayerConfig,
 		type TrumpMode
 	} from '$lib/api';
+	import { sessionStore } from '$lib/stores/session';
 
 	const MIN_PLAYERS = 4;
 	const MAX_PLAYERS = 7;
@@ -285,6 +286,7 @@
 			startError = errMessage(applied.error);
 			return;
 		}
+		sessionStore.set(result.data);
 		goto('/hand-entry');
 	}
 </script>
