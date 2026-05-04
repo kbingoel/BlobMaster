@@ -112,9 +112,12 @@ async submitBid(seat: number, bid: number) : Promise<Result<SessionSnapshot, Gui
  * Record a card played by `seat`. Public-state-only wrapper around
  * [`apply_play`].
  * 
- * **Stub** — the public-state-only variant of `apply_play` lands in
- * Session 9.6. For now this surfaces a structured `NotImplemented` error
- * so the frontend can wire the call site without crashing.
+ * For the human seat we hold the real hand and the engine's `legal_plays`
+ * mask is authoritative. For opponents we don't know their hand at all —
+ * we synthesize a one-card hand consisting of just the played card so
+ * `apply_play` can run its trick bookkeeping uniformly. The card is
+ * validated against public knowledge (not already played, not in the
+ * human's hand, in range) before being recorded.
  */
 async recordCardPlayed(seat: number, card: number) : Promise<Result<SessionSnapshot, GuiError>> {
     try {
