@@ -1,11 +1,20 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { type SessionSnapshot } from '$lib/api';
+	import { commands, type AiSuggestion, type SessionSnapshot } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
 	import CardGrid from '$lib/components/CardGrid.svelte';
+	import BiddingKeypad from '$lib/components/BiddingKeypad.svelte';
+	import PlayersPanel from '$lib/components/PlayersPanel.svelte';
 
 	let snapshot = $state<SessionSnapshot | null>(null);
+	let aiSuggestion = $state<AiSuggestion | null>(null);
+	let submitting = $state(false);
+	let lastError = $state<string | null>(null);
+
+	// Bumped on every snapshot replacement so we can ignore stale AI replies
+	// (e.g. Player 3 plays before iter-229 finished thinking for Player 2).
+	let suggestionRequestId = 0;
 
 	onMount(() => {
 		const unsub = sessionStore.subscribe((s) => {
@@ -14,19 +23,75 @@
 		if (snapshot === null) goto('/setup', { replaceState: true });
 		return unsub;
 	});
+
+	// Auto-fetch an AI suggestion whenever it's the human's turn in bidding
+	// (or playing — Session 9.7 expands this surface).
+	$effect(() => {
+		if (!snapshot) return;
+		const humanActive = snapshot.current_player === snapshot.human_seat;
+		const phase = snapshot.phase;
+		if (!humanActive || (phase !== 'bidding' && phase !== 'playing')) {
+			aiSuggestion = null;
+			return;
+		}
+		fetchSuggestion();
+	});
+
+	async function fetchSuggestion() {
+		const id = ++suggestionRequestId;
+		const result = await commands.requestAiSuggestion();
+		if (id !== suggestionRequestId) return; // stale
+		if (result.status === 'ok') {
+			aiSuggestion = result.data;
+		} else {
+			aiSuggestion = null;
+		}
+	}
+
+	async function submitBid(bid: number) {
+		if (!snapshot || submitting) return;
+		const seat = snapshot.current_player;
+		submitting = true;
+		lastError = null;
+		// Drop the suggestion immediately — it's tied to the seat that just bid.
+		aiSuggestion = null;
+		const result = await commands.submitBid(seat, bid);
+		submitting = false;
+		if (result.status === 'ok') {
+			sessionStore.set(result.data);
+		} else {
+			const err = result.error;
+			lastError = 'message' in err ? err.message : err.kind;
+		}
+	}
 </script>
 
 {#if snapshot}
 	<div class="play-layout">
-		<!-- ── Left column: two placeholder panes ─────────────── -->
+		<!-- ── Left column: players (top) + phase-specific panel (bottom) -->
 		<div class="left-col">
-			<div class="top-left pane-placeholder">
-				<p class="placeholder-label">Players panel</p>
-				<p class="placeholder-sub">Session 9.5</p>
+			<div class="top-left">
+				<PlayersPanel {snapshot} />
 			</div>
-			<div class="bottom-left pane-placeholder">
-				<p class="placeholder-label">Hand panel</p>
-				<p class="placeholder-sub">Session 9.6</p>
+			<div class="bottom-left">
+				{#if snapshot.phase === 'bidding'}
+					<BiddingKeypad
+						{snapshot}
+						suggestion={aiSuggestion}
+						{submitting}
+						errorMessage={lastError}
+						onSubmit={submitBid}
+					/>
+				{:else if snapshot.phase === 'playing'}
+					<div class="pane-placeholder">
+						<p class="placeholder-label">Hand panel</p>
+						<p class="placeholder-sub">Session 9.6</p>
+					</div>
+				{:else}
+					<div class="pane-placeholder">
+						<p class="placeholder-label">Phase: {snapshot.phase}</p>
+					</div>
+				{/if}
 			</div>
 		</div>
 
@@ -56,11 +121,15 @@
 
 	.top-left {
 		flex: 1;
+		min-height: 0;
 		border-bottom: 1px solid #e2e8f0;
+		overflow: hidden;
 	}
 
 	.bottom-left {
 		flex: 1;
+		min-height: 0;
+		overflow: hidden;
 	}
 
 	.pane-placeholder {
@@ -74,13 +143,13 @@
 
 	.placeholder-label {
 		font-size: 0.875rem;
-		color: #94a3b8; /* slate-400 */
+		color: #94a3b8;
 		margin: 0;
 	}
 
 	.placeholder-sub {
 		font-size: 0.75rem;
-		color: #cbd5e1; /* slate-300 */
+		color: #cbd5e1;
 		margin: 0;
 	}
 
