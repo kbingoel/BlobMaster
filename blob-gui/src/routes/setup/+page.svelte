@@ -41,7 +41,8 @@
 			mcts_simulations: 400,
 			determinization_samples: 8,
 			deterministic_seed: null,
-			eval_display: 'win-rate'
+			eval_display: 'win-rate',
+			show_grid_eval: false
 		},
 		last_model_path: null
 	});

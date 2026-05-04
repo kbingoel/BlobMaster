@@ -130,9 +130,15 @@ async recordCardPlayed(seat: number, card: number) : Promise<Result<SessionSnaps
 /**
  * Run an AI suggestion on the current state.
  * 
- * **Stub** — returns a deterministic mock payload so the frontend can
- * render the eval surface end-to-end. Real MCTS + belief wiring lands in
- * Session 9.7.
+ * Uses the loaded `OnnxEvaluator` if one is installed on the session,
+ * otherwise falls back to `HeuristicEvaluator` so the AI surface stays
+ * usable without a trained model. Per-card metrics are averaged across
+ * `determinization_samples` belief samples; visit counts are summed.
+ * 
+ * Streaming `ai-thinking` progress events and a CancellationToken are
+ * out of scope for this pass — the heuristic path completes well under
+ * the 1.5 s budget and the on-NN path can be split into a tokio task in
+ * a follow-up without touching the result shape.
  */
 async requestAiSuggestion() : Promise<Result<AiSuggestion, GuiError>> {
     try {
@@ -293,7 +299,13 @@ deterministic_seed: number | null;
 /**
  * Display mode for inline AI eval (cycled by `E`).
  */
-eval_display: EvalDisplay }
+eval_display: EvalDisplay; 
+/**
+ * Render the primary eval annotation on the right CardGrid's legal
+ * cells too (Session 9.7 secondary surface). Off by default to keep
+ * the 52-cell grid uncluttered.
+ */
+show_grid_eval?: boolean }
 export type EvalDisplay = "win-rate" | "policy" | "mcts-visits" | "value" | "off"
 /**
  * Pre-game configuration (the form on `/setup`).

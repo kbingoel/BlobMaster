@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { SessionSnapshot } from '$lib/api';
+	import type { CardEval, EvalDisplay, SessionSnapshot } from '$lib/api';
 	import {
 		cardIndex,
 		isRed,
@@ -8,6 +8,7 @@
 		SUIT_KEYS,
 		RANK_KEYS
 	} from '$lib/cardUtils';
+	import { primaryMetric } from '$lib/evalUtils';
 
 	interface Props {
 		snapshot?: SessionSnapshot | null;
@@ -15,14 +16,26 @@
 		/** Card indices currently toggled as in-hand (hand-entry mode only). */
 		selectedCards?: number[];
 		onCardclick?: (cardIdx: number) => void;
+		/**
+		 * Optional per-card AI evals (Session 9.7 secondary surface). When
+		 * non-empty and `evalMode !== 'off'`, legal cells render the primary
+		 * metric in the bottom corner. Off by default — the right grid
+		 * stays uncluttered unless the user opts in.
+		 */
+		perCardEvals?: CardEval[];
+		evalMode?: EvalDisplay;
 	}
 
 	let {
 		snapshot = null,
 		mode = 'play',
 		selectedCards = [],
-		onCardclick = () => {}
+		onCardclick = () => {},
+		perCardEvals = [],
+		evalMode = 'off'
 	}: Props = $props();
+
+	let evalByCard = $derived(new Map(perCardEvals.map((e) => [e.card, e])));
 
 	type CellState = 'in-hand' | 'legal' | 'played' | 'illegal' | 'empty';
 
@@ -155,6 +168,8 @@
 				<span class="suit-text">{suitGlyph(col)}</span>
 				{#if ci.state === 'played' && ci.playedInfo}
 					<span class="played-label">{ci.playedInfo.label}</span>
+				{:else if ci.state === 'legal' && evalMode !== 'off' && evalByCard.has(cardIdx)}
+					<span class="grid-eval">{primaryMetric(evalByCard.get(cardIdx)!, evalMode)}</span>
 				{/if}
 			</div>
 		{/each}
@@ -297,5 +312,18 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		padding: 0 2px;
+	}
+
+	/* ── Secondary AI eval annotation (Session 9.7) ──────────────── */
+
+	.grid-eval {
+		position: absolute;
+		bottom: 1px;
+		right: 3px;
+		font-size: clamp(0.4rem, 1cqw, 0.62rem);
+		font-weight: 600;
+		color: #166534;
+		font-variant-numeric: tabular-nums;
+		pointer-events: none;
 	}
 </style>

@@ -90,6 +90,11 @@ pub struct EngineSettings {
     pub deterministic_seed: Option<u64>,
     /// Display mode for inline AI eval (cycled by `E`).
     pub eval_display: EvalDisplay,
+    /// Render the primary eval annotation on the right CardGrid's legal
+    /// cells too (Session 9.7 secondary surface). Off by default to keep
+    /// the 52-cell grid uncluttered.
+    #[serde(default)]
+    pub show_grid_eval: bool,
 }
 
 impl Default for EngineSettings {
@@ -100,6 +105,7 @@ impl Default for EngineSettings {
             determinization_samples: 8,
             deterministic_seed: None,
             eval_display: EvalDisplay::WinRate,
+            show_grid_eval: false,
         }
     }
 }

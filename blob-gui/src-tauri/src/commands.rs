@@ -6,9 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use blob_engine::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
 use blob_engine::bidding::{apply_bid, legal_bids};
 use blob_engine::card::NUM_CARDS;
 use blob_engine::dealing::start_round;
+use blob_engine::encoder::encode;
+use blob_engine::evaluator::{Evaluator, HeuristicEvaluator};
+use blob_engine::mcts::{run_search, MctsArena};
 use blob_engine::onnx::OnnxEvaluator;
 use blob_engine::playing::{apply_play, legal_plays};
 use blob_engine::state::GamePhase as EnginePhase;
@@ -18,8 +22,8 @@ use tauri::State;
 
 use crate::session::{indices_to_hand, GameSession};
 use crate::types::{
-    AiSuggestion, AppSettings, EngineSettings, GameConfig, GameEvent, GuiError, GuiResult,
-    ModelInfo, SessionSnapshot,
+    AiSuggestion, AppSettings, CardEval, EngineSettings, GameConfig, GameEvent, GuiError,
+    GuiResult, ModelInfo, SessionSnapshot,
 };
 
 /// `tauri::State` payload. `Mutex` is fine for our single-user GUI — every
@@ -389,41 +393,290 @@ pub fn record_card_played(
 
 /// Run an AI suggestion on the current state.
 ///
-/// **Stub** — returns a deterministic mock payload so the frontend can
-/// render the eval surface end-to-end. Real MCTS + belief wiring lands in
-/// Session 9.7.
+/// Uses the loaded `OnnxEvaluator` if one is installed on the session,
+/// otherwise falls back to `HeuristicEvaluator` so the AI surface stays
+/// usable without a trained model. Per-card metrics are averaged across
+/// `determinization_samples` belief samples; visit counts are summed.
+///
+/// Streaming `ai-thinking` progress events and a CancellationToken are
+/// out of scope for this pass — the heuristic path completes well under
+/// the 1.5 s budget and the on-NN path can be split into a tokio task in
+/// a follow-up without touching the result shape.
 #[tauri::command]
 #[specta::specta]
 pub fn request_ai_suggestion(state: State<'_, AppState>) -> GuiResult<AiSuggestion> {
     with_session(&state, |session| {
         let phase = session.state.phase();
         match phase {
-            EnginePhase::Bidding => {
-                let cards_dealt = session.state.cards_dealt as usize;
-                let mut policy = vec![0.0f32; cards_dealt + 1];
-                if !policy.is_empty() {
-                    let mid = policy.len() / 2;
-                    policy[mid] = 1.0;
-                }
-                Ok(AiSuggestion::Bidding {
-                    policy,
-                    recommended_bid: (cards_dealt / 2) as u8,
-                    value_estimate: 0.0,
-                })
-            }
-            EnginePhase::Playing => Ok(AiSuggestion::Playing {
-                per_card: Vec::new(),
-                recommended_card: 0,
-                value_estimate: 0.0,
-                sims_completed: 0,
-                depth: 0,
-            }),
+            EnginePhase::Bidding => compute_bidding_suggestion(session),
+            EnginePhase::Playing => compute_playing_suggestion(session),
             other => Err(GuiError::WrongPhase(format!(
                 "AI suggestion not available in phase {other:?}"
             ))),
         }
     })
 }
+
+/// Adapter so we can call the same orchestration code on either the
+/// loaded ONNX model or the heuristic fallback without dynamic dispatch
+/// at every leaf.
+fn run_with_evaluator<R>(session: &GameSession, f: impl FnOnce(&dyn Evaluator) -> R) -> R {
+    match &session.evaluator {
+        Some(onnx) => f(onnx as &dyn Evaluator),
+        None => f(&HeuristicEvaluator as &dyn Evaluator),
+    }
+}
+
+fn compute_bidding_suggestion(session: &GameSession) -> GuiResult<AiSuggestion> {
+    let s = &session.state;
+    let cards_dealt = s.cards_dealt as usize;
+    let mask = legal_bids(s);
+    if mask == 0 {
+        return Err(GuiError::IllegalAction(
+            "no legal bids available".into(),
+        ));
+    }
+
+    // Bidding is fully observable from the bidder's perspective (their own
+    // hand was just entered), so a single evaluator call is enough — no
+    // determinization needed for the policy/value at the bidding root.
+    let (raw_policy, value) = run_with_evaluator(session, |eval| eval.evaluate(s));
+
+    // Project onto the legal mask + 0..=cards_dealt window the frontend
+    // expects, renormalize.
+    let mut policy = vec![0.0f32; cards_dealt + 1];
+    let mut total = 0.0f32;
+    for b in 0..=cards_dealt as u8 {
+        if (mask >> b) & 1 == 1 {
+            let p = raw_policy.get(b as usize).copied().unwrap_or(0.0).max(0.0);
+            policy[b as usize] = p;
+            total += p;
+        }
+    }
+    if total > 0.0 {
+        for v in policy.iter_mut() {
+            *v /= total;
+        }
+    } else {
+        // Evaluator returned no mass over the legal window (edge case for
+        // OnnxEvaluator with degenerate output) — fall back to uniform.
+        let n = (0..=cards_dealt as u8).filter(|b| (mask >> *b) & 1 == 1).count();
+        let p = 1.0 / n as f32;
+        for b in 0..=cards_dealt as u8 {
+            if (mask >> b) & 1 == 1 {
+                policy[b as usize] = p;
+            }
+        }
+    }
+
+    let recommended_bid = policy
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u8)
+        .unwrap_or(0);
+
+    Ok(AiSuggestion::Bidding {
+        policy,
+        recommended_bid,
+        value_estimate: value,
+    })
+}
+
+fn compute_playing_suggestion(session: &GameSession) -> GuiResult<AiSuggestion> {
+    let s = &session.state;
+    let perspective = s.current_player;
+    let legal_mask = legal_plays(s);
+    if legal_mask == 0 {
+        return Err(GuiError::IllegalAction(
+            "no legal plays available".into(),
+        ));
+    }
+
+    let cfg = &session.engine_settings;
+    let num_dets = cfg.determinization_samples.max(1) as usize;
+    let sims_per = cfg.mcts_simulations;
+    let voids = void_suits(s);
+
+    // Per-card aggregators, indexed by card 0..52 to keep the math obvious.
+    // Only entries with `samples[c] > 0` are meaningful.
+    let mut visit_sum = [0u32; NUM_CARDS as usize];
+    let mut value_sum = [0.0f32; NUM_CARDS as usize];
+    let mut value_n = [0u32; NUM_CARDS as usize];
+    let mut policy_sum = [0.0f32; NUM_CARDS as usize];
+    let mut policy_n = [0u32; NUM_CARDS as usize];
+    let mut root_value_sum = 0.0f32;
+    let mut root_value_n = 0u32;
+    let mut total_visits = 0u32;
+    let mut max_depth = 0u32;
+
+    let c_puct = blob_engine::mcts::DEFAULT_C_PUCT;
+    let mut rng = rng_for(session);
+
+    // We need the legal cards in absolute index form for renormalization
+    // of the evaluator's hand-position-indexed policy.
+    let legal_cards: Vec<u8> = (0..NUM_CARDS).filter(|c| (legal_mask >> *c) & 1 == 1).collect();
+
+    run_with_evaluator(session, |eval| {
+        for _ in 0..num_dets {
+            let det_state = determinize(s, perspective, &voids, &mut rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+
+            // Encoder hand-card-index map for THIS determinization (the
+            // perspective's hand is preserved, so it's the same every
+            // iteration in practice — but recompute defensively).
+            let enc = encode(&det_state, perspective);
+            let (raw_policy, root_value) = eval.evaluate(&det_state);
+
+            // Renormalize policy across the legal subset and accumulate
+            // into the per-card buckets.
+            let mut policy_total = 0.0f32;
+            let mut per_card_policy = [0.0f32; NUM_CARDS as usize];
+            for (pos, &card) in enc.hand_card_indices.iter().enumerate() {
+                if (legal_mask >> card) & 1 == 0 {
+                    continue;
+                }
+                let p = raw_policy.get(pos).copied().unwrap_or(0.0).max(0.0);
+                per_card_policy[card as usize] = p;
+                policy_total += p;
+            }
+            if policy_total > 0.0 {
+                for &card in &legal_cards {
+                    per_card_policy[card as usize] /= policy_total;
+                }
+            } else {
+                let p = 1.0 / legal_cards.len() as f32;
+                for &card in &legal_cards {
+                    per_card_policy[card as usize] = p;
+                }
+            }
+            for &card in &legal_cards {
+                policy_sum[card as usize] += per_card_policy[card as usize];
+                policy_n[card as usize] += 1;
+            }
+
+            root_value_sum += root_value;
+            root_value_n += 1;
+
+            if sims_per == 0 {
+                // Pure-policy mode: visits stay zero, win-rate falls back
+                // to root value projected to [0,1] (handled below).
+                continue;
+            }
+
+            // Run MCTS on this determinization. We use the per-det
+            // `run_search` rather than the cross-det lockstep driver
+            // because we need direct access to each arena's root children
+            // to extract per-card visits/Q.
+            let mut arena = MctsArena::new(perspective);
+            run_search(&mut arena, &det_state, eval, sims_per, c_puct);
+
+            let depth = arena_depth(&arena);
+            if depth > max_depth {
+                max_depth = depth;
+            }
+
+            for &child_idx in arena.root().children.iter() {
+                let child = arena.node(child_idx);
+                if (legal_mask >> child.action) & 1 == 0 {
+                    continue;
+                }
+                let card = child.action as usize;
+                visit_sum[card] += child.visit_count;
+                total_visits = total_visits.saturating_add(child.visit_count);
+                if child.value_counts[perspective as usize] > 0 {
+                    value_sum[card] += child.q(perspective);
+                    value_n[card] += 1;
+                }
+            }
+        }
+    });
+
+    let root_value = if root_value_n > 0 {
+        root_value_sum / root_value_n as f32
+    } else {
+        0.0
+    };
+
+    let mut per_card: Vec<CardEval> = legal_cards
+        .iter()
+        .map(|&card| {
+            let i = card as usize;
+            let policy = if policy_n[i] > 0 { policy_sum[i] / policy_n[i] as f32 } else { 0.0 };
+            let mcts_value = if value_n[i] > 0 { value_sum[i] / value_n[i] as f32 } else { 0.0 };
+            // Win-rate uses MCTS Q where available (proper imperfect-info
+            // estimate), and falls back to the root value when MCTS was
+            // skipped (mcts_simulations == 0). Q ∈ [-1,1] → [0,1].
+            let v_for_card = if value_n[i] > 0 { mcts_value } else { root_value };
+            let win_rate = ((v_for_card + 1.0) * 0.5).clamp(0.0, 1.0);
+            CardEval {
+                card,
+                policy,
+                mcts_visits: visit_sum[i],
+                mcts_value,
+                win_rate,
+            }
+        })
+        .collect();
+
+    // Recommended card: highest visit count (MCTS available), else highest
+    // policy probability, with deterministic tie-break on the lowest card
+    // index. Falls back to the first legal card if everything is zero.
+    let recommended_card = if total_visits > 0 {
+        per_card
+            .iter()
+            .max_by(|a, b| {
+                a.mcts_visits
+                    .cmp(&b.mcts_visits)
+                    .then_with(|| b.card.cmp(&a.card))
+            })
+            .map(|e| e.card)
+            .unwrap_or(legal_cards[0])
+    } else {
+        per_card
+            .iter()
+            .max_by(|a, b| {
+                a.policy
+                    .partial_cmp(&b.policy)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.card.cmp(&a.card))
+            })
+            .map(|e| e.card)
+            .unwrap_or(legal_cards[0])
+    };
+
+    // Sort entries by card index for stable rendering on the frontend.
+    per_card.sort_by_key(|e| e.card);
+
+    Ok(AiSuggestion::Playing {
+        per_card,
+        recommended_card,
+        value_estimate: root_value,
+        sims_completed: total_visits,
+        depth: max_depth,
+    })
+}
+
+/// BFS depth of an arena rooted at node 0. Used as the displayed search
+/// depth — the deepest path reached by any descent in `run_search`.
+fn arena_depth(arena: &MctsArena) -> u32 {
+    let mut depth = 0u32;
+    let mut frontier: Vec<u32> = vec![0];
+    while !frontier.is_empty() {
+        let mut next: Vec<u32> = Vec::new();
+        for &idx in &frontier {
+            for &child in arena.node(idx).children.iter() {
+                next.push(child);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        depth += 1;
+        frontier = next;
+    }
+    depth
+}
+
 
 #[tauri::command]
 #[specta::specta]
