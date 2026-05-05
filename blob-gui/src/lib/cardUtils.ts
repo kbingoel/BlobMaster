@@ -40,3 +40,13 @@ export function suitGlyph(suit: number): string {
 export function isRed(suit: number): boolean {
 	return suit === 1 || suit === 3;
 }
+
+// Sentinel value the engine uses for no-trump rounds (blob_engine::round::NO_TRUMP).
+export const NO_TRUMP = 4;
+
+// Trump label that handles the no-trump sentinel. Used in the round-progress
+// strip and the round-end / end-of-game screens.
+export function trumpLabel(suit: number): string {
+	if (suit === NO_TRUMP) return 'NT';
+	return suitGlyph(suit);
+}

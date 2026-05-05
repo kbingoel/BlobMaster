@@ -298,6 +298,64 @@ impl Default for AppSettings {
     }
 }
 
+// ---- round summary / saved sessions --------------------------------------
+
+/// Per-player row on the round-end screen. Computed from a `Scoring`-phase
+/// session before `advance_round` is called, so `cumulative_after` shows
+/// what the cumulative score will be once the round is committed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+pub struct RoundScoreRow {
+    pub seat: u8,
+    pub bid: u8,
+    pub tricks_won: u8,
+    /// `10 + bid` if `tricks_won == bid`, else `0`.
+    pub round_score: u8,
+    /// Cumulative score after this round is committed.
+    pub cumulative_after: u16,
+}
+
+/// Round-end summary, returned by `round_summary` while the engine is in
+/// the `Scoring` phase.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct RoundSummary {
+    pub round_idx: u8,
+    pub cards_dealt: u8,
+    pub trump_suit: u8,
+    pub dealer: u8,
+    pub player_names: Vec<String>,
+    pub rows: Vec<RoundScoreRow>,
+    /// `true` once the round just scored is the last round of the game.
+    pub is_final_round: bool,
+}
+
+/// One entry per round on the persistent round-progress strip.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+pub struct RoundStructureEntry {
+    pub round_idx: u8,
+    pub cards_dealt: u8,
+    pub trump_suit: u8,
+}
+
+/// Header for a saved session file, returned by `list_sessions` so the
+/// setup screen can render the Resume list without deserializing the full
+/// payload of every file.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SavedSessionInfo {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub saved_unix_secs: Option<u64>,
+    pub num_players: u8,
+    pub start_cards: u8,
+    pub round_idx: u8,
+    pub total_rounds: u8,
+    pub phase: GamePhase,
+    /// Name of the seat with the highest cumulative score; `None` for an
+    /// all-zero scoreboard (round 0 not yet scored).
+    pub leader_name: Option<String>,
+    pub leader_score: u16,
+    pub player_names: Vec<String>,
+}
+
 // ---- event log -----------------------------------------------------------
 
 /// Reversible session-level event. Kept on `GameSession.event_log` to power

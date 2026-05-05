@@ -10,6 +10,7 @@
 		type GuiError,
 		type ModelInfo,
 		type PlayerConfig,
+		type SavedSessionInfo,
 		type TrumpMode
 	} from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
@@ -62,6 +63,10 @@
 	let starting = $state(false);
 	let startError = $state<string | null>(null);
 
+	let savedSessions = $state<SavedSessionInfo[]>([]);
+	let resuming = $state(false);
+	let resumeError = $state<string | null>(null);
+
 	// Dealer seat tracked separately so clicking D never reorders the list.
 	let dealerSeat = $state(defaultPlayers().length - 1);
 
@@ -96,11 +101,13 @@
 	// --- mount ------------------------------------------------------------
 
 	onMount(async () => {
-		const [settings, disc, rec] = await Promise.all([
+		const [settings, disc, rec, sessions] = await Promise.all([
 			commands.loadAppSettings(),
 			commands.listModels(),
-			commands.listRecentModels()
+			commands.listRecentModels(),
+			commands.listSessions()
 		]);
+		if (sessions.status === 'ok') savedSessions = sessions.data;
 		if (settings.status === 'ok') {
 			form = sanitize(settings.data);
 			// Regenerate stable IDs to match the loaded player count.
@@ -256,6 +263,49 @@
 		form.engine_settings.mcts_simulations = v;
 	}
 
+	// --- resume saved session --------------------------------------------
+
+	function fmtSessionAge(ts: number | null): string {
+		if (ts === null) return '';
+		return new Date(ts * 1000).toLocaleString();
+	}
+
+	async function resumeSession(info: SavedSessionInfo) {
+		resuming = true;
+		resumeError = null;
+		const result = await commands.loadSession(info.path);
+		if (result.status !== 'ok') {
+			resumeError = errMessage(result.error);
+			resuming = false;
+			return;
+		}
+		// Re-load the model the user had picked previously, if any. If the
+		// file's gone we silently skip — the heuristic evaluator still works.
+		if (form.last_model_path) {
+			await commands.loadModel(form.last_model_path).catch(() => {});
+		}
+		// Push the persisted engine settings through to the live session so
+		// AI calls match what the saved game was using. (load_session only
+		// restores the snapshot; the live engine settings come from the
+		// settings.json the user picked in /setup.)
+		await commands.updateEngineSettings(form.engine_settings);
+		sessionStore.set(result.data);
+		const phase = result.data.phase;
+		resuming = false;
+		if (phase === 'complete') goto('/end');
+		else if (phase === 'scoring') goto('/round-summary');
+		else if (phase === 'playing' || result.data.human_hand.length > 0) goto('/play');
+		else goto('/hand-entry');
+	}
+
+	async function deleteSavedSession(info: SavedSessionInfo, ev: MouseEvent) {
+		ev.stopPropagation();
+		const res = await commands.deleteSession(info.path);
+		if (res.status === 'ok') {
+			savedSessions = savedSessions.filter((s) => s.path !== info.path);
+		}
+	}
+
 	// --- start ------------------------------------------------------------
 
 	async function startGame() {
@@ -300,6 +350,61 @@
 			loaded) provides AI suggestions.
 		</p>
 	</header>
+
+	{#if savedSessions.length > 0}
+		<section class="mb-8">
+			<div class="mb-3 flex items-baseline justify-between">
+				<h2 class="text-sm font-medium tracking-wide text-slate-700 uppercase">
+					Resume game ({savedSessions.length})
+				</h2>
+				<span class="text-xs text-slate-400">Saved at every round end &amp; on quit.</span>
+			</div>
+			{#if resumeError}
+				<p class="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-700">{resumeError}</p>
+			{/if}
+			<ul class="divide-y divide-slate-200 rounded border border-slate-200 bg-white">
+				{#each savedSessions as session (session.path)}
+					<li class="flex items-center gap-3 px-3 py-2">
+						<button
+							type="button"
+							onclick={() => resumeSession(session)}
+							disabled={resuming}
+							class="flex flex-1 items-center justify-between text-left disabled:opacity-50"
+						>
+							<div>
+								<div class="text-sm font-medium text-slate-800">
+									{session.num_players} players · C={session.start_cards} ·
+									Round {session.round_idx + 1}/{session.total_rounds}
+									{#if session.phase === 'complete'}
+										<span class="ml-1 rounded bg-amber-600 px-1.5 py-0.5 text-[10px] font-medium text-white">
+											finished
+										</span>
+									{:else if session.phase === 'scoring'}
+										<span class="ml-1 rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] font-medium text-white">
+											scoring
+										</span>
+									{/if}
+								</div>
+								<div class="text-xs text-slate-500">
+									{fmtSessionAge(session.saved_unix_secs)}
+									{#if session.leader_name}
+										· Leader: <strong>{session.leader_name}</strong> ({session.leader_score})
+									{/if}
+								</div>
+							</div>
+							<span class="text-xs font-medium text-emerald-700">Resume →</span>
+						</button>
+						<button
+							type="button"
+							onclick={(e) => deleteSavedSession(session, e)}
+							aria-label="Delete saved session"
+							class="rounded px-2 py-1 text-xs text-slate-400 hover:bg-red-50 hover:text-red-600"
+						>✕</button>
+					</li>
+				{/each}
+			</ul>
+		</section>
+	{/if}
 
 	<!-- Players -->
 	<section class="mb-8">

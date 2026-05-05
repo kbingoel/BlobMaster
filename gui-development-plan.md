@@ -348,6 +348,32 @@ Wire round transitions, the cumulative scoreboard, and durable session state.
 - End-of-game screen: full scoreboard, winner announcement, "Start new game" / "Export log" buttons.
 - **Done when**: a full 17-round game (5 players, C=7) plays through cold-launch → save mid-game → quit → resume → finish, with all scores matching the engine.
 
+Update 05.05.2026
+What landed
+
+Backend ([blob-gui/src-tauri/src/commands.rs](blob-gui/src-tauri/src/commands.rs)) — replaced the `save_session` / `load_session` stubs and added five new commands:
+- `round_summary` — returns per-player `bid / tricks_won / round_score / cumulative_after` rows from a `Scoring`-phase session, plus `is_final_round`. Pure: does not mutate state or commit scores.
+- `advance_round` — wraps `blob_engine::game::advance_round`, then resets `human_hand` and `bid_placed` and clears every seat's `state.hands` so the GUI re-prompts for the human's hand on the new round.
+- `round_structure` — derived `Vec<{round_idx, cards_dealt, trump_suit}>` for the persistent strip.
+- `save_session` / `load_session` — JSON serialization via `PersistedSession` (versioned wrapper that drops the non-serializable `OnnxEvaluator`). Files written to `~/.blobmaster/sessions/<unix_secs>.json`.
+- `list_sessions` / `delete_session` — Resume-list metadata (timestamp, num_players, current round, leader name+score) by parsing each file header; bad files silently skipped.
+- `export_session_log` — writes the same JSON to a user-picked path so the file write stays in-process (no JS-side `fs` plugin required).
+
+New types in [types.rs](blob-gui/src-tauri/src/types.rs): `RoundScoreRow`, `RoundSummary`, `RoundStructureEntry`, `SavedSessionInfo`. The `GameEvent::AdvanceRound` variant was already declared and is now actually emitted.
+
+Frontend:
+- New [RoundProgressStrip.svelte](blob-gui/src/lib/components/RoundProgressStrip.svelte) — persistent top strip on `/hand-entry`, `/play`, `/round-summary`, `/end`. Highlights current round; renders cards-dealt + trump glyph (NT for the no-trump round).
+- New [/round-summary](blob-gui/src/routes/round-summary/+page.svelte) — per-player table with bid / tricks / round score / cumulative; auto-saves on mount; "Continue to next round" surfaces a confirmation explaining the no-undo-across-rounds rule; on the final round the button reads "Finish game" and routes to `/end`.
+- New [/end](blob-gui/src/routes/end/+page.svelte) — full standings with rank, winner highlight, "Export log" (Save dialog → `export_session_log`) and "Start new game".
+- [play/+page.svelte](blob-gui/src/routes/play/+page.svelte) and [hand-entry/+page.svelte](blob-gui/src/routes/hand-entry/+page.svelte) — phase routing: snapshots flipping to `scoring` / `complete` auto-navigate; resume into `Bidding` with a populated `human_hand` skips straight to `/play`.
+- [setup/+page.svelte](blob-gui/src/routes/setup/+page.svelte) — new "Resume game" section above Players: lists saved sessions with timestamp, player count, round, leader, and a delete affordance. Clicking Resume calls `load_session`, re-loads the previously selected model best-effort, and routes by phase.
+- [+layout.svelte](blob-gui/src/routes/+layout.svelte) — `beforeunload` handler fires `save_session` on app close (best-effort).
+
+Card encoding helper extended: [cardUtils.ts](blob-gui/src/lib/cardUtils.ts) gained `NO_TRUMP = 4` and `trumpLabel(suit)` (returns `'NT'` for the sentinel).
+
+Deferred / out of scope:
+- True window-close hook on the Rust side (currently relies on the webview's `beforeunload`; sufficient for the normal quit path, may miss kill-window).
+- Trimming the saved-sessions list (no engine-side cap; user prunes via the ✕ button in the Resume list).
 ---
 
 ## Session 9.9 — Practical polish, error handling, packaging
