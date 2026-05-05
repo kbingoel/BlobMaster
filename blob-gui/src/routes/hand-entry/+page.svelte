@@ -5,6 +5,7 @@
 	import { sessionStore } from '$lib/stores/session';
 	import { suitGlyph, isRed } from '$lib/cardUtils';
 	import CardGrid from '$lib/components/CardGrid.svelte';
+	import RoundProgressStrip from '$lib/components/RoundProgressStrip.svelte';
 
 	let snapshot = $state<SessionSnapshot | null>(null);
 	let selectedCards = $state<number[]>([]);
@@ -16,7 +17,17 @@
 		const unsub = sessionStore.subscribe((s) => {
 			snapshot = s;
 		});
-		if (snapshot === null) goto('/setup', { replaceState: true });
+		if (snapshot === null) {
+			goto('/setup', { replaceState: true });
+			return unsub;
+		}
+		// Resume routing: human already has a hand → straight to /play.
+		// Phases beyond Bidding belong to other routes.
+		if (snapshot.phase === 'scoring') goto('/round-summary', { replaceState: true });
+		else if (snapshot.phase === 'complete') goto('/end', { replaceState: true });
+		else if (snapshot.phase === 'playing' || snapshot.human_hand.length > 0) {
+			goto('/play', { replaceState: true });
+		}
 		return unsub;
 	});
 
@@ -27,6 +38,7 @@
 	let dealer = $derived(snapshot?.dealer ?? 0);
 	let playerNames = $derived(snapshot?.player_names ?? []);
 	let canSubmit = $derived(selectedCards.length === cardsDealt && cardsDealt > 0 && !submitting);
+	let gameKey = $derived(snapshot ? `${snapshot.start_cards}-${snapshot.num_players}` : '');
 
 	function handleCardclick(cardIdx: number) {
 		if (selectedCards.includes(cardIdx)) {
@@ -54,6 +66,8 @@
 
 {#if snapshot}
 	<div class="hand-entry-layout">
+		<RoundProgressStrip currentRound={snapshot.round_idx} {gameKey} />
+
 		<!-- ── Sticky info strip ──────────────────────────────── -->
 		<header class="info-strip">
 			<span class="strip-item">

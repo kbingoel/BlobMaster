@@ -5,6 +5,8 @@
 //! locally. Per-session bookkeeping that the engine doesn't track lives on
 //! `GameSession`: human seat, model handle, engine knobs, event log for undo.
 
+use serde::{Deserialize, Serialize};
+
 use blob_engine::bidding::{forbidden_bid, legal_bids};
 use blob_engine::card::NUM_CARDS;
 use blob_engine::onnx::OnnxEvaluator;
@@ -16,6 +18,25 @@ use crate::types::{
     CompletedTrick, EngineSettings, GameConfig, GameEvent, GuiError, GuiResult,
     SessionSnapshot, TrickPlay, TrumpMode,
 };
+
+/// On-disk shape of a [`GameSession`]. Mirrors the live struct minus the
+/// non-serializable `evaluator`. Versioned so future format changes can be
+/// handled gracefully — bump on any breaking schema change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSession {
+    pub version: u32,
+    pub state: BlobState,
+    pub config: GameConfig,
+    pub human_seat: u8,
+    pub human_hand: u64,
+    pub trump_mode: TrumpMode,
+    pub player_names: Vec<String>,
+    pub engine_settings: EngineSettings,
+    pub event_log: Vec<GameEvent>,
+    pub bid_placed: [bool; MAX_PLAYERS],
+}
+
+const PERSISTED_SESSION_VERSION: u32 = 1;
 
 /// Live session held in `tauri::State<Mutex<Option<GameSession>>>`.
 pub struct GameSession {
@@ -57,6 +78,46 @@ impl GameSession {
             engine_settings: EngineSettings::default(),
             event_log: Vec::new(),
             bid_placed: [false; MAX_PLAYERS],
+        })
+    }
+
+    /// Snapshot used by `save_session`. Drops the loaded ONNX evaluator —
+    /// model selection is per-launch and the user re-picks on resume.
+    pub fn to_persisted(&self) -> PersistedSession {
+        PersistedSession {
+            version: PERSISTED_SESSION_VERSION,
+            state: self.state,
+            config: self.config.clone(),
+            human_seat: self.human_seat,
+            human_hand: self.human_hand,
+            trump_mode: self.trump_mode,
+            player_names: self.player_names.clone(),
+            engine_settings: self.engine_settings,
+            event_log: self.event_log.clone(),
+            bid_placed: self.bid_placed,
+        }
+    }
+
+    /// Inverse of `to_persisted`. The evaluator is left empty — the caller
+    /// installs one via `load_model` if AI suggestions are needed.
+    pub fn from_persisted(p: PersistedSession) -> GuiResult<Self> {
+        if p.version != PERSISTED_SESSION_VERSION {
+            return Err(GuiError::InvalidConfig(format!(
+                "session file version {} not supported (expected {})",
+                p.version, PERSISTED_SESSION_VERSION
+            )));
+        }
+        Ok(Self {
+            state: p.state,
+            config: p.config,
+            human_seat: p.human_seat,
+            human_hand: p.human_hand,
+            trump_mode: p.trump_mode,
+            player_names: p.player_names,
+            evaluator: None,
+            engine_settings: p.engine_settings,
+            event_log: p.event_log,
+            bid_placed: p.bid_placed,
         })
     }
 

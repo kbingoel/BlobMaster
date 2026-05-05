@@ -12,18 +12,21 @@ use blob_engine::card::NUM_CARDS;
 use blob_engine::dealing::start_round;
 use blob_engine::encoder::encode;
 use blob_engine::evaluator::{Evaluator, HeuristicEvaluator};
+use blob_engine::game::advance_round as engine_advance_round;
 use blob_engine::mcts::{run_search, MctsArena};
 use blob_engine::onnx::OnnxEvaluator;
 use blob_engine::playing::{apply_play, legal_plays};
-use blob_engine::state::GamePhase as EnginePhase;
+use blob_engine::round::{cards_dealt_for_round, total_rounds, trump_for_round};
+use blob_engine::state::{GamePhase as EnginePhase, MAX_PLAYERS};
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use tauri::State;
 
-use crate::session::{indices_to_hand, GameSession};
+use crate::session::{indices_to_hand, GameSession, PersistedSession};
 use crate::types::{
     AiSuggestion, AppSettings, CardEval, EngineSettings, GameConfig, GameEvent, GuiError,
-    GuiResult, ModelInfo, SessionSnapshot,
+    GuiResult, ModelInfo, RoundScoreRow, RoundStructureEntry, RoundSummary, SavedSessionInfo,
+    SessionSnapshot,
 };
 
 /// `tauri::State` payload. `Mutex` is fine for our single-user GUI — every
@@ -87,6 +90,10 @@ fn settings_path() -> GuiResult<PathBuf> {
 
 fn recents_path() -> GuiResult<PathBuf> {
     Ok(config_dir()?.join("recents.json"))
+}
+
+fn sessions_dir() -> GuiResult<PathBuf> {
+    Ok(config_dir()?.join("sessions"))
 }
 
 /// Build a `ModelInfo` from a path. Returns `None` if the file is missing
@@ -706,22 +713,252 @@ pub fn undo_last_event(state: State<'_, AppState>) -> GuiResult<SessionSnapshot>
     })
 }
 
+/// Compute the round-end summary for the just-finished round.
+///
+/// Must be called while the engine is in the `Scoring` phase — i.e. after
+/// the last `apply_play` but before `advance_round`. Pure: does not mutate
+/// state or commit scores.
 #[tauri::command]
 #[specta::specta]
-pub fn save_session(state: State<'_, AppState>) -> GuiResult<PathBuf> {
-    with_session(&state, |_session| {
-        Err(GuiError::NotImplemented(
-            "save_session — wired in Session 9.8".into(),
-        ))
+pub fn round_summary(state: State<'_, AppState>) -> GuiResult<RoundSummary> {
+    with_session(&state, |session| {
+        let phase = session.state.phase();
+        // We allow Complete here too, so the end-of-game screen can show
+        // the final round's breakdown (cumulative_after == cumulative_scores).
+        let np = session.state.num_players as usize;
+        let mut rows = Vec::with_capacity(np);
+        for seat in 0..np {
+            let bid = session.state.bids[seat];
+            let tricks = session.state.tricks_won[seat];
+            let round_score = if bid == tricks { 10 + bid } else { 0 };
+            // In Scoring the engine has not yet folded the round into
+            // cumulative_scores; in Complete it has. Compute the "after"
+            // value from whichever side of advance_round we're sitting on.
+            let cumulative_after = match phase {
+                EnginePhase::Scoring => session.state.cumulative_scores[seat] + round_score as u16,
+                _ => session.state.cumulative_scores[seat],
+            };
+            rows.push(RoundScoreRow {
+                seat: seat as u8,
+                bid,
+                tricks_won: tricks,
+                round_score,
+                cumulative_after,
+            });
+        }
+        let total = total_rounds(session.state.start_cards, session.state.num_players);
+        let is_final_round = session.state.round_idx + 1 >= total;
+        Ok(RoundSummary {
+            round_idx: session.state.round_idx,
+            cards_dealt: session.state.cards_dealt,
+            trump_suit: session.state.trump_suit,
+            dealer: session.state.dealer,
+            player_names: session.player_names.clone(),
+            rows,
+            is_final_round,
+        })
     })
 }
 
+/// Score the just-finished round and either deal the next round (Bidding
+/// phase) or transition to `Complete`. Wraps [`engine_advance_round`].
+///
+/// Resets the per-round bookkeeping the GUI tracks alongside the engine —
+/// `human_hand` (cleared so `set_human_hand` is required again next round)
+/// and `bid_placed`. Appends an [`GameEvent::AdvanceRound`] event to the log.
 #[tauri::command]
 #[specta::specta]
-pub fn load_session(_path: PathBuf) -> GuiResult<SessionSnapshot> {
-    Err(GuiError::NotImplemented(
-        "load_session — wired in Session 9.8".into(),
-    ))
+pub fn advance_round(state: State<'_, AppState>) -> GuiResult<SessionSnapshot> {
+    with_session(&state, |session| {
+        if session.state.phase() != EnginePhase::Scoring {
+            return Err(GuiError::WrongPhase(format!(
+                "advance_round requires Scoring, got {:?}",
+                session.state.phase()
+            )));
+        }
+        let mut rng = rng_for(session);
+        engine_advance_round(&mut session.state, &mut rng);
+        // The engine's `start_round` deals fresh hands to *every* seat,
+        // including the human's. We overwrite the human seat's hand with 0
+        // so the GUI re-prompts via `set_human_hand` (the user is the
+        // source of truth for what's actually been dealt at the table).
+        if session.state.phase() == EnginePhase::Bidding {
+            let seat = session.human_seat as usize;
+            session.state.hands[seat] = 0;
+            // Engine also dealt cards to the other seats — wipe them too,
+            // belief sampling will re-fill them at AI time.
+            for s in 0..session.state.num_players as usize {
+                if s != seat {
+                    session.state.hands[s] = 0;
+                }
+            }
+        }
+        session.human_hand = 0;
+        session.bid_placed = [false; MAX_PLAYERS];
+        session.event_log.push(GameEvent::AdvanceRound);
+        Ok(session.snapshot())
+    })
+}
+
+/// Deterministic round structure for the current game. Used to render the
+/// persistent round-progress strip — one entry per round in play order.
+#[tauri::command]
+#[specta::specta]
+pub fn round_structure(state: State<'_, AppState>) -> GuiResult<Vec<RoundStructureEntry>> {
+    with_session(&state, |session| {
+        let total = total_rounds(session.state.start_cards, session.state.num_players);
+        let mut out = Vec::with_capacity(total as usize);
+        for r in 0..total {
+            out.push(RoundStructureEntry {
+                round_idx: r,
+                cards_dealt: cards_dealt_for_round(r, session.state.start_cards, session.state.num_players),
+                trump_suit: trump_for_round(r as u32),
+            });
+        }
+        Ok(out)
+    })
+}
+
+/// Persist the current session to `~/.blobmaster/sessions/<timestamp>.json`.
+/// Returns the resolved path so the frontend can show a "saved to …" toast.
+///
+/// Uses Unix-epoch seconds for the filename. Sessions are append-only —
+/// there's no in-place overwrite across launches; resuming from one and
+/// saving again writes a new file.
+#[tauri::command]
+#[specta::specta]
+pub fn save_session(state: State<'_, AppState>) -> GuiResult<PathBuf> {
+    with_session(&state, |session| {
+        let dir = sessions_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("{stamp}.json"));
+        let persisted = session.to_persisted();
+        let buf = serde_json::to_string_pretty(&persisted)
+            .map_err(|e| GuiError::Io(format!("serialize session: {e}")))?;
+        std::fs::write(&path, buf)?;
+        Ok(path)
+    })
+}
+
+/// Restore a session from disk, replacing any in-memory session. The
+/// returned snapshot is the standard `SessionSnapshot` — the frontend
+/// routes based on `phase` (Bidding → /hand-entry if no human hand yet,
+/// otherwise /play; Scoring → /round-summary; Complete → /end).
+#[tauri::command]
+#[specta::specta]
+pub fn load_session(state: State<'_, AppState>, path: PathBuf) -> GuiResult<SessionSnapshot> {
+    let buf = std::fs::read_to_string(&path)
+        .map_err(|e| GuiError::SessionNotFound(format!("{}: {e}", path.display())))?;
+    let persisted: PersistedSession = serde_json::from_str(&buf)
+        .map_err(|e| GuiError::Io(format!("parse session {}: {e}", path.display())))?;
+    let session = GameSession::from_persisted(persisted)?;
+    let snap = session.snapshot();
+    let mut guard = state.lock().expect("AppState mutex poisoned");
+    *guard = Some(session);
+    Ok(snap)
+}
+
+/// List saved sessions, newest first. Each entry parses the file header to
+/// surface enough metadata for the Resume list (player count, round, leader).
+/// Files that fail to parse are silently skipped.
+#[tauri::command]
+#[specta::specta]
+pub fn list_sessions() -> GuiResult<Vec<SavedSessionInfo>> {
+    let dir = sessions_dir()?;
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(buf) = std::fs::read_to_string(&path) else { continue };
+        let Ok(p) = serde_json::from_str::<PersistedSession>(&buf) else { continue };
+        let saved_unix_secs = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| modified_unix_secs(&m));
+        let np = p.state.num_players as usize;
+        let total = total_rounds(p.state.start_cards, p.state.num_players);
+        // Leader: highest cumulative score, ties go to lowest seat for
+        // deterministic display. None if the entire scoreboard is 0.
+        let (leader_name, leader_score) = {
+            let mut best: Option<(usize, u16)> = None;
+            for s in 0..np {
+                let sc = p.state.cumulative_scores[s];
+                match best {
+                    Some((_, b)) if sc <= b => {}
+                    _ => best = Some((s, sc)),
+                }
+            }
+            match best {
+                Some((s, sc)) if sc > 0 => (
+                    p.player_names.get(s).cloned(),
+                    sc,
+                ),
+                _ => (None, 0),
+            }
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push(SavedSessionInfo {
+            path: path.clone(),
+            file_name,
+            saved_unix_secs,
+            num_players: p.state.num_players,
+            start_cards: p.state.start_cards,
+            round_idx: p.state.round_idx,
+            total_rounds: total,
+            phase: p.state.phase().into(),
+            leader_name,
+            leader_score,
+            player_names: p.player_names,
+        });
+    }
+    out.sort_by(|a, b| b.saved_unix_secs.cmp(&a.saved_unix_secs));
+    Ok(out)
+}
+
+/// Delete a saved-session file. Used by the setup screen's Resume list to
+/// prune dead entries; missing files are treated as success.
+#[tauri::command]
+#[specta::specta]
+pub fn delete_session(path: PathBuf) -> GuiResult<()> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GuiError::Io(format!("delete {}: {e}", path.display()))),
+    }
+}
+
+/// Serialize the in-memory session as JSON and write it to `path`. Used by
+/// the end-of-game "Export log" affordance — the frontend collects `path`
+/// from a Save dialog and hands it off here so the file write happens
+/// in-process (no JS-side `fs` plugin required).
+#[tauri::command]
+#[specta::specta]
+pub fn export_session_log(state: State<'_, AppState>, path: PathBuf) -> GuiResult<PathBuf> {
+    with_session(&state, |session| {
+        let persisted = session.to_persisted();
+        let buf = serde_json::to_string_pretty(&persisted)
+            .map_err(|e| GuiError::Io(format!("serialize session: {e}")))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(&path, buf)?;
+        Ok(path.clone())
+    })
 }
 
 /// Load persisted setup-screen form values from

@@ -171,6 +171,57 @@ async undoLastEvent() : Promise<Result<SessionSnapshot, GuiError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Compute the round-end summary for the just-finished round.
+ * 
+ * Must be called while the engine is in the `Scoring` phase — i.e. after
+ * the last `apply_play` but before `advance_round`. Pure: does not mutate
+ * state or commit scores.
+ */
+async roundSummary() : Promise<Result<RoundSummary, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("round_summary") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Score the just-finished round and either deal the next round (Bidding
+ * phase) or transition to `Complete`. Wraps [`engine_advance_round`].
+ * 
+ * Resets the per-round bookkeeping the GUI tracks alongside the engine —
+ * `human_hand` (cleared so `set_human_hand` is required again next round)
+ * and `bid_placed`. Appends an [`GameEvent::AdvanceRound`] event to the log.
+ */
+async advanceRound() : Promise<Result<SessionSnapshot, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("advance_round") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Deterministic round structure for the current game. Used to render the
+ * persistent round-progress strip — one entry per round in play order.
+ */
+async roundStructure() : Promise<Result<RoundStructureEntry[], GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("round_structure") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist the current session to `~/.blobmaster/sessions/<timestamp>.json`.
+ * Returns the resolved path so the frontend can show a "saved to …" toast.
+ * 
+ * Uses Unix-epoch seconds for the filename. Sessions are append-only —
+ * there's no in-place overwrite across launches; resuming from one and
+ * saving again writes a new file.
+ */
 async saveSession() : Promise<Result<string, GuiError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_session") };
@@ -179,9 +230,54 @@ async saveSession() : Promise<Result<string, GuiError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Restore a session from disk, replacing any in-memory session. The
+ * returned snapshot is the standard `SessionSnapshot` — the frontend
+ * routes based on `phase` (Bidding → /hand-entry if no human hand yet,
+ * otherwise /play; Scoring → /round-summary; Complete → /end).
+ */
 async loadSession(path: string) : Promise<Result<SessionSnapshot, GuiError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_session", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List saved sessions, newest first. Each entry parses the file header to
+ * surface enough metadata for the Resume list (player count, round, leader).
+ * Files that fail to parse are silently skipped.
+ */
+async listSessions() : Promise<Result<SavedSessionInfo[], GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_sessions") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Delete a saved-session file. Used by the setup screen's Resume list to
+ * prune dead entries; missing files are treated as success.
+ */
+async deleteSession(path: string) : Promise<Result<null, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_session", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Serialize the in-memory session as JSON and write it to `path`. Used by
+ * the end-of-game "Export log" affordance — the frontend collects `path`
+ * from a Save dialog and hands it off here so the file write happens
+ * in-process (no JS-side `fs` plugin required).
+ */
+async exportSessionLog(path: string) : Promise<Result<string, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_session_log", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -369,6 +465,44 @@ export type PlayerConfig = { name: string;
  * the GUI so AI suggestions and hand entry know which seat is yours.
  */
 is_human: boolean }
+/**
+ * Per-player row on the round-end screen. Computed from a `Scoring`-phase
+ * session before `advance_round` is called, so `cumulative_after` shows
+ * what the cumulative score will be once the round is committed.
+ */
+export type RoundScoreRow = { seat: number; bid: number; tricks_won: number; 
+/**
+ * `10 + bid` if `tricks_won == bid`, else `0`.
+ */
+round_score: number; 
+/**
+ * Cumulative score after this round is committed.
+ */
+cumulative_after: number }
+/**
+ * One entry per round on the persistent round-progress strip.
+ */
+export type RoundStructureEntry = { round_idx: number; cards_dealt: number; trump_suit: number }
+/**
+ * Round-end summary, returned by `round_summary` while the engine is in
+ * the `Scoring` phase.
+ */
+export type RoundSummary = { round_idx: number; cards_dealt: number; trump_suit: number; dealer: number; player_names: string[]; rows: RoundScoreRow[]; 
+/**
+ * `true` once the round just scored is the last round of the game.
+ */
+is_final_round: boolean }
+/**
+ * Header for a saved session file, returned by `list_sessions` so the
+ * setup screen can render the Resume list without deserializing the full
+ * payload of every file.
+ */
+export type SavedSessionInfo = { path: string; file_name: string; saved_unix_secs: number | null; num_players: number; start_cards: number; round_idx: number; total_rounds: number; phase: GamePhase; 
+/**
+ * Name of the seat with the highest cumulative score; `None` for an
+ * all-zero scoreboard (round 0 not yet scored).
+ */
+leader_name: string | null; leader_score: number; player_names: string[] }
 /**
  * Frontend-facing view of a `GameSession`. Authoritative state lives in
  * Rust — this struct is rebuilt on every state-mutating command and the

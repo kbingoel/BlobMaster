@@ -7,6 +7,7 @@
 	import BiddingKeypad from '$lib/components/BiddingKeypad.svelte';
 	import PlayersPanel from '$lib/components/PlayersPanel.svelte';
 	import MyHandPanel from '$lib/components/MyHandPanel.svelte';
+	import RoundProgressStrip from '$lib/components/RoundProgressStrip.svelte';
 
 	let snapshot = $state<SessionSnapshot | null>(null);
 	let aiSuggestion = $state<AiSuggestion | null>(null);
@@ -45,6 +46,17 @@
 
 	$effect(() => {
 		if (!snapshot) return;
+		// Phase transitions out of /play are handled here so any command that
+		// flips the phase (the last apply_play, an advance_round on resume)
+		// gets the user to the right screen automatically.
+		if (snapshot.phase === 'scoring') {
+			goto('/round-summary');
+			return;
+		}
+		if (snapshot.phase === 'complete') {
+			goto('/end');
+			return;
+		}
 		const humanActive = snapshot.current_player === snapshot.human_seat;
 		const phase = snapshot.phase;
 		if (!humanActive || (phase !== 'bidding' && phase !== 'playing')) {
@@ -118,49 +130,53 @@
 	let perCardEvals = $derived(
 		aiSuggestion && aiSuggestion.phase === 'playing' ? aiSuggestion.per_card : []
 	);
+	let gameKey = $derived(snapshot ? `${snapshot.start_cards}-${snapshot.num_players}` : '');
 </script>
 
 {#if snapshot}
 	<div class="play-layout">
-		<div class="left-col">
-			<div class="top-left">
-				<PlayersPanel {snapshot} />
+		<RoundProgressStrip currentRound={snapshot.round_idx} {gameKey} />
+		<div class="play-body">
+			<div class="left-col">
+				<div class="top-left">
+					<PlayersPanel {snapshot} />
+				</div>
+				<div class="bottom-left">
+					{#if snapshot.phase === 'bidding'}
+						<BiddingKeypad
+							{snapshot}
+							suggestion={aiSuggestion}
+							{submitting}
+							errorMessage={lastError}
+							onSubmit={submitBid}
+						/>
+					{:else if snapshot.phase === 'playing'}
+						<MyHandPanel
+							{snapshot}
+							suggestion={aiSuggestion}
+							settings={engineSettings}
+							{submitting}
+							errorMessage={lastError}
+							onPlay={playCard}
+							onSettingsChange={updateEngineSettings}
+						/>
+					{:else}
+						<div class="pane-placeholder">
+							<p class="placeholder-label">Phase: {snapshot.phase}</p>
+						</div>
+					{/if}
+				</div>
 			</div>
-			<div class="bottom-left">
-				{#if snapshot.phase === 'bidding'}
-					<BiddingKeypad
-						{snapshot}
-						suggestion={aiSuggestion}
-						{submitting}
-						errorMessage={lastError}
-						onSubmit={submitBid}
-					/>
-				{:else if snapshot.phase === 'playing'}
-					<MyHandPanel
-						{snapshot}
-						suggestion={aiSuggestion}
-						settings={engineSettings}
-						{submitting}
-						errorMessage={lastError}
-						onPlay={playCard}
-						onSettingsChange={updateEngineSettings}
-					/>
-				{:else}
-					<div class="pane-placeholder">
-						<p class="placeholder-label">Phase: {snapshot.phase}</p>
-					</div>
-				{/if}
-			</div>
-		</div>
 
-		<div class="right-col">
-			<CardGrid
-				{snapshot}
-				mode="play"
-				onCardclick={handleGridClick}
-				perCardEvals={engineSettings.show_grid_eval ? perCardEvals : []}
-				evalMode={engineSettings.eval_display}
-			/>
+			<div class="right-col">
+				<CardGrid
+					{snapshot}
+					mode="play"
+					onCardclick={handleGridClick}
+					perCardEvals={engineSettings.show_grid_eval ? perCardEvals : []}
+					evalMode={engineSettings.eval_display}
+				/>
+			</div>
 		</div>
 	</div>
 {:else}
@@ -170,9 +186,16 @@
 <style>
 	.play-layout {
 		display: flex;
+		flex-direction: column;
 		width: 100vw;
 		height: 100vh;
 		overflow: hidden;
+	}
+
+	.play-body {
+		flex: 1;
+		min-height: 0;
+		display: flex;
 	}
 
 	.left-col {
