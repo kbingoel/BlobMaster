@@ -46,7 +46,7 @@ flamegraph.svg
 # Model artifacts (large binary files - do not commit)
 *.pth
 *.pkl
-*.onnx
+# *.onnx
 *.safetensors
 *.ot
 
