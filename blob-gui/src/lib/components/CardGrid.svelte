@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { get } from 'svelte/store';
 	import type { CardEval, EvalDisplay, SessionSnapshot } from '$lib/api';
 	import {
 		cardIndex,
@@ -9,6 +10,7 @@
 		RANK_KEYS
 	} from '$lib/cardUtils';
 	import { primaryMetric } from '$lib/evalUtils';
+	import { trumpEditingStore } from '$lib/stores/trumpEditing';
 
 	interface Props {
 		snapshot?: SessionSnapshot | null;
@@ -51,6 +53,10 @@
 	const ROWS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // row 0 = A (rank 12)
 	const COLS = [0, 1, 2, 3]; // suit index
 
+	function nameFor(seat: number): string {
+		return snapshot?.player_names[seat] ?? `P${seat}`;
+	}
+
 	function getPlayedInfo(cardIdx: number): PlayedInfo | null {
 		if (!snapshot) return null;
 
@@ -59,7 +65,7 @@
 				if (play.card === cardIdx) {
 					return {
 						seat: play.seat,
-						label: `P${play.seat} R${snapshot.round_idx + 1}.t${t + 1}`
+						label: `${nameFor(play.seat)} R${snapshot.round_idx + 1}.t${t + 1}`
 					};
 				}
 			}
@@ -68,7 +74,10 @@
 		const tIdx = snapshot.trick_history.length + 1;
 		for (const play of snapshot.trick_in_progress) {
 			if (play.card === cardIdx) {
-				return { seat: play.seat, label: `P${play.seat} R${snapshot.round_idx + 1}.t${tIdx}` };
+				return {
+					seat: play.seat,
+					label: `${nameFor(play.seat)} R${snapshot.round_idx + 1}.t${tIdx}`
+				};
 			}
 		}
 
@@ -111,6 +120,8 @@
 
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		// Surrender keyboard control to the trump editor when it's open.
+		if (get(trumpEditingStore)) return;
 
 		const key = e.key.toUpperCase();
 

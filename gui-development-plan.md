@@ -415,6 +415,37 @@ Tighten the UX where it matters at the table; ship a Windows installer. Skip cos
 - **Explicitly skipped**: card-flip / dealing animations, sound effects, themes. Practicality first.
 - **Done when**: an MSI installer produces a working app on a fresh Windows install with no Rust/Node toolchain present.
 
+Update 05.05.2026
+What landed (this pass deliberately skipped MSI packaging and the dev-mode log viewer — no installer push wanted yet, no .onnx file on hand to validate the engine surface, so the per-cell loading spinner / model-load progress strip would be untested).
+
+User-table polish
+- Player names now show wherever a seat was previously labelled `P{seat}`. CardGrid played-card footers (`Alice R7.t3` instead of `P3 R7.t3`), the bidding header (`Alice bids:`), and the MyHandPanel waiting line (`Waiting for Alice…`) all use `snapshot.player_names`. The `?? \`P${seat}\`` fallback is preserved for the (rare) malformed snapshot.
+
+Trump-suit editor on the round-progress strip
+- New backend command `set_trump_overrides(Vec<TrumpOverrideEntry>)` and a per-round `trump_overrides: Vec<Option<u8>>` on the `GameSession`. Persisted with `PersistedSession`; old save files round-trip through `serde(default)`.
+- `new_game` and `advance_round` now call `apply_trump_override(round_idx)` after the engine sets `trump_suit` to the cycle default, so a manual override sticks across round transitions.
+- `round_structure` returns `trump_overridden: bool` per entry so the strip can mark them with an amber dot.
+- [`RoundProgressStrip.svelte`](blob-gui/src/lib/components/RoundProgressStrip.svelte) gained an **Edit trumps** toggle. In edit mode: a cursor lands on the present round, **1**–**5** sets `♠ ♥ ♣ ♦ NT` and advances, **←/→** moves the cursor without writing, **Enter** saves, **Esc** cancels. Past rounds stay locked. Save calls `set_trump_overrides`; the returned snapshot is pushed back into `sessionStore` via a new `onTrumpsSaved` callback so `state.trump_suit` flips immediately for the current round.
+- A small [`trumpEditingStore`](blob-gui/src/lib/stores/trumpEditing.ts) flag tells `BiddingKeypad`, `MyHandPanel`, and `CardGrid` to surrender keystrokes while the editor is open — otherwise the digit/Enter keys would bid simultaneously.
+
+Error surfacing
+- New [`Toast.svelte`](blob-gui/src/lib/components/Toast.svelte) + [`toastStore`](blob-gui/src/lib/stores/toast.ts) — engine errors (illegal play/bid, save/load failures, model load) now surface as auto-dismissing toasts in addition to the inline message they already had.
+
+Keyboard help overlay
+- `?` opens a generated overlay listing every shortcut. The overlay reads from a single [`KEYMAP`](blob-gui/src/lib/keymap.ts) constant so docs and behaviour can't drift; the [README](blob-gui/README.md) sources its shortcut table from the same list.
+- `N` on `/round-summary` now advances the round (open confirm if not yet, accept it if already shown).
+
+README
+- New [blob-gui/README.md](blob-gui/README.md) replaces the SvelteKit boilerplate — install, dev loop, build, model-file expectations, the CardGrid contract, the trump-override workflow, the keyboard map, and a layout cheat-sheet pointing into the source tree.
+
+Deferred / out of scope
+- MSI bundle + portable EXE (no installer push wanted).
+- Modal recovery flow for mid-game ONNX failure (no .onnx on hand to validate).
+- Per-cell AI-thinking spinner & model-load progress strip (heuristic path completes synchronously; meaningful only with an ONNX model loaded, deferred until one is available for testing).
+- Tracing-to-file + `/debug/logs` viewer route (kept the existing dev `tauri-plugin-log` to console only).
+- `tauri-plugin-store` migration — settings still live in `~/.blobmaster/settings.json` via the existing custom JSON path.
+- Ctrl+Z undo across phases (engine event-log replay is still stubbed in `undo_last_event`).
+
 ---
 
 ## Cross-Cutting Concerns

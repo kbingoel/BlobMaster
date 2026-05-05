@@ -88,7 +88,7 @@
 
 {#if snapshot}
 	<div class="layout">
-		<RoundProgressStrip currentRound={lastRoundIdx} {gameKey} />
+		<RoundProgressStrip currentRound={lastRoundIdx} {gameKey} editable={false} />
 
 		<main class="content">
 			<header class="hero">

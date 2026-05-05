@@ -1,8 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { get } from 'svelte/store';
 	import { goto } from '$app/navigation';
 	import { commands, type RoundSummary, type SessionSnapshot } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
+	import { trumpEditingStore } from '$lib/stores/trumpEditing';
+	import { pushToast } from '$lib/stores/toast';
 	import { trumpLabel, isRed, NO_TRUMP } from '$lib/cardUtils';
 	import RoundProgressStrip from '$lib/components/RoundProgressStrip.svelte';
 
@@ -47,6 +50,7 @@
 		} else {
 			saveStatus = 'error';
 			saveError = 'message' in res.error ? res.error.message : res.error.kind;
+			pushToast(`Save failed: ${saveError}`, 'error');
 		}
 	}
 
@@ -89,6 +93,17 @@
 		confirming = false;
 	}
 
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		if (get(trumpEditingStore)) return;
+		if (e.key === 'n' || e.key === 'N') {
+			e.preventDefault();
+			if (advancing) return;
+			if (confirming) continueToNext();
+			else requestContinue();
+		}
+	}
+
 	let trumpClass = $derived(
 		summary ? (isRed(summary.trump_suit) ? 'trump-red' : summary.trump_suit === NO_TRUMP ? 'trump-nt' : 'trump-dark') : ''
 	);
@@ -96,9 +111,15 @@
 	let currentRound = $derived(summary?.round_idx ?? 0);
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 {#if snapshot && summary}
 	<div class="layout">
-		<RoundProgressStrip {currentRound} {gameKey} />
+		<RoundProgressStrip
+			{currentRound}
+			{gameKey}
+			onTrumpsSaved={(s) => sessionStore.set(s)}
+		/>
 
 		<header class="header">
 			<div>

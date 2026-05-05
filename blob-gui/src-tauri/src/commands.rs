@@ -22,11 +22,11 @@ use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use tauri::State;
 
-use crate::session::{indices_to_hand, GameSession, PersistedSession};
+use crate::session::{indices_to_hand, GameSession, PersistedSession, MAX_TRUMP_VALUE};
 use crate::types::{
     AiSuggestion, AppSettings, CardEval, EngineSettings, GameConfig, GameEvent, GuiError,
     GuiResult, ModelInfo, RoundScoreRow, RoundStructureEntry, RoundSummary, SavedSessionInfo,
-    SessionSnapshot,
+    SessionSnapshot, TrumpOverrideEntry,
 };
 
 /// `tauri::State` payload. `Mutex` is fine for our single-user GUI — every
@@ -245,7 +245,12 @@ pub fn new_game(
     state: State<'_, AppState>,
     config: GameConfig,
 ) -> GuiResult<SessionSnapshot> {
-    let session = GameSession::from_config(config)?;
+    let mut session = GameSession::from_config(config)?;
+    // Round 0 has no override on a fresh game (`trump_overrides` was just
+    // initialized to all-None) but call apply_trump_override anyway so the
+    // path is exercised — keeps a single contract: state.trump_suit is the
+    // final word after construction.
+    session.apply_trump_override(session.state.round_idx);
     let snap = session.snapshot();
     let mut guard = state.lock().expect("AppState mutex poisoned");
     *guard = Some(session);
@@ -778,6 +783,9 @@ pub fn advance_round(state: State<'_, AppState>) -> GuiResult<SessionSnapshot> {
         }
         let mut rng = rng_for(session);
         engine_advance_round(&mut session.state, &mut rng);
+        // Apply any user override for the new round before snapshotting so
+        // both the strip and BlobState agree on what trump is in effect.
+        session.apply_trump_override(session.state.round_idx);
         // The engine's `start_round` deals fresh hands to *every* seat,
         // including the human's. We overwrite the human seat's hand with 0
         // so the GUI re-prompts via `set_human_hand` (the user is the
@@ -802,6 +810,8 @@ pub fn advance_round(state: State<'_, AppState>) -> GuiResult<SessionSnapshot> {
 
 /// Deterministic round structure for the current game. Used to render the
 /// persistent round-progress strip — one entry per round in play order.
+/// `trump_suit` is the user override when one has been set via
+/// [`set_trump_overrides`], otherwise the engine's default rotation.
 #[tauri::command]
 #[specta::specta]
 pub fn round_structure(state: State<'_, AppState>) -> GuiResult<Vec<RoundStructureEntry>> {
@@ -809,13 +819,75 @@ pub fn round_structure(state: State<'_, AppState>) -> GuiResult<Vec<RoundStructu
         let total = total_rounds(session.state.start_cards, session.state.num_players);
         let mut out = Vec::with_capacity(total as usize);
         for r in 0..total {
+            let override_for_r = session
+                .trump_overrides
+                .get(r as usize)
+                .copied()
+                .flatten();
+            let (trump_suit, overridden) = match override_for_r {
+                Some(t) => (t, true),
+                None => (trump_for_round(r as u32), false),
+            };
             out.push(RoundStructureEntry {
                 round_idx: r,
                 cards_dealt: cards_dealt_for_round(r, session.state.start_cards, session.state.num_players),
-                trump_suit: trump_for_round(r as u32),
+                trump_suit,
+                trump_overridden: overridden,
             });
         }
         Ok(out)
+    })
+}
+
+/// Replace one or more entries in the per-round trump-override table.
+///
+/// Each entry's `round_idx` must be the current round or a future round —
+/// past rounds are immutable since their trump has already shaped the
+/// scoring. Each `trump` value is 0..=3 for the four suits or 4 for
+/// no-trump (matches `blob_engine::round::NO_TRUMP`).
+///
+/// On success the current round's override (if any) is applied to
+/// `state.trump_suit` immediately so the play screen reflects the change
+/// without waiting for an `advance_round`.
+#[tauri::command]
+#[specta::specta]
+pub fn set_trump_overrides(
+    state: State<'_, AppState>,
+    overrides: Vec<TrumpOverrideEntry>,
+) -> GuiResult<SessionSnapshot> {
+    with_session(&state, |session| {
+        let total = total_rounds(session.state.start_cards, session.state.num_players);
+        let current = session.state.round_idx;
+        for entry in &overrides {
+            if entry.round_idx >= total {
+                return Err(GuiError::InvalidConfig(format!(
+                    "trump override round_idx {} out of range (0..{})",
+                    entry.round_idx, total
+                )));
+            }
+            if entry.round_idx < current {
+                return Err(GuiError::IllegalAction(format!(
+                    "round {} is in the past — only present and future rounds can be edited",
+                    entry.round_idx + 1
+                )));
+            }
+            if entry.trump > MAX_TRUMP_VALUE {
+                return Err(GuiError::InvalidConfig(format!(
+                    "trump value {} out of range (0..={})",
+                    entry.trump, MAX_TRUMP_VALUE
+                )));
+            }
+        }
+        if session.trump_overrides.len() != total as usize {
+            session.trump_overrides.resize(total as usize, None);
+        }
+        for entry in overrides {
+            session.trump_overrides[entry.round_idx as usize] = Some(entry.trump);
+        }
+        // The current round may have just changed — apply the override so
+        // the BlobState reflects what the strip will display.
+        session.apply_trump_override(session.state.round_idx);
+        Ok(session.snapshot())
     })
 }
 
