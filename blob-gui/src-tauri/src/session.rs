@@ -14,6 +14,9 @@ use blob_engine::playing::legal_plays;
 use blob_engine::round::total_rounds;
 use blob_engine::state::{BlobState, GamePhase as EnginePhase, MAX_PLAYERS};
 
+/// Trump suits 0..=3 (♠♥♣♦) plus 4 = no-trump.
+pub const MAX_TRUMP_VALUE: u8 = 4;
+
 use crate::types::{
     CompletedTrick, EngineSettings, GameConfig, GameEvent, GuiError, GuiResult,
     SessionSnapshot, TrickPlay, TrumpMode,
@@ -34,6 +37,12 @@ pub struct PersistedSession {
     pub engine_settings: EngineSettings,
     pub event_log: Vec<GameEvent>,
     pub bid_placed: [bool; MAX_PLAYERS],
+    /// Per-round manual trump override. `Some(t)` replaces the engine's
+    /// auto-rotated trump for that round; `None` falls through to the
+    /// default cycle. Length matches `total_rounds(start_cards, num_players)`.
+    /// Defaulted on load for backward compatibility with v1 files.
+    #[serde(default)]
+    pub trump_overrides: Vec<Option<u8>>,
 }
 
 const PERSISTED_SESSION_VERSION: u32 = 1;
@@ -56,6 +65,8 @@ pub struct GameSession {
     /// from `dealer + 1`). `BlobState.bids` zero-initializes so we can't
     /// tell "bid 0" from "not yet bid" without this side-channel.
     pub bid_placed: [bool; MAX_PLAYERS],
+    /// Per-round manual trump override; see [`PersistedSession::trump_overrides`].
+    pub trump_overrides: Vec<Option<u8>>,
 }
 
 impl GameSession {
@@ -67,6 +78,7 @@ impl GameSession {
         state.dealer = config.dealer;
         state.current_player = (config.dealer + 1) % config.num_players;
         state.trick_leader = state.current_player;
+        let total = total_rounds(state.start_cards, state.num_players) as usize;
         Ok(Self {
             state,
             human_seat: config.human_seat,
@@ -78,6 +90,7 @@ impl GameSession {
             engine_settings: EngineSettings::default(),
             event_log: Vec::new(),
             bid_placed: [false; MAX_PLAYERS],
+            trump_overrides: vec![None; total],
         })
     }
 
@@ -95,6 +108,7 @@ impl GameSession {
             engine_settings: self.engine_settings,
             event_log: self.event_log.clone(),
             bid_placed: self.bid_placed,
+            trump_overrides: self.trump_overrides.clone(),
         }
     }
 
@@ -107,6 +121,13 @@ impl GameSession {
                 p.version, PERSISTED_SESSION_VERSION
             )));
         }
+        let total = total_rounds(p.state.start_cards, p.state.num_players) as usize;
+        let mut trump_overrides = p.trump_overrides;
+        // Older save files have no overrides field; serde defaults it to an
+        // empty Vec. Pad to the right length so index access is always safe.
+        if trump_overrides.len() != total {
+            trump_overrides.resize(total, None);
+        }
         Ok(Self {
             state: p.state,
             config: p.config,
@@ -118,7 +139,17 @@ impl GameSession {
             engine_settings: p.engine_settings,
             event_log: p.event_log,
             bid_placed: p.bid_placed,
+            trump_overrides,
         })
+    }
+
+    /// Apply the override (if any) for the given round to `state.trump_suit`.
+    /// Used after `new_game`, `start_round`, and `advance_round` so the
+    /// engine's auto-rotated default never leaks past a user-set value.
+    pub fn apply_trump_override(&mut self, round_idx: u8) {
+        if let Some(Some(t)) = self.trump_overrides.get(round_idx as usize) {
+            self.state.trump_suit = *t;
+        }
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

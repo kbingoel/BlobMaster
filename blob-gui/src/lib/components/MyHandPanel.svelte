@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { get } from 'svelte/store';
 	import type { AiSuggestion, CardEval, EngineSettings, EvalDisplay, SessionSnapshot } from '$lib/api';
+	import { trumpEditingStore } from '$lib/stores/trumpEditing';
 	import { isRed, rankLabel, suitGlyph, cardSuit, cardRank } from '$lib/cardUtils';
 	import {
 		cycleEvalDisplay,
@@ -91,6 +93,7 @@
 
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		if (get(trumpEditingStore)) return;
 		if (
 			e.key === 'Enter' &&
 			isHumanTurn &&
@@ -186,7 +189,8 @@
 
 	{#if !isHumanTurn}
 		<p class="hint waiting-hint">
-			Waiting for P{snapshot.current_player} to play — click a card on the right grid to record their move.
+			Waiting for <strong>{snapshot.player_names[snapshot.current_player] ?? `P${snapshot.current_player}`}</strong>
+			to play — click a card on the right grid to record their move.
 		</p>
 	{:else if recommendedCard !== null}
 		<p class="hint">

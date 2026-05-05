@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { commands, type AiSuggestion, type EngineSettings, type SessionSnapshot } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
+	import { pushToast } from '$lib/stores/toast';
 	import CardGrid from '$lib/components/CardGrid.svelte';
 	import BiddingKeypad from '$lib/components/BiddingKeypad.svelte';
 	import PlayersPanel from '$lib/components/PlayersPanel.svelte';
@@ -90,6 +91,7 @@
 		} else {
 			const err = result.error;
 			lastError = 'message' in err ? err.message : err.kind;
+			pushToast(`Bid rejected: ${lastError}`, 'error');
 		}
 	}
 
@@ -107,6 +109,7 @@
 		} else {
 			const err = result.error;
 			lastError = 'message' in err ? err.message : err.kind;
+			pushToast(`Illegal play: ${lastError}`, 'error');
 		}
 	}
 
@@ -135,7 +138,11 @@
 
 {#if snapshot}
 	<div class="play-layout">
-		<RoundProgressStrip currentRound={snapshot.round_idx} {gameKey} />
+		<RoundProgressStrip
+			currentRound={snapshot.round_idx}
+			{gameKey}
+			onTrumpsSaved={(s) => sessionStore.set(s)}
+		/>
 		<div class="play-body">
 			<div class="left-col">
 				<div class="top-left">

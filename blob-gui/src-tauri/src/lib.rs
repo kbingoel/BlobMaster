@@ -14,8 +14,8 @@ use crate::commands::{
     add_recent_model, advance_round, delete_session, engine_version, export_session_log,
     list_models, list_recent_models, list_sessions, load_app_settings, load_model, load_session,
     new_game, record_card_played, request_ai_suggestion, round_structure, round_summary,
-    save_app_settings, save_session, set_human_hand, submit_bid, undo_last_event,
-    update_engine_settings, AppState,
+    save_app_settings, save_session, set_human_hand, set_trump_overrides, submit_bid,
+    undo_last_event, update_engine_settings, AppState,
 };
 
 /// Build the tauri-specta `Builder` with every command registered. Shared
@@ -38,6 +38,7 @@ pub fn build_specta_builder() -> SpectaBuilder<tauri::Wry> {
         round_summary,
         advance_round,
         round_structure,
+        set_trump_overrides,
         save_session,
         load_session,
         list_sessions,

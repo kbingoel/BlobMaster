@@ -205,10 +205,32 @@ async advanceRound() : Promise<Result<SessionSnapshot, GuiError>> {
 /**
  * Deterministic round structure for the current game. Used to render the
  * persistent round-progress strip — one entry per round in play order.
+ * `trump_suit` is the user override when one has been set via
+ * [`set_trump_overrides`], otherwise the engine's default rotation.
  */
 async roundStructure() : Promise<Result<RoundStructureEntry[], GuiError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("round_structure") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace one or more entries in the per-round trump-override table.
+ * 
+ * Each entry's `round_idx` must be the current round or a future round —
+ * past rounds are immutable since their trump has already shaped the
+ * scoring. Each `trump` value is 0..=3 for the four suits or 4 for
+ * no-trump (matches `blob_engine::round::NO_TRUMP`).
+ * 
+ * On success the current round's override (if any) is applied to
+ * `state.trump_suit` immediately so the play screen reflects the change
+ * without waiting for an `advance_round`.
+ */
+async setTrumpOverrides(overrides: TrumpOverrideEntry[]) : Promise<Result<SessionSnapshot, GuiError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_trump_overrides", { overrides }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -480,9 +502,16 @@ round_score: number;
  */
 cumulative_after: number }
 /**
- * One entry per round on the persistent round-progress strip.
+ * One entry per round on the persistent round-progress strip. `trump_suit`
+ * is the *effective* trump — the user override if one is set on the
+ * session, otherwise the engine's default cycle.
  */
-export type RoundStructureEntry = { round_idx: number; cards_dealt: number; trump_suit: number }
+export type RoundStructureEntry = { round_idx: number; cards_dealt: number; trump_suit: number; 
+/**
+ * `true` iff the trump for this round has been manually overridden via
+ * `set_trump_overrides` (so the strip can mark it visually).
+ */
+trump_overridden: boolean }
 /**
  * Round-end summary, returned by `round_summary` while the engine is in
  * the `Scoring` phase.
@@ -545,6 +574,11 @@ export type TrickPlay = { seat: number; card: number }
  * continues to use auto-rotate. Wiring the override is a follow-up.
  */
 export type TrumpMode = "auto-rotate" | "spades" | "hearts" | "clubs" | "diamonds" | "no-trump"
+/**
+ * One row in a `set_trump_overrides` payload. `trump` is 0..=3 for the
+ * four suits or 4 for no-trump (matching `blob_engine::round::NO_TRUMP`).
+ */
+export type TrumpOverrideEntry = { round_idx: number; trump: number }
 
 /** tauri-specta globals **/
 

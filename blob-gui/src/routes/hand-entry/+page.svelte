@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { commands, type SessionSnapshot } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
+	import { pushToast } from '$lib/stores/toast';
 	import { suitGlyph, isRed } from '$lib/cardUtils';
 	import CardGrid from '$lib/components/CardGrid.svelte';
 	import RoundProgressStrip from '$lib/components/RoundProgressStrip.svelte';
@@ -60,13 +61,18 @@
 		} else {
 			const err = result.error;
 			submitError = 'message' in err ? err.message : err.kind;
+			pushToast(`Hand rejected: ${submitError}`, 'error');
 		}
 	}
 </script>
 
 {#if snapshot}
 	<div class="hand-entry-layout">
-		<RoundProgressStrip currentRound={snapshot.round_idx} {gameKey} />
+		<RoundProgressStrip
+			currentRound={snapshot.round_idx}
+			{gameKey}
+			onTrumpsSaved={(s) => sessionStore.set(s)}
+		/>
 
 		<!-- ── Sticky info strip ──────────────────────────────── -->
 		<header class="info-strip">

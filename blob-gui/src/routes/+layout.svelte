@@ -4,6 +4,8 @@
 	import favicon from '$lib/assets/favicon.svg';
 	import { commands } from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
+	import Toast from '$lib/components/Toast.svelte';
+	import KeymapOverlay from '$lib/components/KeymapOverlay.svelte';
 
 	let { children } = $props();
 
@@ -25,3 +27,5 @@
 
 <svelte:head><link rel="icon" href={favicon} /></svelte:head>
 {@render children()}
+<Toast />
+<KeymapOverlay />

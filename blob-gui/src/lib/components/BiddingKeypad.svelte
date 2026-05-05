@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { get } from 'svelte/store';
 	import type { AiSuggestion, SessionSnapshot } from '$lib/api';
+	import { trumpEditingStore } from '$lib/stores/trumpEditing';
 
 	interface Props {
 		snapshot: SessionSnapshot;
@@ -72,6 +74,9 @@
 
 	function handleKeydown(e: KeyboardEvent) {
 		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+		// While the round-progress strip is in trump-edit mode it owns the
+		// digit + Enter keys.
+		if (get(trumpEditingStore)) return;
 
 		if (e.key === 'Enter' && isHumanTurn && recommendedBid !== null && !submitting) {
 			e.preventDefault();
@@ -95,7 +100,7 @@
 <div class="keypad">
 	<header class="header">
 		<span class="active-label">
-			<strong>P{activeSeat} ({activeName})</strong> bids:
+			<strong>{activeName}</strong> bids:
 		</span>
 		{#if isDealerTurn}
 			<span class="dealer-tag">dealer</span>

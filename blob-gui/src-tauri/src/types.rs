@@ -328,12 +328,25 @@ pub struct RoundSummary {
     pub is_final_round: bool,
 }
 
-/// One entry per round on the persistent round-progress strip.
+/// One entry per round on the persistent round-progress strip. `trump_suit`
+/// is the *effective* trump — the user override if one is set on the
+/// session, otherwise the engine's default cycle.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
 pub struct RoundStructureEntry {
     pub round_idx: u8,
     pub cards_dealt: u8,
     pub trump_suit: u8,
+    /// `true` iff the trump for this round has been manually overridden via
+    /// `set_trump_overrides` (so the strip can mark it visually).
+    pub trump_overridden: bool,
+}
+
+/// One row in a `set_trump_overrides` payload. `trump` is 0..=3 for the
+/// four suits or 4 for no-trump (matching `blob_engine::round::NO_TRUMP`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+pub struct TrumpOverrideEntry {
+    pub round_idx: u8,
+    pub trump: u8,
 }
 
 /// Header for a saved session file, returned by `list_sessions` so the

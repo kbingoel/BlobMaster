@@ -14,6 +14,7 @@
 		type TrumpMode
 	} from '$lib/api';
 	import { sessionStore } from '$lib/stores/session';
+	import { pushToast } from '$lib/stores/toast';
 
 	const MIN_PLAYERS = 4;
 	const MAX_PLAYERS = 7;
@@ -244,6 +245,7 @@
 		} else {
 			loadedModel = null;
 			modelError = errMessage(result.error);
+			pushToast(`Model load failed: ${modelError}`, 'error');
 		}
 	}
 
