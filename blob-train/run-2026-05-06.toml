@@ -1,0 +1,71 @@
+# Fresh long-run config — 2026-05-06.
+#
+# Replaces the 2026-04-28 anchor sweep, which plateaued at iter ~31 and
+# trained 195 iters into noise. Two structural fixes vs that run:
+#
+#   1. Temperature schedule on. The 2026-04-28 anchor arm was the *control*
+#      (constant τ=1.0) and was never meant to drive a 200-iter run; it
+#      was the no-schedule baseline being compared against arms A/B/C.
+#      We adopt arm A's hard-step (τ=1.0 → 0.1 after the first 15
+#      decisions per game) so the bid head stops chasing late-game noise.
+#
+#   2. Anchor auto-promotion. `[eval] anchor_promotion_min_gap = 25` and
+#      `anchor_promotion_lower95 = 0.55` together promote the candidate
+#      to anchor whenever the eval at iter K shows a Wilson lower-95
+#      win rate ≥ 0.55 and at least 25 iters have passed since the
+#      previous anchor. Without this the first iter to clear iter_0
+#      becomes a permanent anchor and all later strength signal is
+#      Wilson-inconclusive parity. (See main.rs `maybe_promote_anchor`.)
+#
+# Run target: iter 173 (so total_iterations = 174). At ~32 min/iter on
+# the 7950X mixed-player stack that's ~92 hours; in practice the user
+# pauses with a `STOP` file (touch <checkpoint_dir>/STOP) when they want
+# to stop. ~8 hours unattended ≈ first 15 iters.
+
+[training]
+checkpoint_dir = "checkpoints/run-2026-05-06"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 174
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+# Mixed Section-5.2 distribution (n=4 10%, n=5 60%, n=6 25%, n=7 5%) by
+# omitting `fixed_player_count`. Same as the 2026-04-28 anchor sweep.
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+
+# Hard-step temperature schedule (dev-plan §7.4d arm A).
+# `decision_index` is a global per-game counter — one increment per
+# `mcts_search` call across all seats, both bid and play. For 5P7C ≈
+# 225 decisions/game, switch_at = 15 keeps the bidding phase + first
+# trick exploratory and goes near-greedy thereafter.
+[mcts.temperature_schedule]
+kind = "hard_step"
+early = 1.0
+late = 0.1
+switch_at = 15
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32
+anchor_promotion_min_gap = 25
+anchor_promotion_lower95 = 0.55

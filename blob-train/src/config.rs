@@ -17,6 +17,16 @@ fn default_eval_num_threads() -> usize {
     32
 }
 
+fn default_anchor_promotion_min_gap() -> u64 {
+    25
+}
+
+fn default_anchor_promotion_lower95() -> f64 {
+    // Mirrors `blob_nn::eval::EVAL_EARLY_STOP_HIGH` — the same Wilson-lower
+    // band the early-stop logic already uses to call a chunk decisive.
+    0.55
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalConfig {
     pub eval_games: usize,
@@ -25,6 +35,22 @@ pub struct EvalConfig {
     pub bid_success_promotion_delta: f32,
     #[serde(default = "default_eval_num_threads")]
     pub eval_num_threads: usize,
+    /// Minimum number of iterations between the current anchor and the
+    /// candidate before auto-promotion can fire. Prevents flapping when an
+    /// early eval happens to clear the Wilson lower bound on a small
+    /// margin. The 2026-04-28 anchor run kept anchor=iter_31 across 195
+    /// iters with no advancement; the new default is to advance whenever
+    /// the candidate is `min_gap` iters newer AND the eval clears the
+    /// lower-95 band. Set to a very large number (e.g. `u64::MAX`) to
+    /// disable auto-promotion.
+    #[serde(default = "default_anchor_promotion_min_gap")]
+    pub anchor_promotion_min_gap: u64,
+    /// Wilson lower-95 win-rate band a candidate must clear vs the current
+    /// anchor before it is promoted to the new anchor. Defaults to 0.55,
+    /// matching the early-stop band so the same chunk that triggered the
+    /// stop is also strong enough to promote.
+    #[serde(default = "default_anchor_promotion_lower95")]
+    pub anchor_promotion_lower95: f64,
 }
 
 impl Default for EvalConfig {
@@ -38,6 +64,8 @@ impl Default for EvalConfig {
             eval_lookback: 20,
             bid_success_promotion_delta: 0.02,
             eval_num_threads: default_eval_num_threads(),
+            anchor_promotion_min_gap: default_anchor_promotion_min_gap(),
+            anchor_promotion_lower95: default_anchor_promotion_lower95(),
         }
     }
 }
