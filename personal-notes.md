@@ -49,7 +49,26 @@ The hot loop in train_one_step is:
 
 buffer.sample_batch(512)      ← calling thread, CPU
   for each of 512 BlobStates:
-    encode(state)             ← CPU; rebuilds entity-token tensor from a 410B BlobState
+    encode(state)             ← CPU; reb**async training**
+Quick read of your stack (key files)
+blob-nn/src/training_loop.rs:582-632 — train_one_step: samples 512 from buffer → encodes on the calling thread → forward/backward on GPU. Two steps per call (bid + play sub-batches).
+blob-nn/src/training_loop.rs:649-683 — train_phase: steps_per_epoch = ceil(buffer_len / batch_size), repeated up to epochs_per_iteration, with relative early-stop.
+blob-engine/src/replay.rs:1-12 — explicit "store raw BlobState, re-encode at sample time" decision. This is the single-CPU-thread cost.
+blob-nn/src/train.rs:127-185 — LrSchedule: linear warmup over warmup_steps only inside iteration 0, then iteration-relative cosine to MIN_LR.
+[blob-nn/src/engine.rs] — self_play_iteration uses rayon map_init so each worker holds one ONNX session and reuses across games.
+[blob-train/config.sample.toml] — batch_size=512, epochs_per_iteration=10, buffer_capacity=500_000, num_games=118, num_threads=32, device="cuda:0".
+Epochs and batch size, concretely on your numbers
+Batch size 512: at every gradient step you sample 512 examples from the buffer, encode them, and run one forward+backward+optimizer step. Two such steps fire per train_one_step call (one batch sampled per phase: bidding and playing). It's the GPU's "mouthful." Bigger = smoother gradient, more GPU work per host roundtrip; smaller = noisier gradient, more frequent updates per example seen. 512 is a sane default for a 1.63M-param transformer on an 8GB card.
+steps_per_epoch is derived: ceil(buffer_len / batch_size). So at full buffer it's ceil(500000 / 512) = 977 steps. One "epoch" is not one pass over distinct examples — it's "977 random samples from the buffer with replacement." Because sampling is uniform with replacement, in expectation each example is touched ~once per epoch.
+Epochs per iteration = 10: ten such passes, so each example in the buffer is sampled ~10 times over an iteration before the next 80k self-play examples mix in. Combined with the 9-iter buffer, the average example contributes to ~10×9=90 gradient steps over its lifetime in the buffer. That number is the real "how hard are we training on each datum" knob, and it's what changing epochs moves. Lower epochs = data churn dominates, smoother but slower learning. Higher epochs = more updates per example, faster per iter but higher overfit risk on a stale buffer (exactly the regression cold_buffer_post_resume_epochs was added to mitigate at training_loop.rs:653-662).
+Early stop: epoch_early_stop_rel=0.005 cuts the 10-epoch budget short if the loss stops dropping fast enough. So sometimes you only run 3-4 epochs.
+On warmup: your schedule does have one (linear over warmup_steps inside iter 0 only), but it's stepwise, not "LR=0 until buffer fills." The reason buffer-fill doesn't need a true zero-LR phase is that early gradients on tiny buffers are still pointed in the right direction — they're just noisy. The Run-3 incident on 2026-04-29 (the cold-buffer-on-resume regression) is the same idea inverted: peak-LR + tiny buffer + many epochs = overfit the small fresh slice. That's the practical edge of "warmup matters."
+
+CPU↔GPU during training, and why training looks single-threaded
+The hot loop in train_one_step is:
+
+
+buffer.sample_batch(512)      ← calling uilds entity-token tensor from a 410B BlobState
   pad_batch(...)              ← CPU; produces a CPU tensor
   to_device(cuda:0)            ← PCIe copy
   forward / backward           ← GPU
