@@ -291,10 +291,13 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
         bootstrap_initial_onnx(&tl, &cfg)?
     };
 
-    // The anchor is the first saved iteration (= the `try_resume` baseline
-    // if resuming, else iter 0 once produced). Eval against it starting at
-    // `iteration == eval_interval`.
-    let anchor_iter: u64 = tl.iteration;
+    // The anchor starts as the first saved iteration (= the `try_resume`
+    // baseline if resuming, else iter 0 once produced). It auto-advances
+    // when an eval shows the candidate decisively beating the current
+    // anchor — see `maybe_promote_anchor`. The 2026-04-28 anchor sweep
+    // pinned anchor=iter_31 across 195 iters with no advancement; this
+    // hides further strength gain inside Wilson noise.
+    let mut anchor_iter: u64 = tl.iteration;
 
     cfg.self_play.iteration = tl.iteration;
 
@@ -391,13 +394,59 @@ fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
             && iter > anchor_iter
             && iter % cfg.eval.eval_interval == 0
         {
-            if let Err(e) = run_eval_against_anchor(&cfg, anchor_iter, iter, &metrics, &mut rng) {
-                tracing::warn!(error = %e, "periodic evaluation failed");
+            match run_eval_against_anchor(&cfg, anchor_iter, iter, &metrics, &mut rng) {
+                Ok(Some(result)) => {
+                    let promoted = maybe_promote_anchor(
+                        &cfg,
+                        &mut anchor_iter,
+                        iter,
+                        &result,
+                    );
+                    if promoted {
+                        tracing::info!(
+                            new_anchor = iter,
+                            win_rate = result.win_rate,
+                            win_rate_lower95 = result.win_rate_lower95,
+                            "anchor promoted — subsequent evals compare against this iter"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "periodic evaluation failed"),
             }
         }
     }
 
     Ok(())
+}
+
+/// Decide whether the current iter has decisively beaten the running
+/// anchor and should replace it. Returns true if `*anchor_iter` was
+/// updated. The two gates are intentionally cheap and explicit:
+/// (a) the candidate must be at least `anchor_promotion_min_gap` iters
+/// newer than the current anchor, and (b) the Wilson lower-95 win rate
+/// from the just-completed eval must clear `anchor_promotion_lower95`.
+/// If the eval was inconclusive (cap burned without crossing either
+/// band), we skip promotion regardless — that path is a "still uncertain"
+/// signal, not a "decisively better" one.
+fn maybe_promote_anchor(
+    cfg: &TrainingConfig,
+    anchor_iter: &mut u64,
+    current_iter: u64,
+    result: &blob_nn::eval::EvaluationResult,
+) -> bool {
+    if result.inconclusive {
+        return false;
+    }
+    let gap = current_iter.saturating_sub(*anchor_iter);
+    if gap < cfg.eval.anchor_promotion_min_gap {
+        return false;
+    }
+    if result.win_rate_lower95 < cfg.eval.anchor_promotion_lower95 {
+        return false;
+    }
+    *anchor_iter = current_iter;
+    true
 }
 
 fn run_eval_against_anchor(
@@ -406,12 +455,12 @@ fn run_eval_against_anchor(
     current_iter: u64,
     metrics: &blob_nn::training_loop::IterationMetrics,
     rng: &mut Xoshiro256PlusPlus,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<blob_nn::eval::EvaluationResult>> {
     let anchor_onnx = iteration_onnx_path(&cfg.training.checkpoint_dir, anchor_iter);
     let current_onnx = iteration_onnx_path(&cfg.training.checkpoint_dir, current_iter);
     if !anchor_onnx.exists() || !current_onnx.exists() {
         tracing::warn!(?anchor_onnx, ?current_onnx, "eval: missing ONNX; skipping");
-        return Ok(());
+        return Ok(None);
     }
     let (n_players, cards) = cfg.self_play.fixed_player_count.unwrap_or((5, 7));
     // Pull a single u64 from the training-loop RNG so eval remains
@@ -455,7 +504,7 @@ fn run_eval_against_anchor(
             eval_inconclusive: result.inconclusive,
         },
     )?;
-    Ok(())
+    Ok(Some(result))
 }
 
 #[allow(clippy::too_many_arguments)]
