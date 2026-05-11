@@ -140,3 +140,9 @@
 [export_onnx] wrote checkpoints/run-2026-05-06/iter_000138/model.onnx
 [export_onnx] wrote checkpoints/run-2026-05-06/iter_000139/model.onnx
 [export_onnx] wrote checkpoints/run-2026-05-06/iter_000140/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000141/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000142/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000143/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000144/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000145/model.onnx
+[export_onnx] wrote checkpoints/run-2026-05-06/iter_000146/model.onnx
