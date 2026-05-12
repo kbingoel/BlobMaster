@@ -53,10 +53,20 @@ temperature = 1.0
 # constant. Only a hard-step schedule is implemented (AlphaZero-style):
 # `early` τ for `decision_index < switch_at`, then `late` τ thereafter.
 # `decision_index` is a global counter — one increment per `mcts_search`
-# call across all seats, both bid and play. For 5P7C ≈ 225 decisions/game,
-# so `switch_at = 15` matches the dev-plan §7.4d default proposal (first
-# ~7% exploratory, rest near-greedy). Late τ=0.1 keeps a sliver of
-# stochasticity; set to 0.0 for pure argmax.
+# call across all seats, **both bid and play, forced or not** (every
+# decision flows through one `mcts_search` call; the forced-move
+# short-circuit is inside, so the counter still advances on forced moves).
+# For 5P7C ≈ 225 decisions/game, so `switch_at = 15` matches the dev-plan
+# §7.4d default proposal (first ~7% exploratory, rest near-greedy).
+# Late τ=0.1 keeps a sliver of stochasticity; set to 0.0 for pure argmax.
+#
+# fix-mcts-plan.md Step 3: the schedule applies **only** to the
+# action-sampling distribution (`MctsResult.policy_sampling`). The
+# training label (`MctsResult.policy_target`) is held at τ=1 regardless,
+# so the policy head trains against the full visit distribution and
+# does not collapse to one-hot under the late-game sampler. Eval rollouts
+# explicitly override τ→0 to be greedy and noise-free (epsilon=0 too),
+# so they are unaffected by this schedule.
 # [mcts.temperature_schedule]
 # kind = "hard_step"
 # early = 1.0

@@ -124,13 +124,20 @@ fn play_eval_game_until<R: Rng + ?Sized>(
     rng: &mut R,
     abort: &AtomicBool,
 ) -> Option<EvalGameOutcome> {
-    // fix-mcts-plan.md Step 1 / C1: eval rollouts must be noise-free so
-    // strength comparisons are deterministic. Self-play enables root
-    // Dirichlet via `mcts_cfg.root_dirichlet_epsilon > 0`; here we clone
-    // the cfg and zero the mixing weight before driving search.
+    // fix-mcts-plan.md Steps 1 + 3: eval rollouts run noise-free and
+    // greedy so strength comparisons are deterministic.
+    // - Step 1: drop root Dirichlet (`root_dirichlet_epsilon = 0`).
+    // - Step 3: force pure-argmax action selection on `policy_sampling`
+    //   by overriding the τ-schedule with the τ→0 fast path
+    //   (`temperature_schedule = None`, `temperature = 0.0`). Inheriting
+    //   the training τ-schedule (the pre-Step-3 behavior) injected
+    //   sampling noise from the τ=1 opening into the eval signal we
+    //   compare against the anchor.
     let mcts_cfg_eval = {
         let mut c = *mcts_cfg;
         c.root_dirichlet_epsilon = 0.0;
+        c.temperature_schedule = None;
+        c.temperature = 0.0;
         c
     };
     let mcts_cfg = &mcts_cfg_eval;
@@ -156,7 +163,7 @@ fn play_eval_game_until<R: Rng + ?Sized>(
                 let wrapper = DynEval(eval);
                 let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
                 decision_index += 1;
-                let action = sample_from_policy(&result.policy, rng) as u8;
+                let action = sample_from_policy(&result.policy_sampling, rng) as u8;
                 apply_bid(&mut state, action);
             }
             GamePhase::Playing => {
@@ -167,7 +174,7 @@ fn play_eval_game_until<R: Rng + ?Sized>(
                 let wrapper = DynEval(eval);
                 let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
                 decision_index += 1;
-                let pos = sample_from_policy(&result.policy, rng);
+                let pos = sample_from_policy(&result.policy_sampling, rng);
                 let card_idx = hand_cards[pos];
                 apply_play(&mut state, card_idx);
             }

@@ -142,11 +142,17 @@ where
 
         let mut examples: Vec<TrainingExample> = Vec::new();
         let mut stats: Vec<DecisionStat> = Vec::new();
-        // Session 7.4d: global decision counter, one increment per
-        // `mcts_search` call. Drives `cfg.temperature_schedule`. Counts
-        // bids and plays of every seat (forced moves do not call
-        // `mcts_search` here, so they are not counted — but `mcts_search`
-        // itself short-circuits forced moves regardless of τ).
+        // Session 7.4d / fix-mcts-plan.md Step 3: global decision
+        // counter, one increment per `mcts_search` call. Drives
+        // `cfg.temperature_schedule` (sampling τ only — `policy_target`
+        // is always τ=1). Counts **every** decision in game-time order:
+        // bids and plays of every seat, forced moves included, since
+        // every decision flows through one `mcts_search` call (the
+        // forced-move short-circuit is *inside* `mcts_search` and still
+        // returns a result, so the caller still increments). The
+        // pre-Step-3 comment claimed forced moves were excluded — that
+        // was always inaccurate; the schedule has mapped to game-time
+        // since 7.4d landed.
         let mut decision_index: usize = 0;
 
         while !is_game_over(&state) {
@@ -156,11 +162,14 @@ where
                     let (dets, sims) = adaptive_budget(num_legal, cfg);
                     let result = mcts_search(&state, eval, cfg, rng, decision_index);
                     decision_index += 1;
-                    debug_assert_eq!(result.policy.len(), MAX_BID_ACTIONS);
+                    debug_assert_eq!(result.policy_target.len(), MAX_BID_ACTIONS);
+                    debug_assert_eq!(result.policy_sampling.len(), MAX_BID_ACTIONS);
                     let perspective = state.current_player;
-                    let sparse = dense_to_sparse(&result.policy);
+                    // Step 3: training label uses τ=1 target; action
+                    // selection uses the τ-scheduled sampling vector.
+                    let sparse = dense_to_sparse(&result.policy_target);
                     let snapshot = state;
-                    let action = sample_from_policy(&result.policy, rng) as u8;
+                    let action = sample_from_policy(&result.policy_sampling, rng) as u8;
                     stats.push(DecisionStat {
                         phase: GamePhase::Bidding,
                         num_legal: num_legal as u32,
@@ -186,10 +195,13 @@ where
                     let (dets, sims) = adaptive_budget(num_legal, cfg);
                     let result = mcts_search(&state, eval, cfg, rng, decision_index);
                     decision_index += 1;
-                    debug_assert_eq!(result.policy.len(), hand_cards.len());
-                    let sparse = dense_to_sparse(&result.policy);
+                    debug_assert_eq!(result.policy_target.len(), hand_cards.len());
+                    debug_assert_eq!(result.policy_sampling.len(), hand_cards.len());
+                    // Step 3: training label uses τ=1 target; action
+                    // selection uses the τ-scheduled sampling vector.
+                    let sparse = dense_to_sparse(&result.policy_target);
                     let snapshot = state;
-                    let pos = sample_from_policy(&result.policy, rng);
+                    let pos = sample_from_policy(&result.policy_sampling, rng);
                     let card_idx = hand_cards[pos];
                     stats.push(DecisionStat {
                         phase: GamePhase::Playing,
@@ -356,6 +368,63 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// fix-mcts-plan.md Step 3 integration: under a hard-step schedule
+    /// with `late = 0.1`, the training labels stored in
+    /// `TrainingExample.policy` must remain non-degenerate (≥ 2 nonzero
+    /// entries on at least some multi-legal decisions). Pre-Step-3 the
+    /// fused policy collapsed to one-hot for ~95% of decisions in a
+    /// 225-decision game, which is the smoking gun documented in
+    /// [fix-mcts-plan.md §1](../../fix-mcts-plan.md).
+    #[test]
+    fn training_labels_stay_non_degenerate_under_late_low_tau() {
+        use blob_engine::mcts::TemperatureSchedule;
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12_03);
+        let eval = DummyEvaluator;
+        let mut cfg = fast_cfg();
+        // Force the τ→0.1 regime for every decision (switch_at=0) so
+        // every non-forced label exercises the Step 3 split.
+        cfg.temperature_schedule = Some(TemperatureSchedule::HardStep {
+            early: 1.0,
+            late: 0.1,
+            switch_at: 0,
+        });
+        // Tighten the search budget so the fast_cfg dummy actually
+        // produces visit spread (otherwise sims=1 returns one-hot
+        // trivially and the assertion below would be meaningless).
+        cfg.num_determinizations = 2;
+        cfg.sims_per_determinization = 40;
+        cfg.min_sims_floor = 60;
+
+        let examples = play_one_game(4, 7, &eval, &cfg, &mut rng);
+        assert!(!examples.is_empty());
+
+        let mut multi_legal_examples = 0usize;
+        let mut multi_nonzero = 0usize;
+        for ex in &examples {
+            if ex.policy.len() <= 1 {
+                continue;
+            }
+            multi_legal_examples += 1;
+            let nonzero = ex.policy.iter().filter(|&&(_, p)| p > 0.0).count();
+            if nonzero >= 2 {
+                multi_nonzero += 1;
+            }
+        }
+        assert!(
+            multi_legal_examples > 0,
+            "test setup produced no multi-legal decisions",
+        );
+        // Under Step 3 the training target is τ=1 over visits, so any
+        // multi-legal decision with ≥ 2 distinct visit counts must show
+        // ≥ 2 nonzero entries. A τ=0.1 sampler would have collapsed
+        // most of these to one-hot pre-Step-3.
+        let ratio = multi_nonzero as f32 / multi_legal_examples as f32;
+        assert!(
+            ratio > 0.5,
+            "only {multi_nonzero}/{multi_legal_examples} multi-legal labels stayed non-degenerate (ratio {ratio:.2})",
+        );
     }
 
     #[test]

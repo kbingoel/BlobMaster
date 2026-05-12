@@ -805,20 +805,20 @@ pub fn apply_root_dirichlet_noise<R: Rng + ?Sized>(
     }
 }
 
-/// Per-decision temperature schedule (Session 7.4d). When set, the
-/// effective τ used by `mcts_search` to convert root visit counts into
-/// `MctsResult.policy` depends on the global decision index within the
-/// game (one increment per `mcts_search` call, covering both bid and
-/// play decisions of every seat).
+/// Per-decision temperature schedule (Session 7.4d, refined in
+/// fix-mcts-plan.md Step 3). When set, the effective τ used by
+/// `mcts_search` to convert root visit counts into the
+/// **action-sampling** distribution depends on the global decision index
+/// within the game (one increment per `mcts_search` call, covering both
+/// bid and play decisions of every seat — forced moves included, since
+/// each forced move still flows through one `mcts_search` call).
 ///
-/// Note: `MctsResult.policy` is fused — the same vector serves both the
-/// training target and the action-sampling distribution in self-play.
-/// At τ → 0 the late-game training target collapses to one-hot on the
-/// argmax-visit action, which is intentional: late-game positions are
-/// where MCTS visit counts are highest-signal and we want the policy
-/// head to commit. If you need a τ=1 training target with τ→0 sampling
-/// (canonical AlphaZero), split `MctsResult` into separate `policy_target`
-/// and `policy_sampling` fields — out of scope for 7.4d.
+/// Note: the τ-schedule applies **only** to `MctsResult.policy_sampling`
+/// since Step 3. `MctsResult.policy_target` is held at τ=1 (proportional
+/// to visit counts) so the policy head trains against the full
+/// MCTS-visit distribution regardless of late-game sampling sharpness.
+/// Canonical AlphaZero: τ=1 for the target, τ→0 for sampling after the
+/// opening.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TemperatureSchedule {
@@ -940,14 +940,35 @@ impl Default for MctsConfig {
 
 /// Aggregated result of an `mcts_search` call.
 ///
-/// `policy` is a dense vector indexed by the phase's canonical action
-/// space: bids 0..14 in `Bidding`, hand-card positions (per
-/// `EncodedState::hand_card_indices`) in `Playing`. `visit_entropy`,
-/// `top1_visit_share`, and `value_estimate` are diagnostic signals used
-/// by the training loop to calibrate the adaptive budget table.
+/// Both `policy_target` and `policy_sampling` are dense vectors indexed
+/// by the phase's canonical action space: bids 0..14 in `Bidding`,
+/// hand-card positions (per `EncodedState::hand_card_indices`) in
+/// `Playing`.
+///
+/// fix-mcts-plan.md Step 3 / C3: the training target and the
+/// action-sampling distribution are deliberately decoupled —
+///
+/// - **`policy_target`** is always computed at τ = 1.0 from aggregated
+///   root visit counts (`v_i / Σ v`). This is the training label and
+///   the diagnostic signal `visit_entropy` / `top1_visit_share` are
+///   computed from it. Keeping the target at τ=1 preserves entropy in
+///   the policy head's training signal even when the late-game sampler
+///   is sharp.
+/// - **`policy_sampling`** is computed at
+///   `cfg.temperature_at(decision_index)`. Used only for action
+///   sampling in self-play (or by callers that override the cfg for
+///   greedy eval). At τ→0 this collapses to one-hot on the argmax-visit
+///   action. Pre-Step-3 these two were a single fused field, which
+///   meant the τ-schedule collapsed both — the 7.4d run regressed
+///   strength because of this fusion.
+///
+/// `visit_entropy`, `top1_visit_share`, and `value_estimate` are
+/// diagnostic signals used by the training loop to calibrate the
+/// adaptive budget table.
 #[derive(Debug, Clone)]
 pub struct MctsResult {
-    pub policy: Vec<f32>,
+    pub policy_target: Vec<f32>,
+    pub policy_sampling: Vec<f32>,
     pub visit_entropy: f32,
     pub top1_visit_share: f32,
     pub total_visits: u32,
@@ -1046,7 +1067,8 @@ where
         let phase = state.phase();
         if matches!(phase, GamePhase::Scoring | GamePhase::Complete) {
             return MctsResult {
-                policy: Vec::new(),
+                policy_target: Vec::new(),
+                policy_sampling: Vec::new(),
                 visit_entropy: 0.0,
                 top1_visit_share: 0.0,
                 total_visits: 0,
@@ -1083,6 +1105,8 @@ where
         };
 
         // Forced move: skip MCTS entirely. Signal ratio is 1 by convention.
+        // Both target and sampling distributions are one-hot on the only
+        // legal action — there is no τ-dependent decision to make.
         if num_legal == 1 {
             let mut policy = vec![0.0f32; policy_len];
             if let Some(action) = forced_action {
@@ -1091,7 +1115,8 @@ where
                 }
             }
             return MctsResult {
-                policy,
+                policy_target: policy.clone(),
+                policy_sampling: policy,
                 visit_entropy: 0.0,
                 top1_visit_share: 1.0,
                 total_visits: 0,
@@ -1197,35 +1222,28 @@ where
             }
         }
 
-        // Temperature-applied policy over aggregated visits.
-        let tau = cfg.temperature_at(decision_index);
-        let mut policy = vec![0.0f32; policy_len];
-        let sum_visits: u64 = agg_visits.iter().sum();
-        if sum_visits > 0 {
-            if tau < 1e-3 {
-                let (best_i, _) = agg_visits
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, v)| **v)
-                    .unwrap();
-                policy[best_i] = 1.0;
-            } else {
-                let inv_tau = 1.0 / tau;
-                let weights: Vec<f32> = agg_visits
-                    .iter()
-                    .map(|&v| (v as f32).powf(inv_tau))
-                    .collect();
-                let z: f32 = weights.iter().sum();
-                if z > 0.0 {
-                    for (i, w) in weights.iter().enumerate() {
-                        policy[i] = w / z;
-                    }
-                }
-            }
-        }
+        // fix-mcts-plan.md Step 3 / C3: emit *two* policy vectors over
+        // the aggregated visits — `policy_target` always at τ=1 for the
+        // training label, `policy_sampling` at the configured τ for
+        // action selection. At `temperature_at(decision_index) == 1.0`
+        // the two are identical (recovers the pre-Step-3 fused
+        // behaviour bit-for-bit on those decisions).
+        let tau_sampling = cfg.temperature_at(decision_index);
+        let policy_target = visits_to_policy(&agg_visits, policy_len, 1.0);
+        let policy_sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
+            policy_target.clone()
+        } else {
+            visits_to_policy(&agg_visits, policy_len, tau_sampling)
+        };
 
-        let visit_entropy = entropy(&policy);
-        let top1_visit_share = policy.iter().cloned().fold(0.0f32, f32::max);
+        // Diagnostics read from the τ=1 target: that's the canonical
+        // "what does MCTS prefer" signal. Pre-Step-3 these were
+        // computed from the τ-applied vector, which collapsed to ~0
+        // entropy under the late-game schedule and masked the actual
+        // visit-count spread (see `run-2026-05-06.toml` smoking gun in
+        // fix-mcts-plan.md §1).
+        let visit_entropy = entropy(&policy_target);
+        let top1_visit_share = policy_target.iter().cloned().fold(0.0f32, f32::max);
         let value_estimate = if value_n > 0 {
             value_sum / value_n as f32
         } else {
@@ -1233,13 +1251,47 @@ where
         };
 
         MctsResult {
-            policy,
+            policy_target,
+            policy_sampling,
             visit_entropy,
             top1_visit_share,
             total_visits,
             value_estimate,
         }
     })
+}
+
+/// Map aggregated root visit counts to a dense probability vector at
+/// temperature `tau`. `tau < 1e-3` collapses to one-hot on the argmax
+/// visit; `tau == 1.0` is proportional to visits. Empty / all-zero
+/// inputs return an all-zero vector (caller treats as no-op).
+fn visits_to_policy(agg_visits: &[u64], policy_len: usize, tau: f32) -> Vec<f32> {
+    let mut policy = vec![0.0f32; policy_len];
+    let sum_visits: u64 = agg_visits.iter().sum();
+    if sum_visits == 0 {
+        return policy;
+    }
+    if tau < 1e-3 {
+        let (best_i, _) = agg_visits
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| **v)
+            .unwrap();
+        policy[best_i] = 1.0;
+        return policy;
+    }
+    let inv_tau = 1.0 / tau;
+    let weights: Vec<f32> = agg_visits
+        .iter()
+        .map(|&v| (v as f32).powf(inv_tau))
+        .collect();
+    let z: f32 = weights.iter().sum();
+    if z > 0.0 {
+        for (i, w) in weights.iter().enumerate() {
+            policy[i] = w / z;
+        }
+    }
+    policy
 }
 
 #[cfg(test)]
@@ -1570,8 +1622,8 @@ mod tests {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
         let cfg = MctsConfig::default();
         let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
-        assert_eq!(r.policy.len(), NUM_BIDS);
-        assert!((r.policy[0] - 1.0).abs() < 1e-6);
+        assert_eq!(r.policy_target.len(), NUM_BIDS);
+        assert!((r.policy_target[0] - 1.0).abs() < 1e-6);
         assert_eq!(r.total_visits, 0);
         assert!((r.top1_visit_share - 1.0).abs() < 1e-6);
     }
@@ -1591,8 +1643,8 @@ mod tests {
             ..MctsConfig::default()
         };
         let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
-        assert_eq!(r.policy.len(), NUM_BIDS);
-        let sum: f32 = r.policy.iter().sum();
+        assert_eq!(r.policy_target.len(), NUM_BIDS);
+        let sum: f32 = r.policy_target.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
 
         // Every legal bid has nonzero probability, illegal bids are zero.
@@ -1600,10 +1652,10 @@ mod tests {
         let mut legal_nonzero = 0usize;
         for b in 0..NUM_BIDS {
             if (mask >> b) & 1 == 1 {
-                assert!(r.policy[b] > 0.0, "legal bid {b} has zero policy");
+                assert!(r.policy_target[b] > 0.0, "legal bid {b} has zero policy");
                 legal_nonzero += 1;
             } else {
-                assert_eq!(r.policy[b], 0.0, "illegal bid {b} has nonzero policy");
+                assert_eq!(r.policy_target[b], 0.0, "illegal bid {b} has nonzero policy");
             }
         }
         assert_eq!(legal_nonzero, num_legal);
@@ -1625,16 +1677,16 @@ mod tests {
             ..MctsConfig::default()
         };
         let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
-        assert_eq!(r.policy.len(), enc.hand_card_indices.len());
-        let sum: f32 = r.policy.iter().sum();
+        assert_eq!(r.policy_target.len(), enc.hand_card_indices.len());
+        let sum: f32 = r.policy_target.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
 
         for (pos, &ci) in enc.hand_card_indices.iter().enumerate() {
             let legal_card = (legal >> ci) & 1 == 1;
             if legal_card {
-                assert!(r.policy[pos] > 0.0, "legal pos {pos} has zero policy");
+                assert!(r.policy_target[pos] > 0.0, "legal pos {pos} has zero policy");
             } else {
-                assert_eq!(r.policy[pos], 0.0, "illegal pos {pos} has nonzero policy");
+                assert_eq!(r.policy_target[pos], 0.0, "illegal pos {pos} has nonzero policy");
             }
         }
     }
@@ -1669,11 +1721,15 @@ mod tests {
         assert_eq!(cfg.temperature_at(15), 0.1);
     }
 
-    /// Late-game τ→0 with a hard-step schedule must collapse the policy to
-    /// one-hot on the argmax-visit action; early-game τ=1 must spread mass
-    /// across all visited children. Same state, same seed, two different
-    /// `decision_index` arguments — verifies the schedule actually wires
-    /// through `mcts_search`.
+    /// Late-game τ→0 with a hard-step schedule must collapse the
+    /// **sampling** policy to one-hot on the argmax-visit action;
+    /// early-game τ=1 must spread sampling mass across all visited
+    /// children. Same state, same seed, two different `decision_index`
+    /// arguments — verifies the schedule actually wires through
+    /// `mcts_search`. fix-mcts-plan.md Step 3: the τ-schedule no longer
+    /// affects `policy_target`, so this test additionally pins that
+    /// late-game `policy_target` is still spread (the training signal
+    /// stays τ=1).
     #[test]
     fn mcts_search_honors_temperature_schedule() {
         let s = playing_state(123);
@@ -1695,24 +1751,60 @@ mod tests {
         let mut rng_b = Xoshiro256PlusPlus::seed_from_u64(7);
         let r_late = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng_b, 50);
 
-        // Early: τ=1 → at least two non-zero entries (some spread).
-        let nonzero_early = r_early.policy.iter().filter(|&&p| p > 0.0).count();
+        // Early: τ=1 → sampling has spread mass; target equals sampling
+        // bit-for-bit (the fast-path branch in `mcts_search`).
+        let nonzero_early = r_early
+            .policy_sampling
+            .iter()
+            .filter(|&&p| p > 0.0)
+            .count();
         assert!(
             nonzero_early >= 2,
-            "early τ=1 should spread mass; nonzero={nonzero_early}"
+            "early τ=1 sampling should spread mass; nonzero={nonzero_early}"
+        );
+        assert_eq!(
+            r_early.policy_target, r_early.policy_sampling,
+            "at τ=1 target and sampling should be identical"
         );
 
-        // Late: τ→0 → exactly one entry == 1.0, rest == 0.0.
-        let max_late = r_late.policy.iter().cloned().fold(0.0f32, f32::max);
-        assert!((max_late - 1.0).abs() < 1e-6, "late argmax mass={max_late}");
-        let nonzero_late = r_late.policy.iter().filter(|&&p| p > 0.0).count();
-        assert_eq!(nonzero_late, 1, "late τ→0 must be one-hot");
+        // Late: τ→0 → sampling is one-hot.
+        let max_late = r_late
+            .policy_sampling
+            .iter()
+            .cloned()
+            .fold(0.0f32, f32::max);
+        assert!(
+            (max_late - 1.0).abs() < 1e-6,
+            "late sampling argmax mass={max_late}"
+        );
+        let nonzero_late_sampling = r_late
+            .policy_sampling
+            .iter()
+            .filter(|&&p| p > 0.0)
+            .count();
+        assert_eq!(
+            nonzero_late_sampling, 1,
+            "late τ→0 sampling must be one-hot"
+        );
+
+        // Step 3 contract: late-game `policy_target` is *not* collapsed
+        // by the schedule — still τ=1 over the same visit counts, so it
+        // must keep spread mass across visited children.
+        let nonzero_late_target =
+            r_late.policy_target.iter().filter(|&&p| p > 0.0).count();
+        assert!(
+            nonzero_late_target >= 2,
+            "late τ→0 target should stay at τ=1 (≥ 2 nonzero); got {nonzero_late_target}"
+        );
+        let target_sum: f32 = r_late.policy_target.iter().sum();
+        assert!((target_sum - 1.0).abs() < 1e-5, "target sum={target_sum}");
     }
 
     #[test]
     fn signal_ratio_zero_for_uniform_policy() {
         let r = MctsResult {
-            policy: vec![0.25, 0.25, 0.25, 0.25],
+            policy_target: vec![0.25, 0.25, 0.25, 0.25],
+            policy_sampling: vec![0.25, 0.25, 0.25, 0.25],
             visit_entropy: (4f32).ln(),
             top1_visit_share: 0.25,
             total_visits: 40,
@@ -2064,6 +2156,70 @@ mod tests {
     /// Combined with `apply_root_dirichlet_noise_mixes_and_renormalizes`
     /// this exercises the C1 integration path end-to-end against the
     /// dummy evaluator.
+    /// fix-mcts-plan.md Step 3 / C3 unit-test contract: with
+    /// `temperature = 0.1`, `policy_target` (held at τ=1) must have
+    /// **higher entropy** than `policy_sampling` (computed at τ=0.1)
+    /// for the same visit counts. Pre-Step-3 these were a single fused
+    /// vector — only `policy_sampling` would exist, and the training
+    /// label inherited the sharpened distribution.
+    #[test]
+    fn mcts_search_policy_target_has_higher_entropy_than_sampling_at_low_tau() {
+        let s = playing_state(41);
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 60,
+            min_sims_floor: 60,
+            temperature: 0.1,
+            temperature_schedule: None,
+            ..MctsConfig::default()
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12);
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+
+        // Skip if the position degenerated to a single legal action
+        // (forced-move path returns one-hot in both fields — by design).
+        let nonzero_target = r.policy_target.iter().filter(|&&p| p > 0.0).count();
+        assert!(
+            nonzero_target >= 2,
+            "test position must be multi-legal; got nonzero_target={nonzero_target}",
+        );
+
+        let h_target = entropy(&r.policy_target);
+        let h_sampling = entropy(&r.policy_sampling);
+        assert!(
+            h_target > h_sampling,
+            "policy_target entropy {h_target} should exceed policy_sampling entropy {h_sampling} at τ=0.1",
+        );
+
+        // Both are valid distributions.
+        let s_t: f32 = r.policy_target.iter().sum();
+        let s_s: f32 = r.policy_sampling.iter().sum();
+        assert!((s_t - 1.0).abs() < 1e-4, "target sum {s_t}");
+        assert!((s_s - 1.0).abs() < 1e-4, "sampling sum {s_s}");
+    }
+
+    /// At τ=1 the target and sampling distributions are equal
+    /// bit-for-bit (the fast-path branch in `mcts_search`). Pins the
+    /// invariant so a future refactor can't introduce a silent drift.
+    #[test]
+    fn mcts_search_policy_target_equals_sampling_at_tau_one() {
+        let s = playing_state(83);
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 30,
+            min_sims_floor: 60,
+            temperature: 1.0,
+            temperature_schedule: None,
+            ..MctsConfig::default()
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(99);
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        assert_eq!(
+            r.policy_target, r.policy_sampling,
+            "τ=1 should yield identical target and sampling vectors",
+        );
+    }
+
     /// fix-mcts-plan.md C2a unit-test contract: `backprop_terminal`
     /// credits every active seat along the path with `values[s]` (rather
     /// than only the leaf seat as `backprop` does).
@@ -2184,8 +2340,8 @@ mod tests {
         };
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12_01);
         let result = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
-        let sum: f32 = result.policy.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-4, "policy sum {sum} ≠ 1");
+        let sum: f32 = result.policy_target.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "policy_target sum {sum} ≠ 1");
         // adaptive_budget may raise dets×sims to satisfy min_sims_floor,
         // so just assert the aggregate is at least the configured floor.
         assert!(
