@@ -31,6 +31,7 @@ pub mod playing;
 pub mod profiling;
 pub mod replay;
 pub mod round;
+pub mod scoring;
 pub mod state;
 
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
@@ -44,10 +45,11 @@ pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
 pub use belief::{determinize, void_suits, VoidTable, DEFAULT_DETERMINIZE_ATTEMPTS};
 pub use mcts::{
-    adaptive_budget, apply_action, backprop, expand, is_terminal, mcts_search, root_action_probs,
-    run_search, select_best_child, select_leaf, signal_ratio, ucb1_score, MctsArena, MctsConfig,
-    MctsNode, MctsResult, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
+    adaptive_budget, apply_action, backprop, backprop_terminal, expand, is_terminal, mcts_search,
+    root_action_probs, run_search, select_best_child, select_leaf, signal_ratio, ucb1_score,
+    MctsArena, MctsConfig, MctsNode, MctsResult, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
+pub use scoring::{terminal_z_scores, z_score_clip, Z_SCORE_EPS};
 pub use playing::{apply_play, legal_plays, score_round};
 pub use replay::{BidBatch, PlayBatch, ReplayBuffer, SparsePolicy, MAX_BID_ACTIONS, MAX_PLAY_ACTIONS};
 pub use round::{

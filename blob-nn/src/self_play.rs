@@ -221,29 +221,19 @@ where
 /// Fill each example's `value` with the z-scored cumulative score of its
 /// perspective player. `clip((s - mean) / max(std, ε), -1, 1)`. If all
 /// players finished with the same score, every target is 0.0.
+///
+/// fix-mcts-plan.md C2c: the z-score statistic itself is shared with
+/// `blob_engine::scoring::terminal_z_scores` (called by MCTS terminal
+/// backprop), so in-tree Q at terminal leaves and the training value
+/// target cannot drift in scale.
 pub fn backfill_values(examples: &mut [TrainingExample], final_state: &BlobState) {
     let n = final_state.num_players as usize;
     debug_assert!(n >= 2 && n <= MAX_PLAYERS);
-    let scores: [f32; MAX_PLAYERS] = {
-        let mut arr = [0.0f32; MAX_PLAYERS];
-        for i in 0..n {
-            arr[i] = final_state.cumulative_scores[i] as f32;
-        }
-        arr
-    };
-    let mean = scores[..n].iter().sum::<f32>() / n as f32;
-    let var = scores[..n].iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n as f32;
-    let std = var.sqrt();
-    const EPS: f32 = 1e-6;
-    let denom = std.max(EPS);
-    let mut z = [0.0f32; MAX_PLAYERS];
-    if std < EPS {
-        // All equal — z-score is undefined; use 0.
-    } else {
-        for i in 0..n {
-            z[i] = ((scores[i] - mean) / denom).clamp(-1.0, 1.0);
-        }
+    let mut scores = [0.0f32; MAX_PLAYERS];
+    for i in 0..n {
+        scores[i] = final_state.cumulative_scores[i] as f32;
     }
+    let z = blob_engine::scoring::z_score_clip(&scores, n);
     for ex in examples.iter_mut() {
         ex.value = z[ex.perspective as usize];
     }
