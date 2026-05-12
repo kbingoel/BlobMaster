@@ -16,7 +16,8 @@
       "Bash(findstr:*)",
       "Bash(venv/Scripts/python.exe:*)",
       "Bash(venv/Scripts/pip.exe install:*)",
-      "Bash(/home/kbuntu/Documents/Github/BlobMaster/.venv/bin/pip install:*)"
+      "Bash(/home/kbuntu/Documents/Github/BlobMaster/.venv/bin/pip install:*)",
+      "Bash(cargo test *)"
     ],
     "deny": [],
     "ask": []
