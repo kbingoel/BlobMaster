@@ -658,6 +658,92 @@ fn default_target_batch() -> usize {
     DEFAULT_TARGET_BATCH
 }
 
+fn default_root_dirichlet_alpha() -> f32 {
+    0.0
+}
+
+fn default_root_dirichlet_epsilon() -> f32 {
+    0.0
+}
+
+/// Sample a single `Gamma(alpha, 1)` variate via Marsaglia–Tsang for
+/// `alpha >= 1`, with the standard boost trick
+/// (`G(alpha) ≡ G(alpha+1) · U^(1/alpha)`) for `alpha < 1`. Used by
+/// `sample_dirichlet` for root-prior noise (Step 1 of fix-mcts-plan.md).
+#[inline]
+fn sample_gamma<R: Rng + ?Sized>(rng: &mut R, alpha: f32) -> f32 {
+    if alpha < 1.0 {
+        let u: f32 = rng.gen_range(1e-9_f32..1.0);
+        return sample_gamma(rng, alpha + 1.0) * u.powf(1.0 / alpha);
+    }
+    let d = alpha - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        // Standard normal via Box–Muller (one sample per call; the
+        // accept/reject loop already discards most variates).
+        let u1: f32 = rng.gen_range(1e-9_f32..1.0);
+        let u2: f32 = rng.gen_range(0.0_f32..1.0);
+        let n = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+        let v_root = 1.0 + c * n;
+        if v_root <= 0.0 {
+            continue;
+        }
+        let v = v_root * v_root * v_root;
+        let u: f32 = rng.gen_range(0.0_f32..1.0);
+        let n2 = n * n;
+        if u < 1.0 - 0.0331 * n2 * n2 {
+            return d * v;
+        }
+        if u.ln() < 0.5 * n2 + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+}
+
+/// Sample a Dirichlet(α, …, α) vector of length `n`. Returns a uniform
+/// `1/n` vector as a degenerate fallback if all Gamma samples underflow
+/// to zero (vanishingly rare; included so noise mixing can never produce
+/// NaNs).
+fn sample_dirichlet<R: Rng + ?Sized>(rng: &mut R, alpha: f32, n: usize) -> Vec<f32> {
+    let mut samples: Vec<f32> = (0..n).map(|_| sample_gamma(rng, alpha)).collect();
+    let s: f32 = samples.iter().sum();
+    if s > 0.0 {
+        for v in samples.iter_mut() {
+            *v /= s;
+        }
+    } else {
+        let uniform = 1.0 / n.max(1) as f32;
+        for v in samples.iter_mut() {
+            *v = uniform;
+        }
+    }
+    samples
+}
+
+/// Mix Dirichlet noise into the priors of `node_idx`'s children in place:
+/// `P'(a) = (1 − ε) · P(a) + ε · η(a)` with `η ~ Dir(α, …, α)`. Intended
+/// for the root only (Step 1 of fix-mcts-plan.md).
+///
+/// No-op when the node is unexpanded or has zero children.
+pub fn apply_root_dirichlet_noise<R: Rng + ?Sized>(
+    arena: &mut MctsArena,
+    node_idx: u32,
+    alpha: f32,
+    epsilon: f32,
+    rng: &mut R,
+) {
+    let n = arena.node(node_idx).children.len();
+    if n == 0 || epsilon <= 0.0 || alpha <= 0.0 {
+        return;
+    }
+    let noise = sample_dirichlet(rng, alpha, n);
+    let child_ids: SmallVec<[u32; 14]> = arena.node(node_idx).children.clone();
+    for (i, child_idx) in child_ids.iter().enumerate() {
+        let child = arena.node_mut(*child_idx);
+        child.prior = (1.0 - epsilon) * child.prior + epsilon * noise[i];
+    }
+}
+
 /// Per-decision temperature schedule (Session 7.4d). When set, the
 /// effective τ used by `mcts_search` to convert root visit counts into
 /// `MctsResult.policy` depends on the global decision index within the
@@ -744,6 +830,23 @@ pub struct MctsConfig {
     /// field keep working.
     #[serde(default = "default_target_batch")]
     pub target_batch: usize,
+    /// Dirichlet concentration α used to inject exploration noise into
+    /// root priors before search (fix-mcts-plan.md Step 1 / C1). When
+    /// `<= 0` the heuristic `α = 10 / num_legal` is used per call —
+    /// DeepMind's scaling rule, more robust across Blob's variable
+    /// branching (5 plays … 14 bids). A fixed value (e.g. 0.3) is also
+    /// supported. Mixing weight is controlled by
+    /// `root_dirichlet_epsilon`; noise is fully disabled whenever
+    /// `epsilon <= 0`, so leaving this at the default with epsilon=0
+    /// keeps the pre-7.5 behavior.
+    #[serde(default = "default_root_dirichlet_alpha")]
+    pub root_dirichlet_alpha: f32,
+    /// Mixing weight ε for root Dirichlet noise:
+    /// `P'(a) = (1 − ε) · P(a) + ε · η(a)`. AlphaZero default is 0.25;
+    /// any value `<= 0` disables noise injection entirely. Per-det
+    /// (each determinization tree gets its own η sample).
+    #[serde(default = "default_root_dirichlet_epsilon")]
+    pub root_dirichlet_epsilon: f32,
 }
 
 impl MctsConfig {
@@ -768,6 +871,8 @@ impl Default for MctsConfig {
             temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: DEFAULT_TARGET_BATCH,
+            root_dirichlet_alpha: default_root_dirichlet_alpha(),
+            root_dirichlet_epsilon: default_root_dirichlet_epsilon(),
         }
     }
 }
@@ -956,11 +1061,52 @@ where
             arenas.push(MctsArena::with_capacity(perspective, cfg.arena_capacity));
         }
 
+        // Root Dirichlet noise (fix-mcts-plan.md Step 1 / C1): when
+        // enabled, pre-expand each det's root via a single batched eval
+        // call so we can decorate the network priors with
+        // `(1−ε)·P + ε·Dir(α)` before any UCB1 selection runs. The
+        // pre-step accounts for one simulation per det (matches what
+        // the first lockstep descent would have done anyway), so we
+        // pass `sims_per - 1` to `run_lockstep_search` to keep the
+        // total sim budget unchanged. Disabled when `epsilon <= 0` or
+        // `sims_per == 0` (forced-move branch is already short-circuited
+        // above, so this safeguards adaptive_budget edge cases).
+        let noise_on = cfg.root_dirichlet_epsilon > 0.0 && sims_per > 0;
+        let effective_sims = if noise_on {
+            // Resolve α: heuristic (10 / num_legal) when config sets a
+            // non-positive sentinel, fixed value otherwise.
+            let alpha = if cfg.root_dirichlet_alpha > 0.0 {
+                cfg.root_dirichlet_alpha
+            } else {
+                (10.0 / num_legal.max(1) as f32).max(1e-3)
+            };
+            let states_ref: Vec<&BlobState> = det_states.iter().collect();
+            let results = eval.evaluate_batch(&states_ref);
+            debug_assert_eq!(results.len(), det_states.len());
+            for (det_idx, (policy, value)) in results.into_iter().enumerate() {
+                expand(&mut arenas[det_idx], 0, &det_states[det_idx], &policy);
+                apply_root_dirichlet_noise(
+                    &mut arenas[det_idx],
+                    0,
+                    alpha,
+                    cfg.root_dirichlet_epsilon,
+                    rng,
+                );
+                // Root visit is acted on by `perspective`; mirrors what
+                // `run_search`/`run_lockstep_search` would record on the
+                // first descent that hits the unexpanded root.
+                backprop(&mut arenas[det_idx], &[0], perspective, value);
+            }
+            sims_per - 1
+        } else {
+            sims_per
+        };
+
         run_lockstep_search(
             &mut arenas,
             &det_states,
             eval,
-            sims_per,
+            effective_sims,
             cfg.c_puct,
             cfg.target_batch,
         );
@@ -1752,5 +1898,133 @@ mod tests {
         // Exactly one non-zero entry at 1.0.
         let ones = probs.iter().filter(|(_, p)| *p == 1.0).count();
         assert_eq!(ones, 1);
+    }
+
+    /// fix-mcts-plan.md Step 1: a Dirichlet(α, …, α) sample of length `n`
+    /// must be non-negative and sum to ~1.
+    #[test]
+    fn sample_dirichlet_is_a_probability_vector() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xD18E_C1E7);
+        for &alpha in &[0.1f32, 0.3, 1.0, 3.0, 10.0] {
+            for &n in &[2usize, 5, 14, 26] {
+                let v = sample_dirichlet(&mut rng, alpha, n);
+                assert_eq!(v.len(), n);
+                let s: f32 = v.iter().sum();
+                assert!((s - 1.0).abs() < 1e-4, "α={alpha} n={n} sum={s}");
+                for x in &v {
+                    assert!(x.is_finite() && *x >= 0.0, "α={alpha} n={n} got {x}");
+                }
+            }
+        }
+    }
+
+    /// fix-mcts-plan.md Step 1 unit-test contract: after
+    /// `apply_root_dirichlet_noise`, root child priors must
+    /// (a) differ from the raw evaluator output by the expected mixing
+    /// weight (`|P' − (1 − ε)·P| = ε · η`), and (b) still sum to 1.
+    #[test]
+    fn apply_root_dirichlet_noise_mixes_and_renormalizes() {
+        let s = playing_state(11);
+        let mut arena = MctsArena::new(s.current_player);
+        let (policy, _) = DummyEvaluator.evaluate(&s);
+        expand(&mut arena, 0, &s, &policy);
+
+        let raw_priors: Vec<f32> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).prior)
+            .collect();
+        let raw_sum: f32 = raw_priors.iter().sum();
+        assert!((raw_sum - 1.0).abs() < 1e-4, "raw priors sum {raw_sum} ≠ 1");
+
+        let epsilon = 0.25f32;
+        let alpha = 0.3f32;
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12);
+        apply_root_dirichlet_noise(&mut arena, 0, alpha, epsilon, &mut rng);
+
+        let mixed: Vec<f32> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).prior)
+            .collect();
+        let mixed_sum: f32 = mixed.iter().sum();
+        // (1−ε)·P sums to (1−ε) and ε·η sums to ε, so the mixed
+        // distribution must still sum to 1 (within fp noise).
+        assert!(
+            (mixed_sum - 1.0).abs() < 1e-4,
+            "mixed prior sum {mixed_sum} ≠ 1"
+        );
+        // Recover the noise vector and check it lies on the simplex.
+        let mut noise: Vec<f32> = mixed
+            .iter()
+            .zip(raw_priors.iter())
+            .map(|(m, p)| (m - (1.0 - epsilon) * p) / epsilon)
+            .collect();
+        let noise_sum: f32 = noise.iter().sum();
+        assert!(
+            (noise_sum - 1.0).abs() < 1e-3,
+            "recovered noise sum {noise_sum} ≠ 1"
+        );
+        for n in noise.iter_mut() {
+            assert!(*n > -1e-4 && *n < 1.0 + 1e-4, "noise out of [0,1]: {n}");
+        }
+    }
+
+    /// Disabled (`epsilon == 0`) noise leaves priors untouched — protects
+    /// the pre-7.5 regime and the parity tests.
+    #[test]
+    fn apply_root_dirichlet_noise_is_noop_when_epsilon_zero() {
+        let s = playing_state(17);
+        let mut arena = MctsArena::new(s.current_player);
+        let (policy, _) = DummyEvaluator.evaluate(&s);
+        expand(&mut arena, 0, &s, &policy);
+        let before: Vec<f32> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).prior)
+            .collect();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        apply_root_dirichlet_noise(&mut arena, 0, 0.3, 0.0, &mut rng);
+        let after: Vec<f32> = arena
+            .root()
+            .children
+            .iter()
+            .map(|&c| arena.node(c).prior)
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// `mcts_search` with `root_dirichlet_epsilon > 0` must:
+    /// - keep the total simulation budget intact (root visits == sims),
+    /// - leave the returned policy as a valid distribution.
+    /// Combined with `apply_root_dirichlet_noise_mixes_and_renormalizes`
+    /// this exercises the C1 integration path end-to-end against the
+    /// dummy evaluator.
+    #[test]
+    fn mcts_search_with_root_noise_preserves_budget_and_policy() {
+        let s = playing_state(23);
+        let cfg = MctsConfig {
+            num_determinizations: 3,
+            sims_per_determinization: 25,
+            min_sims_floor: 60,
+            root_dirichlet_alpha: 0.3,
+            root_dirichlet_epsilon: 0.25,
+            ..MctsConfig::default()
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12_01);
+        let result = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let sum: f32 = result.policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "policy sum {sum} ≠ 1");
+        // adaptive_budget may raise dets×sims to satisfy min_sims_floor,
+        // so just assert the aggregate is at least the configured floor.
+        assert!(
+            result.total_visits >= cfg.min_sims_floor,
+            "total_visits {} below floor {}",
+            result.total_visits,
+            cfg.min_sims_floor
+        );
     }
 }

@@ -124,6 +124,16 @@ fn play_eval_game_until<R: Rng + ?Sized>(
     rng: &mut R,
     abort: &AtomicBool,
 ) -> Option<EvalGameOutcome> {
+    // fix-mcts-plan.md Step 1 / C1: eval rollouts must be noise-free so
+    // strength comparisons are deterministic. Self-play enables root
+    // Dirichlet via `mcts_cfg.root_dirichlet_epsilon > 0`; here we clone
+    // the cfg and zero the mixing weight before driving search.
+    let mcts_cfg_eval = {
+        let mut c = *mcts_cfg;
+        c.root_dirichlet_epsilon = 0.0;
+        c
+    };
+    let mcts_cfg = &mcts_cfg_eval;
     let mut state = new_game(num_players, start_cards).expect("valid game params");
     start_round(&mut state, rng);
     let mut outcome = EvalGameOutcome {
@@ -671,6 +681,8 @@ mod tests {
             temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
+            root_dirichlet_alpha: 0.0,
+            root_dirichlet_epsilon: 0.0,
         }
     }
 
