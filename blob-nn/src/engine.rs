@@ -237,6 +237,8 @@ mod tests {
             temperature_schedule: None,
             arena_capacity: blob_engine::mcts::DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
+            root_dirichlet_alpha: 0.0,
+            root_dirichlet_epsilon: 0.0,
         };
         let cfg = SelfPlayConfig {
             num_games: 2,

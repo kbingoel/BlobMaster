@@ -74,6 +74,17 @@ arena_capacity = 4096
 # as the default; revisit only if `num_determinizations` grows or the
 # model widens to d_model ≥ 256.
 target_batch = 5
+# fix-mcts-plan.md Step 1 / C1: root Dirichlet noise. AlphaZero-style
+# exploration injected only at each determinization's root prior:
+# `P'(a) = (1 − ε) · P(a) + ε · η(a)`, η ~ Dir(α). Eval rollouts always
+# run with epsilon=0 (forced inside `play_eval_game_until`), so strength
+# comparisons stay deterministic. Set `root_dirichlet_epsilon = 0.0` here
+# to recover the pre-7.5 noise-free regime.
+# `root_dirichlet_alpha = 0.0` selects the DeepMind 10/num_legal heuristic
+# (recommended for Blob's variable branching 5..14). Set a positive fixed
+# value (e.g. 0.3, the chess default) to override.
+root_dirichlet_alpha = 0.0
+root_dirichlet_epsilon = 0.25
 
 [eval]
 # 192 = 6 × 32-thread batches. Under the parallel eval harness the Wilson

@@ -270,6 +270,8 @@ mod tests {
             temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             target_batch: blob_engine::mcts::DEFAULT_TARGET_BATCH,
+            root_dirichlet_alpha: 0.0,
+            root_dirichlet_epsilon: 0.0,
         }
     }
 
