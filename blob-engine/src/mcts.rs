@@ -262,6 +262,17 @@ where
 /// `apply_bid` or `apply_play` based on the current phase. No-op in
 /// terminal phases (`Scoring`, `Complete`) — expansion never produces
 /// children from those phases.
+///
+/// TODO(C2b — fix-mcts-plan.md §2): the `Scoring`/`Complete` no-op
+/// truncates MCTS's search horizon to the current round. In a 5P7C
+/// game with 7 rounds, a round-1 search sees zero of rounds 2..7 even
+/// though that's where most of the cumulative-score variance lives.
+/// [`crate::scoring::terminal_z_scores`] returns the closest
+/// single-statistic proxy at the boundary (round-z), but the proxy is
+/// bounded by single-round signal. The real fix is to call
+/// `advance_round` here with a freshly sampled deal (a new
+/// determinization rolled forward); parked until Steps 1–3 land and
+/// the strength baseline is re-measured.
 #[inline]
 pub fn apply_action(state: &mut BlobState, action: u8) {
     match state.phase() {
@@ -341,6 +352,38 @@ pub fn backprop(arena: &mut MctsArena, path: &[u32], leaf_seat: u8, v: f32) {
     })
 }
 
+/// Backpropagate a per-seat terminal value vector along every node in
+/// `path` (root → leaf inclusive). Increments `visit_count` once per
+/// node and adds `values[s]` to `value_sums[s]` for every active seat
+/// `s ∈ 0..num_players`.
+///
+/// fix-mcts-plan.md C2a: terminal leaves have ground truth for **every**
+/// seat (z-scored from the actual scores), so per-seat credit is correct
+/// — unlike network leaves where only one perspective is known and
+/// [`backprop`] credits the leaf seat only.
+///
+/// Slots beyond `num_players` are left untouched even if `values[s]`
+/// contains a nonzero entry there (defensive — [`crate::scoring::terminal_z_scores`]
+/// always zeroes them, so this is just a safety net).
+pub fn backprop_terminal(
+    arena: &mut MctsArena,
+    path: &[u32],
+    values: &[f32; MAX_PLAYERS],
+    num_players: u8,
+) {
+    crate::profiling::time(&crate::profiling::BACKPROP, || {
+        let n = (num_players as usize).min(MAX_PLAYERS);
+        for &idx in path {
+            let node = arena.node_mut(idx);
+            node.visit_count += 1;
+            for s in 0..n {
+                node.value_sums[s] += values[s];
+                node.value_counts[s] += 1;
+            }
+        }
+    })
+}
+
 /// Run `num_simulations` MCTS iterations against `root_state`.
 ///
 /// Each iteration: walk from the root picking UCB1-best children (using
@@ -375,18 +418,21 @@ pub fn run_search<E: Evaluator + ?Sized>(
             path.push(idx);
         }
 
-        // Evaluate the leaf (terminal phases short-circuit to v = 0).
-        let (policy, value) = if is_terminal(&state) {
-            (Vec::new(), 0.0)
+        // fix-mcts-plan.md C2: terminal leaves backprop the per-seat
+        // z-scored real outcome (same scale as `backfill_values`), and
+        // C2a: credit lands on every active seat — not just
+        // `leaf_seat` — since ground truth exists for all of them. The
+        // single-perspective `backprop` is still used for network
+        // leaves where the value comes from one seat's eval only.
+        if is_terminal(&state) {
+            let z = crate::scoring::terminal_z_scores(&state);
+            backprop_terminal(arena, &path, &z, state.num_players);
         } else {
-            eval.evaluate(&state)
-        };
-        let leaf_seat = state.current_player;
-
-        if !is_terminal(&state) {
+            let (policy, value) = eval.evaluate(&state);
+            let leaf_seat = state.current_player;
             expand(arena, idx, &state, &policy);
+            backprop(arena, &path, leaf_seat, value);
         }
-        backprop(arena, &path, leaf_seat, value);
     }
 }
 
@@ -435,8 +481,11 @@ pub fn select_leaf_state(
 /// 2. Walk root → unexpanded leaf using the standard UCB1 scorer, which
 ///    already reads `MctsNode::in_flight` so descents already in this
 ///    batch bias subsequent descents away from their paths.
-/// 3. Terminal leaves backprop `v=0` immediately (no eval, no
-///    `in_flight` decoration), matching `run_search`.
+/// 3. Terminal leaves backprop the per-seat z-scored outcome from
+///    [`crate::scoring::terminal_z_scores`] via [`backprop_terminal`]
+///    immediately (no eval, no `in_flight` decoration), matching
+///    `run_search`. (Pre-C2 this was a hard-coded `v=0`; see
+///    fix-mcts-plan.md Step 2 for the scale-alignment rationale.)
 /// 4. Non-terminal leaves: increment `in_flight` along the path and push
 ///    onto the pending batch.
 /// 5. **Cold-start duplicate guard.** If a fresh descent lands on a leaf
@@ -524,10 +573,22 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
             let leaf_seat = leaf_state.current_player;
 
             if is_terminal(&leaf_state) {
-                // Terminal leaves never need eval or expand; backprop the
-                // canonical v=0 immediately, matching `run_search`. No
-                // `in_flight` decoration since nothing is queued.
-                backprop(&mut arenas[det], &path, leaf_seat, 0.0);
+                // fix-mcts-plan.md C2/C2a: terminal leaves never need
+                // eval or expand; backprop the per-seat z-scored real
+                // outcome (multi-seat credit, scale-aligned with
+                // `backfill_values`) immediately. Matches `run_search`'s
+                // updated terminal path. `leaf_seat` is unused here
+                // because credit lands on every active seat — only the
+                // non-terminal branch below still needs it (for the
+                // single-perspective `backprop` after `evaluate_batch`).
+                // No `in_flight` decoration since nothing was queued.
+                let z = crate::scoring::terminal_z_scores(&leaf_state);
+                backprop_terminal(
+                    &mut arenas[det],
+                    &path,
+                    &z,
+                    leaf_state.num_players,
+                );
                 sims_done[det] += 1;
                 continue;
             }
@@ -2003,6 +2064,113 @@ mod tests {
     /// Combined with `apply_root_dirichlet_noise_mixes_and_renormalizes`
     /// this exercises the C1 integration path end-to-end against the
     /// dummy evaluator.
+    /// fix-mcts-plan.md C2a unit-test contract: `backprop_terminal`
+    /// credits every active seat along the path with `values[s]` (rather
+    /// than only the leaf seat as `backprop` does).
+    #[test]
+    fn backprop_terminal_credits_every_active_seat() {
+        let mut arena = MctsArena::new(0);
+        // Path root → A → B.
+        let a = arena.alloc(0.5, 1);
+        let b = arena.alloc(0.5, 2);
+        arena.node_mut(0).children.push(a);
+        arena.node_mut(a).children.push(b);
+
+        let mut z = [0.0f32; MAX_PLAYERS];
+        // Distinct values per seat so seat-mixing bugs would show up.
+        for i in 0..4 {
+            z[i] = (i as f32) * 0.25 - 0.5; // -0.5, -0.25, 0.0, 0.25
+        }
+
+        let path = [0, a, b];
+        backprop_terminal(&mut arena, &path, &z, 4);
+
+        for &idx in &path {
+            let n = arena.node(idx);
+            assert_eq!(n.visit_count, 1);
+            for s in 0..4usize {
+                assert_eq!(n.value_counts[s], 1, "seat {s} not credited");
+                assert!(
+                    (n.value_sums[s] - z[s]).abs() < 1e-6,
+                    "seat {s} sum {} ≠ {}",
+                    n.value_sums[s],
+                    z[s]
+                );
+            }
+            for s in 4..MAX_PLAYERS {
+                assert_eq!(n.value_counts[s], 0, "inactive seat {s} touched");
+                assert_eq!(n.value_sums[s], 0.0, "inactive seat {s} touched");
+            }
+        }
+    }
+
+    /// fix-mcts-plan.md C2 integration: after `run_search` on a
+    /// playing-phase state with enough sims to reach terminal `Scoring`
+    /// leaves, the root's `value_counts[s]` must be > 0 for every active
+    /// seat (proves multi-seat backprop fires from terminal). Pre-C2 this
+    /// would only have been true for the perspective seat, since `v=0`
+    /// went through single-seat [`backprop`].
+    #[test]
+    fn run_search_terminal_value_counts_grow_for_all_seats() {
+        let s = playing_state(31);
+        let mut arena = MctsArena::new(s.current_player);
+        // 4P5C playing state at trick 1: 20 plays to terminal; 600 sims is
+        // plenty for the descent to reach Scoring through many branches.
+        let sims = 600u32;
+        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+
+        let n = s.num_players as usize;
+        let root = arena.root();
+        for seat in 0..n {
+            assert!(
+                root.value_counts[seat] > 0,
+                "seat {seat} value_counts == 0 (terminal credit missing)",
+            );
+        }
+        // q(perspective) should land in the z-score band [-1, 1].
+        let q = root.q(s.current_player);
+        assert!(
+            (-1.0..=1.0).contains(&q),
+            "q(perspective) {q} outside [-1, 1]",
+        );
+    }
+
+    /// fix-mcts-plan.md C2c parity: `terminal_z_scores` on a final-state
+    /// snapshot must match the per-seat output of `backfill_values`,
+    /// since both call `z_score_clip` on the same statistic. Built as
+    /// an in-crate parity check so a future refactor of either side
+    /// triggers a CI failure rather than a silent scale drift in-tree.
+    #[test]
+    fn terminal_z_scores_matches_backfill_value_statistic() {
+        use crate::scoring::{terminal_z_scores, z_score_clip};
+
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.game_phase = GamePhase::Complete as u8;
+        s.cumulative_scores[0] = 60;
+        s.cumulative_scores[1] = 10;
+        s.cumulative_scores[2] = 30;
+        s.cumulative_scores[3] = 0;
+
+        let got = terminal_z_scores(&s);
+
+        // Reproduce `backfill_values`'s computation locally.
+        let mut scores = [0.0f32; MAX_PLAYERS];
+        for i in 0..4 {
+            scores[i] = s.cumulative_scores[i] as f32;
+        }
+        let expected = z_score_clip(&scores, 4);
+
+        for i in 0..MAX_PLAYERS {
+            assert!(
+                (got[i] - expected[i]).abs() < 1e-6,
+                "seat {i}: got {} expected {}",
+                got[i],
+                expected[i],
+            );
+        }
+    }
+
     #[test]
     fn mcts_search_with_root_noise_preserves_budget_and_policy() {
         let s = playing_state(23);
