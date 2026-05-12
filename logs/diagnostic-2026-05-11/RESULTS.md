@@ -1,0 +1,23 @@
+# Diagnostic 2026-05-11 — MCTS-budget vs capacity
+
+Each row: one 192-game head-to-head, Wilson-95 early-stop active (so
+`n` may be 32/64/96/.../192). Same `base_seed` across the 1× and 2×
+arms for a given current↔opponent pair, so identical games up to the
+point where the trees diverge.
+
+| ts | current | opponent | sims | wins/n | wr | lo95 | hi95 | score_diff | bid_a | bid_b | inconc | elapsed_s |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|
+| 20260511T071730 | iter_145 | iter_0 | 5x100 | 97/192 | 0.505 | 0.435 | 0.575 | 5.74 | 0.507 | 0.472 | true | 706 |
+| ~~20260511T071730~~ | ~~iter_145~~ | ~~iter_0~~ | ~~5x200~~ | ~~97/192~~ | ~~0.505~~ | ~~0.435~~ | ~~0.575~~ | ~~5.74~~ | ~~0.507~~ | ~~0.472~~ | ~~true~~ | ~~708~~ |
+| 20260511T071730 | iter_80 | iter_0 | 5x100 | 94/192 | 0.490 | 0.420 | 0.560 | 0.38 | 0.490 | 0.486 | true | 702 |
+| ~~20260511T071730~~ | ~~iter_80~~ | ~~iter_0~~ | ~~5x200~~ | ~~94/192~~ | ~~0.490~~ | ~~0.420~~ | ~~0.560~~ | ~~0.38~~ | ~~0.490~~ | ~~0.486~~ | ~~true~~ | ~~704~~ |
+
+> The two 5×200 rows above (strikethrough) are **void**: identical
+> wins/192 and score_diff to the 5×100 arm with elapsed time +2s
+> revealed that `adaptive_budget` in blob-engine/src/mcts.rs:802
+> hardcodes (5, 100) and ignores `cfg.sims_per_determinization`. The
+> 2× config has been re-driven via `min_sims_floor = 1000` (the one
+> field that *does* flow through adaptive_budget); the two 5×200 rows
+> below were produced by the fixed config.
+| 20260511T182511 | iter_145 | iter_0 | 5x200-floor1000 | 95/192 | 0.495 | 0.425 | 0.565 | 3.81 | 0.498 | 0.474 | true | 1214 |
+| 20260511T182511 | iter_80 | iter_0 | 5x200-floor1000 | 99/192 | 0.516 | 0.445 | 0.585 | 3.09 | 0.507 | 0.488 | true | 1183 |
