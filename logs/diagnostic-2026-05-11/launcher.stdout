@@ -1,0 +1,25 @@
+=== diagnostic-2026-05-11 — start 20260511T071730 ===
+  log:     logs/diagnostic-2026-05-11/eval-20260511T071730.log
+  results: logs/diagnostic-2026-05-11/RESULTS.md
+
+[07:17:31] iter_145 vs iter_0 @ 5x100 …
+[07:29:18] iter_145 vs iter_0 @ 5x200 …
+[07:41:07] iter_80 vs iter_0 @ 5x100 …
+[07:52:49] iter_80 vs iter_0 @ 5x200 …
+
+=== logs/diagnostic-2026-05-11/RESULTS.md ===
+# Diagnostic 2026-05-11 — MCTS-budget vs capacity
+
+Each row: one 192-game head-to-head, Wilson-95 early-stop active (so
+`n` may be 32/64/96/.../192). Same `base_seed` across the 1× and 2×
+arms for a given current↔opponent pair, so identical games up to the
+point where the trees diverge.
+
+| ts | current | opponent | sims | wins/n | wr | lo95 | hi95 | score_diff | bid_a | bid_b | inconc | elapsed_s |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|
+| 20260511T071730 | iter_145 | iter_0 | 5x100 | 97/192 | 0.505 | 0.435 | 0.575 | 5.74 | 0.507 | 0.472 | true | 706 |
+| 20260511T071730 | iter_145 | iter_0 | 5x200 | 97/192 | 0.505 | 0.435 | 0.575 | 5.74 | 0.507 | 0.472 | true | 708 |
+| 20260511T071730 | iter_80 | iter_0 | 5x100 | 94/192 | 0.490 | 0.420 | 0.560 | 0.38 | 0.490 | 0.486 | true | 702 |
+| 20260511T071730 | iter_80 | iter_0 | 5x200 | 94/192 | 0.490 | 0.420 | 0.560 | 0.38 | 0.490 | 0.486 | true | 704 |
+
+Per-eval stdout: logs/diagnostic-2026-05-11/eval-20260511T071730.log
