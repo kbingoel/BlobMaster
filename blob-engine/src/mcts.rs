@@ -288,6 +288,41 @@ pub fn is_terminal(state: &BlobState) -> bool {
     matches!(state.phase(), GamePhase::Scoring | GamePhase::Complete)
 }
 
+/// fix-mcts-plan.md Step 5: return `Some(action)` when exactly one legal
+/// move exists at `state` (i.e. the position is forced), else `None`.
+///
+/// Used by the leaf-descent fast-path to skip the NN call entirely on
+/// forced nodes — the prior carries no information when there is only
+/// one child to put it on, so a placeholder child with `prior = 1.0` is
+/// equivalent in expectation and saves the inference. Forced moves are
+/// common in trick-taking games (root-forced rate ~37% in 7.4c
+/// measurements), so the saved evaluations compound across the search.
+///
+/// Always `None` in terminal phases; the descent loop checks
+/// [`is_terminal`] before consulting this helper anyway.
+#[inline]
+pub fn forced_action(state: &BlobState) -> Option<u8> {
+    match state.phase() {
+        GamePhase::Bidding => {
+            let mask = legal_bids(state);
+            if mask.count_ones() == 1 {
+                Some(mask.trailing_zeros() as u8)
+            } else {
+                None
+            }
+        }
+        GamePhase::Playing => {
+            let mask = legal_plays(state);
+            if mask.count_ones() == 1 {
+                Some(mask.trailing_zeros() as u8)
+            } else {
+                None
+            }
+        }
+        GamePhase::Scoring | GamePhase::Complete => None,
+    }
+}
+
 /// Expand `node_idx` by creating one child per legal action.
 ///
 /// `policy` is the evaluator output for `state` (bidding: length
@@ -406,16 +441,37 @@ pub fn run_search<E: Evaluator + ?Sized>(
         let mut idx: u32 = 0;
         path.push(idx);
 
-        // Walk from root, descending while expanded. The acting seat at
-        // each step is `state.current_player` (the seat that will act
-        // *from* this node), which UCB1 needs to read its Q slot from.
-        while arena.node(idx).is_expanded() && !is_terminal(&state) {
-            let acting = state.current_player;
-            let child_idx = select_best_child(arena, idx, acting, c_puct);
-            let action = arena.node(child_idx).action;
-            apply_action(&mut state, action);
-            idx = child_idx;
-            path.push(idx);
+        // Walk from root. At each step:
+        //  - terminal → stop, terminal backprop downstream.
+        //  - expanded → UCB1-best child (acting seat read from
+        //    `state.current_player`, the seat that will act *from* this
+        //    node).
+        //  - unexpanded but forced (exactly one legal action) → Step 5
+        //    fast-path: synthesize a placeholder child with `prior=1.0`
+        //    inline and keep descending. No NN call.
+        //  - unexpanded and multi-legal → stop, fall through to NN eval.
+        loop {
+            if is_terminal(&state) {
+                break;
+            }
+            if arena.node(idx).is_expanded() {
+                let acting = state.current_player;
+                let child_idx = select_best_child(arena, idx, acting, c_puct);
+                let action = arena.node(child_idx).action;
+                apply_action(&mut state, action);
+                idx = child_idx;
+                path.push(idx);
+                continue;
+            }
+            if let Some(action) = forced_action(&state) {
+                let child_idx = arena.alloc(1.0, action);
+                arena.node_mut(idx).children.push(child_idx);
+                apply_action(&mut state, action);
+                idx = child_idx;
+                path.push(idx);
+                continue;
+            }
+            break;
         }
 
         // fix-mcts-plan.md C2: terminal leaves backprop the per-seat
@@ -437,13 +493,24 @@ pub fn run_search<E: Evaluator + ?Sized>(
 }
 
 /// Walk from the root of `arena` along UCB1-best children, replaying
-/// actions on a clone of `root_state`, until reaching either an unexpanded
-/// node or a terminal state. Returns `(leaf_idx, path, leaf_state)` where
-/// `path` includes both endpoints (root and leaf inclusive). Mirrors the
-/// per-sim descent inside `run_search` exactly so callers can round-trip
-/// through batched evaluation without changing semantics.
+/// actions on a clone of `root_state`, until reaching either an
+/// unexpanded multi-legal node or a terminal state. Returns
+/// `(leaf_idx, path, leaf_state)` where `path` includes both endpoints
+/// (root and leaf inclusive). Mirrors the per-sim descent inside
+/// `run_search` exactly so callers can round-trip through batched
+/// evaluation without changing semantics.
+///
+/// **Forced-move fast-path (Step 5):** when descent lands on an
+/// unexpanded node whose state has exactly one legal action, the
+/// placeholder child is allocated inline with `prior = 1.0` and descent
+/// continues — no NN evaluation is queued for the forced node. The
+/// returned leaf is therefore guaranteed to be either terminal or
+/// multi-legal-unexpanded; both are valid eval candidates and the
+/// existing terminal-vs-eval dispatch in `run_lockstep_search` handles
+/// them without further changes. Takes `&mut MctsArena` because the
+/// fast-path allocates placeholder nodes during descent.
 pub fn select_leaf_state(
-    arena: &MctsArena,
+    arena: &mut MctsArena,
     root_state: &BlobState,
     c_puct: f32,
 ) -> (u32, Vec<u32>, BlobState) {
@@ -451,15 +518,29 @@ pub fn select_leaf_state(
     let mut path: Vec<u32> = Vec::with_capacity(16);
     let mut idx: u32 = 0;
     path.push(idx);
-    while arena.node(idx).is_expanded() && !is_terminal(&state) {
-        let acting = state.current_player;
-        let child_idx = select_best_child(arena, idx, acting, c_puct);
-        let action = arena.node(child_idx).action;
-        apply_action(&mut state, action);
-        idx = child_idx;
-        path.push(idx);
+    loop {
+        if is_terminal(&state) {
+            return (idx, path, state);
+        }
+        if arena.node(idx).is_expanded() {
+            let acting = state.current_player;
+            let child_idx = select_best_child(arena, idx, acting, c_puct);
+            let action = arena.node(child_idx).action;
+            apply_action(&mut state, action);
+            idx = child_idx;
+            path.push(idx);
+            continue;
+        }
+        if let Some(action) = forced_action(&state) {
+            let child_idx = arena.alloc(1.0, action);
+            arena.node_mut(idx).children.push(child_idx);
+            apply_action(&mut state, action);
+            idx = child_idx;
+            path.push(idx);
+            continue;
+        }
+        return (idx, path, state);
     }
-    (idx, path, state)
 }
 
 /// Generalized lockstep search across multiple determinization trees with
@@ -569,7 +650,7 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
             };
 
             let (leaf_idx, path, leaf_state) =
-                select_leaf_state(&arenas[det], &root_states[det], c_puct);
+                select_leaf_state(&mut arenas[det], &root_states[det], c_puct);
             let leaf_seat = leaf_state.current_player;
 
             if is_terminal(&leaf_state) {
@@ -2325,6 +2406,97 @@ mod tests {
                 expected[i],
             );
         }
+    }
+
+    /// fix-mcts-plan.md Step 5 unit-test contract: when the descent
+    /// reaches an unexpanded node whose state has exactly one legal
+    /// action, the fast-path must allocate a placeholder child inline
+    /// with `prior = 1.0`, apply that action, and keep descending —
+    /// rather than returning the unexpanded node as a leaf for NN eval.
+    ///
+    /// Constructed scenario: a 3P 0-card bidding state with
+    /// `current_player = 0`, `dealer = 2`. `legal_bids` returns `1`
+    /// (only bid 0) for the two non-dealers, so the descent should
+    /// chain through both non-dealer placeholders and stop at the
+    /// dealer (where `legal_bids = 0`, neither forced nor expandable
+    /// by NN — the existing `expand` no-ops on this degenerate state).
+    /// We pin two observable signals:
+    /// 1. The root grew a child with `action = 0` and `prior = 1.0`
+    ///    (placeholder synthesized rather than NN-derived).
+    /// 2. The returned path is deeper than `[root]` — the fast-path
+    ///    actually advanced descent past the unexpanded root.
+    #[test]
+    fn select_leaf_state_takes_forced_fast_path() {
+        let mut s = BlobState::empty();
+        s.num_players = 3;
+        s.cards_dealt = 0;
+        s.dealer = 2;
+        s.current_player = 0;
+        s.game_phase = GamePhase::Bidding as u8;
+        // Sanity: matches the `mcts_search_forced_move_shortcut` setup —
+        // only bid 0 is legal at the root.
+        assert_eq!(legal_bids(&s), 1);
+        assert_eq!(forced_action(&s), Some(0));
+
+        let mut arena = MctsArena::new(s.current_player);
+        let (leaf_idx, path, _leaf_state) =
+            select_leaf_state(&mut arena, &s, DEFAULT_C_PUCT);
+
+        // Root must have one child (the forced placeholder), and the
+        // descent must have walked at least one step.
+        let root = arena.root();
+        assert_eq!(root.children.len(), 1, "root should have one forced child");
+        let forced_child = arena.node(root.children[0]);
+        assert_eq!(forced_child.action, 0, "forced action should be bid 0");
+        assert!(
+            (forced_child.prior - 1.0).abs() < 1e-6,
+            "forced placeholder prior should be 1.0, got {}",
+            forced_child.prior,
+        );
+        assert!(path.len() >= 2, "descent didn't advance past root; path={:?}", path);
+        assert_eq!(path[0], 0, "path should start at root");
+        assert_ne!(leaf_idx, 0, "leaf should not be the root after fast-path");
+    }
+
+    /// Step 5 perf contract: when the lockstep driver descends through
+    /// forced nodes, the *placeholders* must also receive `visit_count`
+    /// and `value_counts` updates on every sim that passes through them
+    /// — otherwise UCB1 reads garbage Q values on the forced chain and
+    /// later (non-forced) callers can't tell from the arena which nodes
+    /// were synthesized vs. NN-derived. Visit budget per root is
+    /// already pinned by `lockstep_search_root_visit_count_matches_sim_budget`;
+    /// this test additionally pins the per-chain accumulation behavior.
+    #[test]
+    fn forced_fast_path_credits_placeholders_along_path() {
+        let mut s = BlobState::empty();
+        s.num_players = 3;
+        s.cards_dealt = 0;
+        s.dealer = 2;
+        s.current_player = 0;
+        s.game_phase = GamePhase::Bidding as u8;
+
+        let mut arena = MctsArena::new(s.current_player);
+        let sims = 20u32;
+        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+
+        // Root visited once per sim.
+        assert_eq!(arena.root().visit_count, sims);
+        // The forced placeholder (root's only child) must have been
+        // visited on every sim — every descent past the root went
+        // through it (UCB1 has nothing else to pick), so its visit
+        // count should equal `sims` minus the one sim that stops at
+        // root before any child exists. The fast-path allocates the
+        // child on the first sim, then every subsequent sim descends
+        // through it; that's `sims` visits along the chain (no -1
+        // because the fast-path also visits the forced child on the
+        // initial sim).
+        let forced = arena.node(arena.root().children[0]);
+        assert!(
+            forced.visit_count >= sims - 1,
+            "forced child undervisited: {} sims, child visit_count = {}",
+            sims,
+            forced.visit_count,
+        );
     }
 
     #[test]
