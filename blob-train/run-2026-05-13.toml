@@ -1,0 +1,57 @@
+# Forced-move short-circuit speed-validation run — 2026-05-13.
+#
+# Identical to blob-train/run-2026-05-12.toml in every knob; only the
+# checkpoint_dir changes. The binary now contains the forced-move
+# short-circuit (commit 6345cf7), so per-iter wall-clock here measured
+# against run-2026-05-12 is a clean apples-to-apples read of the
+# self-play speedup. Strength trajectory should also match (forced-move
+# shortcut allocates the unique legal child with prior 1.0 and does not
+# change root visit distributions in expectation).
+#
+# Feeds into async.md §2 throughput model: if self-play time drops from
+# ~15 min/iter to materially less, the GPU duty cycle gap (currently
+# 64%) widens and the projected async speedup grows.
+
+[training]
+checkpoint_dir = "checkpoints/run-2026-05-13"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 16
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+fixed_player_count = [5, 7]
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+root_dirichlet_alpha = 0.0
+root_dirichlet_epsilon = 0.25
+
+[mcts.temperature_schedule]
+kind = "hard_step"
+early = 1.0
+late = 0.1
+switch_at = 15
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32
+anchor_promotion_min_gap = 25
+anchor_promotion_lower95 = 0.55
