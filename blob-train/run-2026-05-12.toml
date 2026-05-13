@@ -1,0 +1,77 @@
+# Validation run for fix-mcts-plan.md Steps 1+2+3 — 2026-05-12.
+#
+# Goal: 15-iter overnight smoke against the 7.2 baseline
+# (checkpoints/7.2-run/), with evals at iter 5, 10, 15. Per §5 of
+# fix-mcts-plan.md, this is the "full 15-iter rerun" once Steps 1-3 have
+# landed:
+#   - Step 1: root Dirichlet noise (eps=0.25, alpha=0.0 -> DeepMind heuristic).
+#   - Step 2: real terminal value backprop, per-seat, full-game z-scale.
+#   - Step 3: split policy_target (tau=1) vs policy_sampling (tau-scheduled);
+#            eval forced to greedy + Dirichlet off internally.
+#
+# Recipe = 7.2-run for direct comparison:
+#   fixed_player_count = [5, 7], num_games = 118, 5x100 MCTS, target_batch = 5.
+# Differences vs 7.2-run: Dirichlet on, terminal-z backprop, split tau (post-Step-3),
+# tau-schedule enabled (Step 3 makes this safe; was harmful pre-fix per C3).
+#
+# Acceptance gate (plan §5.4): >= 0.85 vs iter_0 by iter 10. If hit, Step 4
+# (supervised warm-start) is unnecessary.
+#
+# total_iterations = 16 (off-by-one: K=15 processed iff K < 16). Evals at
+# iter > 0 && iter % 5 == 0 -> iters 5, 10, 15.
+
+[training]
+checkpoint_dir = "checkpoints/run-2026-05-12"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 16
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+# 7.2 recipe: fixed 5P7C for direct strength comparability against
+# checkpoints/7.2-run/. 118 games matches the 7.2 baseline exactly.
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+fixed_player_count = [5, 7]
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+# Step 1: Dirichlet noise at the root prior of each determinization.
+# alpha = 0.0 -> use DeepMind 10/num_legal heuristic (recommended for
+# Blob's variable branching 5..14). Eval forces epsilon = 0 internally,
+# so strength signal stays deterministic.
+root_dirichlet_alpha = 0.0
+root_dirichlet_epsilon = 0.25
+
+# Step 3 makes the schedule safe: the training label
+# (MctsResult.policy_target) is held at tau = 1 regardless of this block;
+# the schedule only affects MctsResult.policy_sampling (action sampling
+# in self-play). Eval rollouts override tau -> 0 internally (greedy).
+[mcts.temperature_schedule]
+kind = "hard_step"
+early = 1.0
+late = 0.1
+switch_at = 15
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32
+# Anchor promotion gap > total iters, so iter_0 stays as the anchor for
+# the whole 15-iter run. Apples-to-apples vs 7.2-run/strength.csv.
+anchor_promotion_min_gap = 25
+anchor_promotion_lower95 = 0.55
