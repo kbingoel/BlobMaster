@@ -13,13 +13,13 @@ Full training-process dashboard (adds convergence + timing plots):
         --out-dir logs/run-2026-05-14
 
 `--metrics` enables the convergence dashboard (loss / accuracy /
-num_epochs_run from blob-nn's per-iter metrics.jsonl). `--stderr` enables
-the iteration-timing plot — wall_clock_secs is parsed from the
-"iteration complete" log line, and per-iter eval wall is derived as the
-gap between consecutive "iteration complete" timestamps minus the next
-iter's wall_clock_secs. (Splitting an iter's wall into self-play vs
-training requires new spans in blob-nn/src/training_loop.rs::run_iteration
-— not derivable from current logs; see plot_iter_timing docstring.)
+num_epochs_run from blob-nn's per-iter metrics.jsonl) AND the SP-vs-
+training split on the timing plot (when `self_play_secs` /
+`training_secs` are present in metrics.jsonl; added 2026-05-15).
+`--stderr` enables the iteration-timing plot — wall_clock_secs is
+parsed from the "iteration complete" log line, and per-iter eval wall
+is derived as the gap between consecutive "iteration complete"
+timestamps minus the next iter's wall_clock_secs.
 """
 
 from __future__ import annotations
@@ -238,29 +238,150 @@ def plot_iter_timing(
     iter_timings: list[tuple[int, float, datetime]],
     eval_walls: dict[int, float],
     out_path: Path,
+    metrics: list[dict] | None = None,
 ) -> None:
-    """Stacked bar: iter wall (SP+train+checkpoint+export) + post-iter eval wall.
+    """Stacked bar of per-iter wall time.
 
-    SP-vs-training split is NOT shown — `wall_clock_secs` in stderr is a
-    single number covering the whole run_iteration() call. To get the
-    split, add `tracing::info_span!("self_play")` and `("training_step")`
-    around the two halves in blob-nn/src/training_loop.rs::run_iteration
-    (~10 lines), then log their elapsed times into IterationMetrics so
-    metrics.jsonl carries `self_play_secs` / `training_step_secs`.
+    When `metrics` is provided AND `self_play_secs` / `training_secs` are
+    present (added 2026-05-15), the iter wall is broken into three stacks:
+    SP (bottom), training (middle), and "other" iter overhead (ckpt save +
+    ONNX export + buffer.save, computed as `wall_clock_secs - SP - train`).
+    Post-iter eval wall sits on top.
+
+    When metrics are absent or the fields are missing (older runs), falls
+    back to the prior behaviour: a single iter-wall bar plus the eval bar.
     """
     iters = [t[0] for t in iter_timings]
     walls = [t[1] for t in iter_timings]
     evals = [eval_walls.get(k, 0.0) for k in iters]
 
+    sp_by_iter: dict[int, float] = {}
+    tr_by_iter: dict[int, float] = {}
+    epoch_secs_by_iter: dict[int, list[float]] = {}
+    if metrics:
+        for m in metrics:
+            it = int(m["iteration"])
+            sp = m.get("self_play_secs")
+            tr = m.get("training_secs")
+            es = m.get("epoch_secs")
+            if sp is not None and tr is not None:
+                sp_by_iter[it] = float(sp)
+                tr_by_iter[it] = float(tr)
+            if isinstance(es, list) and es:
+                epoch_secs_by_iter[it] = [float(v) for v in es]
+    has_split = bool(sp_by_iter) and bool(tr_by_iter)
+    has_epochs = bool(epoch_secs_by_iter)
+
     fig, ax = plt.subplots(figsize=(13, 6))
-    ax.bar(iters, walls, color="tab:blue", label="iter wall (SP + train + ckpt + export)")
-    ax.bar(iters, evals, bottom=walls, color="tab:orange",
-           label="post-iter eval wall (vs anchor)")
+    if has_split:
+        # Only stack the split where we have data for the iter; fall back
+        # to a single iter-wall bar for iters that predate the metric.
+        sp_vals = [sp_by_iter.get(k, 0.0) for k in iters]
+        tr_vals = [tr_by_iter.get(k, 0.0) for k in iters]
+        # "other" = wall - sp - tr (checkpoint + buffer + ONNX export +
+        # any scheduling slack). Clamp to 0 in case of clock skew.
+        other_vals = [max(0.0, w - sp - tr) for w, sp, tr in zip(walls, sp_vals, tr_vals)]
+        # Where SP/TR are missing (iter predates the metric), fall back to
+        # putting the full wall in "other" so the bar still shows up.
+        for i, k in enumerate(iters):
+            if k not in sp_by_iter or k not in tr_by_iter:
+                other_vals[i] = walls[i]
+                sp_vals[i] = 0.0
+                tr_vals[i] = 0.0
+
+        ax.bar(iters, sp_vals, color="tab:blue", label="self-play")
+
+        if has_epochs:
+            # Per-epoch stack: one sub-bar per epoch, stacked on top of SP.
+            # Global grey gradient — epoch 1 darkest, epoch N lightest —
+            # keyed to `epochs_per_iteration` (defaulted to 10 if unknown)
+            # so colours are comparable across iters. Iters that ran fewer
+            # epochs just produce shorter stacks, making `num_epochs_run`
+            # readable directly from the count of grey bands.
+            max_epochs = max(
+                (len(v) for v in epoch_secs_by_iter.values()), default=10
+            )
+            max_epochs = max(max_epochs, 10)
+            # Dark grey = 0.25, light grey = 0.85 in matplotlib's 0..1 scale.
+            def grey(epoch_zero_indexed: int) -> tuple[float, float, float]:
+                if max_epochs <= 1:
+                    g = 0.5
+                else:
+                    g = 0.25 + 0.60 * (epoch_zero_indexed / (max_epochs - 1))
+                return (g, g, g)
+
+            # Stack epoch sub-bars on top of SP, in order. We draw one bar
+            # per (iter, epoch_index) slot; only iters with that epoch
+            # contribute a non-zero height. Single legend entry per epoch
+            # index for readability.
+            legended: set[int] = set()
+            for e_idx in range(max_epochs):
+                heights = []
+                bottoms = []
+                for k, sp in zip(iters, sp_vals):
+                    es = epoch_secs_by_iter.get(k, [])
+                    if e_idx < len(es):
+                        # Stack onto SP + sum of prior epochs.
+                        prior = sum(es[:e_idx])
+                        heights.append(es[e_idx])
+                        bottoms.append(sp + prior)
+                    else:
+                        heights.append(0.0)
+                        bottoms.append(sp)
+                # Only label epochs 1, 5, max in the legend so it stays readable.
+                show_in_legend = e_idx in (0, 4, max_epochs - 1)
+                label = f"epoch {e_idx + 1}" if show_in_legend else None
+                if label and e_idx not in legended:
+                    legended.add(e_idx)
+                ax.bar(iters, heights, bottom=bottoms, color=grey(e_idx),
+                       edgecolor="white", linewidth=0.3, label=label)
+
+            # For iters without per-epoch data but with `training_secs`,
+            # draw the single training block in solid green so the bar's
+            # total height still matches `wall`.
+            fallback_heights = []
+            fallback_bottoms = []
+            for k, sp, tr in zip(iters, sp_vals, tr_vals):
+                if k in epoch_secs_by_iter:
+                    fallback_heights.append(0.0)
+                    fallback_bottoms.append(sp)
+                else:
+                    fallback_heights.append(tr)
+                    fallback_bottoms.append(sp)
+            if any(h > 0 for h in fallback_heights):
+                ax.bar(iters, fallback_heights, bottom=fallback_bottoms,
+                       color="tab:green", alpha=0.6,
+                       label="training (no per-epoch data)")
+        else:
+            ax.bar(iters, tr_vals, bottom=sp_vals,
+                   color="tab:green", label="training")
+
+        bottom_other = [s + t for s, t in zip(sp_vals, tr_vals)]
+        ax.bar(iters, other_vals, bottom=bottom_other, color="tab:olive",
+               alpha=0.7, label="other (ckpt + export + buffer)")
+        ax.bar(iters, evals, bottom=walls, color="tab:orange",
+               label="post-iter eval wall (vs anchor)")
+    else:
+        ax.bar(iters, walls, color="tab:blue",
+               label="iter wall (SP + train + ckpt + export)")
+        ax.bar(iters, evals, bottom=walls, color="tab:orange",
+               label="post-iter eval wall (vs anchor)")
 
     if walls:
         mean_wall = sum(walls) / len(walls)
-        ax.axhline(mean_wall, color="tab:blue", linewidth=0.7, linestyle=":",
+        ax.axhline(mean_wall, color="black", linewidth=0.7, linestyle=":",
                    label=f"mean iter wall: {mean_wall:.0f}s")
+    if has_split:
+        sp_nonzero = [v for v in sp_vals if v > 0]
+        tr_nonzero = [v for v in tr_vals if v > 0]
+        if sp_nonzero:
+            ax.axhline(sum(sp_nonzero) / len(sp_nonzero),
+                       color="tab:blue", linewidth=0.6, linestyle="--",
+                       label=f"mean SP: {sum(sp_nonzero) / len(sp_nonzero):.0f}s")
+        if tr_nonzero:
+            mean_tr = sum(tr_nonzero) / len(tr_nonzero)
+            ax.axhline(mean_tr, color="dimgrey", linewidth=0.6, linestyle="--",
+                       label=f"mean training: {mean_tr:.0f}s")
     if evals and any(e > 0 for e in evals):
         nonzero = [e for e in evals if e > 0]
         mean_eval = sum(nonzero) / len(nonzero)
@@ -269,7 +390,14 @@ def plot_iter_timing(
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("seconds")
-    ax.set_title("Wall-clock per iteration (eval bars on top)")
+    title = "Wall-clock per iteration"
+    if has_epochs:
+        title += " (SP / per-epoch greys / other / eval)"
+    elif has_split:
+        title += " (SP / training / other / eval stacks)"
+    else:
+        title += " (eval bars on top)"
+    ax.set_title(title)
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3, axis="y")
     fig.tight_layout()
@@ -294,6 +422,7 @@ def main() -> None:
     plot_score_differential(rows, args.out_dir / "02_score_differential.png")
     plot_losses(rows, args.out_dir / "03_train_losses.png")
 
+    metrics: list[dict] | None = None
     if args.metrics and args.metrics.exists():
         metrics = load_metrics(args.metrics)
         plot_convergence(metrics, args.out_dir / "04_convergence.png")
@@ -302,7 +431,12 @@ def main() -> None:
         iter_timings = parse_iter_timings(args.stderr)
         if iter_timings:
             eval_walls = derive_eval_walls(iter_timings)
-            plot_iter_timing(iter_timings, eval_walls, args.out_dir / "05_iter_timing.png")
+            plot_iter_timing(
+                iter_timings,
+                eval_walls,
+                args.out_dir / "05_iter_timing.png",
+                metrics=metrics,
+            )
 
     print(f"done -> {args.out_dir}")
 
