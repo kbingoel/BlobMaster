@@ -6,58 +6,58 @@ Input for a future implementation plan. The goal is a **standalone V2 training p
 
 Hardware: AM5 7950X (16C/32T) + RTX 4060 8GB. V1 baseline comes from two consecutive runs on the current stack (Cause 1–3 MCTS fixes, fixed [5,7] player distribution, `num_games=118`, `target_batch=5`, batch=512, buffer=500k, `epoch_early_stop_rel=0.005`, 32 self-play threads):
 
-- **`run-2026-05-12`** — Cause 1–3 fixes, no forced-move shortcut. Steady-state (iters 11–15): **~895 s/iter**.
-- **`run-2026-05-13`** — same config + forced-move shortcut. Steady-state (iters 11–13): **~785 s/iter**.
+- **`run-2026-05-12`** — Cause 1–3 fixes, no forced-move shortcut. Steady-state (iters 11–15, mtime-derived): **~960 s/iter**.
+- **`run-2026-05-13`** — same config + forced-move shortcut. Steady-state (iters 12–13, excluding the eval-overhead spike on iter 11): **~785 s/iter**. Mean of iters 11–13 incl. eval = ~825 s.
 
-The forced-move shortcut saves a flat **~120 s/iter**, all coming off the self-play half (the shortcut never touches the training step). That gives one anchor on the SP/training split. A second anchor comes from `num_epochs_run` in `metrics.jsonl`: at steady state, `epoch_early_stop_rel = 0.005` fires aggressively and **only 2 of the configured 10 epochs run** (see `checkpoints/run-2026-05-13/metrics.jsonl`, iters 5–13 all log `num_epochs_run = 2`).
+The forced-move shortcut accounts for the gap: 960 − 785 ≈ **~175 s/iter saved**, all on the self-play half (the shortcut never touches the training step). A second anchor comes from `num_epochs_run` in `metrics.jsonl`: at steady state, `epoch_early_stop_rel = 0.005` fires aggressively and **only 2 of the configured 10 epochs run** (see `checkpoints/run-2026-05-13/metrics.jsonl`, iters 5–13 all log `num_epochs_run = 2`).
 
-The third anchor is the per-step training time. The old `run-2026-05-06` numbers (30 min for ~7 effective epochs × 977 batches) imply **~263 ms/step** wall-clock. Per-step time is invariant across stacks — same 1.6M-param model, same batch=512, same RTX 4060, same 1-thread CPU re-encode (which is the actual bottleneck — pure GPU forward/backward is ~30–50 ms, the encode loop pads it out). Applying that rate:
+The third anchor is the per-step training time. Old `run-2026-05-06` actually ran **10 epochs almost every iter** (147 rows in `metrics.jsonl`; only iters 2/13/139 dipped to 4/7/8). 47 min/iter wall with 10 × 977 × 263 ms = ~42.8 min of training implies **~263 ms/step** and only ~4 min of SP+ONNX per iter on the old stack. Per-step time is invariant across stacks — same 1.6M-param model, same batch=512, same RTX 4060. **The 263 ms/step is GPU-bound forward/backward**: `nvidia-smi` shows 95–100% utilisation sustained through the training phase, which is incompatible with the "30–50 ms GPU + CPU-encode tail" framing that earlier drafts of this doc carried. The 1-thread CPU re-encode is fine because the GPU saturates anyway. Applying that rate:
 
-| Phase | V1 sync wall (estimated, current stack) | Hardware engaged |
+| Phase | V1 sync wall (measured, current stack) | Hardware engaged |
 |---|---|---|
-| Self-play | **~245 s** (post-shortcut); ~365 s pre-shortcut | 32 CPU threads at ~100%, GPU idle |
-| Training (2 × 977 × 263 ms) | **~510 s** (8.5 min) | GPU at **90–97%** (sampled), 1 CPU thread for re-encode |
-| ONNX export | ~30 s | mixed CPU/GPU, Python subprocess |
+| Self-play | **~270 s** (post-shortcut); ~445 s pre-shortcut | 32 CPU threads at ~100%, GPU idle |
+| Training (2 × 977 × 263 ms) | **~514 s** (8.6 min) | GPU at **95–100%** sustained, 1 CPU thread for re-encode (not the bottleneck) |
+| ONNX export | ~25 s | mixed CPU/GPU, Python subprocess |
 | **Total** | **~785 s** (13.1 min) | each half idles the other half's hardware |
 
-A GPU-utilization sample during iter 13 of `run-2026-05-13` confirmed the order: GPU stayed at 90–97% right up to the iter-complete log line, then dropped to ~2% — so training is the **last** phase. The capture caught the last ~25 s of training; that's consistent with ~510 s of training ending at iter end (starting ~509 s into a 785 s iter).
+A GPU-utilization sample during iter 13 of `run-2026-05-13` confirmed the order: GPU stayed at 95–100% right up to the iter-complete log line, then dropped to ~2% — so training is the **last** phase, and the GPU is saturated during it.
 
-> **SP duty cycle: ~31%** under the current stack (vs 34% on the old `run-2026-05-06` mixed-player stack). The proportions held because both halves got faster by similar factors during the 2026-05 fixes:
+> **Current-stack SP duty cycle: ~34%** (271 / 785). On the old `run-2026-05-06` stack the SP duty cycle was actually **~9%**, not 34% — old iters were dominated by the 10-epoch training half (~43 min of 47 min). Earlier drafts misread this as a "both halves shrunk proportionally" story; the real decomposition is:
 >
 > - Iter wall: 47 min → 13 min (~3.6× drop)
-> - Epochs at early-stop: ~7 → 2 (~3.5× drop) — accounts for most of the training-half shrink
-> - SP per iter: ~16 min → ~4 min (~4× drop) — faster games (fixed [5,7] vs mixed) + forced-move shortcut + Cause-3 changes
-> - **Per-step training time: unchanged at ~263 ms**
+> - Epochs at early-stop: **10 → 2 (~5× drop)** — accounts for essentially all of the iter-wall shrink. Cause 1–3 MCTS fixes give the trainer a much sharper signal, so loss bottoms out within 2 passes of the buffer instead of needing the full 10. (LR-schedule compression from the short 16-iter `total_iterations` is a secondary contributor at iter 8+ but doesn't explain the early iters: iter 1 of `run-2026-05-13` already runs only 3 epochs at LR=2.97e-4, while the old run at the same LR ran 10.)
+> - SP per iter: **~4 min → ~4.5 min (~unchanged)**. The forced-move shortcut saved ~175 s on top, but the underlying SP wall didn't move much — fixed [5,7] vs mixed-player only trimmed examples-per-iter ~17% (54k → 44.8k), not the SP wall.
+> - **Per-step training time: unchanged at ~263 ms** — GPU-bound on the 4060.
 >
-> The "reclaim idle CPU during training" framing the original async case was built on still applies. The 30%-SP-duty-cycle headline is intact; the absolute walls just shrank ~3.6× in both halves.
+> The "reclaim idle CPU during training" framing for V2 is **stronger** under the current stack than the old: SP duty cycle is now 34% (not 9%), so freeing the trainer-phase CPU yields a real ~3× SP throughput multiplier. The old stack had nothing to gain from continuous SP because training, not SP, was the bottleneck.
 >
-> *Caveat — the SP/training split is still derived, not directly measured. Adding a `tracing::info_span!("self_play")` / `("training_step")` pair around the two halves is a ~10-line change and would replace the derivation with a single number. Recommended before V2 commits to engineering effort.*
+> *Caveat — the SP/training split is still derived from `num_epochs_run × 977 × 263 ms`, not directly measured. Adding a `tracing::info_span!("self_play")` / `("training_step")` pair around the two halves is a ~10-line change and would replace the derivation with a single number. Recommended before V2 commits to engineering effort.*
 
 ## 2. Throughput model — refreshed numbers, same shape
 
 | Metric | V1 sync (post-shortcut, current stack) | V2 async (continuous SP + continuous trainer) |
 |---|---|---|
-| SP duty cycle | **~31%** (245 / 785) | ~100% |
-| GPU duty cycle | ~65% (510 / 785) | ~85–95% |
-| SP rate during SP phase | 44,840 examples / 245 s ≈ **11k/min** at 32 threads | same per-thread rate |
-| Examples produced per 13 min | 44,840 | **~120k–140k** (**~2.7–3.2×**) |
-| Sample-uses per 13 min | 1.0M (2 epochs × 977 × 512) | up to ~3.0M (continuous trainer, gated by per-step time) |
-| Buffer life (500k cap) | 11.2 iters ≈ 2.4 hr | **~55 min** (3× faster fill rate) |
-| **Reuse per example over buffer life** | **~22 uses** (2 epochs × 11.2 iters) | depends on V2 trainer rate — see §2.1 |
+| SP duty cycle | **~34%** (271 / 785) | ~100% |
+| GPU duty cycle | ~65% (514 / 785) | ~85–95% (trainer GPU-bound at 263 ms/step) |
+| SP rate during SP phase | 44,840 examples / 271 s ≈ **9.9k/min** at 32 threads (~5.7 ex/s/thread) | same per-thread rate, scaled to 30T |
+| Examples produced per 13 min | 44,840 | **~135k** at 30T (~3.0×) |
+| Sample-uses per 13 min | 1.0M (2 epochs × 977 × 512) | ~1.5M (3.80 steps/s × 512 × 780 s; trainer GPU-bound) |
+| Buffer life (500k cap) | 11.2 iters ≈ 2.4 hr | **~48 min** (~3× faster fill rate) |
+| **Reuse per example over buffer life** | **~22 uses** (2 epochs × 11.2 iters) | **~11 uses** (trainer step rate fixed at 263 ms; see §2.1) |
 
-Headline: the **~3× SP-throughput multiplier from V1 → V2 is intact** because the new stack's SP duty cycle (~31%) is essentially the same as the old (~34%). The user-intuition "self-play will nearly triple in speed because it runs all the time and not just 30% of the time" reads against the post-shortcut numbers exactly the same way it read against the original.
+Headline: the **~3× SP-throughput multiplier from V1 → V2 is intact** against the current stack — V1's ~34% SP duty cycle goes to ~100% in V2. (The earlier "essentially the same as the old (~34%)" framing was based on a wrong old-stack number — the old run was actually ~9% SP-duty, training-bound at 10 epochs/iter.)
 
-Two specific changes from the original §2:
+Two specific changes from earlier drafts of §2:
 
-1. **Reuse-per-example is lower than the old number** (~22 vs the old ~66) because early-stop now fires at 2 epochs instead of running ~7 effective epochs. That's a structural win the early-stop heuristic delivered for free — *V1 already trains on each example one-third as often as the old async.md modeled*.
-2. **Whether the V2 trainer should run "continuously" or also early-stop is now an explicit design question** (see §2.1). On the old stack the V2 trainer would clearly do more work than V1; on the new stack, V1 already self-throttles to 2 epochs and the V2-trainer-vs-V1-trainer step delta depends on what gates the early-stop heuristic in V2.
-
+1. **Reuse-per-example dropped from ~93 (old stack, 10 × 9.3 iters) to ~22 (current stack, 2 × 11.2 iters)** because early-stop now fires at 2 epochs instead of running the full 10. That's a structural win the early-stop heuristic delivered for free — *V1 already trains on each example roughly one-quarter as often as the old run did*. V2 brings this further to **~11 reuses**: trainer rate is GPU-bound at ~3.80 steps/s, so over one ~48 min buffer-life it consumes ~5.66M sample-uses against a 500k buffer.
+2. **The V2 trainer is GPU-bound, not "continuously runnable as fast as you want."** The 263 ms/step is what the 4060 delivers at batch=512 on the current 1.6M-param model with 95–100% GPU utilisation. V2 doesn't speed the trainer up; it just keeps it busy 100% of the time instead of the 66% it manages in V1's training phase. The case for V2 is therefore SP-side (3× throughput) and freshness-side (§3), not trainer-side.
+ö
 ## 2.1. Reuse-per-example is the quality axis
 
-The headline `~22 uses → unknown` in §2's table is the more important half of the case. Two effects:
+The headline `~22 uses → ~11 uses` in §2's table is the more important half of the case. Two effects:
 
-1. **Less overfit-on-stale-data.** At 22 reuses per example, each example's gradient signal has been blended into the optimizer ~22 times before it leaves the buffer. Modern AlphaZero implementations target single-digit reuses; we're well above that. The 7→2 epoch early-stop is itself partial evidence — by the third epoch the loss isn't moving on most of the buffer, because most of the buffer has already been trained on many times.
-2. **Younger average example age.** With buffer life dropping from 2.4 hr → ~55 min under V2, the median example the trainer sees is generated against a model that is **less stale** by wall clock — typically 2–3 model-versions old in V2 vs 5–6 in V1. This both raises the quality of the visit-distribution target (newer model has stronger priors → better MCTS targets) and shrinks the off-policy gap between the data source and the trainer's current network.
+1. **Less overfit-on-stale-data.** At 22 reuses per example (V1), each example's gradient signal has been blended into the optimizer ~22 times before it leaves the buffer. V2 cuts that to ~11. Modern AlphaZero implementations target single-digit reuses; V2 lands at the upper edge of that range, V1 is still well above. The 10→2 epoch early-stop is itself partial evidence — by the third epoch the loss isn't moving on most of the buffer, because most of the buffer has already been trained on many times.
+2. **Younger average example age.** With buffer life dropping from 2.4 hr → ~48 min under V2, the median example the trainer sees is generated against a model that is **less stale** by wall clock — typically 2–3 model-versions old in V2 vs 5–6 in V1. This both raises the quality of the visit-distribution target (newer model has stronger priors → better MCTS targets) and shrinks the off-policy gap between the data source and the trainer's current network.
 
 V1 trainer hitting `epoch_early_stop_rel < 0.005` after 2 epochs is not "the trainer has nothing left to learn"; it's "the trainer has nothing left to learn *from this buffer*, which is 91% data it already trained on 1–22 times." Two ways to read that:
 
@@ -170,7 +170,7 @@ These are the design questions whose answers shape the API. They should be resol
 ## 8. Risks and unknowns
 
 - **Buffer contention under 30 writers + 1 reader.** Untested at our throughput. Bench before committing to a primitive.
-- **CUDA kernel launch latency** is currently invisible (~1–4 ms / step at our shape, vs ~263 ms step time on the current 1.6M-param model at batch=512 — wall-dominated by the 1-thread CPU re-encode, not the GPU forward/backward). It would become a bottleneck only if we drove batch size much smaller. Not a concern for V2 at batch=512.
+- **CUDA kernel launch latency** is currently invisible (~1–4 ms / step at our shape, vs ~263 ms step time on the current 1.6M-param model at batch=512). The 263 ms is GPU-bound forward/backward on the 4060 (sustained 95–100% utilisation), not CPU-encode-bound — V2 can't reclaim time here by parallelising encode. Kernel-launch latency would become visible only if we drove batch size much smaller. Not a concern for V2 at batch=512.
 - **Model-swap race.** If a worker mid-game holds an old ONNX session reference and the file is renamed under it: ONNX Runtime keeps its mmap valid; safe on Linux. Confirm on the actual platform.
 - **Eval throughput interference.** Even CPU-only eval steals cores from self-play during eval windows. Acceptable if eval is short relative to inter-eval intervals; quantify before deciding.
 - **Determinism.** Lost. Document that V2 runs are not bit-reproducible.
@@ -188,7 +188,7 @@ Things explicitly *not* in the first cut, to keep scope finite:
 
 V2 is "done" when:
 
-- [ ] **Wall-clock to a fixed strength target is ≤ 60% of V1's time** on the same hardware (the ~2× target). Under the post-2026-05 stack, this should be achievable from the ~3× SP-throughput multiplier alone (V1 SP duty cycle ~31% → V2 ~100%), provided the continuous-fresh-data training (§2.1) breaks V1's 2-epoch early-stop ceiling rather than over-fitting to fresh-but-still-stale data. The bracket is 1.5× (compute-only view) to 2.7× (data-only view).
+- [ ] **Wall-clock to a fixed strength target is ≤ 60% of V1's time** on the same hardware (the ~2× target). Under the post-2026-05 stack, this should be achievable from the ~3× SP-throughput multiplier alone (V1 SP duty cycle ~34% → V2 ~100%), provided the continuous-fresh-data training (§2.1) breaks V1's 2-epoch early-stop ceiling rather than over-fitting to fresh-but-still-stale data. The bracket is 1.5× (compute-only view) to 2.7× (data-only view). Reference V1 wall for a 200-iter target run on the current stack: **~43.5 h** (~8000 s for the partial-buffer ramp on iters 0–10, plus 189 × 785 s steady state).
 - [ ] GPU utilization sustained ≥ 90% over a multi-hour run (`nvidia-smi` sampling).
 - [ ] CPU utilization sustained ≥ 28 of 32 threads at >80% over the same window.
 - [ ] STOP file → clean exit with serialized buffer + checkpoint in ≤ 30 sec.

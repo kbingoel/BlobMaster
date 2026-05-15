@@ -116,3 +116,33 @@ Resume-anchor caveat: `--resume`'ing does not preserve the from-scratch eval anc
 ## Graceful exit (`STOP` file)
 
 The training driver checks for `<checkpoint_dir>/STOP` at each iteration boundary. `touch checkpoints/<run-name>/STOP` to ask the loop to finish the current iteration (save checkpoint + export ONNX), then exit cleanly. The file is deleted on detection so the next `--resume` doesn't immediately stop again. There is no SIGINT/SIGTERM handler, so Ctrl-C still hard-kills mid-iter and loses the in-flight iteration's compute (~35-45 min on the 7950X mixed-player stack). Use STOP if you care about that work.
+
+## Visualizing a run
+
+Two Python scripts read a run's checkpoint directory + logs and produce plot folders under `logs/`. Both use the venv interpreter (matplotlib + numpy + onnx are pinned in `requirements.lock.txt`); the bare `python3` on the system likely won't have the right onnx version.
+
+### Training-process dashboard — [scripts/visualize_strength.py](scripts/visualize_strength.py)
+
+Three original strength plots (winrate vs anchor with Wilson CI bands, score differential, train losses) plus two diagnostics added 2026-05-14: per-iter convergence (combined/value loss, top-1 accuracies, `num_epochs_run`, LR cosine, policy KL + visit entropy) and wall-clock per iter (iter wall stacked with derived post-iter eval wall). The `--metrics` and `--stderr` flags are optional — without them you get just the original three plots.
+
+```
+.venv/bin/python scripts/visualize_strength.py \
+  --csv      checkpoints/<run-name>/strength.csv \
+  --metrics  checkpoints/<run-name>/metrics.jsonl \
+  --stderr   logs/<run-name>.stderr \
+  --out-dir  logs/<run-name>-progress
+```
+
+Eval wall is derived from stderr as `(T_{K+1} − T_K) − wall_clock_secs_{K+1}` between consecutive `iteration complete` log lines (the `iteration_complete` timer in [blob-train/src/main.rs](blob-train/src/main.rs) wraps `run_iteration` only — eval runs *after* that log line). The SP-vs-training split inside `wall_clock_secs` is **not** derivable from current logs; getting it requires adding `self_play_secs` / `training_step_secs` fields to `IterationMetrics` in [blob-nn/src/training_loop.rs](blob-nn/src/training_loop.rs)::`run_iteration`.
+
+### Weight evolution — [scripts/visualize_weight_evolution.py](scripts/visualize_weight_evolution.py)
+
+Reads every `iter_NNNNNN/model.onnx` in the checkpoint directory and produces five plots: per-step weight velocity (`||W_t − W_{t-1}|| / ||W_t||`), distance/cosine from init, weight histograms per representative layer, singular-value spectra, and init-vs-final heatmaps. Useful to diagnose dead/saturated layers and to check whether the trainer is still meaningfully moving weights late in a run.
+
+```
+.venv/bin/python scripts/visualize_weight_evolution.py \
+  --checkpoint-dir checkpoints/<run-name> \
+  --out-dir        logs/<run-name>-weight-evolution
+```
+
+The script loads every checkpoint's full state into memory (~11 MB per iter × N iters), so on a 230-iter run expect a few GB of RAM. `--max-layers-histogram` (default 12) controls how many representative layers the histogram/SVD/heatmap panels sample — increase for more detail, decrease if the plots get too crowded.
