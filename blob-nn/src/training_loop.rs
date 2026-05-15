@@ -185,6 +185,14 @@ pub struct IterationMetrics {
     pub num_nn_evaluations: u64,
     pub examples_generated: usize,
     pub buffer_len: usize,
+    /// Wall-clock seconds spent in `self_play_iteration` this iter.
+    pub self_play_secs: f64,
+    /// Wall-clock seconds spent in `train_phase` this iter.
+    pub training_secs: f64,
+    /// Per-epoch wall-clock seconds for the epochs actually run this iter.
+    /// `len() == num_epochs_run`. Sum approximates `training_secs` modulo the
+    /// per-epoch loop overhead (early-stop check, RNG, …).
+    pub epoch_secs: Vec<f64>,
     /// Session 7.1 — P10/P50/P90 of `DecisionStat::signal_ratio`, bucketed
     /// by branching factor (`num_legal`): `bucket_low` = `num_legal ≤ 3`,
     /// `bucket_mid` = `4..=7`, `bucket_high` = `> 7`. Missing buckets emit
@@ -235,6 +243,18 @@ impl IterationMetrics {
         kv!("num_nn_evaluations", self.num_nn_evaluations);
         kv!("examples_generated", self.examples_generated);
         kv!("buffer_len", self.buffer_len);
+        kv!("self_play_secs", json_f64(self.self_play_secs));
+        kv!("training_secs", json_f64(self.training_secs));
+        // Array, not scalar — emit inline.
+        s.push(',');
+        s.push_str("\"epoch_secs\":[");
+        for (i, v) in self.epoch_secs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_f64(*v));
+        }
+        s.push(']');
         kv!("num_decisions", self.num_decisions);
         kv!("signal_p10_low", json_f64(self.signal_p10_low));
         kv!("signal_p50_low", json_f64(self.signal_p50_low));
@@ -651,6 +671,7 @@ impl TrainingLoop {
 
         let mut prev_epoch_loss = f64::INFINITY;
         let mut epochs_run = 0usize;
+        let mut epoch_secs: Vec<f64> = Vec::new();
         let max_epochs = if self.resumed_from_iter.is_some()
             && self.buffer.len() < self.cfg.buffer_capacity
         {
@@ -661,12 +682,14 @@ impl TrainingLoop {
             self.cfg.epochs_per_iteration
         };
         for _epoch in 0..max_epochs {
+            let epoch_started = std::time::Instant::now();
             let start_combined = acc.combined_count;
             let start_combined_sum = acc.combined_sum;
             for _ in 0..steps_per_epoch {
                 self.train_one_step(rng, &mut acc);
             }
             epochs_run += 1;
+            epoch_secs.push(epoch_started.elapsed().as_secs_f64());
             let epoch_combined = acc.combined_sum - start_combined_sum;
             let epoch_count = (acc.combined_count - start_combined).max(1) as f64;
             let epoch_loss = epoch_combined / epoch_count;
@@ -682,12 +705,14 @@ impl TrainingLoop {
             prev_epoch_loss = epoch_loss;
         }
 
-        acc.finalize(
+        let mut metrics = acc.finalize(
             self.iteration,
             epochs_run,
             examples_from_self_play.len(),
             self.buffer.len(),
-        )
+        );
+        metrics.epoch_secs = epoch_secs;
+        metrics
     }
 
     /// Run one full training iteration: self-play → buffer → training →
@@ -707,15 +732,20 @@ impl TrainingLoop {
         R: Rng + ?Sized,
         F: FnOnce(&Path, &Path) -> std::io::Result<()>,
     {
+        let sp_started = std::time::Instant::now();
         let (examples, decision_stats) =
             self_play_iteration(onnx_model_path, self_play_cfg, mcts_cfg);
+        let self_play_secs = sp_started.elapsed().as_secs_f64();
         for ex in &examples {
             if matches!(ex.phase, GamePhase::Bidding | GamePhase::Playing) {
                 self.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
             }
         }
 
+        let train_started = std::time::Instant::now();
         let mut metrics = self.train_phase(rng, &examples);
+        metrics.training_secs = train_started.elapsed().as_secs_f64();
+        metrics.self_play_secs = self_play_secs;
         fold_decision_stats(&mut metrics, &decision_stats);
 
         let dir = self.iteration_dir(self.iteration);
@@ -1062,6 +1092,9 @@ impl LossAccumulators {
             num_nn_evaluations: self.num_nn_evals,
             examples_generated,
             buffer_len,
+            self_play_secs: 0.0,
+            training_secs: 0.0,
+            epoch_secs: Vec::new(),
             num_decisions: 0,
             signal_p10_low: f64::NAN,
             signal_p50_low: f64::NAN,

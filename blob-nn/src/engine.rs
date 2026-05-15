@@ -18,7 +18,6 @@ use blob_engine::onnx::OnnxEvaluator;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
-use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use crate::self_play::{
@@ -100,58 +99,75 @@ pub fn self_play_iteration(
     };
     let resolved_model = std::sync::Arc::new(resolved_model);
 
+    // 2026-05-15: switch from `par_iter` over `num_games` to `pool.broadcast`
+    // so each of the `num_threads` workers plays exactly `games_per_thread`
+    // games — no rayon work-stealing of individual games. With the prior
+    // dynamic scheduling, a thread that finished early would pick up another
+    // game while slower threads were still on their last one, extending wall
+    // clock past the perfectly-balanced minimum. `num_games` is now interpreted
+    // as a target and rounded down to `num_threads * games_per_thread`; any
+    // remainder is dropped with a warning, since aligning games to threads
+    // is the whole point.
+    let games_per_thread = cfg.num_games / cfg.num_threads.max(1);
+    let total_games = games_per_thread * cfg.num_threads;
+    if total_games != cfg.num_games {
+        tracing::warn!(
+            requested = cfg.num_games,
+            num_threads = cfg.num_threads,
+            playing = total_games,
+            games_per_thread,
+            "num_games is not a multiple of num_threads; rounding down so every \
+             worker plays the same number of games"
+        );
+    }
+
     let progress = if cfg.show_progress {
-        let pb = ProgressBar::new(cfg.num_games as u64);
+        let pb = ProgressBar::new(total_games as u64);
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner} {pos}/{len} games ({per_sec}) examples={msg} eta={eta}",
             )
             .unwrap(),
         );
-        Some(pb)
+        Some(std::sync::Arc::new(pb))
     } else {
         None
     };
 
     let example_count = AtomicUsize::new(0);
 
-    // `map_init` constructs one `OnnxEvaluator` per rayon work chunk and
-    // reuses it across every game in that chunk, rather than per-game. The
-    // session's internal mutex still prevents sharing one evaluator across
-    // threads, so each worker keeps its own.
-    let results: Vec<(Vec<TrainingExample>, Vec<DecisionStat>)> = pool.install(|| {
-        (0..cfg.num_games)
-            .into_par_iter()
-            .map_init(
-                {
-                    let resolved_model = resolved_model.clone();
-                    move || {
-                        OnnxEvaluator::from_file(resolved_model.as_ref())
-                            .expect("load ONNX model for self-play worker")
-                    }
-                },
-                |eval, game_idx| {
-                    let thread_idx = rayon::current_thread_index().unwrap_or(0) as u64;
-                    let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
-                    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-                    let (n, c) = match cfg.fixed_player_count {
-                        Some(nc) => nc,
-                        None => sample_game_params(&mut rng),
-                    };
-                    let (examples, stats) =
-                        play_one_game_with_stats(n, c, eval, mcts_cfg, &mut rng);
+    // `broadcast` runs the closure exactly once per worker thread in the pool
+    // and returns `Vec<R>` indexed by thread. Each worker owns its own
+    // `OnnxEvaluator` (the session's internal mutex makes it not shareable)
+    // and plays `games_per_thread` games sequentially.
+    let results: Vec<(Vec<TrainingExample>, Vec<DecisionStat>)> = pool.broadcast(|ctx| {
+        let thread_idx = ctx.index() as u64;
+        let eval = OnnxEvaluator::from_file(resolved_model.as_ref())
+            .expect("load ONNX model for self-play worker");
+        let mut local_examples: Vec<TrainingExample> = Vec::new();
+        let mut local_stats: Vec<DecisionStat> = Vec::new();
+        for game_local in 0..games_per_thread {
+            let game_idx = (thread_idx as usize) * games_per_thread + game_local;
+            let seed = mix_seed(cfg.iteration, thread_idx, game_idx as u64);
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+            let (n, c) = match cfg.fixed_player_count {
+                Some(nc) => nc,
+                None => sample_game_params(&mut rng),
+            };
+            let (examples, stats) =
+                play_one_game_with_stats(n, c, &eval, mcts_cfg, &mut rng);
 
-                    let new_total = example_count
-                        .fetch_add(examples.len(), Ordering::Relaxed)
-                        + examples.len();
-                    if let Some(pb) = &progress {
-                        pb.inc(1);
-                        pb.set_message(new_total.to_string());
-                    }
-                    (examples, stats)
-                },
-            )
-            .collect()
+            let new_total = example_count
+                .fetch_add(examples.len(), Ordering::Relaxed)
+                + examples.len();
+            if let Some(pb) = &progress {
+                pb.inc(1);
+                pb.set_message(new_total.to_string());
+            }
+            local_examples.extend(examples);
+            local_stats.extend(stats);
+        }
+        (local_examples, local_stats)
     });
 
     if let Some(pb) = progress {

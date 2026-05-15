@@ -32,7 +32,12 @@ device = "cuda:0"
 enable_muon = false
 
 [self_play]
-num_games = 118
+# 2026-05-15: 128 = 32 threads × 4 games/thread. Old 118 was inherited
+# from Session 7.1 (chosen for ~80K examples/iter; never aligned to the
+# thread count). With the broadcast-based self-play loop each worker now
+# plays exactly 4 games and no thread picks up a 5th while others finish
+# — see blob-nn/src/engine.rs::self_play_iteration.
+num_games = 128
 num_threads = 32
 iteration = 0
 show_progress = true
@@ -57,7 +62,16 @@ late = 0.1
 switch_at = 15
 
 [eval]
-eval_games = 192
+# 2026-05-15: trimmed from 192 → 96. Wilson early-stop (lower95 ≥ 0.55 /
+# upper95 ≤ 0.45) usually fires well before 96, so the cap mostly bounds
+# wall-clock for inconclusive cases. 96 keeps the worst-case eval roughly
+# half as long as before while still providing enough resolution for a
+# decisively better model to clear the band. Note: the eval harness in
+# blob-nn/src/eval.rs uses an atomic-counter work-stealing pattern (the
+# first free thread grabs the next game), not the per-thread broadcast
+# used in self-play — this is intentional because the sequential CI check
+# needs results in index order and tolerates uneven thread load.
+eval_games = 96
 eval_interval = 5
 eval_lookback = 20
 bid_success_promotion_delta = 0.02
