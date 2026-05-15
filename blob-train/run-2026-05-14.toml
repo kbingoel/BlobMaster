@@ -1,0 +1,66 @@
+# Long run — 2026-05-14.
+#
+# First large run after the Cause 1-3 MCTS fixes + forced-move short-circuit.
+# The 13-iter test launch on 2026-05-13 (checkpoints/run-2026-05-13/) ran
+# clean to completion at ~785 s/iter steady state, so we now commit to a
+# 230-iter long run on the same proven recipe (iter 229 is the last
+# processed; loop exits when iter == total_iterations).
+#
+# Recipe = run-2026-05-13 exactly, only total_iterations and checkpoint_dir
+# change. Fixed_player_count = [5, 7] keeps strength comparable to the
+# 7.2-run/strength.csv baseline; mixed-player is deferred to a later run.
+#
+# Wall-clock budget: 230 iters × ~785 s ≈ 50 hours. The driver runs
+# until iter == total_iterations or until `<checkpoint_dir>/STOP` is
+# touched (graceful exit at the next iteration boundary; see AGENTS.md).
+# Resume after a manual stop:
+#   scripts/run-2026-05-14.sh --resume
+#
+# Anchor auto-promotion is on (`anchor_promotion_min_gap = 25`,
+# `anchor_promotion_lower95 = 0.55`), so strength signal stays meaningful
+# past the first ~25 iters instead of degenerating into Wilson-inconclusive
+# parity once the candidate clears iter_0.
+
+[training]
+checkpoint_dir = "checkpoints/run-2026-05-14"
+buffer_capacity = 500000
+batch_size = 512
+epochs_per_iteration = 10
+epoch_early_stop_rel = 0.005
+total_iterations = 230
+device = "cuda:0"
+enable_muon = false
+
+[self_play]
+num_games = 118
+num_threads = 32
+iteration = 0
+show_progress = true
+fixed_player_count = [5, 7]
+use_int8 = false
+
+[mcts]
+c_puct = 1.5
+num_determinizations = 5
+sims_per_determinization = 100
+min_sims_floor = 60
+temperature = 1.0
+arena_capacity = 4096
+target_batch = 5
+root_dirichlet_alpha = 0.0
+root_dirichlet_epsilon = 0.25
+
+[mcts.temperature_schedule]
+kind = "hard_step"
+early = 1.0
+late = 0.1
+switch_at = 15
+
+[eval]
+eval_games = 192
+eval_interval = 5
+eval_lookback = 20
+bid_success_promotion_delta = 0.02
+eval_num_threads = 32
+anchor_promotion_min_gap = 25
+anchor_promotion_lower95 = 0.55
