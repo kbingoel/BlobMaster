@@ -222,15 +222,27 @@ def derive_eval_walls(
     Iters with no following completion logged yet (last in-progress iter)
     are omitted. Iters where the derived eval is <= 5s are treated as
     "no eval ran" (just checkpoint i/o jitter) and also omitted.
+
+    Resume gaps masquerade as huge "evals" (training was paused between
+    consecutive `iteration complete` lines). Detect these via the ratio
+    to the next iter's wall — a real eval at the cap is roughly the same
+    order of magnitude as one iter's compute, never 5× larger. Above the
+    threshold the value almost certainly contains a pause, so we drop it
+    rather than letting it crush the y-axis.
     """
+    RESUME_GAP_RATIO = 5.0
     out: dict[int, float] = {}
     for i in range(len(iter_timings) - 1):
         k, _w_k, t_k = iter_timings[i]
         _k1, w_k1, t_k1 = iter_timings[i + 1]
         between = (t_k1 - t_k).total_seconds()
         eval_wall = between - w_k1
-        if eval_wall > 5.0:
-            out[k] = eval_wall
+        if eval_wall <= 5.0:
+            continue
+        if w_k1 > 0 and eval_wall > RESUME_GAP_RATIO * w_k1:
+            # Looks like a pause/resume gap, not an eval.
+            continue
+        out[k] = eval_wall
     return out
 
 
@@ -373,20 +385,10 @@ def plot_iter_timing(
                    label=f"mean iter wall: {mean_wall:.0f}s")
     if has_split:
         sp_nonzero = [v for v in sp_vals if v > 0]
-        tr_nonzero = [v for v in tr_vals if v > 0]
         if sp_nonzero:
             ax.axhline(sum(sp_nonzero) / len(sp_nonzero),
                        color="tab:blue", linewidth=0.6, linestyle="--",
                        label=f"mean SP: {sum(sp_nonzero) / len(sp_nonzero):.0f}s")
-        if tr_nonzero:
-            mean_tr = sum(tr_nonzero) / len(tr_nonzero)
-            ax.axhline(mean_tr, color="dimgrey", linewidth=0.6, linestyle="--",
-                       label=f"mean training: {mean_tr:.0f}s")
-    if evals and any(e > 0 for e in evals):
-        nonzero = [e for e in evals if e > 0]
-        mean_eval = sum(nonzero) / len(nonzero)
-        ax.axhline(mean_eval, color="tab:orange", linewidth=0.7, linestyle=":",
-                   label=f"mean eval wall: {mean_eval:.0f}s")
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("seconds")
@@ -398,7 +400,11 @@ def plot_iter_timing(
     else:
         title += " (eval bars on top)"
     ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=8)
+    # Y-axis ticks every 300s (5 min) so iter-wall totals line up to a
+    # readable grid.
+    from matplotlib.ticker import MultipleLocator
+    ax.yaxis.set_major_locator(MultipleLocator(300))
+    ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3, axis="y")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
