@@ -1,30 +1,25 @@
 potential optimisations (not checked) worth adressing when starting from scratch, in no order:
 
 
-**In-tree forced-move short-circuit** would help, and is not done
-The current cost model:
+delta-buffer idea
+It's a good idea and it's actually how AlphaZero/MuZero-style trainers typically do it. The math: capacity 500k, ~48,640 examples/iter → window = ~10.3 iters. Currently each iter_N/buffer.bin is a snapshot of that whole window, so adjacent iters share ~90% of their data. Per-iter deltas would cut each file from ~200 MB to ~20 MB — a ~10× reduction, matching your estimate.
 
-Where	Forced (num_legal=1) handling
-Root decision	Tree skipped entirely. Zero inferences. ✓
-Interior node, during descent	Treated like any other node. NN evaluates (policy, value); the policy gets used to seed exactly 1 child whose prior is irrelevant. Inference cost = 1, fully wasted on the policy half. Value half is still useful.
-Interior node, deeper revisit	UCB1 trivially picks the only child (no exploration to do); descent continues. No extra inference.
-So the leak is specifically: the first time a sim reaches a forced interior node, we pay one inference whose policy output is wasted. It happens once per such node per tree (5 trees, 1 cache).
+At 125 iters with retention disabled (training_loop.rs:768 — pruning was turned off 2026-04-29 for weight-evolution analysis), that's a swing from ~25 GB down to ~2.5 GB. Almost certainly what would have prevented today's crash.
 
-How big is the leak? Trick-taking games are unusually rich in this — follow-suit constraints frequently leave opponents with exactly 1 legal card. We don't have an instrumented count for interior forced leaves; decision_stats.jsonl only records root-level. A rough estimate based on the ~37% root-forced rate: probably 30-50% of leaves visited inside the tree are forced. That maps to a similar fraction of inference savings if you short-circuit them.
+Sketch of the change:
 
-What it costs to implement:
+Per iter, write only the new examples generated that iter: iter_N/examples.bin (~20 MB).
+Resume: walk iter dirs newest → oldest, load examples.bin from each, push into a fresh buffer until you hit buffer_capacity or run out of iters. Result is identical to today's hot resume — the FIFO's contents are exactly "last N iters of self-play".
+The old buffer.bin save path stays alive long enough to read existing runs (run-2026-05-14, the sweep dirs), then deprecate.
+Trade-offs worth knowing about:
 
-During leaf descent, after applying the selected action, peek at legal_plays(state). If exactly 1 legal action: auto-apply it, push a placeholder child (synthesized prior=1.0), keep descending — don't break out for an NN evaluation yet.
-Continue this fast-path until you hit a multi-legal node or terminal.
-Then either: (a) evaluate that real branching node with the NN, or (b) if terminal, backprop 0 and exit.
-The forced-chain nodes get visit-count increments and are properly part of path for backprop. UCB1 semantics are preserved exactly (a 1-child node always selects that child anyway).
+Mid-window corruption matters now. Today, if iter_124/buffer.bin is fine and iter_125/buffer.bin is corrupt, resume from 125 falls back to cold, but 124 is still a clean hot-resume option. With deltas, a corrupt iter_119/examples.bin punches a hole in the reconstructed window — you'd want logic to either skip that iter and continue further back, or accept a partially-full buffer.
+Order matters: the buffer is a circular FIFO. Loading deltas oldest-first preserves chronological order; doing it newest-first works for "fill until full" but the write-index won't match the original. For training (uniform sampling) that's fine; for any analysis that depends on insertion order it's not.
+Bookkeeping per delta: should include the iter number and example count, so reconstruction can sanity-check (e.g. warn if a delta's count doesn't match its iter's logged examples= field).
+Capacity changes become natural: just read more or fewer prior iters. Today the load path has to honor the saved capacity to avoid losing data.
+One-time migration concern: this current run (run-2026-05-14) already has the old-format snapshots. Either keep the old loader for back-compat, or do a one-shot conversion script that splits the iter-N snapshot into iter-N's delta by diffing against iter-(N-1)'s snapshot.
 
-Catches:
 
-Backprop needs a value to propagate. The chain currently relies on the first forced node's NN value. Skipping inference there means the chain has to wait for the next real branching point's value — slightly delayed value signal, but identical in expectation.
-Cheap legality check: legal_plays(state) is already a popcount on a bitmask, so it's fast — no perf concern.
-Terminal short-circuit already exists, so the fast-path naturally terminates correctly.
-It is a clean, high-value optimization — probably 20-40% inference reduction per iter, which directly cuts the ~47 min/iter wall-clock you're seeing. Worth a future session, but not for this run (changes the tree-build trace, would invalidate the test goldens that pin lockstep to run_search).
 
 
 
