@@ -113,6 +113,30 @@ For resumes: `total_iterations` is still the absolute target. Resuming from `ite
 
 Resume-anchor caveat: `--resume`'ing does not preserve the from-scratch eval anchor. `try_resume` sets `anchor_iter = tl.iteration` (= the resume baseline), so post-resume in-loop evals in `strength.csv` are vs the resume baseline, not vs `iter_000000`. To compare the resumed model to the from-scratch starting point, run `blobmaster-train evaluate iter_K/model.onnx iter_000000/model.onnx` directly.
 
+## MCTS sim budget is config-driven (since 2026-05-17)
+
+[`adaptive_budget`](blob-engine/src/mcts.rs) returns `(num_determinizations, sims_per_determinization)` for every non-forced decision and **reads both directly from `MctsConfig`** — i.e. the `[mcts]` block of the training TOML or the `--config` TOML passed to `blobmaster-train evaluate`. Forced moves (`num_legal ≤ 1`) still short-circuit to `(1, 0)`. `min_sims_floor` is a safety net that can raise `sims` if the configured budget falls below it.
+
+**Before 2026-05-17 this was hardcoded to `(5, 100)`** and the TOML fields were silently ignored. Any pre-2026-05-17 run logs / scripts that "set" `sims_per_determinization` were really running at 5×100; treat their declared budgets as decorative. Going forward, the values in `[mcts]` are load-bearing.
+
+**To run an eval at a different sim budget** (e.g. the diagnostic that asks "is iter_X actually stronger than iter_Y at 2× sims, or are they just tied because 500 sims can't resolve them?"):
+
+```bash
+cp blob-train/run-<name>.toml /tmp/eval-5x200.toml
+sed -i 's/^sims_per_determinization = 100$/sims_per_determinization = 200/' /tmp/eval-5x200.toml
+./scripts/run-train.sh evaluate \
+  --model-a checkpoints/<run>/iter_AAAAAA/model.onnx \
+  --model-b checkpoints/<run>/iter_BBBBBB/model.onnx \
+  --num-games 200 --num-players 5 --cards-dealt 7 \
+  --config /tmp/eval-5x200.toml
+```
+
+Confirm the override took effect: the startup log line `evaluate — starting head-to-head ...` echoes `num_determinizations=` and `sims_per_determinization=`. If those don't match your TOML, the override didn't land.
+
+**To run training at a different sim budget**, edit the run's TOML before launch (or before `--resume`). The cost is roughly linear in `dets × sims`: at 5×100 self-play is ~520s/iter on this box (mean from run-2026-05-14, see [self-play-profile.md](self-play-profile.md)); 5×200 ≈ ~1000s, pushing iter wall from ~1500s to ~2000s. Budget accordingly.
+
+**Don't lower the budget below 5×100 without a strong reason.** The 7.3a "bucketed" schedule (60 sims at `nl=2`, 90 at `nl=3`) starved low-branching decisions and regressed strength — see [7.3b-analysis.md](7.3b-analysis.md) §5 / §7.1. The 5×100 floor is the empirical minimum for usable learning signal. The `adaptive_budget_reads_cfg` unit test in [blob-engine/src/mcts.rs](blob-engine/src/mcts.rs) pins the cfg-driven behavior; if you change the budget shape, update that test.
+
 ## Graceful exit (`STOP` file)
 
 The training driver checks for `<checkpoint_dir>/STOP` at each iteration boundary. `touch checkpoints/<run-name>/STOP` to ask the loop to finish the current iteration (save checkpoint + export ONNX), then exit cleanly. The file is deleted on detection so the next `--resume` doesn't immediately stop again. There is no SIGINT/SIGTERM handler, so Ctrl-C still hard-kills mid-iter and loses the in-flight iteration's compute (~35-45 min on the 7950X mixed-player stack). Use STOP if you care about that work.

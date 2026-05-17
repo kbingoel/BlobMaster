@@ -1058,20 +1058,24 @@ pub struct MctsResult {
 
 /// Pick per-decision `(num_determinizations, sims_per_determinization)`.
 ///
-/// Phase-A baseline (Session 7.3c): flat `5 × 100 = 500` sims for every
-/// non-forced decision, matching the 7.2 run that reached 0.77 eval win
-/// rate at iter 10. The 7.3a bucketed schedule starved low-branching
-/// decisions (60 / 90 sims at `nl ∈ {2, 3}`) — see `7.3b-analysis.md`
-/// §5 and §7.1. Forced moves (`num_legal ≤ 1`) still short-circuit with
-/// `(1, 0)` so `mcts_search` can skip the tree.
+/// Reads `cfg.num_determinizations` and `cfg.sims_per_determinization`
+/// directly (Session 7.3c rewired 2026-05-17): the previous Phase-A
+/// implementation hardcoded `5 × 100 = 500` for every non-forced
+/// decision, so TOML overrides were silently ignored. The 7.3a bucketed
+/// schedule (60 / 90 sims at `nl ∈ {2, 3}`) starved low-branching
+/// decisions — see `7.3b-analysis.md` §5 / §7.1 — so the practical
+/// floor remains 5 × 100, but the budget is now config-driven for
+/// diagnostics and future sweeps. Forced moves (`num_legal ≤ 1`) still
+/// short-circuit with `(1, 0)` so `mcts_search` can skip the tree.
 ///
-/// `min_sims_floor` remains as a safety net in case a future change
+/// `min_sims_floor` remains as a safety net in case a future config
 /// lowers these numbers.
 pub fn adaptive_budget(num_legal: usize, cfg: &MctsConfig) -> (u32, u32) {
     if num_legal <= 1 {
         return (1, 0);
     }
-    let (dets, mut sims) = (5u32, 100u32);
+    let dets = cfg.num_determinizations.max(1);
+    let mut sims = cfg.sims_per_determinization;
 
     let total = dets.saturating_mul(sims);
     if total < cfg.min_sims_floor {
@@ -1662,25 +1666,37 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_budget_is_flat_5x100() {
-        let cfg = MctsConfig {
-            num_determinizations: 1,
-            sims_per_determinization: 1,
-            min_sims_floor: 60,
+    fn adaptive_budget_reads_cfg() {
+        // Forced move → (1, 0) regardless of cfg.
+        let any_cfg = MctsConfig::default();
+        assert_eq!(adaptive_budget(1, &any_cfg), (1, 0));
+
+        // Default cfg (5 × 100) → flat (5, 100) for every branching factor.
+        for n in 2..=25 {
+            assert_eq!(adaptive_budget(n, &any_cfg), (5, 100), "nl={n}");
+        }
+
+        // Doubled sims-per-determinization → flows through.
+        let cfg_2x_sims = MctsConfig {
+            sims_per_determinization: 200,
             ..MctsConfig::default()
         };
-        // Forced move → (1, 0).
-        assert_eq!(adaptive_budget(1, &cfg), (1, 0));
-        // Every non-forced branching factor → flat (5, 100) per Phase-A.
-        for n in 2..=25 {
-            assert_eq!(adaptive_budget(n, &cfg), (5, 100), "nl={n}");
-        }
-        // A larger `min_sims_floor` can still raise sims above 100.
-        let cfg2 = MctsConfig {
-            min_sims_floor: 750,
-            ..cfg
+        assert_eq!(adaptive_budget(4, &cfg_2x_sims), (5, 200));
+
+        // Doubled determinizations → flows through.
+        let cfg_2x_dets = MctsConfig {
+            num_determinizations: 10,
+            ..MctsConfig::default()
         };
-        let (dets, sims) = adaptive_budget(4, &cfg2);
+        assert_eq!(adaptive_budget(4, &cfg_2x_dets), (10, 100));
+
+        // A larger `min_sims_floor` can still raise sims above the cfg value.
+        let cfg_floor = MctsConfig {
+            sims_per_determinization: 50,
+            min_sims_floor: 750,
+            ..MctsConfig::default()
+        };
+        let (dets, sims) = adaptive_budget(4, &cfg_floor);
         assert_eq!(dets, 5);
         assert!(dets * sims >= 750, "floor not enforced: {dets}×{sims}");
     }
