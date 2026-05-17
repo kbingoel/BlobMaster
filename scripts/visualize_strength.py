@@ -84,7 +84,41 @@ def plot_score_differential(rows: list[dict], out_path: Path) -> None:
     ax.set_xlabel("iteration")
     ax.set_ylabel("score differential")
     ax.set_title("Mean score differential vs anchor opponents")
-    ax.legend(loc="lower right")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_bid_success(rows: list[dict], out_path: Path) -> None:
+    """Bid success rate (1 − blob rate) per anchor stretch.
+
+    Plots `bid_success_rate_current` (solid) and `bid_success_rate_opponent`
+    (dashed, same colour) for each anchor in `strength.csv`. The two
+    lines being close together is the diagnostic that "both sides have
+    saturated at the structural bidding ceiling" (see AGENTS.md — for a
+    5-player table the per-player success ceiling sits around ~0.6).
+
+    A divergence — current rising above opponent — is a real strength
+    gain that the win-rate plot may mask, since bid accuracy precedes
+    win-rate gains in this AlphaZero loop.
+    """
+    groups = group_by_opponent(rows)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for opp, items in sorted(groups.items()):
+        x = [int(r["iteration"]) for r in items]
+        cur = [float(r["bid_success_rate_current"]) for r in items]
+        anc = [float(r["bid_success_rate_opponent"]) for r in items]
+        line, = ax.plot(x, cur, marker="o", label=f"current vs {opp}")
+        ax.plot(x, anc, marker="x", linestyle="--",
+                color=line.get_color(), alpha=0.6,
+                label=f"{opp} (anchor)")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("bid success rate (1 − blob rate)")
+    ax.set_title("Bid success rate vs anchor opponents")
+    ax.set_ylim(0.2, 0.8)
+    ax.legend(loc="lower right", fontsize=7, ncol=2)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -427,6 +461,7 @@ def main() -> None:
     plot_winrate(rows, args.out_dir / "01_winrate.png")
     plot_score_differential(rows, args.out_dir / "02_score_differential.png")
     plot_losses(rows, args.out_dir / "03_train_losses.png")
+    plot_bid_success(rows, args.out_dir / "06_bid_success.png")
 
     metrics: list[dict] | None = None
     if args.metrics and args.metrics.exists():

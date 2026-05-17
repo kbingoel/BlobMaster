@@ -46,6 +46,17 @@ The original Python/PyTorch implementation (Phases 1-4) has been **concluded and
 
 The Rust rewrite is in progress. The neural network architecture has been fully specified and supersedes the legacy design.
 
+## Training Progress (iter 0–167)
+
+Snapshots from the run logged in [logs/run-2026-05-14-progress/](logs/run-2026-05-14-progress/). The model is steadily promoting past its own past selves and the bid success rate — the most domain-meaningful skill metric — keeps climbing.
+
+| | |
+|:---:|:---:|
+| ![Win rate vs anchor opponents](logs/run-2026-05-14-progress/01_winrate.png) | ![Mean score differential vs anchor opponents](logs/run-2026-05-14-progress/02_score_differential.png) |
+| **Win rate vs anchor opponents** — each color is a frozen past checkpoint; the current model crosses the promote band (lower 95% CI ≥ 0.55) and a new anchor is captured. | **Mean score differential** — same anchors, signed score gap. Trending up against every successive anchor after early promotions. |
+| ![Training convergence diagnostics](logs/run-2026-05-14-progress/04_convergence.png) | ![Bid success rate vs anchor opponents](logs/run-2026-05-14-progress/06_bid_success.png) |
+| **Training convergence** — combined / value loss, top-1 accuracy (bid & play), early-stop epoch budget, LR cosine schedule, and policy KL vs MCTS visit entropy. | **Bid success rate** — fraction of rounds where the model hits its bid exactly. Current vs anchor at each evaluation; current (solid) consistently outperforms the frozen anchor (dashed). |
+
 ## What's Here
 
 ```
