@@ -38,7 +38,7 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 | `blob-train/` | `blobmaster-train` CLI: train, evaluate, self-play, export, profile. |
 | `blob-bin/` | `blobmaster` inference CLI (human play is still a stub). |
 | `scripts/` | ONNX export (Python), plotting, launch helpers. |
-| `checkpoints/`, `logs/` | Gen-1 run artifacts. `run-2026-05-14/iter_000167` is the gen-1 final model. |
+| `checkpoints/`, `logs/` | Gen-1 reference checkpoints (pruned 2026-10-02; gen-2.md §9) and run logs. `run-2026-05-14/iter_000167` is the gen-1 final model. |
 | `legacy/` | Gen-0 Python reference code (read-only). |
 | [gen-2.md](gen-2.md) | Findings, design and roadmap. |
 | [AGENTS.md](AGENTS.md) | Working notes for Claude Code: runtime environment, commands, conventions. |

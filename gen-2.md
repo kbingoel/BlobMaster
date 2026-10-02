@@ -212,7 +212,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
   - "Bug #2" (2026-04-28): on resume, the iteration counter and the schedule span disagreed, so the learning rate stayed pinned at its minimum for 14 iterations.
   - In gen 2 the schedule is keyed to learner steps, and the learning rate is logged every metrics row.
 - **"Never go below 5×100 simulations" was measured under gen-1's broken values.** Re-measure it once the values carry signal.
-- **Keep:** the STOP file, resume with the replay buffer, the `[mcts]` budget being driven by config, `decision_stats.jsonl`, and the two visualization scripts.
+- **Keep:** the STOP file, resume with the replay buffer, the `[mcts]` budget being driven by config, `decision_stats.jsonl` (summarize it when a run ends; the raw file reached 0.73 GB for one run), and the two visualization scripts.
 
 ---
 
@@ -238,6 +238,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 | `scripts/visualize_*.py` | **Keep** | Re-key to learner steps |
 | Gen-1 sweep, overnight and diagnostic scripts | **Delete** | Tied to gen-1 runs |
 | `blob-bin` | **Build** | `play` (human vs bot) early (Phase 0) |
+| `gui` branch on GitHub: `blob-gui/` app + `gui-development-plan.md`, 9 commits not in `master` | **Review** before building `play` | Built on gen 1 and not examined in the 2026-10-02 diagnosis; holds the history that blocks the `.git` rewrite (§9) |
 | `blob-engine/examples/diagnostics.rs` | **Keep** | Becomes `bench` |
 
 ---
@@ -398,7 +399,7 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 - [x] Rule bot `blob-engine/src/rule_bot.rs` (2026-10-02).
 - [x] Gen-1 diagnostics `blob-engine/examples/diagnostics.rs` (2026-10-02).
 - [ ] `bench` subcommand: duplicate deals, both modes, by-hand-size bid stats.
-- [ ] `blobmaster play`: human vs bot in the terminal, with an option to show the bot's policy and values.
+- [ ] `blobmaster play`: human vs bot in the terminal, with an option to show the bot's policy and values. First check what the `gui` branch already provides (§4).
 - [ ] Round-level validation split and validation losses in the gen-1 driver.
 - [ ] Repo hygiene (§9).
 - *Exit:* `bench` reproduces −9 ± 3 for the gen-1 final checkpoint; you can play a full game against it.
@@ -474,10 +475,32 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 
 ## 9. Repo hygiene
 
-- **Disk use.** `checkpoints/` is 41 GB on disk and `.git` is 4.9 GB, because a `model.onnx` was committed every iteration.
-  - Keep only the reference checkpoints: `run-2026-05-14/iter_000167` (gen-1 final, the benchmark opponent) and `iter_000000`.
-  - Stop committing per-iteration weights: ignore them in git and record runs in a short note instead.
-- **Delete dead code as its replacement lands:** the INT8 path, Muon, gen-1 scripts, and `HeuristicEvaluator` (§4).
+**Done 2026-10-02.**
+- **`checkpoints/` pruned from 41 GB to 0.22 GB.** All that remains is `run-2026-05-14/`:
+  - `iter_000000`, `iter_000025`, `iter_000125`, `iter_000167` (`model.onnx` + `meta.json`; the four rows of §2.1);
+  - `iter_000167/model.ot` (for the ONNX↔tch parity test) and `iter_000167/buffer.bin` (for `diagnostics value`);
+  - `metrics.jsonl`, `strength.csv`;
+  - `signal_ratio_by_iter.csv`, which replaces the 0.73 GB `decision_stats.jsonl`.
+
+  All other runs and iterations were deleted. Their small text files (metrics, strength.csv, meta.json) are still in git history.
+- **`*.onnx` is ignored by git.** Reference models go in with `git add -f`; per-iteration weights are never committed.
+- **Machine-level clean-up:** `target/debug` (13 GB) and the pip download cache (12 GB) were removed. Free disk went from 22 GB to 86 GB.
+
+**Deferred: shrinking `.git` (4.9 GB).**
+- **What's in it:** about 4.6 GB of model blobs in history:
+  - `sweep-2026-04-28-anchor` 1.4 GB, `run-2026-05-14` 1.1 GB, `run-2026-05-06` 1.0 GB;
+  - smaller runs, plus 0.24 GB of gen-0 `.pth` files.
+- **Why it waits:** reclaiming it needs a history rewrite and force-push. That must include the `gui` branch on GitHub, which shares this history (see §4). Rewriting `master` alone would leave `gui` with diverged history and wouldn't shrink GitHub.
+- **Recipe when ready:**
+  1. Tag `c6f0c2a` as `gen-1-final` and point the §10 / `AGENTS.md` references at the tag.
+  2. Check out `gui` locally.
+  3. Run `git filter-repo --force --prune-empty never --invert-paths --path-glob '*.onnx' --path-glob '*.pth' --path-glob '*calibration.bin' --path-glob '*decision_stats.jsonl'` on all branches.
+  4. Back up the reference models before running it: the rewrite removes them from the working tree. Then re-add them with `git add -f`.
+  5. Verify: commit count, HEAD tree, `git show gen-1-final:fix-mcts-plan.md`.
+  6. Force-push `master`, `gui` and the tag. Other clones must re-clone.
+
+**Still to do:**
+- **Delete dead code as its replacement lands:** the INT8 path, Muon, gen-1 sweep and overnight scripts, and `HeuristicEvaluator` (§4).
 - **Code comments still cite the retired documents,** about 50 references, most to `fix-mcts-plan.md`. Rewrite them as the code changes; until then use §10.
 
 ---
@@ -517,4 +540,4 @@ $D value  $M checkpoints/run-2026-05-14/iter_000167/buffer.bin 96   # §2.2–2.
 $D tokens $M                      # §3.1 cost by sequence length
 ```
 
-The bid signal-ratio table (§2.5) comes from `checkpoints/run-2026-05-14/decision_stats.jsonl`: take the median `signal_ratio` by (iteration, phase, num_legal).
+The signal-ratio table (§2.5) is read from `checkpoints/run-2026-05-14/signal_ratio_by_iter.csv` (column `signal_median`). That file summarizes the per-decision log (7.84M decisions, deleted 2026-10-02) by iteration, phase and legal-move count. The other §2.1 rows use `iter_000000`, `iter_000025` and `iter_000125` in place of `iter_000167`.
