@@ -112,7 +112,7 @@ impl Evaluator for DummyEvaluator {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeuristicEvaluator;
 
-fn current_trick_best(state: &BlobState) -> Option<(u8, bool, u8)> {
+pub(crate) fn current_trick_best(state: &BlobState) -> Option<(u8, bool, u8)> {
     // Returns (best_rank, best_is_trump, best_suit) across already-played
     // cards in the in-progress trick, or None if no cards played yet.
     if state.trick_cards_played == 0 {
