@@ -117,10 +117,15 @@ impl ReplayBuffer {
         } else {
             (0..n).map(|_| rng.gen_range(0..self.len)).collect()
         };
+        self.batch_from_indices(&indices)
+    }
 
+    /// Per-phase dense batches for the given slots (each `< len`), in order.
+    /// Used to sweep a whole buffer, e.g. the validation set.
+    pub fn batch_from_indices(&self, indices: &[usize]) -> (BidBatch, PlayBatch) {
         let mut bid_idx = Vec::new();
         let mut play_idx = Vec::new();
-        for &i in &indices {
+        for &i in indices {
             match self.phases[i] {
                 GamePhase::Bidding => bid_idx.push(i),
                 GamePhase::Playing => play_idx.push(i),

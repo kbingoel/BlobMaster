@@ -1,13 +1,23 @@
-//! blob-bin — inference / deployment CLI. Session 6.2.
+//! blob-bin — inference / deployment CLI.
 //!
 //! Intentionally free of training-only dependencies (`tch`, `rayon`,
-//! `indicatif`). Session 5.3 invariant: this binary must load and run ONNX
-//! models without pulling in libtorch, so it is safe to ship for the
-//! Windows + Intel iGPU target in AGENTS.md.
+//! `indicatif`): this binary must load and run ONNX models without pulling
+//! in libtorch, so it is safe to ship for the Windows + Intel iGPU target
+//! in AGENTS.md.
+//!
+//! - `bench`: absolute strength vs fixed opponents on duplicate deals
+//!   (gen-2.md §5.7, `blob_engine::bench`).
+//! - `play`: one human against bots in the terminal (`play.rs`).
 
+mod play;
+
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, DEFAULT_SEED};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,18 +30,90 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// Greedy MCTS (`--dets` × `--sims`).
+    Search,
+    /// The network's raw policy, no search.
+    Network,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Bot {
+    Search,
+    Network,
+    Rulebot,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Human-vs-AI scaffolding (filled in in Section 9).
-    Play {
+    /// One focal player vs identical opponents on duplicate deals: every deal
+    /// is played once from each seat. Reports points/game with a 95% CI over
+    /// deals, win share and bid statistics by hand size.
+    Bench {
+        /// Focal player: an ONNX model, or `rulebot`.
+        focal: String,
+        /// How a focal model plays. Required unless the focal player is `rulebot`.
+        #[arg(long, value_enum)]
+        mode: Option<Mode>,
+        /// Opponents: `rulebot`, or an ONNX model playing its raw policy
+        /// (bots never search).
+        #[arg(long, default_value = "rulebot")]
+        opponent: String,
+        /// Deal seeds; games = deals × players. Default 64 with search
+        /// (~4.5 min for gen 1 at 5×100), 128 otherwise (~10 s).
         #[arg(long)]
-        model: PathBuf,
+        deals: Option<usize>,
+        #[arg(long, default_value_t = 5)]
+        players: u8,
+        #[arg(long, default_value_t = 7)]
+        cards: u8,
+        /// Search: sampled deals per decision.
+        #[arg(long, default_value_t = 5)]
+        dets: u32,
+        /// Search: simulations per sampled deal.
+        #[arg(long, default_value_t = 100)]
+        sims: u32,
+        /// Worker threads (default: every core).
         #[arg(long)]
-        num_players: u8,
-        #[arg(long)]
-        seat: u8,
+        threads: Option<usize>,
+        /// Base seed of the deal list. Keep it fixed to compare models on
+        /// the same cards.
+        #[arg(long, default_value_t = DEFAULT_SEED)]
+        seed: u64,
     },
-    /// Single-state policy+value dump for debugging.
+    /// Play a game in the terminal against bots.
+    Play {
+        /// ONNX model for the bots. Without it the bots are rule bots.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Bot type (default: search with a model, else rulebot).
+        #[arg(long, value_enum)]
+        bot: Option<Bot>,
+        #[arg(long, default_value_t = 5)]
+        players: u8,
+        #[arg(long, default_value_t = 7)]
+        cards: u8,
+        /// Your seat (seat 0 deals the first round and bids last).
+        #[arg(long, default_value_t = 0)]
+        seat: u8,
+        /// Deal seed (default: from the clock).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Print every bot decision's policy and value. Reveals the bots'
+        /// cards through their policies.
+        #[arg(long)]
+        show: bool,
+        #[arg(long, default_value_t = 5)]
+        dets: u32,
+        #[arg(long, default_value_t = 100)]
+        sims: u32,
+        /// Disable ANSI colours (also off when NO_COLOR is set or stdout is
+        /// not a terminal).
+        #[arg(long)]
+        no_color: bool,
+    },
+    /// Single-state policy+value dump for debugging (not yet implemented).
     Analyze {
         #[arg(long)]
         model: PathBuf,
@@ -40,25 +122,132 @@ enum Command {
     },
 }
 
+fn parse_opponent(s: &str) -> Agent {
+    if s == "rulebot" {
+        Agent::RuleBot
+    } else {
+        Agent::Network(PathBuf::from(s))
+    }
+}
+
+fn require_file(agent: &Agent) {
+    if let Some(p) = agent.model() {
+        if !p.is_file() {
+            eprintln!("error: model {} not found", p.display());
+            std::process::exit(2);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench(
+    focal: String,
+    mode: Option<Mode>,
+    opponent: String,
+    deals: Option<usize>,
+    players: u8,
+    cards: u8,
+    dets: u32,
+    sims: u32,
+    threads: Option<usize>,
+    seed: u64,
+) {
+    let focal = match (focal.as_str(), mode) {
+        ("rulebot", _) => Agent::RuleBot,
+        (p, Some(Mode::Search)) => Agent::Search(PathBuf::from(p)),
+        (p, Some(Mode::Network)) => Agent::Network(PathBuf::from(p)),
+        (_, None) => {
+            eprintln!("error: --mode search|network is required for a model");
+            std::process::exit(2);
+        }
+    };
+    let opponent = parse_opponent(&opponent);
+    require_file(&focal);
+    require_file(&opponent);
+    let searching = matches!(focal, Agent::Search(_));
+    let mut cfg = BenchConfig {
+        num_players: players,
+        start_cards: cards,
+        deals: deals.unwrap_or(if searching { 64 } else { 128 }),
+        seed,
+        mcts: eval_mcts_config(dets, sims),
+        ..BenchConfig::default()
+    };
+    if let Some(t) = threads {
+        cfg.threads = t;
+    }
+    if let Err(e) = blob_engine::new_game(players, cards) {
+        eprintln!("error: invalid table {players} players / {cards} cards: {e:?}");
+        std::process::exit(2);
+    }
+    eprintln!(
+        "bench: {} deals x {players} seats = {} games on {} threads",
+        cfg.deals,
+        cfg.deals * players as usize,
+        cfg.threads
+    );
+    let started = Instant::now();
+    let last_tenth = AtomicUsize::new(0);
+    let progress = |done: usize, total: usize| {
+        let tenth = done * 10 / total;
+        if tenth > last_tenth.fetch_max(tenth, Ordering::Relaxed) && done < total {
+            eprintln!("bench: {done}/{total} games, {:.0} s", started.elapsed().as_secs_f64());
+        }
+    };
+    let report = run_bench(&focal, &opponent, &cfg, &progress);
+    println!("{report}");
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Play {
-            model,
-            num_players,
-            seat,
-        } => {
-            tracing::info!(?model, num_players, seat, "play — not yet implemented (Section 9)");
+        Command::Bench { focal, mode, opponent, deals, players, cards, dets, sims, threads, seed } => {
+            cmd_bench(focal, mode, opponent, deals, players, cards, dets, sims, threads, seed)
+        }
+        Command::Play { model, bot, players, cards, seat, seed, show, dets, sims, no_color } => {
+            let bot = match (bot, model) {
+                (Some(Bot::Rulebot), _) | (None, None) => Agent::RuleBot,
+                (Some(Bot::Search) | None, Some(m)) => Agent::Search(m),
+                (Some(Bot::Network), Some(m)) => Agent::Network(m),
+                (Some(_), None) => {
+                    eprintln!("error: --bot search|network needs --model");
+                    std::process::exit(2);
+                }
+            };
+            require_file(&bot);
+            let seed = seed.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+            let opts = play::Options {
+                num_players: players,
+                start_cards: cards,
+                human_seat: seat,
+                seed,
+                bot,
+                mcts: eval_mcts_config(dets, sims),
+                show,
+                color: !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal(),
+            };
+            let stdin = std::io::stdin();
+            if let Err(e) = play::run(&opts, stdin.lock(), std::io::stdout().lock()) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Analyze { model, state } => {
-            tracing::info!(?model, ?state, "analyze — not yet implemented (Section 9)");
+            eprintln!("analyze is not implemented yet ({} / {})", model.display(), state.display());
+            std::process::exit(2);
         }
     }
 }

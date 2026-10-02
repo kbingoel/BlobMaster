@@ -33,10 +33,10 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 
 | Path | What it is |
 |---|---|
-| `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bot. No libtorch dependency. |
+| `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bot, strength benchmark. No libtorch dependency. |
 | `blob-nn/` | Transformer model (tch / libtorch), self-play, training loop, evaluation. |
 | `blob-train/` | `blobmaster-train` CLI: train, evaluate, self-play, export, profile. |
-| `blob-bin/` | `blobmaster` inference CLI (human play is still a stub). |
+| `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bot) and `play` (you vs bots in the terminal). |
 | `scripts/` | ONNX export (Python), plotting, launch helpers. |
 | `checkpoints/`, `logs/` | Gen-1 reference checkpoints (pruned 2026-10-02; gen-2.md §9) and run logs. `run-2026-05-14/iter_000167` is the gen-1 final model. |
 | `legacy/` | Gen-0 Python reference code (read-only). |
@@ -48,8 +48,8 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 ```bash
 cargo build --release
 cargo test -p blob-engine          # debug profile — some tests expect debug assertions
-cargo run --release -p blob-engine --example diagnostics -- \
-  match checkpoints/run-2026-05-14/iter_000167/model.onnx raw rulebot 640
+./target/release/blobmaster bench checkpoints/run-2026-05-14/iter_000167/model.onnx --mode network
+./target/release/blobmaster play --model checkpoints/run-2026-05-14/iter_000167/model.onnx
 ```
 
 Training needs the pinned Python venv and the downloaded libtorch on the library path; see [AGENTS.md](AGENTS.md#runtime-environment-training-runs-on-this-machine).

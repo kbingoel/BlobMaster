@@ -30,6 +30,10 @@ pub struct TrainingExample {
     /// at decision time). Stored so the backfill pass can index
     /// `cumulative_scores` correctly after the game ends.
     pub perspective: u8,
+    /// Identifies the game the example came from (the self-play driver
+    /// sets it to the game's RNG seed; 0 until then). Keys the held-out
+    /// split, `training_loop::is_validation_game`.
+    pub game_id: u64,
 }
 
 /// Sample `(num_players, start_cards)` from the distribution described in
@@ -182,6 +186,7 @@ where
                         value: f32::NAN,
                         phase: GamePhase::Bidding,
                         perspective,
+                        game_id: 0,
                     });
                     apply_bid(&mut state, action);
                 }
@@ -215,6 +220,7 @@ where
                         value: f32::NAN,
                         phase: GamePhase::Playing,
                         perspective,
+                        game_id: 0,
                     });
                     apply_play(&mut state, card_idx);
                 }
@@ -435,6 +441,7 @@ mod tests {
             value: f32::NAN,
             phase: GamePhase::Bidding,
             perspective: 0,
+            game_id: 0,
         }];
         let mut final_state = BlobState::empty();
         final_state.num_players = 4;

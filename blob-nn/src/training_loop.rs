@@ -6,7 +6,12 @@
 //!
 //! Per-iteration diagnostics are logged as one JSON line per iteration to a
 //! `metrics.jsonl` file next to the checkpoint directory and also echoed
-//! via `tracing::info!`. Checkpoint retention follows the Session 5.4 rule:
+//! via `tracing::info!`.
+//!
+//! A share of self-play games is held out of training (gen-2.md §5.6): their
+//! examples go to a separate validation buffer, and every iteration reports
+//! losses on it next to the same losses measured on training data, so a
+//! growing gap (memorization, gen-2.md §2.2) is visible. Checkpoint retention follows the Session 5.4 rule:
 //! every-5th iteration is evaluated and kept permanently; otherwise only
 //! the most recent "rolling" checkpoint is retained (the previous rolling
 //! checkpoint is deleted once the next iteration completes).
@@ -27,11 +32,10 @@ use crate::engine::{self_play_iteration, SelfPlayConfig};
 use crate::heads::NUM_BIDS;
 use crate::input::pad_batch;
 use crate::model::BlobNet;
-use crate::muon::Muon;
 use crate::self_play::{DecisionStat, TrainingExample};
 use crate::train::{
     build_optimizer, policy_cross_entropy, save_checkpoint as save_model_checkpoint,
-    set_schedule_lr, value_mse, LrSchedule, Phase, TrainBatch, MUON_GROUP, VALUE_LOSS_COEF,
+    set_schedule_lr, value_mse, LrSchedule, Phase, TrainBatch, VALUE_LOSS_COEF,
     GRAD_CLIP_MAX_NORM,
 };
 
@@ -50,14 +54,8 @@ fn default_total_iterations() -> u64 {
     1
 }
 
-fn default_enable_muon() -> bool {
-    // 2026-04-28 paired 10-iter validation showed Muon converges to
-    // identical strength as AdamW-only at 1.63M / d_model=128 (overnight
-    // battery, [logs/overnight-2026-04-27/SUMMARY.md]). Default off; the
-    // plumbing remains for future architecture stretches where Muon's
-    // singular-value-balancing behaviour starts to pay (≥100M params per
-    // the published Muon literature).
-    false
+fn default_validation_fraction() -> f64 {
+    0.03
 }
 
 /// Configuration for one training run.
@@ -80,15 +78,12 @@ pub struct TrainingLoopConfig {
     /// tag (`"cpu"` / `"cuda"` / `"cuda:N"` / `"mps"`).
     #[serde(with = "device_serde")]
     pub device: Device,
-    /// Session 7.4d: when `false`, the Muon optimizer's `step` is skipped
-    /// and AdamW updates the [`MUON_GROUP`] params at the regular schedule
-    /// LR (instead of the Muon-on default of zero). Used for Muon vs no-Muon
-    /// trajectory comparisons. Defaults to `true` so existing configs keep
-    /// the 7.4d Muon behaviour without an explicit knob.
-    ///
-    /// [`MUON_GROUP`]: crate::train::MUON_GROUP
-    #[serde(default = "default_enable_muon")]
-    pub enable_muon: bool,
+    /// Share of self-play games held out of training for validation
+    /// (gen-2.md §5.6); see [`is_validation_game`]. The validation buffer
+    /// holds `buffer_capacity × validation_fraction` examples, so it spans
+    /// about as many iterations as the replay buffer. 0 disables the split.
+    #[serde(default = "default_validation_fraction")]
+    pub validation_fraction: f64,
     /// Cap on `epochs_per_iteration` while the replay buffer is still
     /// refilling **after a resume**. Mitigates the Run-3 regression
     /// observed 2026-04-29 on `sweep-2026-04-28-anchor`: post-resume cold
@@ -155,8 +150,54 @@ impl Default for TrainingLoopConfig {
             epoch_early_stop_rel: 0.005,
             total_iterations: 1,
             device: Device::Cpu,
-            enable_muon: false,
+            validation_fraction: default_validation_fraction(),
             cold_buffer_post_resume_epochs: default_cold_buffer_post_resume_epochs(),
+        }
+    }
+}
+
+impl TrainingLoopConfig {
+    pub fn validation_capacity(&self) -> usize {
+        ((self.buffer_capacity as f64 * self.validation_fraction).ceil() as usize).max(1)
+    }
+}
+
+/// Whether game `game_id` (see [`TrainingExample::game_id`]) is held out.
+///
+/// The split is by whole game, not by position or round: the gen-1 value
+/// target is the final game score, shared by all of a seat's decisions in
+/// a game, and cumulative scores are encoder inputs, so a round-level split
+/// would leave near-copies of every held-out label in training. Once
+/// targets are per round (gen-2.md §6 Phase 2) and cumulative scores leave
+/// the encoder (§5.5), key this on `(game_id, round_idx)` instead.
+pub fn is_validation_game(game_id: u64, fraction: f64) -> bool {
+    let mut x = game_id ^ 0x5A11_DA7E_0F0F_0F0F;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x >> 11) as f64 / (1u64 << 53) as f64) < fraction
+}
+
+/// Losses of the current weights (eval mode, no dropout) over a set of
+/// examples. `NaN` where the set has no examples of that phase.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldOutLosses {
+    pub examples: usize,
+    pub bid_policy_loss: f64,
+    pub play_policy_loss: f64,
+    pub value_loss: f64,
+    /// Value MSE of always predicting 0, for scale (gen-2.md §2.2).
+    pub value_loss_predict0: f64,
+}
+
+impl Default for HeldOutLosses {
+    fn default() -> Self {
+        Self {
+            examples: 0,
+            bid_policy_loss: f64::NAN,
+            play_policy_loss: f64::NAN,
+            value_loss: f64::NAN,
+            value_loss_predict0: f64::NAN,
         }
     }
 }
@@ -207,6 +248,17 @@ pub struct IterationMetrics {
     pub signal_p50_high: f64,
     pub signal_p90_high: f64,
     pub num_decisions: usize,
+    /// Examples from held-out games added to the validation buffer this
+    /// iteration (not trained on), and the validation buffer's size.
+    pub val_examples_added: usize,
+    pub val_buffer_len: usize,
+    /// Losses on the validation buffer after this iteration's training.
+    pub val: HeldOutLosses,
+    /// The same measurement on an equally large sample of the replay
+    /// buffer. `val − train_eval` is the generalization gap; the training
+    /// losses above are averaged over the iteration with dropout on, so
+    /// they are not comparable to `val`.
+    pub train_eval: HeldOutLosses,
 }
 
 impl IterationMetrics {
@@ -265,6 +317,15 @@ impl IterationMetrics {
         kv!("signal_p10_high", json_f64(self.signal_p10_high));
         kv!("signal_p50_high", json_f64(self.signal_p50_high));
         kv!("signal_p90_high", json_f64(self.signal_p90_high));
+        kv!("val_examples_added", self.val_examples_added);
+        kv!("val_buffer_len", self.val_buffer_len);
+        for (prefix, l) in [("val", &self.val), ("train_eval", &self.train_eval)] {
+            kv!(&format!("{prefix}_examples"), l.examples);
+            kv!(&format!("{prefix}_bid_policy_loss"), json_f64(l.bid_policy_loss));
+            kv!(&format!("{prefix}_play_policy_loss"), json_f64(l.play_policy_loss));
+            kv!(&format!("{prefix}_value_loss"), json_f64(l.value_loss));
+            kv!(&format!("{prefix}_value_loss_predict0"), json_f64(l.value_loss_predict0));
+        }
         s.push(',');
         s.push_str("\"grad_norms\":{");
         for (i, (k, v)) in self.grad_norms.iter().enumerate() {
@@ -481,26 +542,10 @@ fn aggregate_grad_norms(vs: &nn::VarStore) -> Vec<(String, f64)> {
 
 /// One forward/backward/step. Returns losses **and** per-group gradient
 /// norms captured between `backward` and `step`.
-///
-/// Muon (Session 7.4d) updates the transformer's hidden 2D weight
-/// matrices, while AdamW handles the rest. Both run after a single
-/// global `clip_grad_norm`. AdamW's LR for the Muon param group is held
-/// at zero (see `train::MUON_GROUP`), so its step is a no-op for those
-/// params and the order of `muon.step` vs `optimizer.step` is not
-/// load-bearing — we run Muon first so that any future logging hook can
-/// inspect post-Muon weights before AdamW touches the rest.
-///
-/// When `enable_muon` is `false`, `muon.step` is skipped; the caller is
-/// responsible for having set the `MUON_GROUP` AdamW LR to a non-zero
-/// value beforehand (see `TrainingLoop::train_one_step`) so AdamW updates
-/// the transformer matrices itself. This is the Session 7.4d revert path.
 fn train_step_with_grad_norms(
     model: &BlobNet,
     vs: &nn::VarStore,
     optimizer: &mut nn::Optimizer,
-    muon: &mut Muon,
-    muon_lr: f64,
-    enable_muon: bool,
     batch: &TrainBatch,
 ) -> (f64, f64, f64, Vec<(String, f64)>) {
     let (policy_probs, value_pred) = match batch.phase {
@@ -515,9 +560,6 @@ fn train_step_with_grad_norms(
     total.backward();
     let grad_norms = aggregate_grad_norms(vs);
     optimizer.clip_grad_norm(GRAD_CLIP_MAX_NORM);
-    if enable_muon {
-        muon.step(muon_lr);
-    }
     optimizer.step();
 
     (
@@ -552,8 +594,9 @@ pub struct TrainingLoop {
     pub vs: nn::VarStore,
     pub model: BlobNet,
     pub optimizer: nn::Optimizer,
-    pub muon: Muon,
     pub buffer: ReplayBuffer,
+    /// Examples from held-out games; never trained on.
+    pub val_buffer: ReplayBuffer,
     pub lr_schedule: LrSchedule,
     pub iteration: u64,
     pub global_step: i64,
@@ -572,16 +615,16 @@ impl TrainingLoop {
         let vs = nn::VarStore::new(cfg.device);
         let model = BlobNet::new(&vs.root());
         let optimizer = build_optimizer(&vs).expect("build optimizer");
-        let muon = Muon::from_var_store(&vs);
         let buffer = ReplayBuffer::new(cfg.buffer_capacity);
+        let val_buffer = ReplayBuffer::new(cfg.validation_capacity());
         let lr_schedule = LrSchedule::new(cfg.total_iterations);
         Self {
             cfg,
             vs,
             model,
             optimizer,
-            muon,
             buffer,
+            val_buffer,
             lr_schedule,
             iteration: 0,
             global_step: 0,
@@ -609,41 +652,20 @@ impl TrainingLoop {
         }
         let lr = self.lr_schedule.lr(self.iteration, self.global_step);
         set_schedule_lr(&mut self.optimizer, lr);
-        // Session 7.4d revert path: when Muon is disabled, AdamW must update
-        // the Muon param group itself. `set_schedule_lr` always pins
-        // MUON_GROUP to 0 (the Muon-on default); override here so the
-        // transformer matrices receive the same LR as the default group.
-        if !self.cfg.enable_muon {
-            self.optimizer.set_lr_group(MUON_GROUP, lr);
-        }
         accumulators.last_lr = lr;
 
         let (bid, play) = self.buffer.sample_batch(self.cfg.batch_size, rng);
 
         if let Some(tb) = bid_train_batch(&bid, self.cfg.device) {
-            let (pp, vl, _tot, gnorms) = train_step_with_grad_norms(
-                &self.model,
-                &self.vs,
-                &mut self.optimizer,
-                &mut self.muon,
-                lr,
-                self.cfg.enable_muon,
-                &tb,
-            );
+            let (pp, vl, _tot, gnorms) =
+                train_step_with_grad_norms(&self.model, &self.vs, &mut self.optimizer, &tb);
             accumulators.add_bid(&self.model, &tb, pp, vl);
             accumulators.add_grad_norms(gnorms);
             self.global_step += 1;
         }
         if let Some(tb) = play_train_batch(&play, self.cfg.device) {
-            let (pp, vl, _tot, gnorms) = train_step_with_grad_norms(
-                &self.model,
-                &self.vs,
-                &mut self.optimizer,
-                &mut self.muon,
-                lr,
-                self.cfg.enable_muon,
-                &tb,
-            );
+            let (pp, vl, _tot, gnorms) =
+                train_step_with_grad_norms(&self.model, &self.vs, &mut self.optimizer, &tb);
             accumulators.add_play(&self.model, &tb, pp, vl);
             accumulators.add_grad_norms(gnorms);
             self.global_step += 1;
@@ -736,9 +758,16 @@ impl TrainingLoop {
         let (examples, decision_stats) =
             self_play_iteration(onnx_model_path, self_play_cfg, mcts_cfg);
         let self_play_secs = sp_started.elapsed().as_secs_f64();
+        let mut val_examples_added = 0usize;
         for ex in &examples {
             if matches!(ex.phase, GamePhase::Bidding | GamePhase::Playing) {
-                self.buffer.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
+                let buf = if is_validation_game(ex.game_id, self.cfg.validation_fraction) {
+                    val_examples_added += 1;
+                    &mut self.val_buffer
+                } else {
+                    &mut self.buffer
+                };
+                buf.push(ex.state, ex.policy.clone(), ex.value, ex.phase);
             }
         }
 
@@ -747,6 +776,19 @@ impl TrainingLoop {
         metrics.training_secs = train_started.elapsed().as_secs_f64();
         metrics.self_play_secs = self_play_secs;
         fold_decision_stats(&mut metrics, &decision_stats);
+        metrics.val_examples_added = val_examples_added;
+        metrics.val_buffer_len = self.val_buffer.len();
+        if !self.val_buffer.is_empty() {
+            let val_idx: Vec<usize> = (0..self.val_buffer.len()).collect();
+            metrics.val = self.held_out_losses(&self.val_buffer, &val_idx);
+            if !self.buffer.is_empty() {
+                use rand::seq::IteratorRandom;
+                let n = self.val_buffer.len().min(self.buffer.len());
+                let mut train_idx = (0..self.buffer.len()).choose_multiple(rng, n);
+                train_idx.sort_unstable();
+                metrics.train_eval = self.held_out_losses(&self.buffer, &train_idx);
+            }
+        }
 
         let dir = self.iteration_dir(self.iteration);
         save_model_checkpoint(&self.vs, self.iteration, &dir)
@@ -758,6 +800,9 @@ impl TrainingLoop {
         // overfit/strength-stall on `sweep-2026-04-28-anchor`.
         if let Err(e) = self.buffer.save(dir.join("buffer.bin")) {
             tracing::warn!(error = %e, dir = %dir.display(), "failed to save replay buffer");
+        }
+        if let Err(e) = self.val_buffer.save(dir.join("val_buffer.bin")) {
+            tracing::warn!(error = %e, dir = %dir.display(), "failed to save validation buffer");
         }
         self.append_metrics_line(&metrics)?;
         self.append_decision_stats(&decision_stats)?;
@@ -771,6 +816,49 @@ impl TrainingLoop {
         // self.prune_checkpoints()?;
         self.iteration += 1;
         Ok(metrics)
+    }
+
+    /// Losses of the current weights on `buf[indices]`, in eval mode
+    /// (no dropout) and without gradients, in `batch_size` chunks.
+    pub fn held_out_losses(&self, buf: &ReplayBuffer, indices: &[usize]) -> HeldOutLosses {
+        let (mut bid_ce, mut play_ce, mut v_se, mut v_zero) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut n_bid, mut n_play) = (0usize, 0usize);
+        let model = &self.model;
+        let mut add = |tb: &TrainBatch, values: &[f32], is_bid: bool| {
+            let n = values.len();
+            let (probs, value_pred) = tch::no_grad(|| match tb.phase {
+                Phase::Bidding => model.forward_bid(&tb.input, &tb.legal_mask, false),
+                Phase::Playing => model.forward_play(&tb.input, &tb.legal_mask, false),
+            });
+            let ce = policy_cross_entropy(&probs, &tb.policy_target).double_value(&[]) * n as f64;
+            v_se += value_mse(&value_pred, &tb.value_target).double_value(&[]) * n as f64;
+            v_zero += values.iter().map(|&t| (t as f64).powi(2)).sum::<f64>();
+            if is_bid {
+                bid_ce += ce;
+                n_bid += n;
+            } else {
+                play_ce += ce;
+                n_play += n;
+            }
+        };
+        for chunk in indices.chunks(self.cfg.batch_size.max(1)) {
+            let (bid, play) = buf.batch_from_indices(chunk);
+            if let Some(tb) = bid_train_batch(&bid, self.cfg.device) {
+                add(&tb, &bid.values, true);
+            }
+            if let Some(tb) = play_train_batch(&play, self.cfg.device) {
+                add(&tb, &play.values, false);
+            }
+        }
+        let n = n_bid + n_play;
+        let mean = |sum: f64, k: usize| if k > 0 { sum / k as f64 } else { f64::NAN };
+        HeldOutLosses {
+            examples: n,
+            bid_policy_loss: mean(bid_ce, n_bid),
+            play_policy_loss: mean(play_ce, n_play),
+            value_loss: mean(v_se, n),
+            value_loss_predict0: mean(v_zero, n),
+        }
     }
 
     fn decision_stats_path(&self) -> PathBuf {
@@ -928,6 +1016,25 @@ impl TrainingLoop {
                 dir = %path.display(),
                 "no buffer.bin found alongside checkpoint; starting with empty replay buffer \
                  (epochs will be capped to cold_buffer_post_resume_epochs until refilled)",
+            );
+        }
+        let val_path = path.join("val_buffer.bin");
+        if val_path.exists() {
+            match ReplayBuffer::load(&val_path) {
+                Ok(b) => {
+                    tracing::info!(len = b.len(), path = %val_path.display(), "resumed validation buffer");
+                    self.val_buffer = b;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    path = %val_path.display(),
+                    "val_buffer.bin present but failed to deserialize; validation starts empty",
+                ),
+            }
+        } else {
+            tracing::warn!(
+                dir = %path.display(),
+                "no val_buffer.bin alongside checkpoint (pre-split run?); validation starts empty",
             );
         }
         self.iteration = iter + 1;
@@ -1105,6 +1212,10 @@ impl LossAccumulators {
             signal_p10_high: f64::NAN,
             signal_p50_high: f64::NAN,
             signal_p90_high: f64::NAN,
+            val_examples_added: 0,
+            val_buffer_len: 0,
+            val: HeldOutLosses::default(),
+            train_eval: HeldOutLosses::default(),
         }
     }
 }
@@ -1130,6 +1241,7 @@ mod tests {
             value: 0.0,
             phase: GamePhase::Playing,
             perspective: s.current_player,
+            game_id: seed,
         }
     }
 
@@ -1144,6 +1256,7 @@ mod tests {
             value: 0.1,
             phase: GamePhase::Bidding,
             perspective: s.current_player,
+            game_id: seed,
         }
     }
 
@@ -1185,7 +1298,7 @@ mod tests {
             epoch_early_stop_rel: -1.0, // never stop early
             total_iterations: 1,
             device: Device::Cpu,
-            enable_muon: true,
+            validation_fraction: 0.0,
             cold_buffer_post_resume_epochs: 4,
         };
         let mut tl = TrainingLoop::new(cfg);
@@ -1431,7 +1544,7 @@ mod tests {
             cold_buffer_post_resume_epochs: 2,
             total_iterations: 10,
             device: Device::Cpu,
-            enable_muon: true,
+            validation_fraction: 0.0,
         };
         let mut tl = TrainingLoop::new(cfg.clone());
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(0);
@@ -1466,5 +1579,57 @@ mod tests {
         assert_eq!(m_resumed_warm.num_epochs_run, cfg.epochs_per_iteration);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validation_split_is_deterministic_and_near_fraction() {
+        let held: usize = (0..100_000u64).filter(|&g| is_validation_game(g, 0.03)).count();
+        assert!((2_700..3_300).contains(&held), "held out {held} of 100k");
+        for g in 0..1000u64 {
+            assert_eq!(is_validation_game(g, 0.03), is_validation_game(g, 0.03));
+            assert!(!is_validation_game(g, 0.0));
+            assert!(is_validation_game(g, 1.0));
+        }
+        // A larger fraction holds out a superset.
+        assert!((0..10_000u64).all(|g| !is_validation_game(g, 0.03) || is_validation_game(g, 0.1)));
+    }
+
+    #[test]
+    fn held_out_losses_cover_every_example() {
+        let tmp = std::env::temp_dir().join(format!("blob-tl-val-{}", std::process::id()));
+        let cfg = TrainingLoopConfig {
+            checkpoint_dir: tmp.clone(),
+            buffer_capacity: 64,
+            batch_size: 3,
+            ..Default::default()
+        };
+        let tl = TrainingLoop::new(cfg);
+        let mut buf = ReplayBuffer::new(16);
+        for i in 0..5u64 {
+            let ex = dummy_play_example(i);
+            buf.push(ex.state, ex.policy, 0.5, ex.phase);
+        }
+        for i in 0..4u64 {
+            let ex = dummy_bid_example(100 + i);
+            buf.push(ex.state, ex.policy, -0.5, ex.phase);
+        }
+        let idx: Vec<usize> = (0..buf.len()).collect();
+        let l = tl.held_out_losses(&buf, &idx);
+        assert_eq!(l.examples, 9);
+        assert!(l.bid_policy_loss.is_finite() && l.play_policy_loss.is_finite());
+        assert!(l.value_loss.is_finite());
+        assert!((l.value_loss_predict0 - 0.25).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn metrics_json_line_has_validation_fields() {
+        let mut m = IterationMetrics::default();
+        m.val = HeldOutLosses { examples: 10, bid_policy_loss: 1.0, play_policy_loss: 0.5, value_loss: 0.4, value_loss_predict0: 0.6 };
+        let line = m.to_json_line();
+        assert!(line.contains("\"val_value_loss\":0.4"));
+        assert!(line.contains("\"val_value_loss_predict0\":0.6"));
+        assert!(line.contains("\"train_eval_value_loss\":null"));
+        assert!(line.contains("\"val_examples\":10"));
     }
 }
