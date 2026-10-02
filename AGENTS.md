@@ -5,6 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project state
 
 - **Gen 1 concluded on 2026-05-17.** The final run is `checkpoints/run-2026-05-14`, 168 iterations.
+  - Since 2026-10-02 only reference files remain: models for iters 0/25/125/167, the iter-167 buffer and tch weights, metrics, `strength.csv` and `signal_ratio_by_iter.csv`.
+  - All other gen-1 checkpoints were deleted (gen-2.md §9).
+- **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. `.git` is still 4.9 GB of old model blobs; the rewrite recipe is in gen-2.md §9 (it must include the `gui` branch).
 - **On 2026-10-02 it was measured against a fixed rule bot and found weak.** With 5×100 search it scores −9.2 ± 2.6 points per game against 4 rule bots.
   - Root causes: a final-game value target that the value head memorized, values credited only to the seat to move at each leaf, and clipped end-of-round values.
   - The remake is planned in **[gen-2.md](gen-2.md)**; current phase: Phase 0 (yardsticks).

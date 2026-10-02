@@ -46,7 +46,8 @@ flamegraph.svg
 # Model artifacts (large binary files - do not commit)
 *.pth
 *.pkl
-# *.onnx
+# Per-iteration weights are never committed (gen-2.md §9); reference models are added with `git add -f`.
+*.onnx
 *.safetensors
 *.ot
 
