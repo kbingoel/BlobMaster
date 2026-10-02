@@ -12,8 +12,6 @@
 
 use tch::{nn, nn::Module, Kind, Tensor};
 
-use crate::train::MUON_GROUP;
-
 pub const D_MODEL: i64 = 128;
 pub const N_HEADS: i64 = 8;
 pub const HEAD_DIM: i64 = D_MODEL / N_HEADS; // 16
@@ -22,29 +20,10 @@ pub const N_LAYERS: usize = 8;
 pub const DROPOUT: f64 = 0.1;
 pub const LN_EPS: f64 = 1e-5;
 
-/// Build a `nn::Linear` whose weight is registered in [`MUON_GROUP`] and
-/// whose bias stays in the parent path's group (default `0`). Hand-rolled
-/// because `nn::linear` registers both vars on the same path, so they
-/// would inherit the same group.
-///
-/// The Muon optimizer (Session 7.4d) targets *only* the 2D weight
-/// matrices of the transformer — biases stay on AdamW. Init mirrors the
-/// upstream `nn::linear` defaults.
-fn muon_linear<'a, P: std::borrow::Borrow<nn::Path<'a>>>(
-    vs: P,
-    in_dim: i64,
-    out_dim: i64,
-) -> nn::Linear {
-    let vs = vs.borrow();
-    let bs_bound = 1.0 / (in_dim as f64).sqrt();
-    let bs = vs.var(
-        "bias",
-        &[out_dim],
-        nn::Init::Uniform { lo: -bs_bound, up: bs_bound },
-    );
-    let ws_path = vs.set_group(MUON_GROUP);
-    let ws = ws_path.var("weight", &[out_dim, in_dim], nn::init::DEFAULT_KAIMING_UNIFORM);
-    nn::Linear { ws, bs: Some(bs) }
+/// `nn::linear` with the default init. Kept as a helper so the four
+/// transformer projections read alike; var names are `weight` and `bias`.
+fn linear(vs: &nn::Path, in_dim: i64, out_dim: i64) -> nn::Linear {
+    nn::linear(vs, in_dim, out_dim, Default::default())
 }
 
 #[derive(Debug)]
@@ -56,8 +35,8 @@ struct MultiHeadSelfAttention {
 impl MultiHeadSelfAttention {
     fn new(vs: &nn::Path) -> Self {
         Self {
-            qkv: muon_linear(&(vs / "qkv"), D_MODEL, 3 * D_MODEL),
-            out: muon_linear(&(vs / "out"), D_MODEL, D_MODEL),
+            qkv: linear(&(vs / "qkv"), D_MODEL, 3 * D_MODEL),
+            out: linear(&(vs / "out"), D_MODEL, D_MODEL),
         }
     }
 
@@ -109,8 +88,8 @@ struct Ffn {
 impl Ffn {
     fn new(vs: &nn::Path) -> Self {
         Self {
-            fc1: muon_linear(&(vs / "fc1"), D_MODEL, FFN_DIM),
-            fc2: muon_linear(&(vs / "fc2"), FFN_DIM, D_MODEL),
+            fc1: linear(&(vs / "fc1"), D_MODEL, FFN_DIM),
+            fc2: linear(&(vs / "fc2"), FFN_DIM, D_MODEL),
         }
     }
 

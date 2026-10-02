@@ -15,14 +15,11 @@ epochs_per_iteration = 10
 epoch_early_stop_rel = 0.005
 total_iterations = 15
 device = "cuda:0"
-# Session 7.4d / overnight 2026-04-28: Muon vs AdamW-only converged to
-# identical eval strength by iter 9 on this 1.63M / d_model=128 model
-# (paired iter-9 evals: 117/192 wins on both, see
-# logs/overnight-2026-04-27/SUMMARY.md). Defaulted off; the Rust default
-# in [TrainingLoopConfig] also sets this to false, so omitting the knob
-# is equivalent. Set to true only for architecture stretches (≥100M params)
-# where the published Muon literature predicts a measurable win.
-enable_muon = false
+# Share of self-play games held out of training (gen-2.md §5.6). Their
+# examples fill a validation buffer of buffer_capacity × this many
+# examples; metrics.jsonl reports val_* losses on it next to train_eval_*
+# (the same measurement on training data). 0 disables the split.
+validation_fraction = 0.03
 
 [self_play]
 # 118 × ~680 decisions ≈ 80K examples/iter (matches Section 5/6 downstream
@@ -34,12 +31,6 @@ show_progress = true
 # Session 7.1 smoke test forces 5P7C; remove / set to `false` for the mixed
 # Section 5 distribution.
 fixed_player_count = [5, 7]
-# Session 7.4b: when true, self-play workers load `model.int8.onnx` (the
-# QDQ-quantized sibling produced by `scripts/export_onnx.py --int8-out`).
-# Eval keeps using the FP32 `model.onnx` so the eval signal is not fighting
-# quantization noise on both sides. Enable only after running
-# `scripts/validate_int8.py` to confirm the policy-agreement gate.
-use_int8 = false
 
 [mcts]
 c_puct = 1.5

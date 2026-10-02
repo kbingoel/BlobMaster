@@ -26,7 +26,9 @@
 //!       threads busy.
 //! ```
 //!
-//! Prototype for the gen-2 `bench` command (gen-2.md §6, Phase 0).
+//! `match` was the prototype for `blobmaster bench` (`blob_engine::bench`),
+//! which adds duplicate deals and per-hand-size bid stats; use that for new
+//! measurements. This file stays to reproduce gen-2.md §2.
 
 use blob_engine::mcts::{run_lockstep_search, TemperatureSchedule};
 use blob_engine::*;

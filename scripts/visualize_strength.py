@@ -15,7 +15,9 @@ Full training-process dashboard (adds convergence + timing plots):
 `--metrics` enables the convergence dashboard (loss / accuracy /
 num_epochs_run from blob-nn's per-iter metrics.jsonl) AND the SP-vs-
 training split on the timing plot (when `self_play_secs` /
-`training_secs` are present in metrics.jsonl; added 2026-05-15).
+`training_secs` are present in metrics.jsonl; added 2026-05-15) and, for
+runs with a validation split (`val_*` fields), the held-out vs
+training-data loss plot.
 `--stderr` enables the iteration-timing plot — wall_clock_secs is
 parsed from the "iteration complete" log line, and per-iter eval wall
 is derived as the gap between consecutive "iteration complete"
@@ -209,6 +211,44 @@ def plot_convergence(metrics: list[dict], out_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_generalization(metrics: list[dict], out_path: Path) -> bool:
+    """Held-out (`val_*`) vs training-data (`train_eval_*`) losses, both
+    measured after the iteration's training with dropout off. A growing gap
+    means memorization (gen-2.md §2.2, §7). Returns False when the run has
+    no validation split."""
+    metrics = sorted(
+        (r for r in metrics if r.get("val_value_loss") is not None),
+        key=lambda r: int(r["iteration"]),
+    )
+    if not metrics:
+        return False
+    x = [int(r["iteration"]) for r in metrics]
+
+    def col(key: str) -> list[float]:
+        return [float("nan") if r.get(key) is None else float(r[key]) for r in metrics]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
+    for ax, (name, title) in zip(
+        axes,
+        [("value_loss", "value MSE"), ("bid_policy_loss", "bid policy CE"),
+         ("play_policy_loss", "play policy CE")],
+    ):
+        ax.plot(x, col(f"val_{name}"), marker="o", color="tab:red", label="held-out games")
+        ax.plot(x, col(f"train_eval_{name}"), marker="s", color="tab:blue", label="training data")
+        if name == "value_loss":
+            ax.plot(x, col("val_value_loss_predict0"), color="grey", linestyle="--",
+                    label="held-out, predict 0")
+        ax.set_title(title)
+        ax.set_xlabel("iteration")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle("Generalization: held-out vs training-data losses (metrics.jsonl)", y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 
 # --- iter-timing from stderr ----------------------------------------------
@@ -467,6 +507,7 @@ def main() -> None:
     if args.metrics and args.metrics.exists():
         metrics = load_metrics(args.metrics)
         plot_convergence(metrics, args.out_dir / "04_convergence.png")
+        plot_generalization(metrics, args.out_dir / "07_generalization.png")
 
     if args.stderr and args.stderr.exists():
         iter_timings = parse_iter_timings(args.stderr)

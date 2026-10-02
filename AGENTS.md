@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. `.git` is still 4.9 GB of old model blobs; the rewrite recipe is in gen-2.md §9 (it must include the `gui` branch).
 - **On 2026-10-02 it was measured against a fixed rule bot and found weak.** With 5×100 search it scores −9.2 ± 2.6 points per game against 4 rule bots.
   - Root causes: a final-game value target that the value head memorized, values credited only to the seat to move at each leaf, and clipped end-of-round values.
-  - The remake is planned in **[gen-2.md](gen-2.md)**; current phase: Phase 0 (yardsticks).
+  - The remake is planned in **[gen-2.md](gen-2.md)**. Phase 0 (yardsticks) is done except a human playtest and the deferred `.git` rewrite; next is Phase 1 (cheap correctness fixes).
 - **The gen-1 planning documents were retired on 2026-10-02.** Code comments still cite them (`fix-mcts-plan.md`, `development-plan.md`, `self-play-profile.md`, `7.3b-analysis.md`); read them with `git show c6f0c2a:<file>` (gen-2.md §10).
 
 ## Documents
@@ -23,14 +23,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Never report progress from training losses or checkpoint-vs-checkpoint win rates alone.** Gen 1 looked healthy on both while losing to an 80-line bot. Strength claims need:
 - the absolute benchmark: one model seat vs 4 rule bots (`blob-engine/src/rule_bot.rs`), with the 95% CI (command below);
-- held-out (not training-buffer) losses, once the validation split exists.
+- held-out (not training-buffer) losses: `val_*` vs `train_eval_*` in `metrics.jsonl` (see the gen-1 driver section).
 
 ```bash
-cargo run --release -p blob-engine --example diagnostics -- match <model.onnx> raw  rulebot 640   # ~10 s
-cargo run --release -p blob-engine --example diagnostics -- match <model.onnx> mcts rulebot 320   # ~4.5 min
+cargo build --release -p blob-bin
+./target/release/blobmaster bench <model.onnx> --mode network   # 128 deals × 5 seats, ~10 s
+./target/release/blobmaster bench <model.onnx> --mode search    # 64 deals × 5 seats at 5×100, ~4.5 min
 ```
 
-The reference is gen-1 final (`run-2026-05-14/iter_000167`): network only −13.5 ± 1.9, with search −9.2 ± 2.6. The tool uses every core, so don't run it next to a training run.
+`bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. Opponents default to the rule bot; `--opponent <model.onnx>` uses a checkpoint's raw policy (bots never search).
+
+The reference is gen-1 final (`run-2026-05-14/iter_000167`): with search **−10.2 ± 2.9**, network only −12.1 ± 2.0 (`bench`, 2026-10-02). The older non-duplicate `diagnostics match` numbers were −9.2 ± 2.6 and −13.5 ± 1.9. The tool uses every core, so don't run it next to a training run.
 
 ## Architecture (current code = gen 1; gen-2 changes are in gen-2.md §5)
 
@@ -84,7 +87,10 @@ BlobState (stack, ~410 B, Copy)
 - `cargo bench -p blob-engine --bench core` — engine micro-benchmarks. Gen-1 numbers are in gen-2.md §3.1.
 - `BLOB_ONNX_MODEL=<model.onnx> cargo bench -p blob-engine --bench onnx_mcts` — ONNX and search benches; they skip without the env var.
 - ONNX ↔ tch parity: `BLOB_ONNX_MODEL=… BLOB_TCH_CHECKPOINT=<dir with model.ot> cargo test -p blob-nn onnx_tch_value_parity`. Tolerance 1e-4: an 8-layer fp32 transformer drifts ~2e-5 between kernels.
-- `blob-engine/examples/diagnostics.rs` — `match`, `value` and `tokens` commands; see its header and gen-2.md Appendix A.
+- `cargo test -p blob-bin` — `play` and CLI tests, including whole games through the terminal UI.
+- Known failure: `blob-nn` `self_play::tests::five_games_produce_valid_examples` (pre-existing; gen-2.md §9).
+- `blob-engine/examples/diagnostics.rs` — `match`, `value` and `tokens` commands; reproduces gen-2.md §2. See its header and gen-2.md Appendix A.
+- `blobmaster play [--model <onnx>] [--show]` — play in the terminal. Without a model the bots are rule bots; with one they search at 5×100. Type `help` in the game.
 
 ## Hardware target
 
@@ -139,7 +145,7 @@ RUST_LOG=info \
 
 - The loop runs `while tl.iteration < total_iterations`.
 - Eval runs when `iter > anchor_iter && iter % eval_interval == 0`. **To get an eval row at iter K, set `total_iterations = K + 1`.**
-- Resumes: `total_iterations` is still absolute. Resume scripts take "additional iterations" and convert: `target = latest_iter + 1 + add` (see [scripts/sweep-2026-04-28-resume.sh](scripts/sweep-2026-04-28-resume.sh)).
+- Resumes: `total_iterations` is still absolute. To run `add` more iterations, set `target = latest_iter + 1 + add`. The deleted gen-1 resume script did this: `git show 36bba81:scripts/sweep-2026-04-28-resume.sh`.
 - `LrSchedule` keys its cosine on the same field. When it used to be a count, a resume pinned the LR at `MIN_LR` (1e-5) for the whole resume window ("Bug #2", 2026-04-28).
   - **Symptom:** `learning_rate` flat at 1e-5 across consecutive iterations in `metrics.jsonl`. The `iteration complete` log line prints `learning_rate=`.
 - `--resume` sets the eval anchor to the resume baseline, not to `iter_000000`. To compare against the start, run `blobmaster-train evaluate iter_K/model.onnx iter_000000/model.onnx`.
@@ -153,6 +159,16 @@ RUST_LOG=info \
 - `evaluate` echoes `num_determinizations=` and `sims_per_determinization=` in its startup line. Check it to confirm an override landed.
 - The `adaptive_budget_reads_cfg` test pins this behavior.
 - The gen-1 "never below 5×100" rule was measured with gen-1's uninformative values. Re-measure it in gen 2 instead of treating it as a law.
+
+### Validation split (since 2026-10-02)
+
+- `[training] validation_fraction` (default 0.03) holds out whole self-play games by a hash of their seed. Their examples go to `val_buffer` and are never trained on.
+  - The split is by game, not round, because the gen-1 value target is the final game score.
+  - `val_buffer` holds `buffer_capacity × fraction` examples.
+  - It is saved as `iter_*/val_buffer.bin` and restored by `--resume`. A pre-split checkpoint resumes with an empty one and logs a warning.
+- `metrics.jsonl` gets `val_*` (whole validation buffer) and `train_eval_*` (an equal-size replay sample). Both are measured after training, with dropout off. Also `val_examples_added` and `val_buffer_len`.
+  - Compare `val_*` with `train_eval_*`, never with the logged training losses: those are averaged over the iteration with dropout on.
+  - `*_value_loss_predict0` is the always-predict-0 baseline.
 
 ### Graceful exit (`STOP` file)
 
@@ -168,7 +184,7 @@ Both scripts use the venv interpreter.
   .venv/bin/python scripts/visualize_strength.py --csv checkpoints/<run>/strength.csv \
     --metrics checkpoints/<run>/metrics.jsonl --stderr logs/<run>.stderr --out-dir logs/<run>-progress
   ```
-  Produces win rate vs anchor, score differential, losses, convergence diagnostics, per-iteration wall-clock and bid success. Its win rates are relative to past checkpoints only; see the rule above.
+  Produces win rate vs anchor, score differential, losses, convergence diagnostics, per-iteration wall-clock and bid success, plus held-out vs training-data losses (`07_generalization.png`) for runs with a validation split. Its win rates are relative to past checkpoints only; see the rule above.
 - **Weight evolution:**
   ```bash
   .venv/bin/python scripts/visualize_weight_evolution.py --checkpoint-dir checkpoints/<run> \

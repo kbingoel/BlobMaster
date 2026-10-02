@@ -2,7 +2,7 @@
 
 The single source of truth for the remake. It replaces every gen-1 planning document (`development-plan.md`, `fix-mcts-plan.md`, `async.md`, `self-play-profile.md` and others), which were retired on 2026-10-02. §10 maps each one to where its surviving content went and how to read the original from git.
 
-Status, 2026-10-02: gen 1 is concluded; gen 2 is at Phase 0 (§6).
+Status, 2026-10-02: gen 1 is concluded; Phase 0 (§6) is done except the human playtest and the deferred `.git` rewrite; Phase 1 is next.
 
 ---
 
@@ -227,19 +227,20 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 | `mcts.rs` arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, separate τ for targets and sampling | **Keep** | Change the backup to all seats, the end-of-round value and the tie-break (§5.4). Delete per-seat counts |
 | `onnx.rs` `OnnxEvaluator` | **Keep + extend** | Two sessions (policy and value), per-seat value output |
 | `rule_bot.rs` (new, 2026-10-02) | **Keep** | Fixed benchmark opponent and warm-start teacher |
+| `bench.rs` (new, 2026-10-02) | **Keep** | The §5.7 yardstick as a library: duplicate deals, CI over deals, bid stats by hand size. CLI: `blobmaster bench` |
 | `evaluator.rs` `HeuristicEvaluator` | **Drop** once eval uses the rule bot | Incoherent baseline |
 | `replay.rs` storage (raw `BlobState` + sparse policy) | **Keep layout** | Per-seat round scores instead of one value; concurrent wrapper; round-level validation split; delta persistence |
 | `blob-nn` transformer, input projections, heads | **Keep** | Per-seat value head; second (value) model |
 | `blob-nn` `self_play.rs` | **Rewrite** | Per-round targets; play rounds, not games |
 | `blob-nn` `training_loop.rs`, `blob-train` driver | **Replace** with an async driver | Reuse the batch construction, train step, metrics, STOP, export call |
-| `blob-nn` `eval.rs` | **Replace** with `bench` | Keep the Wilson CI helper |
-| `muon.rs`, INT8 path (`use_int8`, `validate_int8.py`, `int8_levers.py`, `--int8-out`) | **Delete** | Ruled out (§3.2) |
+| `blob-nn` `eval.rs` | **Replace** with `bench` | Keep the Wilson CI helper. Still drives the gen-1 driver's in-loop eval and `blobmaster-train evaluate` |
+| `muon.rs`, INT8 path (`use_int8`, `validate_int8.py`, `int8_levers.py`, `--int8-out`) | **Deleted** 2026-10-02 | Ruled out (§3.2). Muon's param group went with it; AdamW already updated those weights at the default LR |
 | `scripts/export_onnx.py` | **Keep + extend** | Second model; per-seat value; the Python mirror must match the Rust model |
 | `scripts/visualize_*.py` | **Keep** | Re-key to learner steps |
-| Gen-1 sweep, overnight and diagnostic scripts | **Delete** | Tied to gen-1 runs |
-| `blob-bin` | **Build** | `play` (human vs bot) early (Phase 0) |
-| `gui` branch on GitHub: `blob-gui/` app + `gui-development-plan.md`, 9 commits not in `master` | **Review** before building `play` | Built on gen 1 and not examined in the 2026-10-02 diagnosis; holds the history that blocks the `.git` rewrite (§9) |
-| `blob-engine/examples/diagnostics.rs` | **Keep** | Becomes `bench` |
+| Gen-1 sweep, overnight and diagnostic scripts | **Deleted** 2026-10-02 | Tied to gen-1 runs; their configs (`blob-train/sweep-2026-04-28/`, `diagnostic-2026-05-11/`) too. The run launchers and `run-2026-05-*.toml` remain |
+| `blob-bin` | **Built** (Phase 0) | `bench` and `play`; `analyze` is still a stub |
+| `gui` branch on GitHub: `blob-gui/` app + `gui-development-plan.md`, 9 commits not in `master` | **Reviewed** 2026-10-02 | A Tauri + Svelte copilot for a *real* table: the user enters their hand and every played card, and the app shows policy / MCTS visits per card. It adds no engine code (only `blob-gui/` and the workspace entry) and runs its own per-deal MCTS loop. Not a simulator, so `play` was written fresh. Revisit for Phase 7; it holds the history that blocks the `.git` rewrite (§9) |
+| `blob-engine/examples/diagnostics.rs` | **Keep** | Reproduces §2; `match` is superseded by `blobmaster bench` |
 
 ---
 
@@ -398,11 +399,25 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 **Phase 0 — Yardsticks first (no training)**
 - [x] Rule bot `blob-engine/src/rule_bot.rs` (2026-10-02).
 - [x] Gen-1 diagnostics `blob-engine/examples/diagnostics.rs` (2026-10-02).
-- [ ] `bench` subcommand: duplicate deals, both modes, by-hand-size bid stats.
-- [ ] `blobmaster play`: human vs bot in the terminal, with an option to show the bot's policy and values. First check what the `gui` branch already provides (§4).
-- [ ] Round-level validation split and validation losses in the gen-1 driver.
-- [ ] Repo hygiene (§9).
+- [x] `bench` subcommand (2026-10-02): `blobmaster bench`, logic in `blob-engine/src/bench.rs`. Duplicate deals, both modes, by-hand-size bid stats, 0-bid share, bid-error histogram.
+- [x] `blobmaster play` (2026-10-02): human vs bot in the terminal; `--show` prints every bot decision's search visits, network policy and value, `hint` does the same for your seat. The `gui` branch is a real-table copilot, not a simulator (§4).
+- [x] Validation split and validation losses in the gen-1 driver (2026-10-02). Split by **whole game**, not round: the gen-1 target is the final game score and cumulative scores are encoder inputs, so a round split would leak. Switch the key to (game, round) in Phase 2. Details below.
+- [x] Repo hygiene (§9) except the `.git` rewrite, which is still deferred.
 - *Exit:* `bench` reproduces −9 ± 3 for the gen-1 final checkpoint; you can play a full game against it.
+  - **`bench`: met.** Gen-1 final with 5×100 search: **−10.2 ± 2.9** (64 deals × 5 seats = 320 games, 262 s). Network only: −12.1 ± 2.0 (128 deals, 7 s). Both agree with §2.1.
+  - **`play`: verified by script, not by a person.** Full 17-round games ran through the terminal UI against the rule bot and against gen-1 with 5×100 search (52 s per game, with `--show`). A human playtest is still open.
+- *Findings:*
+  - **Duplicate deals barely narrow the CI here:** ±2.0 over 128 deals vs ±1.9 for 640 independent games. In Blob, outcome variance comes mostly from play, not from card quality. Keep them anyway: they cost nothing and models are compared on identical cards.
+  - **Gen-1 bids 0 in 84% of rounds,** 84% even in 5–8-card rounds, against the rule bot's 25%. It makes only 41% of 5–8-card bids, against the rule bot's 55%.
+
+*Validation split, as built:*
+- `validation_fraction` (default 0.03) in `[training]` holds out games by a hash of their seed (`training_loop::is_validation_game`). Their examples fill `val_buffer` (capacity `buffer_capacity × fraction`), saved as `val_buffer.bin` and restored on resume. They are never trained on.
+- Each iteration, `metrics.jsonl` gets:
+  - `val_*`: bid/play policy CE, value MSE, and the predict-0 MSE, over the whole validation buffer.
+  - `train_eval_*`: the same measurement on an equal-size sample of the replay buffer.
+
+  Both are measured after training, with dropout off. The logged training losses are not comparable: they are averaged over the iteration with dropout on.
+- `scripts/visualize_strength.py` plots both as `07_generalization.png`.
 
 **Phase 1 — Cheap correctness fixes**
 - [ ] Encoder items 1–6 from §5.5.
@@ -447,7 +462,7 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 
 | Gate | Measure | Pass |
 |---|---|---|
-| G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced |
+| G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced — **passed 2026-10-02: −10.2 ± 2.9** |
 | G1 value learnable | V on held-out rule-bot rounds | correlation with outcome > 0.7; 1-card rounds after bidding ≈ exact |
 | G2 per-round values help | Phase-2 run, search bench | > −9 by iter 20, rising |
 | G3 beats the rule bot | search bench | ≥ +10 points/game |
@@ -499,9 +514,12 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
   5. Verify: commit count, HEAD tree, `git show gen-1-final:fix-mcts-plan.md`.
   6. Force-push `master`, `gui` and the tag. Other clones must re-clone.
 
+**Done 2026-10-02 (Phase 0):** deleted the INT8 path (calibration capture, `--int8-out`, `use_int8`, `validate_int8.py`, `int8_levers.py`), Muon (`muon.rs`, its param group, `enable_muon`), and the gen-1 sweep, overnight and diagnostic scripts with their configs. Old TOMLs that still set `enable_muon` or `use_int8` load fine; serde ignores the unknown keys.
+
 **Still to do:**
-- **Delete dead code as its replacement lands:** the INT8 path, Muon, gen-1 sweep and overnight scripts, and `HeuristicEvaluator` (§4).
+- **`HeuristicEvaluator`:** drop it once the driver's in-loop eval and `blobmaster-train evaluate` use `bench` (§4).
 - **Code comments still cite the retired documents,** about 50 references, most to `fix-mcts-plan.md`. Rewrite them as the code changes; until then use §10.
+- **Pre-existing test failure:** `blob-nn` `self_play::tests::five_games_produce_valid_examples` fails on `36bba81` (before Phase 0) too. Its 1×1 search budget gives no visits since the budget became config-driven (2026-05-17); raise it to a few simulations.
 
 ---
 
@@ -529,9 +547,13 @@ All are recoverable with `git show c6f0c2a:<file>`.
 Run from the repo root with nothing else busy (the tool uses every core).
 
 ```bash
-cargo build --release -p blob-engine --example diagnostics
+cargo build --release -p blob-bin -p blob-engine --example diagnostics
+B=./target/release/blobmaster
 D=./target/release/examples/diagnostics
 M=checkpoints/run-2026-05-14/iter_000167/model.onnx
+
+$B bench $M --mode search         # G0 yardstick, duplicate deals (−10.2 ± 2.9, ~4.5 min)
+$B bench $M --mode network        # network only (−12.1 ± 2.0, ~10 s)
 
 $D match  $M mcts rulebot 320     # §2.1 headline (~4.5 min)
 $D match  $M raw  rulebot 640     # network only (~10 s)
