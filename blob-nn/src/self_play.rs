@@ -267,12 +267,13 @@ mod tests {
 
     fn fast_cfg() -> MctsConfig {
         // Keep sims tiny — correctness of the self-play loop is the target,
-        // not search quality. `adaptive_budget` will raise these to meet
-        // the per-branching-factor floors.
+        // not search quality. The budget is taken as given (2026-05-17), and
+        // the first simulation only expands the root, so a few are needed
+        // for the root's children to get visits.
         MctsConfig {
             c_puct: 1.5,
             num_determinizations: 1,
-            sims_per_determinization: 1,
+            sims_per_determinization: 4,
             min_sims_floor: 1,
             temperature: 1.0,
             temperature_schedule: None,

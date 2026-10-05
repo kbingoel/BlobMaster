@@ -43,6 +43,7 @@ enum Bot {
     Search,
     Network,
     Rulebot,
+    Rulebot2,
 }
 
 #[derive(Subcommand, Debug)]
@@ -51,13 +52,13 @@ enum Command {
     /// is played once from each seat. Reports points/game with a 95% CI over
     /// deals, win share and bid statistics by hand size.
     Bench {
-        /// Focal player: an ONNX model, or `rulebot`.
+        /// Focal player: an ONNX model, `rulebot` or `rulebot2`.
         focal: String,
-        /// How a focal model plays. Required unless the focal player is `rulebot`.
+        /// How a focal model plays. Required unless the focal player is a rule bot.
         #[arg(long, value_enum)]
         mode: Option<Mode>,
-        /// Opponents: `rulebot`, or an ONNX model playing its raw policy
-        /// (bots never search).
+        /// Opponents: `rulebot`, `rulebot2`, or an ONNX model playing its
+        /// raw policy (bots never search).
         #[arg(long, default_value = "rulebot")]
         opponent: String,
         /// Deal seeds; games = deals × players. Default 64 with search
@@ -123,10 +124,10 @@ enum Command {
 }
 
 fn parse_opponent(s: &str) -> Agent {
-    if s == "rulebot" {
-        Agent::RuleBot
-    } else {
-        Agent::Network(PathBuf::from(s))
+    match s {
+        "rulebot" => Agent::RuleBot,
+        "rulebot2" => Agent::RuleBot2,
+        _ => Agent::Network(PathBuf::from(s)),
     }
 }
 
@@ -154,6 +155,7 @@ fn cmd_bench(
 ) {
     let focal = match (focal.as_str(), mode) {
         ("rulebot", _) => Agent::RuleBot,
+        ("rulebot2", _) => Agent::RuleBot2,
         (p, Some(Mode::Search)) => Agent::Search(PathBuf::from(p)),
         (p, Some(Mode::Network)) => Agent::Network(PathBuf::from(p)),
         (_, None) => {
@@ -215,6 +217,7 @@ fn main() {
         Command::Play { model, bot, players, cards, seat, seed, show, dets, sims, no_color } => {
             let bot = match (bot, model) {
                 (Some(Bot::Rulebot), _) | (None, None) => Agent::RuleBot,
+                (Some(Bot::Rulebot2), _) => Agent::RuleBot2,
                 (Some(Bot::Search) | None, Some(m)) => Agent::Search(m),
                 (Some(Bot::Network), Some(m)) => Agent::Network(m),
                 (Some(_), None) => {

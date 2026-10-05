@@ -10,10 +10,11 @@
 
 use std::io::{self, BufRead, Write};
 
-use blob_engine::bench::{greedy_action, Agent};
+use blob_engine::bench::{greedy_action, search_action, Agent};
 use blob_engine::card::NUM_RANKS;
 use blob_engine::mcts::{mcts_search, MctsConfig};
 use blob_engine::rule_bot::{expected_tricks, rule_bot_action};
+use blob_engine::rule_bot_2::{bid_chances, play_chances, rule_bot_2_action};
 use blob_engine::{
     advance_round, apply_bid, apply_play, legal_bids, legal_plays, new_game, start_round, total_rounds,
     BlobState, Evaluator, GamePhase, Hand, OnnxEvaluator, NO_TRUMP,
@@ -306,6 +307,27 @@ impl<R: BufRead, W: Write> Table<R, W> {
                 });
                 (a, why)
             }
+            Agent::RuleBot2 => {
+                let a = rule_bot_2_action(&s);
+                let why = explain.then(|| {
+                    let mut items: Vec<(String, f32)> = if bidding {
+                        let mask = legal_bids(&s);
+                        bid_chances(&s)
+                            .iter()
+                            .enumerate()
+                            .filter(|(b, _)| (mask >> b) & 1 == 1)
+                            .map(|(b, &p)| (format!("bid {b}"), p))
+                            .collect()
+                    } else {
+                        play_chances(&s).iter().map(|&(c, p)| (self.card(c), p)).collect()
+                    };
+                    items.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let line: Vec<String> =
+                        items.iter().take(6).map(|(a, p)| format!("{a} {:.0}%", 100.0 * p)).collect();
+                    format!("rule bot 2: chance to make the bid: {}", line.join(" · "))
+                });
+                (a, why)
+            }
             Agent::Network(_) => {
                 let ev = self.eval.as_ref().expect("network bot has a model");
                 let (policy, v) = ev.evaluate(&s);
@@ -315,7 +337,7 @@ impl<R: BufRead, W: Write> Table<R, W> {
             Agent::Search(_) => {
                 let ev = self.eval.as_ref().expect("search bot has a model");
                 let r = mcts_search(&s, ev, &self.opts.mcts, &mut self.rng, 0);
-                let a = greedy_action(&s, &r.policy_target);
+                let a = search_action(&s, &r);
                 let why = explain.then(|| {
                     let (prior, v) = ev.evaluate(&s);
                     if r.total_visits == 0 {
@@ -563,6 +585,7 @@ pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Re
     start_round(&mut state, &mut cards);
     let bot = match &opts.bot {
         Agent::RuleBot => "the rule bot".to_string(),
+        Agent::RuleBot2 => "rule bot 2".to_string(),
         Agent::Network(p) => format!("{} (network only)", p.display()),
         Agent::Search(p) => format!(
             "{} with {}x{} search",

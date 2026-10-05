@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. `.git` is still 4.9 GB of old model blobs; the rewrite recipe is in gen-2.md §9 (it must include the `gui` branch).
 - **On 2026-10-02 it was measured against a fixed rule bot and found weak.** With 5×100 search it scores −9.2 ± 2.6 points per game against 4 rule bots.
   - Root causes: a final-game value target that the value head memorized, values credited only to the seat to move at each leaf, and clipped end-of-round values.
-  - The remake is planned in **[gen-2.md](gen-2.md)**. Phase 0 (yardsticks) is done except a human playtest and the deferred `.git` rewrite; next is Phase 1 (cheap correctness fixes).
+  - The remake is planned in **[gen-2.md](gen-2.md)**. Phase 0 (yardsticks) is done except a human playtest and the deferred `.git` rewrite. Phase 1 (cheap correctness fixes: encoder layout v2, determinization, tie-break) was done on 2026-10-05; next is Phase 2 (per-round, per-seat values).
 - **The gen-1 planning documents were retired on 2026-10-02.** Code comments still cite them (`fix-mcts-plan.md`, `development-plan.md`, `self-play-profile.md`, `7.3b-analysis.md`); read them with `git show c6f0c2a:<file>` (gen-2.md §10).
 
 ## Documents
@@ -32,6 +32,8 @@ cargo build --release -p blob-bin
 ```
 
 `bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. Opponents default to the rule bot; `--opponent <model.onnx>` uses a checkpoint's raw policy (bots never search).
+
+`rulebot2` (`blob-engine/src/rule_bot_2.rs`: card counting, bid-aware, +14.5 vs the rule bot) works as the focal player or as `--opponent`. It is a harder second yardstick; the rule bot stays the reference, so never retune `rule_bot.rs`.
 
 The reference is gen-1 final (`run-2026-05-14/iter_000167`): with search **−10.2 ± 2.9**, network only −12.1 ± 2.0 (`bench`, 2026-10-02). The older non-duplicate `diagnostics match` numbers were −9.2 ± 2.6 and −13.5 ± 1.9. The tool uses every core, so don't run it next to a training run.
 
@@ -55,8 +57,11 @@ BlobState (stack, ~410 B, Copy)
 **Scoring:** `tricks_won == bid ? 10 + bid : 0`.
 
 **Encoder contracts:**
-- Hand-card tokens are emitted in `Hand::iter()` order (ascending card index). That order is the play-policy action order used by MCTS, the replay buffer and the ONNX postprocessing. Don't reorder it.
-- Rank, suit and player are raw one-hots inside per-token feature vectors, with one input projection per token type. Played-card tokens also get a learned chronological embedding.
+- Hand-card tokens are emitted in `Hand::iter()` order (ascending card index). That order is the play-policy action order used by MCTS, the replay buffer and the ONNX postprocessing. Don't reorder it. `encoder::hand_card_indices` gives it without encoding.
+- Rank, suit and seat are raw one-hots inside per-token feature vectors, with one input projection per token type. Played-card tokens also get a learned chronological embedding.
+- Seats are relative to the perspective (layout v2, gen-2.md §6 Phase 1): "me" is seat 0, and player tokens come in that order.
+- **Two layouts.** `encoder.rs` is v2 (padded width 49), used for training and gen-2 models. `encoder::v1` is the frozen gen-1 layout (width 48), pinned by a golden-hash test; never edit it. `OnnxEvaluator` picks the layout from the model's `features` width, so gen-1 checkpoints still run in `bench`, `play` and diagnostics. Once a v2 model is trained, a layout change needs a new version, not an edit to v2.
+- `scripts/export_onnx.py` mirrors the token widths; `export_script_mirrors_feature_widths` checks them.
 
 **MCTS:**
 - Determinization: N sampled deals per decision, one arena-allocated tree each, root visits summed across trees.
@@ -86,9 +91,9 @@ BlobState (stack, ~410 B, Copy)
 - `cargo test -p blob-engine` — run in the **debug** profile. Several tests expect debug-assertion panics and fail under `--release`.
 - `cargo bench -p blob-engine --bench core` — engine micro-benchmarks. Gen-1 numbers are in gen-2.md §3.1.
 - `BLOB_ONNX_MODEL=<model.onnx> cargo bench -p blob-engine --bench onnx_mcts` — ONNX and search benches; they skip without the env var.
-- ONNX ↔ tch parity: `BLOB_ONNX_MODEL=… BLOB_TCH_CHECKPOINT=<dir with model.ot> cargo test -p blob-nn onnx_tch_value_parity`. Tolerance 1e-4: an 8-layer fp32 transformer drifts ~2e-5 between kernels.
+- ONNX ↔ tch parity: `BLOB_ONNX_MODEL=… BLOB_TCH_CHECKPOINT=<dir with model.ot> cargo test -p blob-nn onnx_tch_value_parity` (absolute paths: tests run in the crate directory). Tolerance 1e-4: an 8-layer fp32 transformer drifts ~2e-5 between kernels.
+  - Gen-1 `model.ot` files no longer load (layout v1). Until a gen-2 run exists, make a v2 pair: `BLOB_SAVE_CKPT_DIR=<dir> cargo test --release -p blob-nn --test save_random_checkpoint -- --ignored save_random_init`, then `( unset LD_PRELOAD; .venv/bin/python scripts/export_onnx.py --weights <dir>/model.ot --out <dir>/model.onnx )`.
 - `cargo test -p blob-bin` — `play` and CLI tests, including whole games through the terminal UI.
-- Known failure: `blob-nn` `self_play::tests::five_games_produce_valid_examples` (pre-existing; gen-2.md §9).
 - `blob-engine/examples/diagnostics.rs` — `match`, `value` and `tokens` commands; reproduces gen-2.md §2. See its header and gen-2.md Appendix A.
 - `blobmaster play [--model <onnx>] [--show]` — play in the terminal. Without a model the bots are rule bots; with one they search at 5×100. Type `help` in the game.
 

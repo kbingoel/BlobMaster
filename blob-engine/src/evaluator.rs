@@ -12,8 +12,7 @@
 
 use crate::bidding::legal_bids;
 use crate::card::{NUM_RANKS, NUM_SUITS};
-use crate::encoder::encode;
-use crate::hand::Hand;
+use crate::encoder::hand_card_indices;
 use crate::playing::legal_plays;
 use crate::round::NO_TRUMP;
 use crate::state::{BlobState, GamePhase};
@@ -71,12 +70,11 @@ impl Evaluator for DummyEvaluator {
                 (policy, 0.0)
             }
             GamePhase::Playing => {
-                let enc = encode(state, state.current_player);
-                let hand = Hand::new(state.hands[state.current_player as usize]);
+                let hand = hand_card_indices(state, state.current_player);
                 let legal = legal_plays(state);
-                let mut policy = vec![0.0f32; enc.hand_card_indices.len()];
+                let mut policy = vec![0.0f32; hand.len()];
                 let mut n_legal = 0u32;
-                for (i, card_idx) in enc.hand_card_indices.iter().enumerate() {
+                for (i, card_idx) in hand.iter().enumerate() {
                     if (legal >> *card_idx) & 1 == 1 {
                         policy[i] = 1.0;
                         n_legal += 1;
@@ -90,7 +88,6 @@ impl Evaluator for DummyEvaluator {
                         }
                     }
                 }
-                let _ = hand;
                 (policy, 0.0)
             }
             GamePhase::Scoring | GamePhase::Complete => (Vec::new(), 0.0),
@@ -189,7 +186,7 @@ impl Evaluator for HeuristicEvaluator {
                 (policy, 0.0)
             }
             GamePhase::Playing => {
-                let enc = encode(state, state.current_player);
+                let hand = hand_card_indices(state, state.current_player);
                 let legal = legal_plays(state);
                 let best = current_trick_best(state);
                 let trump = state.trump_suit;
@@ -212,7 +209,7 @@ impl Evaluator for HeuristicEvaluator {
                 let mut chosen: Option<usize> = None;
                 let mut chosen_rank: i32 = i32::MAX;
                 // Prefer lowest legal that beats current winner.
-                for (pos, &c) in enc.hand_card_indices.iter().enumerate() {
+                for (pos, &c) in hand.iter().enumerate() {
                     if (legal >> c) & 1 != 1 {
                         continue;
                     }
@@ -227,7 +224,7 @@ impl Evaluator for HeuristicEvaluator {
                 // Fallback: lowest legal card overall.
                 if chosen.is_none() {
                     let mut lo: i32 = i32::MAX;
-                    for (pos, &c) in enc.hand_card_indices.iter().enumerate() {
+                    for (pos, &c) in hand.iter().enumerate() {
                         if (legal >> c) & 1 != 1 {
                             continue;
                         }
@@ -238,7 +235,7 @@ impl Evaluator for HeuristicEvaluator {
                         }
                     }
                 }
-                let mut policy = vec![0.0f32; enc.hand_card_indices.len()];
+                let mut policy = vec![0.0f32; hand.len()];
                 if let Some(p) = chosen {
                     policy[p] = 1.0;
                 }
@@ -253,6 +250,7 @@ impl Evaluator for HeuristicEvaluator {
 mod tests {
     use super::*;
     use crate::dealing::deal;
+    use crate::encoder::encode;
     use crate::game::new_game;
     use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
 

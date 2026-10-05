@@ -5,7 +5,8 @@
 //! that the Transformer encoder (Session 3.2) consumes.
 //!
 //! Input tensors (constructed by callers; see [`pad_batch`]):
-//! - `features: [B, S, 48]` f32 — per-token features, right-padded to 48
+//! - `features: [B, S, FEAT_DIM]` f32 — per-token features, right-padded to
+//!   `FEAT_DIM` (the encoder's widest token type)
 //! - `token_types: [B, S]` i64 — values 0..=4 (see encoder constants)
 //! - `chrono_indices: [B, S]` i64 — 0..52 for played tokens, 0 elsewhere
 //! - `attention_mask: [B, S]` bool — true for real tokens, false for padding
@@ -13,16 +14,16 @@
 //! Output: `[B, S, 128]` f32 with padding rows zeroed.
 
 use blob_engine::encoder::{
-    EncodedState, CONTEXT_DIM as ENC_CONTEXT_DIM, HAND_CARD_DIM, PLAYED_CARD_DIM,
-    PLAYER_STATE_DIM, TOKEN_TYPE_CLS, TOKEN_TYPE_CONTEXT, TOKEN_TYPE_HAND,
+    EncodedState, CONTEXT_DIM as ENC_CONTEXT_DIM, FEAT_DIM as ENC_FEAT_DIM, HAND_CARD_DIM,
+    PLAYED_CARD_DIM, PLAYER_STATE_DIM, TOKEN_TYPE_CLS, TOKEN_TYPE_CONTEXT, TOKEN_TYPE_HAND,
     TOKEN_TYPE_PLAYED, TOKEN_TYPE_PLAYER,
 };
 use tch::{nn, nn::Module, Tensor};
 
 pub const D_MODEL: i64 = 128;
-/// Max per-token feature width (played card = 48). All features are
+/// Max per-token feature width (`encoder::FEAT_DIM`). All features are
 /// right-padded to this width before being stacked into a batched tensor.
-pub const FEAT_DIM: i64 = PLAYED_CARD_DIM as i64;
+pub const FEAT_DIM: i64 = ENC_FEAT_DIM as i64;
 /// Chronological-embedding table size — max 52 plays in a 4P×13C round.
 pub const MAX_CHRONO: i64 = 52;
 
@@ -66,12 +67,12 @@ impl InputProjection {
     ) -> Tensor {
         let sz = features.size();
         assert_eq!(sz.len(), 3, "features must be [B, S, FEAT_DIM]");
-        assert_eq!(sz[2], FEAT_DIM, "last dim must equal FEAT_DIM (48)");
+        assert_eq!(sz[2], FEAT_DIM, "last dim must equal FEAT_DIM");
         let b = sz[0];
         let s = sz[1];
 
         // Per-type projections over the full [B, S, ...] tensor; each consumes
-        // only its meaningful prefix of the 48-dim feature vector.
+        // only its meaningful prefix of the padded feature vector.
         let hand_out = self.hand.forward(&features.narrow(-1, 0, HAND_DIM));
         let played_out = self.played.forward(&features.narrow(-1, 0, PLAYED_DIM));
         let player_out = self.player.forward(&features.narrow(-1, 0, PLAYER_DIM));
@@ -100,7 +101,7 @@ impl InputProjection {
 
 /// Batched tensor bundle produced from a slice of `EncodedState`s.
 pub struct InputBatch {
-    pub features: Tensor,       // [B, S, 48] f32
+    pub features: Tensor,       // [B, S, FEAT_DIM] f32
     pub token_types: Tensor,    // [B, S] i64
     pub chrono_indices: Tensor, // [B, S] i64
     pub attention_mask: Tensor, // [B, S] bool
@@ -110,7 +111,7 @@ pub struct InputBatch {
 ///
 /// Sequence length is the max `num_tokens` across the batch; shorter
 /// sequences are right-padded. Per-token feature vectors are right-padded to
-/// `FEAT_DIM` (48).
+/// `FEAT_DIM`.
 pub fn pad_batch(states: &[EncodedState], device: tch::Device) -> InputBatch {
     let b = states.len();
     assert!(b > 0, "batch must be non-empty");

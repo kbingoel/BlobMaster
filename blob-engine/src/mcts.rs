@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 
 use crate::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
 use crate::bidding::{apply_bid, legal_bids};
-use crate::encoder::encode;
+use crate::encoder::hand_card_indices;
 use crate::evaluator::{Evaluator, NUM_BIDS};
 use crate::playing::{apply_play, legal_plays};
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
@@ -353,10 +353,10 @@ pub fn expand(arena: &mut MctsArena, node_idx: u32, state: &BlobState, policy: &
                 arena.node_mut(node_idx).children = new_children;
             }
             GamePhase::Playing => {
-                let enc = encode(state, state.current_player);
+                let hand = hand_card_indices(state, state.current_player);
                 let legal = legal_plays(state);
                 let mut new_children: SmallVec<[u32; 14]> = SmallVec::new();
-                for (pos, &card_idx) in enc.hand_card_indices.iter().enumerate() {
+                for (pos, &card_idx) in hand.iter().enumerate() {
                     if (legal >> card_idx) & 1 == 1 {
                         let prior = policy.get(pos).copied().unwrap_or(0.0);
                         new_children.push(arena.alloc(prior, card_idx));
@@ -736,14 +736,29 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
     );
 }
 
+/// Index of the most-visited action. Ties go to the higher prior, then to
+/// the lower index (gen-2.md §5.4: with near-flat visits, the gen-1
+/// `max_by_key` handed ties to the highest bid). `priors` shorter than
+/// `visits` reads as 0. Returns 0 for an empty slice.
+fn most_visited<V: PartialOrd + Copy>(visits: &[V], priors: &[f32]) -> usize {
+    let prior = |i: usize| priors.get(i).copied().unwrap_or(0.0);
+    let mut best = 0;
+    for i in 1..visits.len() {
+        if visits[i] > visits[best] || (visits[i] == visits[best] && prior(i) > prior(best)) {
+            best = i;
+        }
+    }
+    best
+}
+
 /// Action probabilities over the root's children, sharpened/flattened by
 /// temperature `tau`. Returns `(action, probability)` pairs in the order
 /// children were allocated (phase-stable action labels).
 ///
 /// - `tau == 1.0`: directly proportional to visit counts.
-/// - `tau → 0`: approaches argmax on visit count (deterministic); the
-///   implementation treats `tau < 1e-3` as argmax to avoid `f32::powf`
-///   overflow.
+/// - `tau → 0`: approaches argmax on visit count (deterministic; ties go to
+///   the higher prior); the implementation treats `tau < 1e-3` as argmax to
+///   avoid `f32::powf` overflow.
 /// - `tau > 1.0`: flatter distribution (more exploration).
 ///
 /// Returns an empty vec if the root is unexpanded.
@@ -767,16 +782,9 @@ pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
     let total_visits: u32 = visits.iter().map(|(_, n)| *n).sum();
     if tau < 1e-3 || total_visits == 0 {
         let mut out: Vec<(u8, f32)> = visits.iter().map(|(a, _)| (*a, 0.0)).collect();
-        // Pick the first child with the max visit count. Ties break on
-        // allocation order, matching `select_best_child`.
-        let (mut best_i, mut best_n) = (0usize, 0u32);
-        for (i, (_, n)) in visits.iter().enumerate() {
-            if *n > best_n {
-                best_n = *n;
-                best_i = i;
-            }
-        }
-        out[best_i].1 = 1.0;
+        let counts: Vec<u32> = visits.iter().map(|(_, n)| *n).collect();
+        let priors: Vec<f32> = root.children.iter().map(|&c| arena.node(c).prior).collect();
+        out[most_visited(&counts, &priors)].1 = 1.0;
         return out;
     }
 
@@ -1050,6 +1058,10 @@ impl Default for MctsConfig {
 pub struct MctsResult {
     pub policy_target: Vec<f32>,
     pub policy_sampling: Vec<f32>,
+    /// Root prior per action, indexed like `policy_target`, averaged over
+    /// the determinizations (after root noise, when on). Breaks visit ties
+    /// for greedy play.
+    pub root_prior: Vec<f32>,
     pub visit_entropy: f32,
     pub top1_visit_share: f32,
     pub total_visits: u32,
@@ -1154,6 +1166,7 @@ where
             return MctsResult {
                 policy_target: Vec::new(),
                 policy_sampling: Vec::new(),
+                root_prior: Vec::new(),
                 visit_entropy: 0.0,
                 top1_visit_share: 0.0,
                 total_visits: 0,
@@ -1176,7 +1189,7 @@ where
                 (NUM_BIDS, SmallVec::<[u8; 13]>::new(), n, forced)
             }
             GamePhase::Playing => {
-                let enc = encode(state, perspective);
+                let hand = hand_card_indices(state, perspective);
                 let legal = legal_plays(state);
                 let n = legal.count_ones() as usize;
                 let forced = if n == 1 {
@@ -1184,7 +1197,7 @@ where
                 } else {
                     None
                 };
-                (enc.hand_card_indices.len(), enc.hand_card_indices, n, forced)
+                (hand.len(), hand, n, forced)
             }
             _ => unreachable!(),
         };
@@ -1201,7 +1214,8 @@ where
             }
             return MctsResult {
                 policy_target: policy.clone(),
-                policy_sampling: policy,
+                policy_sampling: policy.clone(),
+                root_prior: policy,
                 visit_entropy: 0.0,
                 top1_visit_share: 1.0,
                 total_visits: 0,
@@ -1283,6 +1297,7 @@ where
         );
 
         let mut agg_visits = vec![0u64; policy_len];
+        let mut root_prior = vec![0.0f32; policy_len];
         let mut total_visits: u32 = 0;
         let mut value_sum = 0.0f32;
         let mut value_n = 0u32;
@@ -1295,6 +1310,7 @@ where
                     action_to_policy_index(phase, child.action, &hand_card_indices)
                 {
                     agg_visits[idx] += child.visit_count as u64;
+                    root_prior[idx] += child.prior / arenas.len() as f32;
                     total_visits = total_visits.saturating_add(child.visit_count);
                 }
             }
@@ -1314,11 +1330,11 @@ where
         // the two are identical (recovers the pre-Step-3 fused
         // behaviour bit-for-bit on those decisions).
         let tau_sampling = cfg.temperature_at(decision_index);
-        let policy_target = visits_to_policy(&agg_visits, policy_len, 1.0);
+        let policy_target = visits_to_policy(&agg_visits, &root_prior, 1.0);
         let policy_sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
             policy_target.clone()
         } else {
-            visits_to_policy(&agg_visits, policy_len, tau_sampling)
+            visits_to_policy(&agg_visits, &root_prior, tau_sampling)
         };
 
         // Diagnostics read from the τ=1 target: that's the canonical
@@ -1338,6 +1354,7 @@ where
         MctsResult {
             policy_target,
             policy_sampling,
+            root_prior,
             visit_entropy,
             top1_visit_share,
             total_visits,
@@ -1347,22 +1364,18 @@ where
 }
 
 /// Map aggregated root visit counts to a dense probability vector at
-/// temperature `tau`. `tau < 1e-3` collapses to one-hot on the argmax
-/// visit; `tau == 1.0` is proportional to visits. Empty / all-zero
-/// inputs return an all-zero vector (caller treats as no-op).
-fn visits_to_policy(agg_visits: &[u64], policy_len: usize, tau: f32) -> Vec<f32> {
-    let mut policy = vec![0.0f32; policy_len];
+/// temperature `tau`. `tau < 1e-3` collapses to one-hot on the most-visited
+/// action, ties going to the higher `priors` entry; `tau == 1.0` is
+/// proportional to visits. Empty / all-zero inputs return an all-zero
+/// vector (caller treats as no-op).
+fn visits_to_policy(agg_visits: &[u64], priors: &[f32], tau: f32) -> Vec<f32> {
+    let mut policy = vec![0.0f32; agg_visits.len()];
     let sum_visits: u64 = agg_visits.iter().sum();
     if sum_visits == 0 {
         return policy;
     }
     if tau < 1e-3 {
-        let (best_i, _) = agg_visits
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, v)| **v)
-            .unwrap();
-        policy[best_i] = 1.0;
+        policy[most_visited(agg_visits, priors)] = 1.0;
         return policy;
     }
     let inv_tau = 1.0 / tau;
@@ -1384,6 +1397,7 @@ mod tests {
     use super::*;
     use crate::bidding::{apply_bid as bid_apply, legal_bids as bid_legal};
     use crate::dealing::deal;
+    use crate::encoder::encode;
     use crate::evaluator::DummyEvaluator;
     use crate::game::new_game;
     use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
@@ -1902,6 +1916,7 @@ mod tests {
         let r = MctsResult {
             policy_target: vec![0.25, 0.25, 0.25, 0.25],
             policy_sampling: vec![0.25, 0.25, 0.25, 0.25],
+            root_prior: vec![0.25, 0.25, 0.25, 0.25],
             visit_entropy: (4f32).ln(),
             top1_visit_share: 0.25,
             total_visits: 40,
@@ -2148,6 +2163,53 @@ mod tests {
         // Exactly one non-zero entry at 1.0.
         let ones = probs.iter().filter(|(_, p)| *p == 1.0).count();
         assert_eq!(ones, 1);
+    }
+
+    #[test]
+    fn greedy_ties_go_to_the_higher_prior_then_the_lower_index() {
+        // Visits tie at 7 between indices 1, 2 and 3; index 2 has the
+        // highest prior. Gen 1's `max_by_key` picked the last (3).
+        let visits = [3u64, 7, 7, 7, 0];
+        let priors = [0.1, 0.2, 0.4, 0.2, 0.1];
+        assert_eq!(most_visited(&visits, &priors), 2);
+        assert_eq!(visits_to_policy(&visits, &priors, 0.0), vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+        // Equal priors too: the lower index wins.
+        assert_eq!(most_visited(&visits, &[0.2; 5]), 1);
+        // A visit lead beats any prior.
+        assert_eq!(most_visited(&[5u64, 4], &[0.0, 1.0]), 0);
+    }
+
+    #[test]
+    fn root_action_probs_argmax_breaks_visit_ties_by_prior() {
+        let mut arena = MctsArena::new(0);
+        for (action, prior, visits) in [(0u8, 0.2f32, 5u32), (1, 0.5, 5), (2, 0.3, 5)] {
+            let c = arena.alloc(prior, action);
+            arena.node_mut(c).visit_count = visits;
+            arena.node_mut(0).children.push(c);
+        }
+        let probs = root_action_probs(&arena, 0.0);
+        assert_eq!(probs, vec![(0, 0.0), (1, 1.0), (2, 0.0)]);
+    }
+
+    #[test]
+    fn mcts_search_reports_root_priors() {
+        // DummyEvaluator priors are uniform over legal bids, so the averaged
+        // root prior is too.
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let mut s = new_game(4, 5).unwrap();
+        deal(&mut s, &mut rng);
+        let mask = bid_legal(&s);
+        let cfg = MctsConfig {
+            num_determinizations: 2,
+            sims_per_determinization: 30,
+            ..MctsConfig::default()
+        };
+        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let n = mask.count_ones() as f32;
+        for (b, &p) in r.root_prior.iter().enumerate() {
+            let expected = if (mask >> b) & 1 == 1 { 1.0 / n } else { 0.0 };
+            assert!((p - expected).abs() < 1e-6, "bid {b}: {p}");
+        }
     }
 
     /// fix-mcts-plan.md Step 1: a Dirichlet(α, …, α) sample of length `n`

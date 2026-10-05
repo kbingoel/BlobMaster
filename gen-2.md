@@ -2,7 +2,7 @@
 
 The single source of truth for the remake. It replaces every gen-1 planning document (`development-plan.md`, `fix-mcts-plan.md`, `async.md`, `self-play-profile.md` and others), which were retired on 2026-10-02. §10 maps each one to where its surviving content went and how to read the original from git.
 
-Status, 2026-10-02: gen 1 is concluded; Phase 0 (§6) is done except the human playtest and the deferred `.git` rewrite; Phase 1 is next.
+Status, 2026-10-05: gen 1 is concluded; Phase 0 (§6) is done except the human playtest and the deferred `.git` rewrite; Phase 1 is done; Phase 2 is next.
 
 ---
 
@@ -130,20 +130,20 @@ The signal ratio is 1 − H(visits)/ln(number of legal moves); 0 means visits sp
 
 ### 2.8 Other confirmed defects (fix during gen 2)
 
-| Defect | Where | Effect |
-|---|---|---|
-| "Not yet bid" encodes like "bid 0, already made" (no `has_bid`) | `encoder.rs` player tokens; `dealing.rs` resets bids to 0 | the network misreads earlier bidders' bids |
-| No bid-sum / bids-to-come features | `encoder.rs` context token | the network must add up bids through attention |
-| Seats encoded as absolute one-hots | `encoder.rs` player and played-card tokens | no symmetry across seats; mixed table sizes are hard |
-| Count features not scaled (up to 13) | `encoder.rs` hand-card features | minor |
-| `is_highest_in_suit` counts my own higher cards as unseen | `encoder.rs` | minor |
-| Greedy pick breaks ties to the **last** index | `mcts.rs::visits_to_policy` (`max_by_key`) | with flat bid visits, ties go to the highest bid |
-| `void_suits` ignores the current trick | `belief.rs` | sampled deals contradict the encoder's void flags |
-| After 32 failed attempts, sampling drops **all** void constraints | `belief.rs` | about 3–7% of sampled deals ignore known voids |
-| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims |
-| `HeuristicEvaluator` ignores its own bid when playing | `evaluator.rs` | weak, incoherent baseline |
-| `DynEval` doesn't forward `evaluate_batch` | `eval.rs` | speed only |
-| `blobmaster play` / `analyze` are stubs | `blob-bin` | no way to play the bot properly |
+| Defect | Where | Effect | Status |
+|---|---|---|---|
+| "Not yet bid" encodes like "bid 0, already made" (no `has_bid`) | `encoder.rs` player tokens; `dealing.rs` resets bids to 0 | the network misreads earlier bidders' bids | fixed, Phase 1 |
+| No bid-sum / bids-to-come features | `encoder.rs` context token | the network must add up bids through attention | fixed, Phase 1 |
+| Seats encoded as absolute one-hots | `encoder.rs` player and played-card tokens | no symmetry across seats; mixed table sizes are hard | fixed, Phase 1 |
+| Count features not scaled (up to 13) | `encoder.rs` hand-card features | minor | fixed, Phase 1 |
+| `is_highest_in_suit` counts my own higher cards as unseen | `encoder.rs` | minor | fixed, Phase 1 |
+| Greedy pick breaks ties to the **last** index | `mcts.rs::visits_to_policy` (`max_by_key`) | with flat bid visits, ties go to the highest bid | fixed, Phase 1 |
+| `void_suits` ignores the current trick | `belief.rs` | sampled deals contradict the encoder's void flags | fixed, Phase 1 |
+| After 32 failed attempts, sampling drops **all** void constraints | `belief.rs` | about 3–7% of sampled deals ignore known voids | fixed, Phase 1 |
+| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims | open |
+| `HeuristicEvaluator` ignores its own bid when playing | `evaluator.rs` | weak, incoherent baseline | open (drop it, §9) |
+| `DynEval` doesn't forward `evaluate_batch` | `eval.rs` | speed only | fixed, Phase 1 (wrapper removed) |
+| `blobmaster play` / `analyze` are stubs | `blob-bin` | no way to play the bot properly | `play` built in Phase 0; `analyze` open |
 
 ---
 
@@ -222,11 +222,12 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 |---|---|---|
 | Game rules: `card`, `hand`, `state`, `dealing`, `bidding`, `playing`, `round`, `game` + 143 ported tests | **Keep** | Correct and fast. Add a helper to start a single round directly (§5.2) |
 | `scoring.rs` z-score helpers | **Replace** | Use the per-round utility (§5.1) |
-| `belief.rs` determinization | **Keep + fix** | Current-trick voids; partial fallback; later, weight sampled deals by the observed bids (§8) |
-| `encoder.rs` | **Keep structure, change features** | §5.5, plus a full-deal mode for the value net |
-| `mcts.rs` arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, separate τ for targets and sampling | **Keep** | Change the backup to all seats, the end-of-round value and the tie-break (§5.4). Delete per-seat counts |
+| `belief.rs` determinization | **Keep + fix** | Current-trick voids and partial fallback done (Phase 1). Later, weight sampled deals by the observed bids (§8) |
+| `encoder.rs` | **Keep structure, change features** | §5.5 items 1–6 done (Phase 1, layout v2); gen-1 layout frozen as `encoder::v1`. Still to do: suit augmentation, full-deal mode for the value net |
+| `mcts.rs` arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, separate τ for targets and sampling | **Keep** | Tie-break done (Phase 1). Change the backup to all seats and the end-of-round value (§5.4). Delete per-seat counts |
 | `onnx.rs` `OnnxEvaluator` | **Keep + extend** | Two sessions (policy and value), per-seat value output |
 | `rule_bot.rs` (new, 2026-10-02) | **Keep** | Fixed benchmark opponent and warm-start teacher |
+| `rule_bot_2.rs` (new, 2026-10-05) | **Keep** | Card-counting, bid-aware rule bot, no search: +14.5 ± 0.3 points/game vs the rule bot (5p/7c). A harder second yardstick and a stronger warm-start teacher; `bid_chances` / `play_chances` give per-action scores for soft targets. `rule_bot.rs` stays the reference yardstick |
 | `bench.rs` (new, 2026-10-02) | **Keep** | The §5.7 yardstick as a library: duplicate deals, CI over deals, bid stats by hand size. CLI: `blobmaster bench` |
 | `evaluator.rs` `HeuristicEvaluator` | **Drop** once eval uses the rule bot | Incoherent baseline |
 | `replay.rs` storage (raw `BlobState` + sparse policy) | **Keep layout** | Per-seat round scores instead of one value; concurrent wrapper; round-level validation split; delta persistence |
@@ -419,11 +420,33 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
   Both are measured after training, with dropout off. The logged training losses are not comparable: they are averaged over the iteration with dropout on.
 - `scripts/visualize_strength.py` plots both as `07_generalization.png`.
 
-**Phase 1 — Cheap correctness fixes**
-- [ ] Encoder items 1–6 from §5.5.
-- [ ] Determinization fixes.
-- [ ] Greedy tie-break; `DynEval` batch forwarding.
+**Phase 1 — Cheap correctness fixes** (done 2026-10-05)
+- [x] Encoder items 1–6 from §5.5 (layout v2, below).
+- [x] Determinization fixes.
+- [x] Greedy tie-break; `DynEval` batch forwarding.
 - *Exit:* unit tests pass. No training run needed.
+  - **Met.** `blob-engine` 272 unit + 44 integration tests, `blob-nn` 48 (including `five_games_produce_valid_examples`, failing since 2026-05-17, §9), `blob-bin` 6. ONNX↔tch parity passes on a freshly exported v2 model.
+  - **Gen 1 still runs as before:** `bench --mode network` on iter 167 gives −12.1 ± 2.0, identical to Phase 0.
+
+*As built:*
+- **Encoder layout v2** (`encoder.rs`). Token widths: hand 32, played 49, player 28, context 17; padded width `FEAT_DIM` = 49 (gen 1: 48).
+  - **Player tokens** come in relative-seat order (me first), with a relative-seat one-hot, `has_bid` and `is_to_move`. Bid, tricks needed and bid status stay 0 until the seat has bid. `has_bid` and `bid_order_position` are in `bidding.rs`.
+  - **Played cards:** relative-seat one-hot; `winning_so_far` on the trick in progress.
+  - **Hand cards:** counts / 13; `is_legal`; `beats_current_winner`, from `playing::beats` and `current_trick_winner`, which `apply_play` also uses. `is_highest` and `is_lowest` both ignore my own cards (§5.5 names only `is_highest`; the same reasoning applies to both).
+  - **Context:** bid sum / 13, seats still to bid / players, (sum − cards) / cards, my bidding position.
+  - **Removed:** cumulative scores. Void flags now read `belief::void_suits`.
+  - **Tests** check `is_legal` against `legal_plays`, `beats_current_winner` against actually playing the card, and that rotating every seat leaves the encoding unchanged.
+- **Gen-1 compatibility.** The gen-1 layout is frozen as `encoder::v1` and pinned bit-for-bit by a golden-hash test. `OnnxEvaluator` reads the model's `features` width (48 → v1, 49 → v2), so `bench`, `play`, diagnostics and `blobmaster-train evaluate` run either generation, mixed in one table too. Gen-1 `model.ot` weights no longer load into `BlobNet`: they can't be trained further or re-exported.
+- **Determinization** (`belief.rs`): `void_suits` includes the trick in progress. After 32 failed rejection attempts, `constrained_deal` deals seat by seat and only draws cards that keep the rest of the deal feasible (Hall's condition over suit sets). It relaxes only seats whose voids can't all be met together, which for a real game state is none.
+- **Greedy play:** most visits, ties to the higher root prior, then the lower index. This applies to τ→0 sampling, `root_action_probs` and `bench::search_action` (used by `bench` and `play`). `MctsResult.root_prior` holds the root priors averaged over sampled deals.
+- **`DynEval` removed:** `mcts_search` takes `&dyn Evaluator` directly, so batches reach `OnnxEvaluator::evaluate_batch`. MCTS also no longer encodes a whole state just to get the hand order (`encoder::hand_card_indices`).
+- **`scripts/export_onnx.py`** uses the v2 widths; the Rust test `export_script_mirrors_feature_widths` keeps them in sync.
+
+*Findings and open points:*
+- **Encoding got no slower:** 272 ns for `encode` (5p7c, mid-trick), against 297 ns for gen 1 (§3.1).
+- **`export_onnx.py --check` reports 1.9e-5 on a random tch init,** over its 1e-5 gate. tch's random init has ~2.5× the weight scale of torch's; with torch's init the new script gives 4.8e-7 (the old one 4.0e-7), so the layout isn't the cause. Trained gen-1 weights gave 4.5e-6. The training driver doesn't run `--check`.
+- **Context `round_number` is still an input.** §5.5 doesn't list it, and per-round targets don't need it. Once self-play plays single rounds (Phase 4) it no longer describes anything; decide then.
+- **A v2 layout change invalidates every v2 model.** Once Phase 2 has trained one, add a v3 next to it instead of editing v2.
 
 **Phase 2 — Per-round, per-seat values (cheap version, gen-1 driver)**
 - [ ] Per-round `u_s` targets; per-seat value head on P (own view); all-seat backup; exact end-of-round `u_s`.
@@ -434,7 +457,7 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 
 **Phase 3 — Full-deal value net + warm start**
 - [ ] V model + encoder V-mode + export + two-session evaluator; search leaves use V for all seats.
-- [ ] Supervised pre-training on rule-bot rounds: V on outcomes, P imitating the bot. This is also V's first test: held-out error, plus exactness on 1-card rounds.
+- [ ] Supervised pre-training on rule-bot rounds: V on outcomes, P imitating the bot. This is also V's first test: held-out error, plus exactness on 1-card rounds. Rule bot 2 (§4) is the stronger teacher to imitate.
 - [ ] Bench the pre-trained P+V with search before any RL.
 - [ ] Short RL run (gen-1 driver).
 - *Exit:* search bench ≥ +10 points per game vs the rule bot.
@@ -519,7 +542,7 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 **Still to do:**
 - **`HeuristicEvaluator`:** drop it once the driver's in-loop eval and `blobmaster-train evaluate` use `bench` (§4).
 - **Code comments still cite the retired documents,** about 50 references, most to `fix-mcts-plan.md`. Rewrite them as the code changes; until then use §10.
-- **Pre-existing test failure:** `blob-nn` `self_play::tests::five_games_produce_valid_examples` fails on `36bba81` (before Phase 0) too. Its 1×1 search budget gives no visits since the budget became config-driven (2026-05-17); raise it to a few simulations.
+- ~~**Pre-existing test failure:** `blob-nn` `self_play::tests::five_games_produce_valid_examples`.~~ Fixed 2026-10-05: its 1×1 search budget gave no visits once the budget became config-driven (2026-05-17); it now uses 1×4.
 
 ---
 

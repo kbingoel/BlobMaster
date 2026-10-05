@@ -33,6 +33,7 @@ pub mod profiling;
 pub mod replay;
 pub mod round;
 pub mod rule_bot;
+pub mod rule_bot_2;
 pub mod scoring;
 pub mod state;
 
@@ -50,6 +51,7 @@ pub use mcts::{
     MctsArena, MctsConfig, MctsNode, MctsResult, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
 pub use rule_bot::{rule_bot_action, rule_bot_bid, rule_bot_play};
+pub use rule_bot_2::{rule_bot_2_action, rule_bot_2_bid, rule_bot_2_play};
 pub use scoring::{terminal_z_scores, z_score_clip, Z_SCORE_EPS};
 pub use playing::{apply_play, legal_plays, score_round};
 pub use replay::{BidBatch, PlayBatch, ReplayBuffer, SparsePolicy, MAX_BID_ACTIONS, MAX_PLAY_ACTIONS};

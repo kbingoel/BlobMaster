@@ -52,6 +52,25 @@ pub fn forbidden_bid(state: &BlobState) -> Option<u8> {
     }
 }
 
+/// Position of `player` in this round's bidding order: 0 for the seat left
+/// of the dealer (first to bid) up to `num_players − 1` for the dealer.
+#[inline]
+pub fn bid_order_position(state: &BlobState, player: u8) -> u8 {
+    let n = state.num_players as usize;
+    let first = (state.dealer as usize + 1) % n;
+    ((player as usize + n - first) % n) as u8
+}
+
+/// True iff `player` has bid this round. `bids` holds 0 for a seat that
+/// hasn't bid yet, so this is the only way to tell "not yet" from "bid 0".
+/// During bidding the seats ahead of `current_player` in bidding order have
+/// bid; after bidding every seat has.
+#[inline]
+pub fn has_bid(state: &BlobState, player: u8) -> bool {
+    state.phase() != GamePhase::Bidding
+        || bid_order_position(state, player) < bid_order_position(state, state.current_player)
+}
+
 /// Apply `bid` for the current player and advance bidding state.
 ///
 /// When the dealer bids (last in order), transitions to the playing phase
@@ -155,6 +174,32 @@ mod tests {
         // Others sum to 2 → forbidden = -1 ⇒ None.
         s.bids[2] = 1;
         assert_eq!(forbidden_bid(&s), None);
+    }
+
+    // -- has_bid / bid_order_position ----------------------------------------
+
+    #[test]
+    fn bid_order_starts_left_of_dealer_and_ends_at_dealer() {
+        let s = bidding_state(5, 7, 3);
+        let order: Vec<u8> = (0..5).map(|p| bid_order_position(&s, p)).collect();
+        // Seats 4, 0, 1, 2 bid first … dealer 3 bids last.
+        assert_eq!(order, vec![1, 2, 3, 4, 0]);
+    }
+
+    #[test]
+    fn has_bid_tracks_bidding_progress_including_zero_bids() {
+        let mut s = bidding_state(4, 5, 2);
+        assert!((0..4).all(|p| !has_bid(&s, p)), "nobody has bid at the start");
+        apply_bid(&mut s, 0); // seat 3 bids 0
+        assert!(has_bid(&s, 3), "a 0 bid still counts as bid");
+        assert!(!has_bid(&s, 0) && !has_bid(&s, 1) && !has_bid(&s, 2));
+        apply_bid(&mut s, 2); // seat 0
+        apply_bid(&mut s, 1); // seat 1
+        assert!(has_bid(&s, 0) && has_bid(&s, 1) && !has_bid(&s, 2), "dealer still to bid");
+        let dealer_bid = legal_set(&s)[0];
+        apply_bid(&mut s, dealer_bid);
+        assert_eq!(s.phase(), GamePhase::Playing);
+        assert!((0..4).all(|p| has_bid(&s, p)), "everyone has bid once play starts");
     }
 
     // -- legal_bids ----------------------------------------------------------

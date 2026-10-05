@@ -1,115 +1,212 @@
-//! Entity encoder — Section 2: raw feature vectors for neural network input.
+//! Entity encoder: raw per-token feature vectors for the network.
 //!
-//! Session 2.1: Hand card token encoder.
-//! Produces a `Vec<[f32; 30]>` of per-card feature vectors for the
-//! perspective player's hand, emitted in `Hand::iter()` order (ascending
-//! card index — the canonical action order).
+//! `encode(state, perspective)` → [`EncodedState`]: the variable-length
+//! sequence `[CLS, context, players…, hand cards…, played cards…]` with
+//! token type IDs, chronological indices for played cards, and the
+//! hand-card index mapping.
 //!
-//! Session 2.2: Played card tokens and player state tokens.
-//! Produces chronologically-ordered 48-dim played card tokens and
-//! per-player 29-dim state tokens with void detection.
+//! Feature layout v2 (gen-2.md §5.5). Everything is seen from
+//! `perspective`:
+//! - **Seats are relative.** "Me" is seat 0, then the seats after me in
+//!   play order. Player tokens are emitted in that order.
+//! - **`has_bid`** on player tokens, so "not yet bid" differs from "bid 0".
+//! - **Bid context:** bids so far, seats still to bid, over/under-bid, and
+//!   my place in bidding order.
+//! - **Trick features:** "winning so far" on current-trick cards; "legal"
+//!   and "beats the current winner" on hand cards.
+//! - Counts are scaled to [0, 1]; "highest/lowest in suit" ignore my own
+//!   cards; cumulative scores are not an input.
 //!
-//! Session 2.3: Context token, CLS placeholder, full sequence assembly.
-//! `encode(state, perspective)` → `EncodedState` with variable-length
-//! token sequence `[CLS, context, player_states…, hand_cards…, played_cards…]`,
-//! token type IDs, chronological indices, and hand-card index mapping.
+//! Gen-1 checkpoints were trained on the frozen layout in [`v1`];
+//! [`EncoderVersion`] selects between them.
 
-use crate::bidding::forbidden_bid;
-use crate::card::{Card, NUM_SUITS};
+use crate::belief::void_suits;
+use crate::bidding::{bid_order_position, forbidden_bid, has_bid};
+use crate::card::{Card, NUM_RANKS, NUM_SUITS};
 use crate::hand::Hand;
+use crate::playing::{beats, current_trick_winner};
 use crate::round::total_rounds;
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 use smallvec::SmallVec;
 
+pub mod v1;
+
 /// Dimensionality of a hand-card token.
-pub const HAND_CARD_DIM: usize = 30;
+pub const HAND_CARD_DIM: usize = 32;
+
+/// Dimensionality of a played-card token.
+pub const PLAYED_CARD_DIM: usize = 49;
+
+/// Dimensionality of a player-state token.
+pub const PLAYER_STATE_DIM: usize = 28;
+
+/// Dimensionality of the context token.
+pub const CONTEXT_DIM: usize = 17;
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Per-token feature width of the network input: every token is
+/// right-padded to the widest token type.
+pub const FEAT_DIM: usize = max(
+    max(HAND_CARD_DIM, PLAYED_CARD_DIM),
+    max(PLAYER_STATE_DIM, CONTEXT_DIM),
+);
+
+/// Token type IDs (0–4) for each position in the assembled sequence.
+pub const TOKEN_TYPE_CLS: u8 = 0;
+pub const TOKEN_TYPE_CONTEXT: u8 = 1;
+pub const TOKEN_TYPE_PLAYER: u8 = 2;
+pub const TOKEN_TYPE_HAND: u8 = 3;
+pub const TOKEN_TYPE_PLAYED: u8 = 4;
+
+/// Feature layout a model was trained on. The token sequence is the same in
+/// both; only the per-token features differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderVersion {
+    /// Gen 1 ([`v1`], 48 features per token).
+    V1,
+    /// Gen 2 (this module, [`FEAT_DIM`] features per token).
+    V2,
+}
+
+impl EncoderVersion {
+    /// The layout new models are trained on.
+    pub const CURRENT: Self = Self::V2;
+
+    /// The version whose padded token width is `feat_dim`, as read from a
+    /// model's `features` input. `None` for an unknown width.
+    pub fn from_feat_dim(feat_dim: usize) -> Option<Self> {
+        match feat_dim {
+            v1::FEAT_DIM => Some(Self::V1),
+            FEAT_DIM => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Padded per-token feature width.
+    pub fn feat_dim(self) -> usize {
+        match self {
+            Self::V1 => v1::FEAT_DIM,
+            Self::V2 => FEAT_DIM,
+        }
+    }
+
+    /// Encode `state` from `perspective` in this layout.
+    pub fn encode(self, state: &BlobState, perspective: u8) -> EncodedState {
+        match self {
+            Self::V1 => v1::encode(state, perspective),
+            Self::V2 => encode(state, perspective),
+        }
+    }
+}
+
+/// Seat of `player` relative to `perspective`: 0 for `perspective`, then 1,
+/// 2, … for the seats after it in play order.
+#[inline]
+pub fn relative_seat(state: &BlobState, perspective: u8, player: u8) -> u8 {
+    (player + state.num_players - perspective) % state.num_players
+}
+
+/// Card indices of `perspective`'s hand in `Hand::iter()` order: the
+/// play-policy action order, identical to `EncodedState::hand_card_indices`
+/// without encoding the rest of the state.
+#[inline]
+pub fn hand_card_indices(state: &BlobState, perspective: u8) -> SmallVec<[u8; 13]> {
+    Hand::new(state.hands[perspective as usize]).iter().map(|c| c.index()).collect()
+}
+
+#[inline]
+fn flag(b: bool) -> f32 {
+    if b {
+        1.0
+    } else {
+        0.0
+    }
+}
 
 /// Encode the perspective player's hand cards into feature vectors.
 ///
-/// Each card in the hand produces a 30-dimensional feature vector:
+/// Each card in the hand produces a 32-dimensional feature vector:
 /// - `[0..16)`: rank one-hot (13 values + 3 padding)
 /// - `[16..24)`: suit one-hot (4 values + 4 padding)
 /// - `[24]`: is_trump
-/// - `[25]`: suit_count_in_hand
-/// - `[26]`: is_highest_in_suit (among cards of that suit still in play)
-/// - `[27]`: is_lowest_in_suit (among cards of that suit still in play)
-/// - `[28]`: cards_above_remaining (same suit, higher rank, not in hand, not played)
-/// - `[29]`: cards_below_remaining (same suit, lower rank, not in hand, not played)
+/// - `[25]`: suit_count_in_hand / 13
+/// - `[26]`: is_highest_in_suit: no unseen card of the suit outranks it
+/// - `[27]`: is_lowest_in_suit: no unseen card of the suit ranks below it
+/// - `[28]`: cards_above_unseen / 13 (same suit, higher, not mine, not played)
+/// - `[29]`: cards_below_unseen / 13 (same suit, lower, not mine, not played)
+/// - `[30]`: is_legal: playable into the current trick (follow suit if able);
+///   0 during bidding
+/// - `[31]`: beats_current_winner: would take the trick in progress from the
+///   card winning it so far; 0 when no card has been played
+///
+/// "Unseen" cards are neither in my hand nor played this round, so they may
+/// be in an opponent's hand (or undealt). My own cards don't count against
+/// `is_highest` / `is_lowest`: holding A♠ doesn't stop my K♠ from being the
+/// best spade an opponent can face.
 ///
 /// Tokens are emitted in `Hand::iter()` order (ascending card index).
 /// This is the canonical action order used by the playing head and MCTS.
 pub fn encode_hand_cards(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_CARD_DIM]> {
     let hand = Hand::new(state.hands[perspective as usize]);
     let trump = state.trump_suit;
-    let played = state.played_this_round;
     let deck_mask: u64 = (1u64 << 52) - 1;
+    let unseen = !hand.bits() & !state.played_this_round & deck_mask;
+    let counts = NUM_RANKS as f32;
 
-    // Cards not in own hand and not yet played — "unknown remaining" for
-    // cards_above_remaining / cards_below_remaining.
-    let unknown_remaining = !hand.bits() & !played & deck_mask;
-
-    // Cards still alive (not yet played) — includes our hand.
-    // Used for is_highest_in_suit / is_lowest_in_suit.
-    let alive = !played & deck_mask;
+    // Follow-suit rule and current winner for the trick in progress.
+    let playing = state.phase() == GamePhase::Playing;
+    let trick = current_trick_winner(state).filter(|_| playing).map(|slot| {
+        let led = state.trick_play_order[0] / NUM_RANKS;
+        (led, state.trick_play_order[slot as usize])
+    });
+    let legal = match trick {
+        _ if !playing => 0,
+        None => hand.bits(),
+        Some((led, _)) => {
+            let of_led = hand.bits() & (0x1FFFu64 << (led * NUM_RANKS));
+            if of_led != 0 {
+                of_led
+            } else {
+                hand.bits()
+            }
+        }
+    };
 
     let mut tokens = Vec::with_capacity(hand.count() as usize);
-
     for card in hand.iter() {
         let mut feat = [0.0f32; HAND_CARD_DIM];
         let suit = card.suit();
-        let rank = card.rank();
         let idx = card.index();
 
-        // Rank one-hot: [0..16), 13 values + 3 padding slots.
-        feat[rank as usize] = 1.0;
-
-        // Suit one-hot: [16..24), 4 values + 4 padding slots.
+        feat[card.rank() as usize] = 1.0;
         feat[16 + suit.index() as usize] = 1.0;
+        feat[24] = flag(trump < NUM_SUITS && suit.index() == trump);
+        feat[25] = hand.cards_of_suit(suit).count_ones() as f32 / counts;
 
-        // is_trump: [24].
-        let is_trump = trump < NUM_SUITS && suit.index() == trump;
-        feat[24] = if is_trump { 1.0 } else { 0.0 };
-
-        // suit_count_in_hand: [25].
-        feat[25] = hand.cards_of_suit(suit).count_ones() as f32;
-
-        // Precompute masks for cards of the same suit strictly above/below.
         let suit_mask = suit.mask();
         let above_in_suit = suit_mask & !((1u64 << (idx + 1)) - 1);
-        let below_in_suit = if idx == 0 { 0 } else { suit_mask & ((1u64 << idx) - 1) };
-        let alive_of_suit = alive & suit_mask;
+        let below_in_suit = suit_mask & ((1u64 << idx) - 1);
+        let above = (unseen & above_in_suit).count_ones();
+        let below = (unseen & below_in_suit).count_ones();
+        feat[26] = flag(above == 0);
+        feat[27] = flag(below == 0);
+        feat[28] = above as f32 / counts;
+        feat[29] = below as f32 / counts;
 
-        // is_highest_in_suit: [26]. No alive card of same suit outranks this.
-        feat[26] = if (alive_of_suit & above_in_suit) == 0 {
-            1.0
-        } else {
-            0.0
-        };
-
-        // is_lowest_in_suit: [27]. No alive card of same suit is lower-ranked.
-        feat[27] = if (alive_of_suit & below_in_suit) == 0 {
-            1.0
-        } else {
-            0.0
-        };
-
-        // cards_above_remaining: [28]. Unknown remaining in same suit, higher rank.
-        feat[28] = (unknown_remaining & above_in_suit).count_ones() as f32;
-
-        // cards_below_remaining: [29]. Unknown remaining in same suit, lower rank.
-        feat[29] = (unknown_remaining & below_in_suit).count_ones() as f32;
+        feat[30] = flag((legal >> idx) & 1 == 1);
+        feat[31] = flag(trick.is_some_and(|(led, best)| beats(idx, best, led, trump)));
 
         tokens.push(feat);
     }
-
     tokens
 }
-
-/// Dimensionality of a played-card token.
-pub const PLAYED_CARD_DIM: usize = 48;
-
-/// Dimensionality of a player-state token.
-pub const PLAYER_STATE_DIM: usize = 29;
 
 /// A played-card token with its chronological position index.
 ///
@@ -121,12 +218,12 @@ pub struct PlayedCardToken {
     pub chrono_index: u8,
 }
 
-/// Encode all played cards into 48-dim feature vectors in chronological order.
+/// Encode all played cards into 49-dim feature vectors in chronological order.
 ///
 /// Each played card token:
 /// - `[0..16)`: rank one-hot (13 values + 3 padding)
 /// - `[16..24)`: suit one-hot (4 values + 4 padding)
-/// - `[24..40)`: player one-hot (up to 8 values + 8 padding)
+/// - `[24..40)`: relative seat of the player one-hot (up to 8 + 8 padding)
 /// - `[40]`: trick_number (normalized by cards_dealt)
 /// - `[41]`: position_in_trick (normalized to \[0, 1\])
 /// - `[42]`: was_lead
@@ -135,10 +232,12 @@ pub struct PlayedCardToken {
 /// - `[45]`: trick_complete
 /// - `[46]`: won_trick (only for the winning card of a completed trick)
 /// - `[47]`: is_current_trick
+/// - `[48]`: winning_so_far (only for the card currently winning the trick
+///   in progress)
 ///
 /// Iterates `trick_history[0..tricks_completed]` then current trick's
 /// `trick_play_order[0..trick_cards_played]` in strict chronological order.
-pub fn encode_played_cards(state: &BlobState) -> Vec<PlayedCardToken> {
+pub fn encode_played_cards(state: &BlobState, perspective: u8) -> Vec<PlayedCardToken> {
     let np = state.num_players as usize;
     let trump = state.trump_suit;
     let cd = state.cards_dealt.max(1) as f32;
@@ -148,35 +247,30 @@ pub fn encode_played_cards(state: &BlobState) -> Vec<PlayedCardToken> {
     let mut tokens = Vec::with_capacity(total_played);
     let mut chrono: u8 = 0;
 
+    // Features shared by both kinds of trick; `slot` is the card's
+    // position in its trick.
+    let base = |player: u8, card_idx: u8, trick: usize, slot: usize, led: u8| {
+        let card = Card::from_index_unchecked(card_idx);
+        let mut feat = [0.0f32; PLAYED_CARD_DIM];
+        feat[card.rank() as usize] = 1.0;
+        feat[16 + card.suit().index() as usize] = 1.0;
+        feat[24 + relative_seat(state, perspective, player) as usize] = 1.0;
+        feat[40] = trick as f32 / cd;
+        feat[41] = slot as f32 / pos_norm;
+        feat[42] = flag(slot == 0);
+        feat[43] = flag(card.suit().index() == led);
+        feat[44] = flag(trump < NUM_SUITS && card.suit().index() == trump);
+        feat
+    };
+
     // Completed tricks.
     for t in 0..state.tricks_completed as usize {
         let rec = &state.trick_history[t];
         for i in 0..rec.num_played as usize {
             let (player, card_idx) = rec.cards[i];
-            let card = Card::from_index_unchecked(card_idx);
-            let mut feat = [0.0f32; PLAYED_CARD_DIM];
-
-            feat[card.rank() as usize] = 1.0;
-            feat[16 + card.suit().index() as usize] = 1.0;
-            feat[24 + player as usize] = 1.0;
-
-            feat[40] = t as f32 / cd;
-            feat[41] = i as f32 / pos_norm;
-            feat[42] = if i == 0 { 1.0 } else { 0.0 };
-            feat[43] = if card.suit().index() == rec.suit_led {
-                1.0
-            } else {
-                0.0
-            };
-            feat[44] = if trump < NUM_SUITS && card.suit().index() == trump {
-                1.0
-            } else {
-                0.0
-            };
+            let mut feat = base(player, card_idx, t, i, rec.suit_led);
             feat[45] = 1.0; // trick_complete
-            feat[46] = if player == rec.winner { 1.0 } else { 0.0 };
-            feat[47] = 0.0; // is_current_trick
-
+            feat[46] = flag(player == rec.winner);
             tokens.push(PlayedCardToken {
                 features: feat,
                 chrono_index: chrono,
@@ -186,38 +280,14 @@ pub fn encode_played_cards(state: &BlobState) -> Vec<PlayedCardToken> {
     }
 
     // Current (in-progress) trick.
-    if state.trick_cards_played > 0 {
-        let led_card = Card::from_index_unchecked(state.trick_play_order[0]);
-        let led_suit = led_card.suit().index();
-        let trick_num = state.tricks_completed as usize;
-
+    if let Some(winning_slot) = current_trick_winner(state) {
+        let led = state.trick_play_order[0] / NUM_RANKS;
+        let trick = state.tricks_completed as usize;
         for i in 0..state.trick_cards_played as usize {
-            let card_idx = state.trick_play_order[i];
-            let card = Card::from_index_unchecked(card_idx);
             let player = (state.trick_leader + i as u8) % state.num_players;
-            let mut feat = [0.0f32; PLAYED_CARD_DIM];
-
-            feat[card.rank() as usize] = 1.0;
-            feat[16 + card.suit().index() as usize] = 1.0;
-            feat[24 + player as usize] = 1.0;
-
-            feat[40] = trick_num as f32 / cd;
-            feat[41] = i as f32 / pos_norm;
-            feat[42] = if i == 0 { 1.0 } else { 0.0 };
-            feat[43] = if card.suit().index() == led_suit {
-                1.0
-            } else {
-                0.0
-            };
-            feat[44] = if trump < NUM_SUITS && card.suit().index() == trump {
-                1.0
-            } else {
-                0.0
-            };
-            feat[45] = 0.0; // trick_complete (in progress)
-            feat[46] = 0.0; // won_trick (not complete)
+            let mut feat = base(player, state.trick_play_order[i], trick, i, led);
             feat[47] = 1.0; // is_current_trick
-
+            feat[48] = flag(i == winning_slot as usize);
             tokens.push(PlayedCardToken {
                 features: feat,
                 chrono_index: chrono,
@@ -229,27 +299,22 @@ pub fn encode_played_cards(state: &BlobState) -> Vec<PlayedCardToken> {
     tokens
 }
 
-/// Encode per-player state tokens (29 dims each, one per player).
+/// Encode per-player state tokens (28 dims each, one per player), in
+/// relative-seat order: `perspective` first, then the seats after it.
 ///
 /// Each player state token:
-/// - `[0..16)`: player one-hot (up to 8 values + 8 padding)
-/// - `[16]`: bid (normalized by cards_dealt)
+/// - `[0..16)`: relative seat one-hot (up to 8 values + 8 padding)
+/// - `[16]`: bid (normalized by cards_dealt; 0 until has_bid)
 /// - `[17]`: tricks_won (normalized by cards_dealt)
-/// - `[18]`: tricks_needed (max(0, bid − tricks_won), normalized by cards_dealt)
-/// - `[19]`: bid_status (−1.0 busted, 0.0 live, +1.0 met)
+/// - `[18]`: tricks_needed (max(0, bid − tricks_won), normalized by
+///   cards_dealt; 0 until has_bid)
+/// - `[19]`: bid_status (−1.0 busted, 0.0 live, +1.0 met; 0 until has_bid)
 /// - `[20]`: is_dealer
-/// - `[21]`: is_me (1.0 for perspective player)
-/// - `[22]`: relative_position ((p − current_player) mod N, normalized to \[0, 1\])
-/// - `[23]`: cumulative_score (normalized by theoretical ceiling)
-/// - `[24]`: cards_in_hand (normalized by cards_dealt)
-/// - `[25]`: void_spades
-/// - `[26]`: void_hearts
-/// - `[27]`: void_clubs
-/// - `[28]`: void_diamonds
-///
-/// Void flags are precomputed by scanning played cards where
-/// `followed_suit == 0 && was_lead == 0`, marking that player as void in
-/// the led suit.
+/// - `[21]`: has_bid
+/// - `[22]`: is_to_move (the seat that acts now)
+/// - `[23]`: cards_in_hand (normalized by cards_dealt)
+/// - `[24..28)`: void in ♠ ♥ ♣ ♦, from [`void_suits`] (completed tricks and
+///   the trick in progress)
 pub fn encode_player_states(
     state: &BlobState,
     perspective: u8,
@@ -257,118 +322,43 @@ pub fn encode_player_states(
     let np = state.num_players as usize;
     let cd = state.cards_dealt.max(1) as f32;
     let tricks_remaining = state.cards_dealt.saturating_sub(state.tricks_completed);
-
-    // Void detection: voids[player][suit] = true when observed.
-    let mut voids = [[false; NUM_SUITS as usize]; MAX_PLAYERS];
-
-    // Scan completed tricks.
-    for t in 0..state.tricks_completed as usize {
-        let rec = &state.trick_history[t];
-        let led_suit = rec.suit_led as usize;
-        for i in 1..rec.num_played as usize {
-            let (player, card_idx) = rec.cards[i];
-            let card = Card::from_index_unchecked(card_idx);
-            if card.suit().index() as usize != led_suit {
-                voids[player as usize][led_suit] = true;
-            }
-        }
-    }
-
-    // Scan current in-progress trick.
-    if state.trick_cards_played > 1 {
-        let led_suit =
-            Card::from_index_unchecked(state.trick_play_order[0]).suit().index() as usize;
-        for i in 1..state.trick_cards_played as usize {
-            let card = Card::from_index_unchecked(state.trick_play_order[i]);
-            let player = (state.trick_leader + i as u8) % state.num_players;
-            if card.suit().index() as usize != led_suit {
-                voids[player as usize][led_suit] = true;
-            }
-        }
-    }
-
-    // Cumulative score normalization: theoretical ceiling.
-    let total_r = total_rounds(state.start_cards.max(1), state.num_players.max(3)) as f32;
-    let score_ceiling = total_r * (10.0 + state.start_cards as f32);
+    let voids = void_suits(state);
 
     let mut tokens = Vec::with_capacity(np);
-
-    for p in 0..np {
+    for rel in 0..np {
+        let player = ((perspective as usize + rel) % np) as u8;
+        let p = player as usize;
         let mut feat = [0.0f32; PLAYER_STATE_DIM];
-        let player_idx = p as u8;
 
-        // Player one-hot [0..16).
-        feat[p] = 1.0;
-
-        // bid [16].
-        feat[16] = state.bids[p] as f32 / cd;
-
-        // tricks_won [17].
+        feat[rel] = 1.0;
+        let bid_made = has_bid(state, player);
+        if bid_made {
+            let needed = state.bids[p].saturating_sub(state.tricks_won[p]);
+            feat[16] = state.bids[p] as f32 / cd;
+            feat[18] = needed as f32 / cd;
+            feat[19] = if state.tricks_won[p] > state.bids[p] {
+                -1.0
+            } else if state.tricks_won[p] == state.bids[p] {
+                1.0
+            } else if tricks_remaining >= needed {
+                0.0
+            } else {
+                -1.0
+            };
+        }
         feat[17] = state.tricks_won[p] as f32 / cd;
-
-        // tricks_needed [18].
-        let needed = state.bids[p].saturating_sub(state.tricks_won[p]);
-        feat[18] = needed as f32 / cd;
-
-        // bid_status [19]: -1 busted, 0 live, +1 met.
-        feat[19] = if state.tricks_won[p] > state.bids[p] {
-            -1.0
-        } else if state.tricks_won[p] == state.bids[p] {
-            1.0
-        } else if tricks_remaining >= needed {
-            0.0
-        } else {
-            -1.0
-        };
-
-        // is_dealer [20].
-        feat[20] = if player_idx == state.dealer { 1.0 } else { 0.0 };
-
-        // is_me [21].
-        feat[21] = if player_idx == perspective { 1.0 } else { 0.0 };
-
-        // relative_position [22].
-        let rel = (player_idx + state.num_players - state.current_player) % state.num_players;
-        feat[22] = rel as f32 / state.num_players as f32;
-
-        // cumulative_score [23].
-        feat[23] = if score_ceiling > 0.0 {
-            state.cumulative_scores[p] as f32 / score_ceiling
-        } else {
-            0.0
-        };
-
-        // cards_in_hand [24].
-        feat[24] = Hand::new(state.hands[p]).count() as f32 / cd;
-
-        // void_spades [25].
-        feat[25] = if voids[p][0] { 1.0 } else { 0.0 };
-        // void_hearts [26].
-        feat[26] = if voids[p][1] { 1.0 } else { 0.0 };
-        // void_clubs [27].
-        feat[27] = if voids[p][2] { 1.0 } else { 0.0 };
-        // void_diamonds [28].
-        feat[28] = if voids[p][3] { 1.0 } else { 0.0 };
+        feat[20] = flag(player == state.dealer);
+        feat[21] = flag(bid_made);
+        feat[22] = flag(player == state.current_player);
+        feat[23] = Hand::new(state.hands[p]).count() as f32 / cd;
+        for s in 0..NUM_SUITS as usize {
+            feat[24 + s] = flag(voids[p][s]);
+        }
 
         tokens.push(feat);
     }
-
     tokens
 }
-
-// ===================================================================
-// Session 2.3 — Context token, CLS, sequence assembly
-// ===================================================================
-
-/// Dimensionality of the context token.
-pub const CONTEXT_DIM: usize = 13;
-
-/// Token type IDs (0–4) for each position in the assembled sequence.
-pub const TOKEN_TYPE_CLS: u8 = 0;
-pub const TOKEN_TYPE_CONTEXT: u8 = 1;
-pub const TOKEN_TYPE_PLAYER: u8 = 2;
-pub const TOKEN_TYPE_HAND: u8 = 3;
-pub const TOKEN_TYPE_PLAYED: u8 = 4;
 
 /// Assembled variable-length sequence output from the encoder.
 ///
@@ -387,7 +377,7 @@ pub struct EncodedState {
     pub num_tokens: usize,
 }
 
-/// Encode the 13-dim context token for the current game state.
+/// Encode the 17-dim context token from `perspective`.
 ///
 /// Layout:
 /// - `[0..5)`: trump_suit one-hot (♠=0, ♥=1, ♣=2, ♦=3, NoTrump=4)
@@ -399,7 +389,12 @@ pub struct EncodedState {
 /// - `[10..12)`: game_phase one-hot: \[is_bidding, is_playing\]
 /// - `[12]`: bidding_constraint_active (1.0 iff bidding, current player is
 ///   dealer, and the forbidden-bid constraint applies)
-pub fn encode_context(state: &BlobState) -> [f32; CONTEXT_DIM] {
+/// - `[13]`: bid_sum / 13: total of the bids made so far
+/// - `[14]`: seats_to_bid / num_players: seats that haven't bid yet
+/// - `[15]`: (bid_sum − cards_dealt) / cards_dealt: over- (> 0) or under-bid
+/// - `[16]`: my bidding position / (num_players − 1): 0 bids first, 1 is
+///   the dealer
+pub fn encode_context(state: &BlobState, perspective: u8) -> [f32; CONTEXT_DIM] {
     let mut feat = [0.0f32; CONTEXT_DIM];
 
     // Trump suit one-hot [0..5): value 0–3 for suits, 4 for NoTrump.
@@ -438,6 +433,21 @@ pub fn encode_context(state: &BlobState) -> [f32; CONTEXT_DIM] {
         feat[12] = 1.0;
     }
 
+    // Bid context [13..17).
+    let np = state.num_players;
+    let (mut bid_sum, mut to_bid) = (0u32, 0u32);
+    for p in 0..np {
+        if has_bid(state, p) {
+            bid_sum += state.bids[p as usize] as u32;
+        } else {
+            to_bid += 1;
+        }
+    }
+    feat[13] = bid_sum as f32 / 13.0;
+    feat[14] = to_bid as f32 / np.max(1) as f32;
+    feat[15] = (bid_sum as f32 - state.cards_dealt as f32) / cd;
+    feat[16] = bid_order_position(state, perspective) as f32 / np.saturating_sub(1).max(1) as f32;
+
     feat
 }
 
@@ -460,9 +470,9 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
         );
 
         let hand_cards = encode_hand_cards(state, perspective);
-        let played_cards = encode_played_cards(state);
+        let played_cards = encode_played_cards(state, perspective);
         let player_states = encode_player_states(state, perspective);
-        let context = encode_context(state);
+        let context = encode_context(state, perspective);
 
         let np = state.num_players as usize;
         let num_hand = hand_cards.len();
@@ -472,7 +482,6 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
         let mut features = Vec::with_capacity(num_tokens);
         let mut token_types = Vec::with_capacity(num_tokens);
         let mut chrono_indices = Vec::with_capacity(num_tokens);
-        let mut hand_card_indices = SmallVec::with_capacity(num_hand);
 
         // CLS token: zero-length feature vector (NN uses a learned 128-dim parameter).
         features.push(Vec::new());
@@ -491,13 +500,11 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
             chrono_indices.push(0);
         }
 
-        // Hand card tokens — record card indices for MCTS action mapping.
-        let hand = Hand::new(state.hands[perspective as usize]);
-        for (i, card) in hand.iter().enumerate() {
-            features.push(hand_cards[i].to_vec());
+        // Hand card tokens.
+        for hc in &hand_cards {
+            features.push(hc.to_vec());
             token_types.push(TOKEN_TYPE_HAND);
             chrono_indices.push(0);
-            hand_card_indices.push(card.index());
         }
 
         // Played card tokens.
@@ -511,10 +518,56 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
             features,
             token_types,
             chronological_indices: chrono_indices,
-            hand_card_indices,
+            hand_card_indices: hand_card_indices(state, perspective),
             num_tokens,
         }
     })
+}
+
+/// Every decision state of three random-move games (4p5c, 5p7c, 6p8c),
+/// shared by the encoder test suites.
+#[cfg(test)]
+pub(crate) fn random_game_states() -> Vec<BlobState> {
+    use crate::bidding::{apply_bid, legal_bids};
+    use crate::dealing::start_round;
+    use crate::game::{advance_round, new_game};
+    use crate::playing::{apply_play, legal_plays};
+    use rand::Rng;
+    use rand_xoshiro::rand_core::SeedableRng;
+    use rand_xoshiro::Xoshiro256PlusPlus;
+
+    fn pick<R: Rng>(mask: u64, rng: &mut R) -> u8 {
+        let k = rng.gen_range(0..mask.count_ones());
+        let mut m = mask;
+        for _ in 0..k {
+            m &= m - 1;
+        }
+        m.trailing_zeros() as u8
+    }
+
+    let mut out = Vec::new();
+    for (i, &(np, sc)) in [(4u8, 5u8), (5, 7), (6, 8)].iter().enumerate() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xE1C0_DE00 + i as u64);
+        let mut s = new_game(np, sc).unwrap();
+        start_round(&mut s, &mut rng);
+        loop {
+            match s.phase() {
+                GamePhase::Bidding => {
+                    out.push(s);
+                    let b = pick(legal_bids(&s) as u64, &mut rng);
+                    apply_bid(&mut s, b);
+                }
+                GamePhase::Playing => {
+                    out.push(s);
+                    let c = pick(legal_plays(&s), &mut rng);
+                    apply_play(&mut s, c);
+                }
+                GamePhase::Scoring => advance_round(&mut s, &mut rng),
+                GamePhase::Complete => break,
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -684,12 +737,12 @@ mod tests {
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let tokens = encode_hand_cards(&s, 0);
 
-        // All three spades tokens should report suit_count = 3.
-        assert_eq!(tokens[0][25], 3.0); // ♠0
-        assert_eq!(tokens[1][25], 3.0); // ♠5
-        assert_eq!(tokens[2][25], 3.0); // ♠12
+        // All three spades tokens should report suit_count = 3 (scaled by 13).
+        assert_eq!(tokens[0][25], 3.0 / 13.0); // ♠0
+        assert_eq!(tokens[1][25], 3.0 / 13.0); // ♠5
+        assert_eq!(tokens[2][25], 3.0 / 13.0); // ♠12
         // Hearts token should report suit_count = 1.
-        assert_eq!(tokens[3][25], 1.0); // ♥3
+        assert_eq!(tokens[3][25], 1.0 / 13.0); // ♥3
     }
 
     // ---------------------------------------------------------------
@@ -704,7 +757,7 @@ mod tests {
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
         assert_eq!(feat[26], 1.0, "Ace should be highest");
-        assert_eq!(feat[27], 0.0, "Ace should not be lowest (all 13 alive)");
+        assert_eq!(feat[27], 0.0, "Ace should not be lowest (12 unseen below)");
     }
 
     #[test]
@@ -712,7 +765,7 @@ mod tests {
         let hand = make_hand(&[c(Suit::Spades, 0)]);
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
-        assert_eq!(feat[26], 0.0, "2 should not be highest (all 13 alive)");
+        assert_eq!(feat[26], 0.0, "2 should not be highest (12 unseen above)");
         assert_eq!(feat[27], 1.0, "2 should be lowest");
     }
 
@@ -782,8 +835,8 @@ mod tests {
         let hand = make_hand(&[c(Suit::Spades, 5)]);
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
-        assert_eq!(feat[28], 7.0, "cards_above_remaining");
-        assert_eq!(feat[29], 5.0, "cards_below_remaining");
+        assert_eq!(feat[28], 7.0 / 13.0, "cards_above_unseen");
+        assert_eq!(feat[29], 5.0 / 13.0, "cards_below_unseen");
     }
 
     #[test]
@@ -794,9 +847,9 @@ mod tests {
         let s = test_state(hand, NO_TRUMP, played, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
         // Originally 7 above (ranks 6..12); 2 played → 5 remaining.
-        assert_eq!(feat[28], 5.0, "cards_above_remaining after 2 played");
+        assert_eq!(feat[28], 5.0 / 13.0, "cards_above_unseen after 2 played");
         // Below unchanged (no below-rank cards played).
-        assert_eq!(feat[29], 5.0, "cards_below_remaining unchanged");
+        assert_eq!(feat[29], 5.0 / 13.0, "cards_below_unseen unchanged");
     }
 
     #[test]
@@ -815,8 +868,26 @@ mod tests {
         let tokens = encode_hand_cards(&s, 0);
         // tokens[1] is rank 8 (middle card in ascending order: 5, 8, 12).
         let feat = &tokens[1];
-        assert_eq!(feat[28], 3.0, "above remaining excludes hand cards");
-        assert_eq!(feat[29], 7.0, "below remaining excludes hand cards");
+        assert_eq!(feat[28], 3.0 / 13.0, "above unseen excludes hand cards");
+        assert_eq!(feat[29], 7.0 / 13.0, "below unseen excludes hand cards");
+    }
+
+    #[test]
+    fn highest_and_lowest_ignore_my_own_cards() {
+        // ♠K with my own ♠A above it: no opponent spade beats the king.
+        // ♠3 with my own ♠2 below it: no opponent spade ducks under it.
+        let hand = make_hand(&[
+            c(Suit::Spades, 0),
+            c(Suit::Spades, 1),
+            c(Suit::Spades, 11),
+            c(Suit::Spades, 12),
+        ]);
+        let s = test_state(hand, NO_TRUMP, 0, 4);
+        let tokens = encode_hand_cards(&s, 0);
+        assert_eq!(tokens[2][26], 1.0, "K is highest: only my A is above");
+        assert_eq!(tokens[1][27], 1.0, "3 is lowest: only my 2 is below");
+        assert_eq!(tokens[1][26], 0.0, "3 is not highest");
+        assert_eq!(tokens[2][27], 0.0, "K is not lowest");
     }
 
     #[test]
@@ -825,7 +896,7 @@ mod tests {
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
         assert_eq!(feat[28], 0.0, "Ace has no cards above");
-        assert_eq!(feat[29], 12.0, "Ace has 12 cards below (not in hand)");
+        assert_eq!(feat[29], 12.0 / 13.0, "Ace has 12 cards below (not in hand)");
     }
 
     #[test]
@@ -833,7 +904,7 @@ mod tests {
         let hand = make_hand(&[c(Suit::Clubs, 0)]);
         let s = test_state(hand, NO_TRUMP, 0, 4);
         let feat = &encode_hand_cards(&s, 0)[0];
-        assert_eq!(feat[28], 12.0, "2 has 12 cards above (not in hand)");
+        assert_eq!(feat[28], 12.0 / 13.0, "2 has 12 cards above (not in hand)");
         assert_eq!(feat[29], 0.0, "2 has no cards below");
     }
 
@@ -875,11 +946,11 @@ mod tests {
         assert_eq!(f0[3], 1.0, "rank 3 one-hot");
         assert_eq!(f0[16], 1.0, "Spades one-hot");
         assert_eq!(f0[24], 0.0, "not trump");
-        assert_eq!(f0[25], 1.0, "suit_count_in_hand");
+        assert_eq!(f0[25], 1.0 / 13.0, "suit_count_in_hand");
         assert_eq!(f0[26], 0.0, "not highest");
         assert_eq!(f0[27], 0.0, "not lowest");
-        assert_eq!(f0[28], 7.0, "cards_above_remaining");
-        assert_eq!(f0[29], 2.0, "cards_below_remaining");
+        assert_eq!(f0[28], 7.0 / 13.0, "cards_above_unseen");
+        assert_eq!(f0[29], 2.0 / 13.0, "cards_below_unseen");
 
         // Token 1: ♥J (rank 9). Hearts alive: all except rank 1 (played).
         // is_trump = true.
@@ -896,11 +967,11 @@ mod tests {
         assert_eq!(f1[9], 1.0, "rank 9");
         assert_eq!(f1[17], 1.0, "Hearts");
         assert_eq!(f1[24], 1.0, "is trump");
-        assert_eq!(f1[25], 1.0, "suit_count_in_hand");
+        assert_eq!(f1[25], 1.0 / 13.0, "suit_count_in_hand");
         assert_eq!(f1[26], 0.0, "not highest (10,11,12 alive)");
         assert_eq!(f1[27], 0.0, "not lowest");
-        assert_eq!(f1[28], 3.0, "cards_above_remaining");
-        assert_eq!(f1[29], 8.0, "cards_below_remaining");
+        assert_eq!(f1[28], 3.0 / 13.0, "cards_above_unseen");
+        assert_eq!(f1[29], 8.0 / 13.0, "cards_below_unseen");
 
         // Token 2: ♦A (rank 12). Diamonds alive: all except rank 0 (played).
         // is_trump = false.
@@ -913,11 +984,16 @@ mod tests {
         assert_eq!(f2[12], 1.0, "rank 12");
         assert_eq!(f2[19], 1.0, "Diamonds");
         assert_eq!(f2[24], 0.0, "not trump");
-        assert_eq!(f2[25], 1.0, "suit_count_in_hand");
+        assert_eq!(f2[25], 1.0 / 13.0, "suit_count_in_hand");
         assert_eq!(f2[26], 1.0, "highest in suit");
         assert_eq!(f2[27], 0.0, "not lowest");
-        assert_eq!(f2[28], 0.0, "cards_above_remaining");
-        assert_eq!(f2[29], 11.0, "cards_below_remaining");
+        assert_eq!(f2[28], 0.0, "cards_above_unseen");
+        assert_eq!(f2[29], 11.0 / 13.0, "cards_below_unseen");
+        // No trick in progress: every card is legal, none beats anything.
+        for f in &tokens {
+            assert_eq!(f[30], 1.0, "legal to lead");
+            assert_eq!(f[31], 0.0, "nothing to beat");
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1001,14 +1077,16 @@ mod tests {
                 feat[27] == 0.0 || feat[27] == 1.0,
                 "token {i}: is_lowest binary"
             );
+            for j in [30, 31] {
+                assert!(feat[j] == 0.0 || feat[j] == 1.0, "token {i}: [{j}] binary");
+            }
 
-            // Count features are non-negative integers ≤ 12.
-            assert!(feat[25] >= 1.0, "token {i}: suit_count ≥ 1");
-            assert!(feat[25] <= 13.0, "token {i}: suit_count ≤ 13");
-            assert!(feat[28] >= 0.0, "token {i}: above_remaining ≥ 0");
-            assert!(feat[28] <= 12.0, "token {i}: above_remaining ≤ 12");
-            assert!(feat[29] >= 0.0, "token {i}: below_remaining ≥ 0");
-            assert!(feat[29] <= 12.0, "token {i}: below_remaining ≤ 12");
+            // Count features are scaled into [0, 1].
+            assert!(feat[25] >= 1.0 / 13.0, "token {i}: suit_count ≥ 1/13");
+            assert!(feat[25] <= 1.0, "token {i}: suit_count ≤ 1");
+            for j in [28, 29] {
+                assert!((0.0..=12.0 / 13.0).contains(&feat[j]), "token {i}: [{j}] in [0, 12/13]");
+            }
         }
     }
 
@@ -1144,7 +1222,7 @@ mod tests {
     #[test]
     fn no_plays_produces_empty_played_tokens() {
         let s = state_with_tricks(4, 5, 5, Suit::Spades as u8, 0, &[], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         assert!(tokens.is_empty());
     }
 
@@ -1160,14 +1238,14 @@ mod tests {
             Suit::Hearts as u8,   // suit_led = Hearts
         );
         let s = state_with_tricks(4, 5, 5, Suit::Spades as u8, 0, &[trick], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         assert_eq!(tokens.len(), 4);
 
         // Token 0: P1, ♥5 (rank 3, suit Hearts=1).
         let f = &tokens[0].features;
         assert_eq!(f[3], 1.0, "rank 3 one-hot");
         assert_eq!(f[17], 1.0, "Hearts suit one-hot");
-        assert_eq!(f[25], 1.0, "player 1 one-hot");
+        assert_eq!(f[25], 1.0, "relative seat 1 one-hot (perspective 0)");
         assert_eq!(f[40], 0.0, "trick_number = 0/5");
         assert_eq!(f[41], 0.0, "position_in_trick = 0/3");
         assert_eq!(f[42], 1.0, "was_lead");
@@ -1206,7 +1284,7 @@ mod tests {
             &[],
             &[(1, 12), (2, 40)],
         );
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         assert_eq!(tokens.len(), 2);
 
         // Both should be is_current_trick=1, trick_complete=0, won_trick=0.
@@ -1215,6 +1293,9 @@ mod tests {
             assert_eq!(tok.features[46], 0.0, "no won_trick for in-progress");
             assert_eq!(tok.features[47], 1.0, "is_current_trick");
         }
+        // The trump ace leads the trick so far.
+        assert_eq!(tokens[0].features[48], 1.0, "♠A winning so far");
+        assert_eq!(tokens[1].features[48], 0.0, "♦3 not winning");
 
         // Token 0: P1, ♠A — lead, followed suit (Spades==Spades), is trump.
         assert_eq!(tokens[0].features[42], 1.0, "was_lead");
@@ -1233,7 +1314,7 @@ mod tests {
         let t0 = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
         let t1 = make_trick(&[(0, 1), (1, 14), (2, 27)], 1, 0);
         let s = state_with_tricks(3, 5, 5, NO_TRUMP, 2, &[t0, t1], &[(1, 15)]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         assert_eq!(tokens.len(), 7);
         for (i, tok) in tokens.iter().enumerate() {
             assert_eq!(tok.chrono_index, i as u8, "chrono_index mismatch at {i}");
@@ -1245,7 +1326,7 @@ mod tests {
         let t0 = make_trick(&[(0, 0), (1, 1), (2, 2), (3, 3)], 2, 0);
         let t1 = make_trick(&[(2, 4), (3, 5), (0, 6), (1, 7)], 0, 0);
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 3, &[t0, t1], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         assert_eq!(tokens.len(), 8);
 
         // Trick 0: winner=P2, which is cards[2] = (2, 2).
@@ -1266,7 +1347,7 @@ mod tests {
         // No-trump round: no card should have is_trump_play = 1.
         let t = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
         let s = state_with_tricks(3, 5, 5, NO_TRUMP, 2, &[t], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         for tok in &tokens {
             assert_eq!(tok.features[44], 0.0, "no trump plays in no-trump round");
         }
@@ -1277,7 +1358,7 @@ mod tests {
         // 4 players, position_in_trick should be 0/3, 1/3, 2/3, 3/3.
         let t = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 3, &[t], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         let expected = [0.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 3.0 / 3.0];
         for (i, tok) in tokens.iter().enumerate() {
             assert!(
@@ -1293,7 +1374,7 @@ mod tests {
     fn played_card_padding_slots_are_zero() {
         let t = make_trick(&[(0, 0), (1, 13), (2, 26)], 0, 0);
         let s = state_with_tricks(3, 5, 5, NO_TRUMP, 2, &[t], &[]);
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         for (i, tok) in tokens.iter().enumerate() {
             // Rank padding [13..16).
             for j in 13..16 {
@@ -1303,10 +1384,11 @@ mod tests {
             for j in 20..24 {
                 assert_eq!(tok.features[j], 0.0, "tok {i}: suit padding[{j}]");
             }
-            // Player padding [27..40) for 3 players (only 0,1,2 used).
+            // Seat padding [27..40) for 3 players (only 0,1,2 used).
             for j in 27..40 {
-                assert_eq!(tok.features[j], 0.0, "tok {i}: player padding[{j}]");
+                assert_eq!(tok.features[j], 0.0, "tok {i}: seat padding[{j}]");
             }
+            assert_eq!(tok.features[48], 0.0, "tok {i}: completed trick has no winning_so_far");
         }
     }
 
@@ -1393,44 +1475,67 @@ mod tests {
     }
 
     #[test]
-    fn is_me_flag() {
-        let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+    fn player_tokens_start_at_perspective_in_play_order() {
+        // Perspective 2 at a 4-seat table: tokens are seats 2, 3, 0, 1, and
+        // each carries its relative seat one-hot.
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        s.tricks_won = [1, 2, 3, 4, 0, 0, 0, 0];
         let tokens = encode_player_states(&s, 2);
-        for (p, feat) in tokens.iter().enumerate() {
-            let expected = if p == 2 { 1.0 } else { 0.0 };
-            assert_eq!(feat[21], expected, "player {p}: is_me (perspective=2)");
+        for (rel, feat) in tokens.iter().enumerate() {
+            for j in 0..16 {
+                assert_eq!(feat[j], if j == rel { 1.0 } else { 0.0 }, "token {rel}: seat[{j}]");
+            }
         }
+        let won: Vec<f32> = tokens.iter().map(|f| f[17]).collect();
+        let expected: Vec<f32> = [3.0, 4.0, 1.0, 2.0].iter().map(|w| w / 5.0).collect();
+        assert_eq!(won, expected, "tokens follow seats 2, 3, 0, 1");
+        // The dealer (seat 0) is relative seat 2.
+        assert_eq!(tokens[2][20], 1.0);
     }
 
     #[test]
-    fn relative_position_values() {
-        // 4 players, current_player = 1.
+    fn is_to_move_marks_the_current_player() {
         let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
         s.current_player = 1;
         let tokens = encode_player_states(&s, 0);
-        // rel = (p + 4 - 1) % 4 / 4
-        // P0: (0+4-1)%4=3, 3/4=0.75
-        // P1: (1+4-1)%4=0, 0/4=0.0
-        // P2: (2+4-1)%4=1, 1/4=0.25
-        // P3: (3+4-1)%4=2, 2/4=0.5
-        assert!((tokens[0][22] - 0.75).abs() < 1e-6, "P0 rel_pos");
-        assert!((tokens[1][22] - 0.0).abs() < 1e-6, "P1 rel_pos (current)");
-        assert!((tokens[2][22] - 0.25).abs() < 1e-6, "P2 rel_pos");
-        assert!((tokens[3][22] - 0.5).abs() < 1e-6, "P3 rel_pos");
+        let to_move: Vec<f32> = tokens.iter().map(|f| f[22]).collect();
+        assert_eq!(to_move, vec![0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn cumulative_score_normalization() {
-        // 4 players, start_cards=5. total_rounds = 2*5+4-2 = 12.
-        // Ceiling = 12 * (10 + 5) = 180.
-        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        s.cumulative_scores[0] = 90; // 90/180 = 0.5
-        s.cumulative_scores[1] = 0;
-        s.cumulative_scores[2] = 180; // 180/180 = 1.0
-        let tokens = encode_player_states(&s, 0);
-        assert!((tokens[0][23] - 0.5).abs() < 1e-6, "P0 score");
-        assert!((tokens[1][23] - 0.0).abs() < 1e-6, "P1 score");
-        assert!((tokens[2][23] - 1.0).abs() < 1e-6, "P2 score");
+    fn not_yet_bid_differs_from_bid_zero() {
+        // 4 players, dealer 3: seats 0 and 1 have bid (0 and 2), seat 2 is
+        // to bid, the dealer bids last.
+        let mut s = BlobState::empty();
+        s.num_players = 4;
+        s.cards_dealt = 5;
+        s.start_cards = 5;
+        s.game_phase = GamePhase::Bidding as u8;
+        s.dealer = 3;
+        s.bids[1] = 2;
+        s.current_player = 2;
+        let tokens = encode_player_states(&s, 2);
+        // Relative order: seats 2, 3, 0, 1.
+        let has: Vec<f32> = tokens.iter().map(|f| f[21]).collect();
+        assert_eq!(has, vec![0.0, 0.0, 1.0, 1.0], "has_bid");
+        // Seat 0 bid 0 and has 0 tricks: "met" so far. Seats 2 and 3 have
+        // not bid: no status yet.
+        assert_eq!(tokens[2][19], 1.0, "seat 0: bid 0, met");
+        assert_eq!(tokens[0][19], 0.0, "seat 2: no bid yet");
+        assert_eq!(tokens[1][19], 0.0, "seat 3: no bid yet");
+        assert!((tokens[3][16] - 2.0 / 5.0).abs() < 1e-6, "seat 1 bid 2");
+        assert!((tokens[3][18] - 2.0 / 5.0).abs() < 1e-6, "seat 1 needs 2");
+    }
+
+    #[test]
+    fn cumulative_scores_are_not_an_input() {
+        let t0 = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 3, &[t0], &[(0, 1)]);
+        s.hands[0] = c(Suit::Hearts, 0).bit() | c(Suit::Clubs, 10).bit();
+        let before = encode(&s, 0);
+        s.cumulative_scores = [90, 0, 180, 33, 0, 0, 0, 0];
+        let after = encode(&s, 0);
+        assert_eq!(before.features, after.features);
     }
 
     #[test]
@@ -1446,17 +1551,17 @@ mod tests {
         let tokens = encode_player_states(&s, 0);
 
         // P2: void_hearts = 1.0 (didn't follow Hearts).
-        assert_eq!(tokens[2][26], 1.0, "P2 void in Hearts");
+        assert_eq!(tokens[2][25], 1.0, "P2 void in Hearts");
         // P2: other voids should be 0.
-        assert_eq!(tokens[2][25], 0.0, "P2 not void Spades");
-        assert_eq!(tokens[2][27], 0.0, "P2 not void Clubs");
-        assert_eq!(tokens[2][28], 0.0, "P2 not void Diamonds");
+        assert_eq!(tokens[2][24], 0.0, "P2 not void Spades");
+        assert_eq!(tokens[2][26], 0.0, "P2 not void Clubs");
+        assert_eq!(tokens[2][27], 0.0, "P2 not void Diamonds");
 
         // P3: followed suit, no void.
-        assert_eq!(tokens[3][26], 0.0, "P3 NOT void in Hearts");
+        assert_eq!(tokens[3][25], 0.0, "P3 NOT void in Hearts");
 
         // P1: leader, not checked for void.
-        assert_eq!(tokens[1][26], 0.0, "P1 (leader) not flagged void");
+        assert_eq!(tokens[1][25], 0.0, "P1 (leader) not flagged void");
     }
 
     #[test]
@@ -1468,9 +1573,9 @@ mod tests {
             &[(0, 3), (1, 44)],
         );
         let tokens = encode_player_states(&s, 0);
-        assert_eq!(tokens[1][25], 1.0, "P1 void in Spades from current trick");
+        assert_eq!(tokens[1][24], 1.0, "P1 void in Spades from current trick");
         // P0 is leader, no void.
-        assert_eq!(tokens[0][25], 0.0, "P0 (leader) not void");
+        assert_eq!(tokens[0][24], 0.0, "P0 (leader) not void");
     }
 
     #[test]
@@ -1485,9 +1590,9 @@ mod tests {
             | c(Suit::Clubs, 6).bit()
             | c(Suit::Clubs, 7).bit();
         let tokens = encode_player_states(&s, 0);
-        assert!((tokens[0][24] - 3.0 / 5.0).abs() < 1e-6, "P0: 3/5");
-        assert!((tokens[1][24] - 5.0 / 5.0).abs() < 1e-6, "P1: 5/5");
-        assert!((tokens[2][24] - 0.0).abs() < 1e-6, "P2: 0/5");
+        assert!((tokens[0][23] - 3.0 / 5.0).abs() < 1e-6, "P0: 3/5");
+        assert!((tokens[1][23] - 5.0 / 5.0).abs() < 1e-6, "P1: 5/5");
+        assert!((tokens[2][23] - 0.0).abs() < 1e-6, "P2: 0/5");
     }
 
     #[test]
@@ -1541,7 +1646,7 @@ mod tests {
             apply_play(&mut s, card);
         }
 
-        let tokens = encode_played_cards(&s);
+        let tokens = encode_played_cards(&s, 0);
         // 3 completed tricks × 4 players + 1 current trick card = 13 tokens.
         assert_eq!(tokens.len(), 13);
 
@@ -1604,15 +1709,11 @@ mod tests {
         let tokens = encode_player_states(&s, perspective);
         assert_eq!(tokens.len(), 5);
 
-        // Exactly one is_me flag.
-        let me_count: usize = tokens.iter().filter(|f| f[21] == 1.0).count();
-        assert_eq!(me_count, 1);
-        assert_eq!(tokens[perspective as usize][21], 1.0);
-
-        // Exactly one is_dealer flag.
+        // Exactly one is_dealer flag, at the dealer's relative seat.
         let dealer_count: usize = tokens.iter().filter(|f| f[20] == 1.0).count();
         assert_eq!(dealer_count, 1);
-        assert_eq!(tokens[s.dealer as usize][20], 1.0);
+        let dealer_rel = relative_seat(&s, perspective, s.dealer);
+        assert_eq!(tokens[dealer_rel as usize][20], 1.0);
 
         // All features within expected ranges.
         for (p, feat) in tokens.iter().enumerate() {
@@ -1623,19 +1724,20 @@ mod tests {
                 feat[19] == -1.0 || feat[19] == 0.0 || feat[19] == 1.0,
                 "P{p} bid_status in {{-1,0,1}}"
             );
-            assert!(feat[22] >= 0.0 && feat[22] < 1.0, "P{p} rel_pos in [0,1)");
-            assert!(feat[23] >= 0.0 && feat[23] <= 1.0, "P{p} cum_score in [0,1]");
-            assert!(feat[24] >= 0.0 && feat[24] <= 1.0, "P{p} cards_in_hand in [0,1]");
-            for v in 25..29 {
+            assert_eq!(feat[21], 1.0, "P{p} has bid during play");
+            assert!(feat[23] >= 0.0 && feat[23] <= 1.0, "P{p} cards_in_hand in [0,1]");
+            for v in [20, 22, 24, 25, 26, 27] {
                 assert!(
                     feat[v] == 0.0 || feat[v] == 1.0,
-                    "P{p} void[{v}] binary"
+                    "P{p} [{v}] binary"
                 );
             }
         }
 
-        // Current player's relative_position is 0.
-        assert_eq!(tokens[s.current_player as usize][22], 0.0);
+        // The perspective is the current player: relative seat 0, to move.
+        assert_eq!(tokens[0][0], 1.0);
+        assert_eq!(tokens[0][22], 1.0);
+        assert_eq!(tokens.iter().filter(|f| f[22] == 1.0).count(), 1);
     }
 
     // ===============================================================
@@ -1645,7 +1747,7 @@ mod tests {
     #[test]
     fn context_token_trump_one_hot_spades() {
         let s = state_with_tricks(4, 5, 5, Suit::Spades as u8, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[0], 1.0, "Spades");
         assert_eq!(ctx[1], 0.0);
         assert_eq!(ctx[2], 0.0);
@@ -1656,7 +1758,7 @@ mod tests {
     #[test]
     fn context_token_trump_one_hot_no_trump() {
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[0], 0.0);
         assert_eq!(ctx[1], 0.0);
         assert_eq!(ctx[2], 0.0);
@@ -1667,7 +1769,7 @@ mod tests {
     #[test]
     fn context_token_trump_one_hot_diamonds() {
         let s = state_with_tricks(4, 5, 5, Suit::Diamonds as u8, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[3], 1.0, "Diamonds");
         let sum: f32 = ctx[0..5].iter().sum();
         assert_eq!(sum, 1.0, "exactly one trump bit");
@@ -1676,7 +1778,7 @@ mod tests {
     #[test]
     fn context_token_cards_dealt_normalization() {
         let s = state_with_tricks(4, 7, 7, NO_TRUMP, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert!((ctx[5] - 7.0 / 13.0).abs() < 1e-6, "cards_dealt=7/13");
     }
 
@@ -1686,7 +1788,7 @@ mod tests {
         let t0 = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
         let t1 = make_trick(&[(0, 1), (1, 14), (2, 27), (3, 40)], 1, 0);
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[t0, t1], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert!((ctx[6] - 2.0 / 5.0).abs() < 1e-6, "current_trick=2/5");
         assert!((ctx[7] - 3.0 / 5.0).abs() < 1e-6, "tricks_remaining=3/5");
     }
@@ -1694,7 +1796,7 @@ mod tests {
     #[test]
     fn context_token_no_tricks_played() {
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[6], 0.0, "current_trick=0");
         assert!((ctx[7] - 1.0).abs() < 1e-6, "tricks_remaining=5/5=1.0");
     }
@@ -1703,7 +1805,7 @@ mod tests {
     fn context_token_num_players_normalization() {
         for np in 3..=6u8 {
             let s = state_with_tricks(np, 5, 5, NO_TRUMP, 0, &[], &[]);
-            let ctx = encode_context(&s);
+            let ctx = encode_context(&s, 0);
             assert!(
                 (ctx[8] - np as f32 / 8.0).abs() < 1e-6,
                 "num_players={np}/8"
@@ -1716,7 +1818,7 @@ mod tests {
         // 4 players, start_cards=5 → total_rounds = 2*5+4-2 = 12.
         let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
         s.round_idx = 3;
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert!((ctx[9] - 3.0 / 12.0).abs() < 1e-6, "round_idx=3/12");
     }
 
@@ -1727,7 +1829,7 @@ mod tests {
         s.cards_dealt = 5;
         s.start_cards = 5;
         s.game_phase = GamePhase::Bidding as u8;
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[10], 1.0, "is_bidding");
         assert_eq!(ctx[11], 0.0, "not is_playing");
     }
@@ -1735,7 +1837,7 @@ mod tests {
     #[test]
     fn context_token_phase_playing() {
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[10], 0.0, "not is_bidding");
         assert_eq!(ctx[11], 1.0, "is_playing");
     }
@@ -1754,7 +1856,7 @@ mod tests {
         s.bids[1] = 0;
         s.bids[2] = 0;
         s.bids[3] = 0;
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[12], 1.0, "bidding constraint active for dealer");
     }
 
@@ -1768,7 +1870,7 @@ mod tests {
         s.game_phase = GamePhase::Bidding as u8;
         s.dealer = 3;
         s.current_player = 1; // not dealer
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[12], 0.0, "non-dealer has no constraint");
     }
 
@@ -1776,7 +1878,7 @@ mod tests {
     fn context_token_bidding_constraint_not_active_playing_phase() {
         // Playing phase → constraint not active regardless.
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
         assert_eq!(ctx[12], 0.0, "no constraint in playing phase");
     }
 
@@ -1784,7 +1886,7 @@ mod tests {
     fn context_token_all_features_in_range() {
         let t = make_trick(&[(0, 0), (1, 13), (2, 26), (3, 39)], 0, 0);
         let s = state_with_tricks(4, 7, 7, Suit::Hearts as u8, 2, &[t], &[]);
-        let ctx = encode_context(&s);
+        let ctx = encode_context(&s, 0);
 
         // Trump one-hot: exactly one 1.0 in [0..5).
         let trump_sum: f32 = ctx[0..5].iter().sum();
@@ -1803,6 +1905,44 @@ mod tests {
 
         // Bidding constraint is binary.
         assert!(ctx[12] == 0.0 || ctx[12] == 1.0);
+
+        // Bid context: everyone has bid during play.
+        assert_eq!(ctx[14], 0.0, "no seats left to bid");
+        assert!(ctx[16] >= 0.0 && ctx[16] <= 1.0, "bidding position in [0,1]");
+    }
+
+    #[test]
+    fn context_bid_totals_mid_bidding() {
+        // 5 players, 7 cards, dealer 3: seats 4 and 0 bid 2 and 1, seat 1
+        // is to bid.
+        let mut s = BlobState::empty();
+        s.num_players = 5;
+        s.cards_dealt = 7;
+        s.start_cards = 7;
+        s.game_phase = GamePhase::Bidding as u8;
+        s.dealer = 3;
+        s.bids[4] = 2;
+        s.bids[0] = 1;
+        s.current_player = 1;
+        let ctx = encode_context(&s, 1);
+        assert!((ctx[13] - 3.0 / 13.0).abs() < 1e-6, "bid_sum 3");
+        assert!((ctx[14] - 3.0 / 5.0).abs() < 1e-6, "seats 1, 2, 3 still to bid");
+        assert!((ctx[15] - (3.0 - 7.0) / 7.0).abs() < 1e-6, "4 tricks unclaimed");
+        assert!((ctx[16] - 2.0 / 4.0).abs() < 1e-6, "seat 1 bids third of five");
+        // The dealer bids last.
+        assert_eq!(encode_context(&s, 3)[16], 1.0);
+        assert_eq!(encode_context(&s, 4)[16], 0.0);
+    }
+
+    #[test]
+    fn context_bid_totals_during_play() {
+        // Everyone has bid; the table overbid 5 cards by 2.
+        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
+        s.bids = [2, 0, 3, 2, 0, 0, 0, 0];
+        let ctx = encode_context(&s, 0);
+        assert!((ctx[13] - 7.0 / 13.0).abs() < 1e-6);
+        assert_eq!(ctx[14], 0.0);
+        assert!((ctx[15] - 2.0 / 5.0).abs() < 1e-6);
     }
 
     // ===============================================================
@@ -1876,7 +2016,7 @@ mod tests {
     fn encode_context_token_has_correct_dim() {
         let s = state_with_tricks(4, 5, 5, Suit::Hearts as u8, 0, &[], &[]);
         let enc = encode(&s, 0);
-        assert_eq!(enc.features[1].len(), CONTEXT_DIM, "context is 13-dim");
+        assert_eq!(enc.features[1].len(), CONTEXT_DIM, "context is 17-dim");
     }
 
     #[test]
@@ -1887,7 +2027,7 @@ mod tests {
             assert_eq!(
                 enc.features[i].len(),
                 PLAYER_STATE_DIM,
-                "player token {i} is 29-dim"
+                "player token {i} is 28-dim"
             );
         }
     }
@@ -1905,7 +2045,7 @@ mod tests {
             assert_eq!(
                 enc.features[i].len(),
                 HAND_CARD_DIM,
-                "hand token {i} is 30-dim"
+                "hand token {i} is 32-dim"
             );
         }
     }
@@ -1920,7 +2060,7 @@ mod tests {
             assert_eq!(
                 enc.features[i].len(),
                 PLAYED_CARD_DIM,
-                "played token {i} is 48-dim"
+                "played token {i} is 49-dim"
             );
         }
     }
@@ -2224,5 +2364,168 @@ mod tests {
 
         // Context: tricks_remaining = 1/5 = 0.2.
         assert!((enc.features[1][7] - 1.0 / 5.0).abs() < 1e-6);
+    }
+
+    // ===============================================================
+    // Layout v2 — properties over real game states
+    // ===============================================================
+
+    #[test]
+    fn legal_flag_matches_legal_plays() {
+        use crate::playing::legal_plays;
+        for s in random_game_states() {
+            let me = s.current_player;
+            let legal = if s.phase() == GamePhase::Playing { legal_plays(&s) } else { 0 };
+            let hand = hand_card_indices(&s, me);
+            for (feat, &card) in encode_hand_cards(&s, me).iter().zip(&hand) {
+                assert_eq!(feat[30], flag((legal >> card) & 1 == 1), "card {card}");
+            }
+        }
+    }
+
+    #[test]
+    fn beats_flag_matches_playing_the_card() {
+        use crate::playing::{apply_play, legal_plays};
+        let mut checked = 0;
+        for s in random_game_states() {
+            if s.phase() != GamePhase::Playing || s.trick_cards_played == 0 {
+                continue;
+            }
+            let me = s.current_player;
+            let my_slot = s.trick_cards_played;
+            let legal = legal_plays(&s);
+            let hand = hand_card_indices(&s, me);
+            for (feat, &card) in encode_hand_cards(&s, me).iter().zip(&hand) {
+                if (legal >> card) & 1 == 0 {
+                    continue;
+                }
+                let mut after = s;
+                apply_play(&mut after, card);
+                let wins = if after.trick_cards_played == 0 {
+                    after.trick_history[after.tricks_completed as usize - 1].winner == me
+                } else {
+                    current_trick_winner(&after) == Some(my_slot)
+                };
+                assert_eq!(feat[31], flag(wins), "card {card}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 500, "only {checked} cards checked");
+    }
+
+    #[test]
+    fn winning_so_far_marks_the_current_winner_only() {
+        for s in random_game_states() {
+            let tokens = encode_played_cards(&s, s.current_player);
+            let marked: Vec<usize> =
+                (0..tokens.len()).filter(|&i| tokens[i].features[48] == 1.0).collect();
+            match current_trick_winner(&s) {
+                None => assert!(marked.is_empty()),
+                Some(slot) => {
+                    let first = tokens.len() - s.trick_cards_played as usize;
+                    assert_eq!(marked, vec![first + slot as usize]);
+                }
+            }
+        }
+    }
+
+    /// `s` with every seat moved `k` places on.
+    fn rotate_seats(s: &BlobState, k: u8) -> BlobState {
+        let n = s.num_players;
+        let r = |p: u8| (p + k) % n;
+        let mut out = *s;
+        for p in 0..n {
+            let (from, to) = (p as usize, r(p) as usize);
+            out.hands[to] = s.hands[from];
+            out.bids[to] = s.bids[from];
+            out.tricks_won[to] = s.tricks_won[from];
+            out.cumulative_scores[to] = s.cumulative_scores[from];
+        }
+        out.current_player = r(s.current_player);
+        out.dealer = r(s.dealer);
+        out.trick_leader = r(s.trick_leader);
+        for t in 0..s.tricks_completed as usize {
+            let rec = &mut out.trick_history[t];
+            for i in 0..rec.num_played as usize {
+                rec.cards[i].0 = r(rec.cards[i].0);
+            }
+            rec.winner = r(rec.winner);
+        }
+        out
+    }
+
+    #[test]
+    fn encoding_is_invariant_to_seat_rotation() {
+        for (i, s) in random_game_states().iter().enumerate().step_by(7) {
+            let k = 1 + (i as u8 % (s.num_players - 1));
+            let rotated = rotate_seats(s, k);
+            for p in [s.current_player, (s.dealer + 1) % s.num_players] {
+                let a = encode(s, p);
+                let b = encode(&rotated, (p + k) % s.num_players);
+                assert_eq!(a.features, b.features, "state {i}, seat {p}, shift {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn features_are_finite_and_one_hots_are_exact() {
+        for s in random_game_states() {
+            let enc = encode(&s, s.current_player);
+            for (i, feat) in enc.features.iter().enumerate() {
+                assert!(feat.iter().all(|v| v.is_finite()), "token {i}");
+                let one_hot = |r: std::ops::Range<usize>| feat[r].iter().sum::<f32>();
+                match enc.token_types[i] {
+                    TOKEN_TYPE_HAND => {
+                        assert_eq!((one_hot(0..16), one_hot(16..24)), (1.0, 1.0));
+                        assert!(feat.iter().all(|v| (0.0..=1.0).contains(v)));
+                    }
+                    TOKEN_TYPE_PLAYED => {
+                        let hots = (one_hot(0..16), one_hot(16..24), one_hot(24..40));
+                        assert_eq!(hots, (1.0, 1.0, 1.0));
+                    }
+                    TOKEN_TYPE_PLAYER => {
+                        assert_eq!(one_hot(0..16), 1.0);
+                        assert!(feat.iter().all(|v| (-1.0..=1.0).contains(v)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_version_follows_feature_width() {
+        assert_eq!(FEAT_DIM, 49);
+        assert_eq!(EncoderVersion::from_feat_dim(48), Some(EncoderVersion::V1));
+        assert_eq!(EncoderVersion::from_feat_dim(FEAT_DIM), Some(EncoderVersion::V2));
+        assert_eq!(EncoderVersion::from_feat_dim(64), None);
+        assert_eq!(EncoderVersion::CURRENT.feat_dim(), FEAT_DIM);
+        for v in [EncoderVersion::V1, EncoderVersion::V2] {
+            let s = random_game_states()[40];
+            let enc = v.encode(&s, s.current_player);
+            assert!(enc.features.iter().all(|f| f.len() <= v.feat_dim()));
+        }
+    }
+
+    /// `scripts/export_onnx.py` rebuilds the network in PyTorch; its token
+    /// widths must equal the encoder's or the exported model can't load
+    /// the trained weights.
+    #[test]
+    fn export_script_mirrors_feature_widths() {
+        let script = include_str!("../../scripts/export_onnx.py");
+        let value = |name: &str| -> usize {
+            let prefix = format!("{name} = ");
+            let line = script
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("{name} not defined in export_onnx.py"));
+            let rest = line[prefix.len()..].split('#').next().unwrap();
+            rest.trim().parse().unwrap_or_else(|_| panic!("not an integer: {line}"))
+        };
+        assert_eq!(value("HAND_DIM"), HAND_CARD_DIM);
+        assert_eq!(value("PLAYED_DIM"), PLAYED_CARD_DIM);
+        assert_eq!(value("PLAYER_DIM"), PLAYER_STATE_DIM);
+        assert_eq!(value("CONTEXT_DIM"), CONTEXT_DIM);
+        assert_eq!(value("FEAT_DIM"), FEAT_DIM);
     }
 }

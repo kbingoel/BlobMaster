@@ -41,11 +41,16 @@ N_LAYERS = 8
 DROPOUT = 0.1
 LN_EPS = 1e-5
 
-HAND_DIM = 30
-PLAYED_DIM = 48
-PLAYER_DIM = 29
-CONTEXT_DIM = 13
-FEAT_DIM = PLAYED_DIM  # right-padded feature width
+# Token widths of the encoder layout (`blob-engine/src/encoder.rs`, gen-2
+# layout v2). The Rust test `export_script_mirrors_feature_widths` checks
+# these lines. Gen-1 checkpoints used 30/48/29/13 (padded to 48) and can't be
+# re-exported with this script.
+HAND_DIM = 32
+PLAYED_DIM = 49
+PLAYER_DIM = 28
+CONTEXT_DIM = 17
+FEAT_DIM = 49  # right-padded feature width: the widest token type
+assert FEAT_DIM == max(HAND_DIM, PLAYED_DIM, PLAYER_DIM, CONTEXT_DIM)
 MAX_CHRONO = 52
 
 NUM_BIDS = 14

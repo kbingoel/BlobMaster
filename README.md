@@ -33,7 +33,7 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 
 | Path | What it is |
 |---|---|
-| `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bot, strength benchmark. No libtorch dependency. |
+| `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bots, strength benchmark. No libtorch dependency. |
 | `blob-nn/` | Transformer model (tch / libtorch), self-play, training loop, evaluation. |
 | `blob-train/` | `blobmaster-train` CLI: train, evaluate, self-play, export, profile. |
 | `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bot) and `play` (you vs bots in the terminal). |

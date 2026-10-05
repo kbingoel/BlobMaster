@@ -9,7 +9,8 @@
 //! Expected ONNX graph I/O (produced by `scripts/export_onnx.py`):
 //!
 //! Inputs:
-//! - `features: [batch, seq, 48]` f32
+//! - `features: [batch, seq, F]` f32, `F` = the encoder layout's padded
+//!   width: `encoder::FEAT_DIM` for gen-2 models, 48 for gen-1 ones
 //! - `token_types: [batch, seq]` i64
 //! - `chrono_indices: [batch, seq]` i64
 //! - `attention_mask: [batch, seq]` bool
@@ -22,6 +23,10 @@
 //! The evaluator re-applies legality masking from the current `BlobState`
 //! rather than relying on the graph-internal mask, so one exported model
 //! works for any phase and any hand size.
+//!
+//! The encoder layout is read from the model: `F` names the
+//! [`EncoderVersion`], so gen-1 checkpoints keep running on the frozen
+//! [`crate::encoder::v1`] layout next to gen-2 models.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,24 +36,22 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 
 use crate::bidding::legal_bids;
-use crate::encoder::{
-    encode, EncodedState, PLAYED_CARD_DIM, TOKEN_TYPE_HAND,
-};
+use crate::encoder::{EncodedState, EncoderVersion, TOKEN_TYPE_HAND};
 use crate::evaluator::{Evaluator, NUM_BIDS};
 use crate::playing::legal_plays;
 use crate::state::{BlobState, GamePhase};
 
-/// Per-token feature width (matches `blob_nn::input::FEAT_DIM`).
-pub const FEAT_DIM: usize = PLAYED_CARD_DIM;
-
 /// ONNX-backed evaluator. Own one per thread for self-play.
 pub struct OnnxEvaluator {
     session: Mutex<Session>,
+    encoder: EncoderVersion,
 }
 
 impl std::fmt::Debug for OnnxEvaluator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnnxEvaluator").finish_non_exhaustive()
+        f.debug_struct("OnnxEvaluator")
+            .field("encoder", &self.encoder)
+            .finish_non_exhaustive()
     }
 }
 
@@ -56,23 +59,46 @@ impl OnnxEvaluator {
     /// Load a model from `path`. Uses `CpuExecutionProvider` with
     /// `intra_op_num_threads=1` so multiple rayon threads can each hold
     /// their own session without contention.
+    ///
+    /// Fails if the model's `features` input width matches no
+    /// [`EncoderVersion`].
     pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
         crate::profiling::time(&crate::profiling::SESSION_CONSTRUCTION, || {
             let session = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .with_intra_threads(1)?
                 .commit_from_file(path)?;
+            let width = session
+                .inputs()
+                .iter()
+                .find(|i| i.name() == "features")
+                .and_then(|i| i.dtype().tensor_shape())
+                .and_then(|shape| shape.last().copied());
+            let encoder = width
+                .and_then(|w| usize::try_from(w).ok())
+                .and_then(EncoderVersion::from_feat_dim)
+                .ok_or_else(|| {
+                    ort::Error::new(format!(
+                        "model `features` input width {width:?} matches no encoder version"
+                    ))
+                })?;
             Ok(Self {
                 session: Mutex::new(session),
+                encoder,
             })
         })
+    }
+
+    /// Feature layout this model was trained on.
+    pub fn encoder_version(&self) -> EncoderVersion {
+        self.encoder
     }
 
     fn run_encoded(&self, enc: &EncodedState) -> ort::Result<(Vec<f32>, Vec<f32>, f32)> {
         let s = enc.num_tokens;
 
         let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
-            let mut features = Array3::<f32>::zeros((1, s, FEAT_DIM));
+            let mut features = Array3::<f32>::zeros((1, s, self.encoder.feat_dim()));
             let mut token_types = Array2::<i64>::zeros((1, s));
             let mut chrono = Array2::<i64>::zeros((1, s));
             let mut mask = Array2::<bool>::from_elem((1, s), false);
@@ -122,7 +148,7 @@ impl OnnxEvaluator {
     }
 
     /// Batched inference over `encs.len()` encoded states. Builds one
-    /// `[B, S_max, FEAT_DIM]` zero-padded tensor, one `sess.run`, and splits
+    /// `[B, S_max, F]` zero-padded tensor, one `sess.run`, and splits
     /// the per-state outputs back. Sequence padding is masked by the
     /// `attention_mask` input (padded positions don't participate in
     /// attention), so per-state outputs are indistinguishable from running
@@ -141,7 +167,7 @@ impl OnnxEvaluator {
         let s_max = encs.iter().map(|e| e.num_tokens).max().unwrap_or(0);
 
         let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
-            let mut features = Array3::<f32>::zeros((b, s_max, FEAT_DIM));
+            let mut features = Array3::<f32>::zeros((b, s_max, self.encoder.feat_dim()));
             let mut token_types = Array2::<i64>::zeros((b, s_max));
             let mut chrono = Array2::<i64>::zeros((b, s_max));
             let mut mask = Array2::<bool>::from_elem((b, s_max), false);
@@ -302,7 +328,7 @@ impl Evaluator for OnnxEvaluator {
             return (Vec::new(), 0.0);
         }
 
-        let enc = encode(state, state.current_player);
+        let enc = self.encoder.encode(state, state.current_player);
         let (raw_bid, raw_play, value) = match self.run_encoded(&enc) {
             Ok(t) => t,
             Err(e) => panic!("ONNX inference failed: {e}"),
@@ -329,7 +355,7 @@ impl Evaluator for OnnxEvaluator {
 
         let encs: Vec<EncodedState> = states
             .iter()
-            .map(|s| encode(s, s.current_player))
+            .map(|s| self.encoder.encode(s, s.current_player))
             .collect();
 
         let triples = match self.run_encoded_batch(&encs) {

@@ -8,7 +8,7 @@
 //!   it, so all games on one seed see the same cards whatever is played.
 //! - **Confidence intervals** treat each seed's games as one sample, because
 //!   games on the same cards are correlated.
-//! - **Bots never search.** Opponents are the rule bot or a network playing
+//! - **Bots never search.** Opponents are a rule bot or a network playing
 //!   its greedy raw policy; only the focal player may search.
 //!
 //! Every deal and every game is seeded from [`BenchConfig::seed`], so two
@@ -32,10 +32,11 @@ use crate::dealing::start_round;
 use crate::evaluator::Evaluator;
 use crate::game::{advance_round, new_game};
 use crate::hand::Hand;
-use crate::mcts::{mcts_search, MctsConfig};
+use crate::mcts::{mcts_search, MctsConfig, MctsResult};
 use crate::onnx::OnnxEvaluator;
 use crate::playing::{apply_play, legal_plays};
 use crate::rule_bot::rule_bot_action;
+use crate::rule_bot_2::rule_bot_2_action;
 use crate::state::{BlobState, GamePhase};
 
 /// Who sits in a seat.
@@ -43,6 +44,8 @@ use crate::state::{BlobState, GamePhase};
 pub enum Agent {
     /// The fixed rule bot (`rule_bot.rs`).
     RuleBot,
+    /// The card-counting rule bot (`rule_bot_2.rs`).
+    RuleBot2,
     /// A network's greedy raw policy, no search.
     Network(PathBuf),
     /// A network driving greedy MCTS with [`BenchConfig::mcts`].
@@ -52,7 +55,7 @@ pub enum Agent {
 impl Agent {
     pub fn model(&self) -> Option<&Path> {
         match self {
-            Agent::RuleBot => None,
+            Agent::RuleBot | Agent::RuleBot2 => None,
             Agent::Network(p) | Agent::Search(p) => Some(p),
         }
     }
@@ -214,30 +217,44 @@ pub fn deal_rng(seed: u64, deal: usize) -> Xoshiro256PlusPlus {
 /// hand position in `Hand::iter` order), as an action label: the bid, or
 /// the card index. Ties go to the lowest index.
 pub fn greedy_action(state: &BlobState, policy: &[f32]) -> u8 {
+    greedy_action_by(state, policy, &[])
+}
+
+/// [`greedy_action`] with ties broken by the higher `tiebreak` entry
+/// (indexed like `policy`; missing entries read as 0), then by the lowest
+/// index.
+pub fn greedy_action_by(state: &BlobState, policy: &[f32], tiebreak: &[f32]) -> u8 {
     let bidding = state.phase() == GamePhase::Bidding;
-    let mut best: Option<(u8, f32)> = None;
-    let mut consider = |action: u8, p: f32| {
-        if best.is_none_or(|(_, bp)| p > bp) {
-            best = Some((action, p));
+    let mut best: Option<(u8, f32, f32)> = None;
+    let mut consider = |action: u8, i: usize| {
+        let (p, t) = (policy[i], tiebreak.get(i).copied().unwrap_or(0.0));
+        if best.is_none_or(|(_, bp, bt)| p > bp || (p == bp && t > bt)) {
+            best = Some((action, p, t));
         }
     };
     if bidding {
         let mask = legal_bids(state);
-        for (b, &p) in policy.iter().enumerate() {
+        for b in 0..policy.len() {
             if (mask >> b) & 1 == 1 {
-                consider(b as u8, p);
+                consider(b as u8, b);
             }
         }
     } else {
         let legal = legal_plays(state);
         let hand = Hand::new(state.hands[state.current_player as usize]);
-        for (card, &p) in hand.iter().zip(policy) {
+        for (i, card) in hand.iter().enumerate().take(policy.len()) {
             if (legal >> card.index()) & 1 == 1 {
-                consider(card.index(), p);
+                consider(card.index(), i);
             }
         }
     }
     best.expect("decision state has a legal action").0
+}
+
+/// The move search picks: the most visits, ties to the higher root prior
+/// (gen-2.md §5.4).
+pub fn search_action(state: &BlobState, result: &MctsResult) -> u8 {
+    greedy_action_by(state, &result.policy_target, &result.root_prior)
 }
 
 /// The action `agent` takes in `state`. `eval` must be loaded from the
@@ -251,13 +268,14 @@ pub fn agent_action(
 ) -> u8 {
     match agent {
         Agent::RuleBot => rule_bot_action(state),
+        Agent::RuleBot2 => rule_bot_2_action(state),
         Agent::Network(_) => {
             let ev = eval.expect("network agent needs an evaluator");
             greedy_action(state, &ev.evaluate(state).0)
         }
         Agent::Search(_) => {
             let ev = eval.expect("search agent needs an evaluator");
-            greedy_action(state, &mcts_search(state, ev, mcts, rng, 0).policy_target)
+            search_action(state, &mcts_search(state, ev, mcts, rng, 0))
         }
     }
 }
@@ -426,6 +444,7 @@ pub fn run_bench(
 fn agent_label(a: &Agent, budget: (u32, u32)) -> String {
     match a {
         Agent::RuleBot => "rule bot".to_string(),
+        Agent::RuleBot2 => "rule bot 2".to_string(),
         Agent::Network(p) => format!("network {}", p.display()),
         Agent::Search(p) => format!("search {}x{} {}", budget.0, budget.1, p.display()),
     }
@@ -582,6 +601,11 @@ mod tests {
         p[5] = 0.4;
         p[12] = 0.9; // illegal with 7 cards
         assert_eq!(greedy_action(&s, &p), 3);
+        // A tiebreak vector decides between the equal maxima.
+        let mut prior = vec![0.0f32; 14];
+        prior[5] = 0.3;
+        prior[3] = 0.2;
+        assert_eq!(greedy_action_by(&s, &p, &prior), 5);
     }
 
     #[test]

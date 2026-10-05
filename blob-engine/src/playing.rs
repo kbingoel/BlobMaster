@@ -117,37 +117,49 @@ pub fn apply_play(state: &mut BlobState, card: u8) {
 ///
 /// Precondition: `state.trick_cards_played == state.num_players`.
 fn winning_slot(state: &BlobState) -> (u8, u8) {
-    let lead = state.trick_play_order[0];
-    let suit_led = lead / NUM_RANKS;
-    let trump = state.trump_suit;
-    let trump_active = trump != NO_TRUMP;
+    let suit_led = state.trick_play_order[0] / NUM_RANKS;
+    (leading_slot(state, state.num_players), suit_led)
+}
 
+/// Slot (index into `trick_play_order`) of the card winning the first
+/// `played` cards of the in-progress trick.
+fn leading_slot(state: &BlobState, played: u8) -> u8 {
+    let suit_led = state.trick_play_order[0] / NUM_RANKS;
     let mut best_slot: u8 = 0;
-    let mut best_rank: u8 = lead % NUM_RANKS;
-    let mut best_is_trump = trump_active && suit_led == trump;
-
-    for i in 1..state.num_players as usize {
-        let c = state.trick_play_order[i];
-        let c_suit = c / NUM_RANKS;
-        let c_rank = c % NUM_RANKS;
-        let c_is_trump = trump_active && c_suit == trump;
-
-        let takes_lead = if best_is_trump {
-            c_is_trump && c_rank > best_rank
-        } else if c_is_trump {
-            true
-        } else {
-            c_suit == suit_led && c_rank > best_rank
-        };
-
-        if takes_lead {
-            best_slot = i as u8;
-            best_rank = c_rank;
-            best_is_trump = c_is_trump;
+    for i in 1..played {
+        let c = state.trick_play_order[i as usize];
+        let best = state.trick_play_order[best_slot as usize];
+        if beats(c, best, suit_led, state.trump_suit) {
+            best_slot = i;
         }
     }
+    best_slot
+}
 
-    (best_slot, suit_led)
+/// True iff `card`, played into a trick led in `suit_led` whose winning card
+/// so far is `best`, would take the trick from it: a higher trump over a
+/// trump, any trump over a non-trump, or a higher card of the led suit.
+/// With `trump == NO_TRUMP` only the led suit counts.
+#[inline]
+pub fn beats(card: u8, best: u8, suit_led: u8, trump: u8) -> bool {
+    let trump_active = trump != NO_TRUMP;
+    let card_is_trump = trump_active && card / NUM_RANKS == trump;
+    let best_is_trump = trump_active && best / NUM_RANKS == trump;
+    if best_is_trump {
+        card_is_trump && card % NUM_RANKS > best % NUM_RANKS
+    } else if card_is_trump {
+        true
+    } else {
+        card / NUM_RANKS == suit_led && card % NUM_RANKS > best % NUM_RANKS
+    }
+}
+
+/// Slot of the card currently winning the in-progress trick, or `None`
+/// before its first card. The seat is `(trick_leader + slot) % num_players`
+/// and the card `trick_play_order[slot]`.
+#[inline]
+pub fn current_trick_winner(state: &BlobState) -> Option<u8> {
+    (state.trick_cards_played > 0).then(|| leading_slot(state, state.trick_cards_played))
 }
 
 /// Compute per-round scores and accumulate them into `cumulative_scores`.
@@ -466,6 +478,39 @@ mod tests {
             ],
         );
         assert_eq!(s.trick_history[0].suit_led, Suit::Diamonds as u8);
+    }
+
+    #[test]
+    fn beats_follows_trump_and_led_suit_rules() {
+        let (h, s) = (Suit::Hearts as u8, Suit::Spades as u8);
+        // Spades trump, hearts led.
+        assert!(beats(card(Suit::Hearts, 9), card(Suit::Hearts, 5), h, s), "higher led card");
+        assert!(!beats(card(Suit::Hearts, 2), card(Suit::Hearts, 5), h, s), "lower led card");
+        assert!(!beats(card(Suit::Clubs, 12), card(Suit::Hearts, 0), h, s), "off-suit discard");
+        assert!(beats(card(Suit::Spades, 0), card(Suit::Hearts, 12), h, s), "trump over non-trump");
+        assert!(beats(card(Suit::Spades, 7), card(Suit::Spades, 3), h, s), "higher trump");
+        assert!(!beats(card(Suit::Hearts, 12), card(Suit::Spades, 0), h, s), "led card over trump");
+        // NoTrump: spades are just an off suit.
+        assert!(!beats(card(Suit::Spades, 12), card(Suit::Hearts, 0), h, NO_TRUMP));
+    }
+
+    #[test]
+    fn current_trick_winner_tracks_the_trick_so_far() {
+        let mut s = playing_state(4, 2, 0, Suit::Spades as u8);
+        set_hand(&mut s, 1, &[card(Suit::Hearts, 5), card(Suit::Clubs, 0)]);
+        set_hand(&mut s, 2, &[card(Suit::Hearts, 9), card(Suit::Clubs, 1)]);
+        set_hand(&mut s, 3, &[card(Suit::Spades, 0), card(Suit::Clubs, 2)]);
+        set_hand(&mut s, 0, &[card(Suit::Hearts, 12), card(Suit::Clubs, 3)]);
+        assert_eq!(current_trick_winner(&s), None);
+        apply_play(&mut s, card(Suit::Hearts, 5));
+        assert_eq!(current_trick_winner(&s), Some(0));
+        apply_play(&mut s, card(Suit::Hearts, 9));
+        assert_eq!(current_trick_winner(&s), Some(1));
+        apply_play(&mut s, card(Suit::Spades, 0)); // trump
+        assert_eq!(current_trick_winner(&s), Some(2));
+        apply_play(&mut s, card(Suit::Hearts, 12)); // completes; trump held
+        assert_eq!(s.trick_history[0].winner, 3);
+        assert_eq!(current_trick_winner(&s), None);
     }
 
     // -- apply_play state updates --------------------------------------------

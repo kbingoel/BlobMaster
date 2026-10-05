@@ -21,7 +21,7 @@ use blob_engine::hand::Hand;
 use blob_engine::mcts::{mcts_search, MctsConfig};
 use blob_engine::onnx::OnnxEvaluator;
 use blob_engine::playing::apply_play;
-use blob_engine::state::{BlobState, GamePhase, MAX_PLAYERS};
+use blob_engine::state::{GamePhase, MAX_PLAYERS};
 use rand::Rng;
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -62,15 +62,6 @@ pub struct RoundOutcome {
 pub struct EvalGameOutcome {
     pub final_scores: [u16; MAX_PLAYERS],
     pub rounds: SmallVec<[RoundOutcome; 24]>,
-}
-
-/// Thin adapter so a `&dyn Evaluator` can be passed to the generic
-/// `mcts_search<E: Evaluator>` API without requiring `dyn Evaluator: Sized`.
-struct DynEval<'a>(&'a dyn Evaluator);
-impl<'a> Evaluator for DynEval<'a> {
-    fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32) {
-        self.0.evaluate(state)
-    }
 }
 
 fn sample_from_policy<R: Rng + ?Sized>(policy: &[f32], rng: &mut R) -> usize {
@@ -160,8 +151,7 @@ fn play_eval_game_until<R: Rng + ?Sized>(
             GamePhase::Bidding => {
                 let seat = state.current_player as usize;
                 let eval = seats.0[seat].expect("seat evaluator for active seat");
-                let wrapper = DynEval(eval);
-                let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
+                let result = mcts_search(&state, eval, mcts_cfg, rng, decision_index);
                 decision_index += 1;
                 let action = sample_from_policy(&result.policy_sampling, rng) as u8;
                 apply_bid(&mut state, action);
@@ -171,8 +161,7 @@ fn play_eval_game_until<R: Rng + ?Sized>(
                 let eval = seats.0[seat].expect("seat evaluator for active seat");
                 let hand_cards: Vec<u8> =
                     Hand::new(state.hands[seat]).iter().map(|c| c.index()).collect();
-                let wrapper = DynEval(eval);
-                let result = mcts_search(&state, &wrapper, mcts_cfg, rng, decision_index);
+                let result = mcts_search(&state, eval, mcts_cfg, rng, decision_index);
                 decision_index += 1;
                 let pos = sample_from_policy(&result.policy_sampling, rng);
                 let card_idx = hand_cards[pos];
