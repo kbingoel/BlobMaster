@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-05: gen 1 is concluded; Phases 0 and 1 are done; next is Phase 2, the clean break (§4, §6).
+Status, 2026-10-05: gen 1 is concluded; Phases 0, 1 and 2 are done; next is Phase 3, the gen-2 engine (§6).
 
 ---
 
@@ -143,7 +143,7 @@ The signal ratio is 1 − H(visits)/ln(number of legal moves); 0 means visits sp
 | Greedy pick breaks ties to the **last** index | `mcts.rs::visits_to_policy` (`max_by_key`) | with flat bid visits, ties go to the highest bid | fixed, Phase 1 |
 | `void_suits` ignores the current trick | `belief.rs` | sampled deals contradict the encoder's void flags | fixed, Phase 1 |
 | After 32 failed attempts, sampling drops **all** void constraints | `belief.rs` | about 3–7% of sampled deals ignore known voids | fixed, Phase 1 |
-| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims | goes with `eval.rs`, Phase 2 |
+| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims | deleted with `eval.rs`, Phase 2 |
 | `HeuristicEvaluator` ignores its own bid when playing | `evaluator.rs` | weak, incoherent baseline | deleted, Phase 2 |
 | `DynEval` doesn't forward `evaluate_batch` | `eval.rs` | speed only | fixed, Phase 1 (wrapper removed) |
 | `blobmaster play` / `analyze` are stubs | `blob-bin` | no way to play the bot properly | `play` built in Phase 0; `analyze` stub deleted, Phase 2 |
@@ -246,7 +246,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 
 | Component | Becomes |
 |---|---|
-| `encoder.rs` (layout v2) | The only layout; drop the "v2" naming. Add §5.5 items 7, 8 and 10 |
+| `encoder.rs` | The only layout (the "v2" naming went in Phase 2). Add §5.5 items 7, 8 and 10 |
 | `evaluator.rs` | Two batched traits: a policy evaluator (own view → priors) and a value evaluator (sampled deal → ŝ for every seat). `DummyEvaluator` stays for tests |
 | `onnx.rs` `OnnxEvaluator` | One session per network; checks the layout id. No layout detection by feature width |
 | `scoring.rs` z-score helpers | The per-round utility `u_s` (§5.1) |
@@ -254,14 +254,14 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 | `replay.rs` | Same raw-state layout. Per-seat round scores instead of one value, a round id for the validation split, a concurrent wrapper, delta persistence (§5.6) |
 | `blob-nn` `model.rs` | P: today's net with the policy heads only. V: a new 4-layer net with an input projection for opponents' hand cards and a per-seat ŝ head |
 | `blob-nn` `train.rs` | LR schedule keyed to learner steps; per-seat value MSE on ŝ. `z_score_clip` and the value-head LR group go |
-| `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs` | A learner module (seeded with the batch construction and held-out-loss code from `training_loop.rs`) and an actor module that plays single rounds (§5.2). Whole-game self-play, `backfill_values` and the synchronous iteration loop are deleted |
-| `blob-train`: `main.rs`, `config.rs`, `config.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export`, on a new config schema. `evaluate`, `self-play` and `profile` are deleted |
+| `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs` | A learner module (seeded in Phase 2 as `blob_nn::learner` with the batch construction and held-out-loss code from `training_loop.rs`) and an actor module that plays single rounds (§5.2). Whole-game self-play, `backfill_values` and the synchronous iteration loop were deleted in Phase 2 |
+| `blob-train`: `main.rs`, `config.rs`, `config.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export` (working since Phase 2), on a new config schema. `evaluate`, `self-play`, `profile`, gen-1 `train` and the gen-1 config were deleted in Phase 2 |
 | `scripts/export_onnx.py` | Exports P and V and writes the layout id into the ONNX metadata; `export_script_mirrors_feature_widths` covers both |
 | `scripts/visualize_strength.py`, `visualize_weight_evolution.py` | Read gen-2 metrics (keyed by learner step) and model directories; gen-1 formats dropped |
 | `blob-engine/benches/onnx_mcts.rs` | P + V search bench. Absorbs the cost-by-sequence-length measurement (`tokens`) from `diagnostics.rs` |
-| `AGENTS.md`, `README.md`, `scripts/README.md` | Gen-1 driver, reference-model and `encoder::v1` notes removed; the gen-2 launch template once the driver exists |
+| `AGENTS.md`, `README.md`, `scripts/README.md` | Gen-1 driver, reference-model and `encoder::v1` notes removed (Phase 2); the gen-2 launch template once the driver exists |
 
-**Delete in Phase 2**
+**Delete in Phase 2** (done 2026-10-05)
 
 | Component | Why it can go |
 |---|---|
@@ -478,22 +478,41 @@ Each training phase starts from the previous phase's benchmarked model, so every
 
 *Open point carried forward:* `export_onnx.py --check` reports 1.9e-5 on a random tch init, over its 1e-5 gate. tch's random init has ~2.5× the weight scale of torch's; with torch's init the script gives 4.8e-7, so the layout isn't the cause. Trained gen-1 weights gave 4.5e-6. Set the gate when the export is rewritten for P and V (Phase 4).
 
-**Phase 2 — Clean break** (no training)
+**Phase 2 — Clean break** (done 2026-10-05, no training)
 
 Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
-- [ ] Tag `c6f0c2a` as `gen-1-final` and the last commit before the deletions as `gen-1-compat` (§10).
-- [ ] Decide whether to archive `checkpoints/run-2026-05-14/` outside the repo. Its `model.ot` and `buffer.bin` were never committed, so deleting them is final. The ONNX models and CSVs stay in git until the `.git` rewrite (§9).
-- [ ] Salvage from the gen-1 driver: move the batch construction (`bid_train_batch`, `play_train_batch`) and the held-out-loss code, with their tests, into a `learner` module for Phase 4. `blob-train` keeps only `export` until Phase 4.
-- [ ] Delete everything in §4 "Delete in Phase 2".
-- [ ] Make the config schema reject unknown keys.
-- [ ] Rewrite `AGENTS.md`, `README.md` and `scripts/README.md` for gen 2. Drop the gen-1 driver section, the gen-1 reference model and its parity recipe, and the `encoder::v1` notes.
+- [x] Tag `c6f0c2a` as `gen-1-final` and the last commit before the deletions as `gen-1-compat` (§10).
+- [x] Decide whether to archive `checkpoints/run-2026-05-14/` outside the repo: archived (below), then deleted.
+- [x] Salvage from the gen-1 driver: the batch construction (`bid_train_batch`, `play_train_batch`) and the held-out-loss code, with their tests, are in a `learner` module for Phase 4. `blob-train` keeps only `export` until Phase 4.
+- [x] Delete everything in §4 "Delete in Phase 2".
+- [x] Make the config schema reject unknown keys.
+- [x] Rewrite `AGENTS.md`, `README.md` and `scripts/README.md` for gen 2. Drop the gen-1 driver section, the gen-1 reference model and its parity recipe, and the `encoder::v1` notes.
 - [ ] Optional: the `.git` rewrite (§9).
 - Not yet: `scoring.rs`, the per-seat counts in `mcts.rs` and the single-value `Evaluator` stay until Phase 3 replaces them, because the search needs a value until then.
-- *Exit:*
-  - `cargo build --release` and every test suite pass (`blob-engine` in debug, `blob-nn`, `blob-bin`).
-  - `bench` and `play` run with rule bots and with a random-init model from `save_random_checkpoint`.
-  - `bench rulebot2` reproduces +14.5 ± 0.3.
+- *Exit, met:*
+  - `cargo build --release` has no warnings. Tests pass: `blob-engine` 279 unit + 44 integration (debug), `blob-nn` 27 (release), `blob-bin` 6.
+  - `bench` and `play` run with rule bots and with a random-init model from `save_random_checkpoint`, exported by `blobmaster-train export`:
+    - network-only vs the rule bot: −74.9 ± 2.1 (128 deals);
+    - 5×100 search: 4 deals in 20 s;
+    - full scripted `play` games with rule bots and with search bots (`--show`).
+  - ONNX↔tch parity passes on that pair.
+  - `bench rulebot2 --deals 4000` reproduces **+14.5 ± 0.3** (bids made 0.725 vs the opponents' 0.639).
   - No code refers to `encoder::v1`, `HeuristicEvaluator`, `backfill_values`, `blob_nn::eval` or a retired document.
+
+*As built:*
+- **Tags** (annotated): `gen-1-final` and `gen-1-compat`; see §10.
+- **Archive:** `checkpoints/run-2026-05-14/` (223 MB: the four ONNX models, iter-167 `model.ot` and `buffer.bin`, metrics, CSVs) was copied to `~/blobmaster-archive/run-2026-05-14/` on the training machine, hash-checked and deleted from the repo. Appendix A uses it.
+- **`blob_nn::learner`** holds `bid_train_batch`, `play_train_batch`, `HeldOutLosses` and `held_out_losses`, now a free function over a `BlobNet`.
+  - The validation-split hash is there too, as `is_validation_round`: it takes the round id that the replay buffer gets in Phase 3.
+  - Tests: the split, the bid mask, the play-policy scatter onto hand tokens (new) and held-out losses.
+  - `blob-nn` now depends only on `blob-engine` and `tch`.
+- **`blobmaster-train export`** was a stub; now it runs `scripts/export_onnx.py` with the repo's `.venv` and without `LD_PRELOAD`. It takes a checkpoint directory or `model.ot`, plus `--check`. `blob-train` no longer links `tch`.
+- **Layout guard:** `OnnxEvaluator` refuses a model whose `features` width isn't `FEAT_DIM`. `bench` and `play` exit with that message for a gen-1 model. Phase 3 replaces the width check with the layout id (§5.5 item 10).
+- **`HeuristicEvaluator`:** its trick helper moved unchanged into `rule_bot.rs`, and the rule-bot test against it was dropped. The test against random opponents stays; `bench rulebot2` covers a stronger opponent.
+- **Config:** `MctsConfig` and `TemperatureSchedule` reject unknown keys, tested on TOML. The blob-train config schema went with its last caller; Phase 4's new schema follows the same rule.
+- **Comments:** about 100 comments citing retired documents or deleted code were rewritten or dropped. A few comments that had become wrong were fixed on the way: the terminal-leaf backup, the parity test's scope and the `train.rs` LR schedule.
+- **Not moved:** the `tokens` measurement from `diagnostics.rs` joins the P + V `onnx_mcts` bench when that is rewritten. Until then it runs at `gen-1-compat` (Appendix A).
+- **Left alone:** 62 git-ignored gen-1 `*.log` files in `logs/`, which were never in git. `logs/` otherwise keeps only the rule bot 2 rollout measurements.
 
 **Phase 3 — Gen-2 engine** (no training)
 - [ ] Start-one-round helper and the round sampler (§5.2).
@@ -629,7 +648,7 @@ Optional covariates: standing (behind/ahead), stage of the game, missed the last
   - `metrics.jsonl`, `strength.csv`;
   - `signal_ratio_by_iter.csv`, which replaces the 0.73 GB `decision_stats.jsonl`.
 
-  Phase 2 deletes the directory.
+  Phase 2 archived it outside the repo and deleted it (§6 Phase 2).
 - **`*.onnx` is ignored by git.** Per-iteration weights are never committed; a deliberate reference model goes in with `git add -f`.
 - **Deleted:** the INT8 path (calibration capture, `--int8-out`, `use_int8`, `validate_int8.py`, `int8_levers.py`), Muon (`muon.rs`, its param group, `enable_muon`), and the gen-1 sweep, overnight and diagnostic scripts with their configs.
 - **Machine-level clean-up:** `target/debug` (13 GB) and the pip download cache (12 GB) were removed. Free disk went from 22 GB to 86 GB.
@@ -654,11 +673,11 @@ Optional covariates: standing (behind/ahead), stage of the game, missed the last
 
 ## 10. Retired documents and code
 
-All retired documents are recoverable with `git show c6f0c2a:<file>`, or `git show gen-1-final:<file>` once Phase 2 has created the tag.
+All retired documents are recoverable with `git show gen-1-final:<file>`.
 
 The retired code lives at two tags:
 - **`gen-1-final`** (`c6f0c2a`): the gen-1 pipeline as it was trained.
-- **`gen-1-compat`**: the last commit whose tooling still runs gen-1 models (`encoder::v1`, `examples/diagnostics.rs`). Appendix A uses it.
+- **`gen-1-compat`** (`3f5a83f`): the last commit whose tooling still runs gen-1 models (`encoder::v1`, `examples/diagnostics.rs`). Appendix A uses it.
 
 | Document | What it was | Where its live content went |
 |---|---|---|
@@ -677,12 +696,13 @@ The retired code lives at two tags:
 
 ## Appendix A — Reproducing the gen-1 measurements
 
-After Phase 2 the gen-1 models no longer run on `master`. Use a worktree at `gen-1-compat`. It contains the four reference ONNX models until the `.git` rewrite; after that, restore them from your archive (§9). `diagnostics value` also needs `iter_000167/buffer.bin`, which was never committed.
+After Phase 2 the gen-1 models no longer run on `master`. Use a worktree at `gen-1-compat`. It contains the four reference ONNX models until the `.git` rewrite (§9). The whole directory, including `iter_000167/buffer.bin` (never committed; `diagnostics value` needs it), is archived at `~/blobmaster-archive/run-2026-05-14/` on the training machine; copy it into the worktree's `checkpoints/`.
 
 Run from the worktree root with nothing else busy (the tools use every core).
 
 ```bash
 git worktree add ../blob-gen1 gen-1-compat && cd ../blob-gen1
+mkdir -p checkpoints && cp -r ~/blobmaster-archive/run-2026-05-14 checkpoints/
 cargo build --release -p blob-bin -p blob-engine --example diagnostics
 B=./target/release/blobmaster
 D=./target/release/examples/diagnostics

@@ -1,4 +1,4 @@
-//! Session 3.3 — output heads.
+//! Output heads.
 //!
 //! Three independent heads read from the Transformer's `[B, S, 128]` output:
 //!

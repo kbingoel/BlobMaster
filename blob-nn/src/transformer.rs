@@ -1,9 +1,8 @@
-//! Session 3.2 — pre-norm Transformer encoder.
+//! Pre-norm Transformer encoder.
 //!
 //! Stacks 8 identical blocks of the form
 //! `x + MHA(LN(x))` then `x + FFN(LN(x))`
-//! over the `[B, S, 128]` tensor produced by the input projection
-//! (Session 3.1).
+//! over the `[B, S, 128]` tensor produced by the input projection.
 //!
 //! Multi-head self-attention is implemented manually rather than via
 //! `tch::nn::MultiheadAttention` so that the key-padding mask can be

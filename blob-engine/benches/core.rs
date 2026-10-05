@@ -1,8 +1,8 @@
-//! Session 6.3 — criterion benches for the always-available engine primitives.
+//! Criterion benches for the always-available engine primitives.
 //!
 //! Run with: `cargo bench -p blob-engine --bench core`.
 //!
-//! Targets from `development-plan.md` Session 6.3:
+//! Targets:
 //! - `BlobState` copy: ~100 ns
 //! - Legal move generation: ~5 ns
 //! - Entity encoding: < 1 µs

@@ -1,5 +1,5 @@
 //! Ports of legacy `legacy/game-engine/test_blob.py` tests that exercise the
-//! full multi-round game loop landed in Session 1.4.
+//! full multi-round game loop.
 //!
 //! Many of the original Python tests covered behavior that is structurally
 //! impossible in the Rust port (e.g. mutating object fields directly,
@@ -8,9 +8,8 @@
 //! This file focuses on the game-flow-level scenarios that only become
 //! testable once `new_game` / `advance_round` exist.
 //!
-//! ⚠ Round-structure related tests use the **corrected** `2C + n − 2` formula
-//! (Session 1.2's gate decision); legacy values from
-//! `generate_round_structure` were off-by-one.
+//! ⚠ Round-structure related tests use the **corrected** `2C + n − 2` formula;
+//! legacy values from `generate_round_structure` were off-by-one.
 
 use blob_engine::{
     advance_round, apply_bid, apply_play, cards_dealt_for_round, forbidden_bid, is_game_over,

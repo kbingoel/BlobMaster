@@ -1,12 +1,12 @@
 //! Bid-aware rule bot — a fixed, search-free baseline opponent.
 //!
-//! Added 2026-10-02 as an **absolute** strength reference. Every in-loop
-//! eval so far compares a checkpoint against an earlier checkpoint, which
-//! cannot tell "stronger than last week" apart from "strong". This bot never
+//! Added 2026-10-02 as an **absolute** strength reference. Gen 1's in-loop
+//! evals compared a checkpoint against an earlier checkpoint, which cannot
+//! tell "stronger than last week" apart from "strong". This bot never
 //! changes, so "score vs 4× rule bot" is comparable across runs.
 //!
-//! Unlike [`crate::evaluator::HeuristicEvaluator`] (which tries to win every
-//! trick regardless of its own bid), this bot plays *towards its bid*:
+//! Unlike gen 1's heuristic baseline (which tried to win every trick
+//! regardless of its own bid), this bot plays *towards its bid*:
 //!
 //! - **Bidding**: sum a per-card chance of taking a trick (high trumps, side
 //!   aces, guarded side kings/queens, plus a ruffing bonus for a void side
@@ -28,7 +28,7 @@
 //! | focal vs 4× …                           | games | pts/game diff | bids made |
 //! |-----------------------------------------|-------|---------------|-----------|
 //! | rule bot vs random                      | 2000  | +70.4 ± 1.0   | 0.679     |
-//! | rule bot vs `HeuristicEvaluator` (raw)  | 2000  | +19.2 ± 1.0   | 0.659     |
+//! | rule bot vs gen-1 heuristic baseline    | 2000  | +19.2 ± 1.0   | 0.659     |
 //! | run-2026-05-14 iter 167, 5×100 MCTS vs rule bot | 320 | −9.2 ± 2.6 | 0.600 |
 //!
 //! The per-card weights are hand-picked, not tuned, and have only been
@@ -36,8 +36,8 @@
 //!
 //! Use the functions here directly. Wrapping the bot in an [`Evaluator`]
 //! and running it through `mcts_search` turns it into a different player
-//! (one-hot priors + value 0 + 500 sims), which is what the existing
-//! `eval.rs` "heuristic" seats do.
+//! (one-hot priors + value 0 + 500 sims), which is what gen 1's eval
+//! "heuristic" seats did (gen-2.md §2.8).
 //!
 //! [`Evaluator`]: crate::evaluator::Evaluator
 
@@ -45,7 +45,6 @@ use smallvec::SmallVec;
 
 use crate::bidding::legal_bids;
 use crate::card::{NUM_RANKS, NUM_SUITS};
-use crate::evaluator::current_trick_best;
 use crate::playing::legal_plays;
 use crate::round::NO_TRUMP;
 use crate::state::{BlobState, GamePhase};
@@ -154,6 +153,40 @@ pub fn rule_bot_bid(state: &BlobState) -> u8 {
     best
 }
 
+fn current_trick_best(state: &BlobState) -> Option<(u8, bool, u8)> {
+    // Returns (best_rank, best_is_trump, best_suit) across already-played
+    // cards in the in-progress trick, or None if no cards played yet.
+    if state.trick_cards_played == 0 {
+        return None;
+    }
+    let trump = state.trump_suit;
+    let trump_active = trump != NO_TRUMP;
+    let lead = state.trick_play_order[0];
+    let suit_led = lead / NUM_RANKS;
+    let mut best_rank = lead % NUM_RANKS;
+    let mut best_is_trump = trump_active && suit_led == trump;
+    let mut best_suit = suit_led;
+    for i in 1..state.trick_cards_played as usize {
+        let c = state.trick_play_order[i];
+        let c_suit = c / NUM_RANKS;
+        let c_rank = c % NUM_RANKS;
+        let c_is_trump = trump_active && c_suit == trump;
+        let takes = if best_is_trump {
+            c_is_trump && c_rank > best_rank
+        } else if c_is_trump {
+            true
+        } else {
+            c_suit == suit_led && c_rank > best_rank
+        };
+        if takes {
+            best_rank = c_rank;
+            best_is_trump = c_is_trump;
+            best_suit = c_suit;
+        }
+    }
+    Some((best_rank, best_is_trump, best_suit))
+}
+
 /// Card index to play for the current player. See module docs for the rule.
 pub fn rule_bot_play(state: &BlobState) -> u8 {
     debug_assert_eq!(state.phase(), GamePhase::Playing);
@@ -222,9 +255,7 @@ mod tests {
     use super::*;
     use crate::bidding::apply_bid;
     use crate::dealing::start_round;
-    use crate::evaluator::{Evaluator, HeuristicEvaluator};
     use crate::game::{advance_round, is_game_over, new_game};
-    use crate::hand::Hand;
     use crate::playing::apply_play;
     use crate::state::MAX_PLAYERS;
     use rand::Rng;
@@ -337,42 +368,19 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum Opponent {
-        Random,
-        Heuristic,
+    fn random_action(s: &BlobState, rng: &mut Xoshiro256PlusPlus) -> u8 {
+        let mask = if s.phase() == GamePhase::Bidding {
+            legal_bids(s) as u64
+        } else {
+            legal_plays(s)
+        };
+        let legal: SmallVec<[u8; 14]> = (0..64u8).filter(|&a| (mask >> a) & 1 == 1).collect();
+        legal[rng.gen_range(0..legal.len())]
     }
 
-    fn opponent_action(opp: Opponent, s: &BlobState, rng: &mut Xoshiro256PlusPlus) -> u8 {
-        match opp {
-            Opponent::Random => {
-                let mask = if s.phase() == GamePhase::Bidding {
-                    legal_bids(s) as u64
-                } else {
-                    legal_plays(s)
-                };
-                let legal: SmallVec<[u8; 14]> = (0..64u8).filter(|&a| (mask >> a) & 1 == 1).collect();
-                legal[rng.gen_range(0..legal.len())]
-            }
-            Opponent::Heuristic => {
-                let (policy, _) = HeuristicEvaluator.evaluate(s);
-                let idx = policy
-                    .iter()
-                    .enumerate()
-                    .fold(0, |b, (i, &p)| if p > policy[b] { i } else { b });
-                if s.phase() == GamePhase::Bidding {
-                    idx as u8
-                } else {
-                    let hand = Hand::new(s.hands[s.current_player as usize]);
-                    hand.iter().nth(idx).unwrap().index()
-                }
-            }
-        }
-    }
-
-    /// Mean (rule-bot score − mean opponent score) over `games` 5p/7c games,
-    /// rule bot in a rotating seat.
-    fn mean_score_edge(opp: Opponent, games: u64) -> f64 {
+    /// Mean (rule-bot score − mean opponent score) over `games` 5p/7c games
+    /// against random opponents, rule bot in a rotating seat.
+    fn mean_score_edge_vs_random(games: u64) -> f64 {
         let mut total = 0.0;
         for g in 0..games {
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xB07 + g);
@@ -385,7 +393,7 @@ mod tests {
                         let a = if s.current_player == seat {
                             rule_bot_action(&s)
                         } else {
-                            opponent_action(opp, &s, &mut rng)
+                            random_action(&s, &mut rng)
                         };
                         if s.phase() == GamePhase::Bidding {
                             apply_bid(&mut s, a);
@@ -405,12 +413,11 @@ mod tests {
     }
 
     /// Guards against a regression that silently weakens the baseline.
-    /// Full-scale numbers (2000 games): +70 vs random, +19 vs heuristic.
+    /// Full-scale number (2000 games): +70 vs random. `bench rulebot2`
+    /// checks the bot against a stronger opponent.
     #[test]
-    fn beats_random_and_heuristic_baselines() {
-        let vs_random = mean_score_edge(Opponent::Random, 200);
-        let vs_heuristic = mean_score_edge(Opponent::Heuristic, 200);
+    fn beats_random_baseline() {
+        let vs_random = mean_score_edge_vs_random(200);
         assert!(vs_random > 50.0, "edge vs random only {vs_random:.1}");
-        assert!(vs_heuristic > 10.0, "edge vs heuristic only {vs_heuristic:.1}");
     }
 }

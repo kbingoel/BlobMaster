@@ -1,4 +1,4 @@
-//! Session 6.3 — numerical-stability gate.
+//! Numerical-stability gate.
 //!
 //! 50 training iterations on randomly-generated batches. Asserts:
 //! - every loss component is finite (no NaN/Inf) every step;

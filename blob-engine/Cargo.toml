@@ -18,6 +18,7 @@ bincode = "1"
 proptest = { workspace = true }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 rand = { workspace = true }
+toml = "0.8"
 
 [[bench]]
 name = "core"

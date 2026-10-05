@@ -1,18 +1,10 @@
-//! Session 6.3 — ONNX ↔ tch output parity.
+//! ONNX ↔ tch output parity.
 //!
 //! Loads a saved VarStore checkpoint (via `BLOB_TCH_CHECKPOINT` → directory
 //! containing `model.ot` + `meta.json`) and the ONNX model exported from the
 //! same weights (via `BLOB_ONNX_MODEL`), then pushes a handful of real game
 //! states through both and asserts per-element agreement within 1e-5 on the
-//! value head.
-//!
-//! The playing-head policy goes through different masking/softmax code paths
-//! in the two backends (tch applies the mask inside `forward_play`; ort emits
-//! raw scores and `OnnxEvaluator` masks them). Comparing final masked
-//! probabilities therefore doubles as a policy-parity check: the Rust-side
-//! softmax and the tch-side softmax both consume the same legal hand
-//! positions, so a mismatch here flags a weight-loading or encoder drift
-//! bug just as reliably as a raw-logit comparison would.
+//! value head. The ONNX play policy is only range-checked, not compared.
 //!
 //! Skipped when either env var is unset so CI stays green on machines without
 //! a trained model. The python-side `scripts/export_onnx.py --check` covers

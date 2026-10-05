@@ -1,40 +1,16 @@
-//! blob-train — training / evaluation / self-play / export CLI.
+//! blob-train — training CLI.
 //!
-//! Session 7.1 wires the `train` subcommand to the `TrainingLoop` driver:
-//!   1. Load the TOML config, apply CLI overrides.
-//!   2. Build (or resume) a `TrainingLoop`.
-//!   3. Seed the first iteration's ONNX model from the in-memory weights
-//!      (unless resuming, in which case the latest iter's `model.onnx` is
-//!      reused).
-//!   4. Loop `total_iterations` times: run one iteration, export the
-//!      freshly-trained weights via `scripts/export_onnx.py`, and use the
-//!      produced `model.onnx` as self-play seed for the next iteration.
-//!   5. Every `eval.eval_interval` iterations (skipping the anchor), pit
-//!      the current model against the anchor checkpoint via
-//!      `blob_nn::eval::run_evaluation` and append the result to
-//!      `strength.csv`.
-
-mod config;
+//! Until the gen-2 learner lands (gen-2.md §6 Phase 4: `pretrain`; Phase 5:
+//! `train`), the only subcommand is `export`: tch checkpoint → ONNX through
+//! `scripts/export_onnx.py`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcCommand;
+use std::process::{Command as ProcCommand, ExitCode};
 
-use blob_nn::eval::{
-    append_strength_row, iteration_onnx_path, run_evaluation, StrengthRow,
-};
-use blob_nn::training_loop::TrainingLoop;
 use clap::{Parser, Subcommand};
-use rand_xoshiro::rand_core::{RngCore, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
-
-use crate::config::TrainingConfig;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "blobmaster-train",
-    about = "Blob training / evaluation / self-play / export CLI.",
-    version
-)]
+#[command(name = "blobmaster-train", about = "Blob training CLI.", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -42,690 +18,78 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Train {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        resume: bool,
-        #[arg(long)]
-        checkpoint_dir: Option<PathBuf>,
-        #[arg(long)]
-        batch_size: Option<usize>,
-        #[arg(long)]
-        num_games: Option<usize>,
-        #[arg(long)]
-        num_threads: Option<usize>,
-        #[arg(long)]
-        device: Option<String>,
-    },
-    Evaluate {
-        #[arg(long)]
-        model_a: PathBuf,
-        /// Path to opponent ONNX model.
-        #[arg(long)]
-        model_b: PathBuf,
-        /// Game cap; the evaluator stops earlier as soon as the Wilson
-        /// 95% CI clears the ±0.55/0.45 bands (chunks of 50).
-        #[arg(long)]
-        num_games: usize,
-        #[arg(long)]
-        num_players: u8,
-        #[arg(long)]
-        cards_dealt: u8,
-        /// Optional config TOML — its `[mcts]` section is used so the
-        /// eval matches the training-time MCTS budget. Defaults to
-        /// `MctsConfig::default()` (5 × 100, c_puct=1.5).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Optional RNG seed for reproducibility.
-        #[arg(long, default_value_t = 0xE5A1_5EEDu64)]
-        seed: u64,
-    },
-    SelfPlay {
-        #[arg(long)]
-        model: PathBuf,
-        #[arg(long)]
-        num_games: usize,
-        #[arg(long)]
-        output: PathBuf,
-    },
+    /// Export a tch checkpoint to ONNX with `scripts/export_onnx.py`.
     Export {
+        /// `model.ot`, or a checkpoint directory containing it.
         #[arg(long)]
         checkpoint: PathBuf,
+        /// Output `.onnx` path.
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Self-play profiler — plays `games_per_thread * num_threads` games
-    /// through the live rayon engine and prints a bucket breakdown of
-    /// time spent in MCTS, ONNX, encoding, determinization, etc.
-    Profile {
+        /// Also compare the exported graph with the PyTorch forward pass.
         #[arg(long)]
-        model: PathBuf,
-        #[arg(long, default_value_t = 5)]
-        games_per_thread: usize,
-        #[arg(long, default_value_t = 32)]
-        num_threads: usize,
-        #[arg(long)]
-        num_players: Option<u8>,
-        #[arg(long)]
-        cards_dealt: Option<u8>,
-        /// Optional config TOML — its `[mcts]` section is used so profiling
-        /// matches the real self-play MCTS budget. Defaults to
-        /// `MctsConfig::default()` (5 × 100, c_puct=1.5).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long, default_value_t = 0xB10B_5EEDu64)]
-        seed: u64,
+        check: bool,
     },
 }
 
-fn init_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("blob-train sits in the workspace")
 }
 
-fn apply_overrides(
-    cfg: &mut TrainingConfig,
-    checkpoint_dir: Option<PathBuf>,
-    batch_size: Option<usize>,
-    num_games: Option<usize>,
-    num_threads: Option<usize>,
-    device: Option<String>,
-) -> Result<(), String> {
-    if let Some(dir) = checkpoint_dir {
-        cfg.training.checkpoint_dir = dir;
-    }
-    if let Some(bs) = batch_size {
-        cfg.training.batch_size = bs;
-    }
-    if let Some(n) = num_games {
-        cfg.self_play.num_games = n;
-    }
-    if let Some(t) = num_threads {
-        cfg.self_play.num_threads = t;
-    }
-    if let Some(d) = device {
-        cfg.training.device = parse_device(&d)?;
-    }
-    Ok(())
-}
-
-fn parse_device(tag: &str) -> Result<tch::Device, String> {
-    let t = tag.to_ascii_lowercase();
-    if t == "cpu" {
-        Ok(tch::Device::Cpu)
-    } else if t == "mps" {
-        Ok(tch::Device::Mps)
-    } else if t == "vulkan" {
-        Ok(tch::Device::Vulkan)
-    } else if t == "cuda" {
-        Ok(tch::Device::Cuda(0))
-    } else if let Some(rest) = t.strip_prefix("cuda:") {
-        let i: usize = rest
-            .parse()
-            .map_err(|e| format!("invalid cuda index: {e}"))?;
-        Ok(tch::Device::Cuda(i))
+/// The repo's pinned venv if present (AGENTS.md), else `python3` on `PATH`.
+fn python() -> PathBuf {
+    let venv = workspace_root().join(".venv/bin/python");
+    if venv.exists() {
+        venv
     } else {
-        Err(format!("unknown device tag: {tag}"))
+        PathBuf::from("python3")
     }
 }
 
-/// Invoke `scripts/export_onnx.py --weights <ot> --out <onnx>`. Returns an
-/// `io::Error` if the script exits non-zero so the caller can propagate it
-/// through `run_iteration`'s error channel.
-fn run_export_script(ot_path: &Path, onnx_path: &Path) -> std::io::Result<()> {
-    let mut cmd = ProcCommand::new("python3");
+/// Run `scripts/export_onnx.py`. `LD_PRELOAD` is removed: a preloaded tch
+/// libtorch crashes the venv's `import torch` (different C++ ABI).
+fn export(checkpoint: &Path, output: &Path, check: bool) -> Result<(), String> {
+    let weights = if checkpoint.is_dir() {
+        checkpoint.join("model.ot")
+    } else {
+        checkpoint.to_path_buf()
+    };
+    if !weights.is_file() {
+        return Err(format!("no checkpoint at {}", weights.display()));
+    }
+    let mut cmd = ProcCommand::new(python());
     cmd.env_remove("LD_PRELOAD")
-        .arg("scripts/export_onnx.py")
+        .arg(workspace_root().join("scripts/export_onnx.py"))
         .arg("--weights")
-        .arg(ot_path)
+        .arg(&weights)
         .arg("--out")
-        .arg(onnx_path);
-    let status = cmd.status()?;
+        .arg(output);
+    if check {
+        cmd.arg("--check");
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run {}: {e}", cmd.get_program().to_string_lossy()))?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("export_onnx.py failed: {status}"),
-        ));
+        return Err(format!("export_onnx.py failed: {status}"));
     }
     Ok(())
 }
 
-/// Export the in-memory weights to a bootstrap ONNX so the first iteration
-/// has an evaluator to drive self-play.
-fn bootstrap_initial_onnx(tl: &TrainingLoop) -> std::io::Result<PathBuf> {
-    use blob_nn::train::save_checkpoint;
-    let dir = tl.cfg.checkpoint_dir.join("bootstrap");
-    std::fs::create_dir_all(&dir)?;
-    save_checkpoint(&tl.vs, 0, &dir)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let ot = dir.join("model.ot");
-    let onnx = dir.join("model.onnx");
-    run_export_script(&ot, &onnx)?;
-    Ok(onnx)
-}
-
-fn run_train(mut cfg: TrainingConfig, resume: bool) -> std::io::Result<()> {
-    let mut tl = TrainingLoop::new(cfg.training.clone());
-
-    let resumed_from = if resume {
-        tl.try_resume()?
-    } else {
-        None
-    };
-
-    // Locate the ONNX model that drives the next iteration's self-play.
-    let mut onnx_path: PathBuf = if let Some(iter_resumed) = resumed_from {
-        let p = iteration_onnx_path(&cfg.training.checkpoint_dir, iter_resumed);
-        if !p.exists() {
-            tracing::warn!(?p, "resumed checkpoint missing model.onnx; re-exporting");
-            bootstrap_initial_onnx(&tl)?
-        } else {
-            p
-        }
-    } else {
-        bootstrap_initial_onnx(&tl)?
-    };
-
-    // The anchor starts as the first saved iteration (= the `try_resume`
-    // baseline if resuming, else iter 0 once produced). It auto-advances
-    // when an eval shows the candidate decisively beating the current
-    // anchor — see `maybe_promote_anchor`. The 2026-04-28 anchor sweep
-    // pinned anchor=iter_31 across 195 iters with no advancement; this
-    // hides further strength gain inside Wilson noise.
-    let mut anchor_iter: u64 = tl.iteration;
-
-    cfg.self_play.iteration = tl.iteration;
-
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xB10B_5EED ^ tl.iteration);
-    // Session 7.4d-followup (2026-04-29): `total_iterations` is the
-    // *absolute target* iter count. The loop runs while
-    // `tl.iteration < total`, so a fresh run with `total = N` processes
-    // iters 0..N-1 (same observable as the old `for _ in 0..total`),
-    // but a resume from iter K with `total = M` processes iters K..M-1
-    // and the LR schedule's cosine span (= `total`) lines up with the
-    // absolute iteration counter that `LrSchedule::lr` reads. The
-    // previous count-semantics caused the LR to clamp to `MIN_LR`
-    // immediately after every resume because `iteration / (count - 1)`
-    // was always > 1 — observed on the sweep-2026-04-28 anchor resume,
-    // which spent 14 iters at lr=1e-5 (peak=3e-4) and produced no
-    // measurable strength gain (iter_29 vs iter_15 = 0.484 win rate).
-    let total = cfg.training.total_iterations;
-    if tl.iteration >= total {
-        tracing::warn!(
-            current_iter = tl.iteration,
-            total_iterations = total,
-            "training already at or past total_iterations — nothing to do; \
-             increase `[training] total_iterations` to extend the run"
-        );
-        return Ok(());
-    }
-    // Graceful-exit hook (2026-04-29): user creates this file to ask the
-    // loop to exit cleanly *after* the current iteration finishes its
-    // checkpoint save. The check fires at every iteration boundary, so
-    // worst-case wait between `touch STOP` and process exit is one
-    // iteration's wall-clock (~35-45 min on this stack). The file is
-    // consumed (deleted) on detection so the next `--resume` doesn't
-    // immediately stop again. Ctrl-C / SIGTERM still hard-kills mid-iter
-    // and loses the in-flight iteration's compute — use the STOP file if
-    // you care about that work.
-    let stop_file = cfg.training.checkpoint_dir.join("STOP");
-    tracing::info!(
-        target_iter = total,
-        start = tl.iteration,
-        iters_to_run = total - tl.iteration,
-        ?stop_file,
-        ?onnx_path,
-        "train — starting driver loop"
-    );
-    while tl.iteration < total {
-        if stop_file.exists() {
-            let _ = std::fs::remove_file(&stop_file);
-            tracing::info!(
-                ?stop_file,
-                next_iter = tl.iteration,
-                "STOP file detected — exiting cleanly before next iteration; \
-                 resume with `--resume` to continue"
-            );
-            break;
-        }
-        let iter = tl.iteration;
-        cfg.self_play.iteration = iter;
-        let started = std::time::Instant::now();
-        let metrics = tl.run_iteration(
-            &mut rng,
-            &cfg.self_play,
-            &cfg.mcts,
-            &onnx_path,
-            run_export_script,
-        )?;
-        let elapsed = started.elapsed();
-        tracing::info!(
-            iteration = iter,
-            wall_clock_secs = elapsed.as_secs_f64(),
-            // 2026-04-29: surface LR in the live log so a frozen-at-MIN_LR
-            // resume is obvious without grepping metrics.jsonl after the
-            // fact. The sweep-2026-04-28 anchor resume burned 14 iters at
-            // lr=1e-5 silently because nothing in the live tracing showed it.
-            learning_rate = metrics.learning_rate,
-            bid_policy_loss = metrics.bid_policy_loss,
-            play_policy_loss = metrics.play_policy_loss,
-            value_loss = metrics.value_loss,
-            combined_loss = metrics.combined_loss,
-            policy_kl_divergence = metrics.policy_kl_divergence,
-            visit_entropy_mean = metrics.visit_entropy_mean,
-            examples = metrics.examples_generated,
-            decisions = metrics.num_decisions,
-            signal_p50_mid = metrics.signal_p50_mid,
-            val_examples = metrics.val_buffer_len,
-            val_value_loss = metrics.val.value_loss,
-            train_eval_value_loss = metrics.train_eval.value_loss,
-            val_bid_policy_loss = metrics.val.bid_policy_loss,
-            train_eval_bid_policy_loss = metrics.train_eval.bid_policy_loss,
-            "iteration complete"
-        );
-
-        onnx_path = iteration_onnx_path(&cfg.training.checkpoint_dir, iter);
-
-        if cfg.eval.eval_interval > 0
-            && iter > anchor_iter
-            && iter % cfg.eval.eval_interval == 0
-        {
-            match run_eval_against_anchor(&cfg, anchor_iter, iter, &metrics, &mut rng) {
-                Ok(Some(result)) => {
-                    let promoted = maybe_promote_anchor(
-                        &cfg,
-                        &mut anchor_iter,
-                        iter,
-                        &result,
-                    );
-                    if promoted {
-                        tracing::info!(
-                            new_anchor = iter,
-                            win_rate = result.win_rate,
-                            win_rate_lower95 = result.win_rate_lower95,
-                            "anchor promoted — subsequent evals compare against this iter"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "periodic evaluation failed"),
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Decide whether the current iter has decisively beaten the running
-/// anchor and should replace it. Returns true if `*anchor_iter` was
-/// updated. The two gates are intentionally cheap and explicit:
-/// (a) the candidate must be at least `anchor_promotion_min_gap` iters
-/// newer than the current anchor, and (b) the Wilson lower-95 win rate
-/// from the just-completed eval must clear `anchor_promotion_lower95`.
-/// If the eval was inconclusive (cap burned without crossing either
-/// band), we skip promotion regardless — that path is a "still uncertain"
-/// signal, not a "decisively better" one.
-fn maybe_promote_anchor(
-    cfg: &TrainingConfig,
-    anchor_iter: &mut u64,
-    current_iter: u64,
-    result: &blob_nn::eval::EvaluationResult,
-) -> bool {
-    if result.inconclusive {
-        return false;
-    }
-    let gap = current_iter.saturating_sub(*anchor_iter);
-    if gap < cfg.eval.anchor_promotion_min_gap {
-        return false;
-    }
-    if result.win_rate_lower95 < cfg.eval.anchor_promotion_lower95 {
-        return false;
-    }
-    *anchor_iter = current_iter;
-    true
-}
-
-fn run_eval_against_anchor(
-    cfg: &TrainingConfig,
-    anchor_iter: u64,
-    current_iter: u64,
-    metrics: &blob_nn::training_loop::IterationMetrics,
-    rng: &mut Xoshiro256PlusPlus,
-) -> std::io::Result<Option<blob_nn::eval::EvaluationResult>> {
-    let anchor_onnx = iteration_onnx_path(&cfg.training.checkpoint_dir, anchor_iter);
-    let current_onnx = iteration_onnx_path(&cfg.training.checkpoint_dir, current_iter);
-    if !anchor_onnx.exists() || !current_onnx.exists() {
-        tracing::warn!(?anchor_onnx, ?current_onnx, "eval: missing ONNX; skipping");
-        return Ok(None);
-    }
-    let (n_players, cards) = cfg.self_play.fixed_player_count.unwrap_or((5, 7));
-    // Pull a single u64 from the training-loop RNG so eval remains
-    // reproducible across runs (downstream per-game seeds come from this).
-    let base_seed: u64 = rng.next_u64();
-    let result = run_evaluation(
-        &current_onnx,
-        &anchor_onnx,
-        cfg.eval.eval_games,
-        n_players,
-        cards,
-        &cfg.mcts,
-        base_seed,
-        cfg.eval.eval_num_threads,
-    );
-    tracing::info!(
-        current_iter,
-        anchor_iter,
-        win_rate = result.win_rate,
-        win_rate_lower95 = result.win_rate_lower95,
-        bid_success_current = result.bid_success_rate_a,
-        bid_success_anchor = result.bid_success_rate_b,
-        "eval vs anchor"
-    );
-    append_strength_row(
-        &cfg.training.checkpoint_dir,
-        &StrengthRow {
-            iteration: current_iter,
-            opponent: format!("iter_{anchor_iter:06}"),
-            win_rate: result.win_rate,
-            win_rate_lower95: result.win_rate_lower95,
-            win_rate_upper95: result.win_rate_upper95,
-            score_differential: result.score_differential,
-            bid_success_rate_current: result.bid_success_rate_a,
-            bid_success_rate_opponent: result.bid_success_rate_b,
-            policy_loss: metrics.play_policy_loss,
-            value_loss: metrics.value_loss,
-            visit_entropy: metrics.visit_entropy_mean,
-            kl_divergence: metrics.policy_kl_divergence,
-            eval_games_played: result.num_games as u32,
-            eval_inconclusive: result.inconclusive,
-        },
-    )?;
-    Ok(Some(result))
-}
-
-fn run_profile(
-    model: &Path,
-    games_per_thread: usize,
-    num_threads: usize,
-    num_players: Option<u8>,
-    cards_dealt: Option<u8>,
-    config: Option<&Path>,
-    seed: u64,
-) -> std::io::Result<()> {
-    use blob_engine::profiling;
-    use blob_nn::engine::{self_play_iteration, SelfPlayConfig};
-
-    let mcts_cfg = if let Some(p) = config {
-        TrainingConfig::load(p)?.mcts
-    } else {
-        blob_engine::mcts::MctsConfig::default()
-    };
-
-    let fixed = match (num_players, cards_dealt) {
-        (Some(n), Some(c)) => Some((n, c)),
-        (None, None) => None,
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "pass both --num-players and --cards-dealt, or neither",
-            ));
-        }
-    };
-
-    let num_games = games_per_thread.saturating_mul(num_threads);
-    let sp_cfg = SelfPlayConfig {
-        num_games,
-        num_threads,
-        iteration: seed,
-        show_progress: false,
-        fixed_player_count: fixed,
-    };
-
-    tracing::info!(
-        ?model,
-        num_games,
-        num_threads,
-        games_per_thread,
-        ?fixed,
-        c_puct = mcts_cfg.c_puct,
-        num_determinizations = mcts_cfg.num_determinizations,
-        sims_per_determinization = mcts_cfg.sims_per_determinization,
-        "profile — starting self-play profiling run"
-    );
-
-    profiling::reset_all();
-    profiling::enable();
-    let started = std::time::Instant::now();
-    let (examples, stats) = self_play_iteration(model, &sp_cfg, &mcts_cfg);
-    let wall = started.elapsed();
-    profiling::disable();
-
-    let thread_seconds_ns = (wall.as_nanos() as u64).saturating_mul(num_threads as u64);
-
-    let total_sims: u64 = stats.iter().map(|s| s.sims_used as u64).sum();
-    let num_decisions = stats.len();
-
-    println!();
-    println!("=== blobmaster-train profile ===");
-    println!("games               : {num_games} ({games_per_thread} × {num_threads} threads)");
-    println!("fixed_player_count  : {fixed:?}");
-    println!(
-        "mcts                : {} det × {} sims (floor={}, c_puct={})",
-        mcts_cfg.num_determinizations,
-        mcts_cfg.sims_per_determinization,
-        mcts_cfg.min_sims_floor,
-        mcts_cfg.c_puct
-    );
-    println!("wall clock (s)      : {:.3}", wall.as_secs_f64());
-    println!("thread-seconds      : {:.3}", thread_seconds_ns as f64 / 1e9);
-    println!("decisions           : {num_decisions}");
-    println!("examples            : {}", examples.len());
-    println!("total sims          : {total_sims}");
-    if num_decisions > 0 {
-        println!(
-            "avg per-game wall   : {:.3} ms",
-            wall.as_secs_f64() * 1000.0 / num_games as f64
-        );
-        println!(
-            "avg per-decision    : {:.3} ms  ({:.1} decisions/game)",
-            (thread_seconds_ns as f64 / 1e6) / num_decisions as f64,
-            num_decisions as f64 / num_games as f64
-        );
-    }
-    println!();
-
-    println!(
-        "{:<22} {:>14} {:>10} {:>14} {:>8} {:>8}",
-        "bucket", "total_ms", "calls", "avg_us", "%wall", "%threads"
-    );
-    println!("{}", "-".repeat(80));
-    for b in profiling::ALL_BUCKETS {
-        let (nanos, count) = b.snapshot();
-        let ms = nanos as f64 / 1e6;
-        let avg_us = if count > 0 {
-            (nanos as f64 / 1e3) / count as f64
-        } else {
-            0.0
-        };
-        let pct_wall = 100.0 * nanos as f64 / wall.as_nanos() as f64;
-        let pct_threads = if thread_seconds_ns > 0 {
-            100.0 * nanos as f64 / thread_seconds_ns as f64
-        } else {
-            0.0
-        };
-        println!(
-            "{:<22} {:>14.2} {:>10} {:>14.2} {:>7.1}% {:>7.1}%",
-            b.name, ms, count, avg_us, pct_wall, pct_threads
-        );
-    }
-    println!();
-    println!(
-        "Notes: buckets are nested — ONNX_* are a sub-slice of MCTS_SEARCH. %wall is"
-    );
-    println!(
-        "summed-thread-time over wall clock (>100% when multi-threaded, divided by"
-    );
-    println!("num_threads gives per-thread share). %threads is share of wall × threads.");
-    Ok(())
-}
-
-fn run_evaluate(
-    model_a: &Path,
-    model_b: &Path,
-    num_games: usize,
-    num_players: u8,
-    cards_dealt: u8,
-    config: Option<&Path>,
-    seed: u64,
-) -> std::io::Result<()> {
-    let (mcts_cfg, num_threads) = if let Some(p) = config {
-        let loaded = TrainingConfig::load(p)?;
-        (loaded.mcts, loaded.eval.eval_num_threads)
-    } else {
-        (blob_engine::mcts::MctsConfig::default(), 32)
-    };
-    tracing::info!(
-        ?model_a,
-        ?model_b,
-        cap_games = num_games,
-        num_players,
-        cards_dealt,
-        num_threads,
-        c_puct = mcts_cfg.c_puct,
-        num_determinizations = mcts_cfg.num_determinizations,
-        sims_per_determinization = mcts_cfg.sims_per_determinization,
-        "evaluate — starting head-to-head (parallel, adaptive early-stop)"
-    );
-    let result = run_evaluation(
-        model_a,
-        model_b,
-        num_games,
-        num_players,
-        cards_dealt,
-        &mcts_cfg,
-        seed,
-        num_threads,
-    );
-    tracing::info!(
-        games_played = result.num_games,
-        wins_a = result.wins_a,
-        win_rate = result.win_rate,
-        win_rate_lower95 = result.win_rate_lower95,
-        win_rate_upper95 = result.win_rate_upper95,
-        score_differential = result.score_differential,
-        bid_success_a = result.bid_success_rate_a,
-        bid_success_b = result.bid_success_rate_b,
-        inconclusive = result.inconclusive,
-        "evaluate — result"
-    );
-    Ok(())
-}
-
-fn main() {
-    init_logging();
-
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Train {
-            config,
-            resume,
-            checkpoint_dir,
-            batch_size,
-            num_games,
-            num_threads,
-            device,
-        } => {
-            let mut cfg = match TrainingConfig::load(&config) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(path = ?config, error = %e, "failed to load config");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(e) = apply_overrides(
-                &mut cfg,
-                checkpoint_dir,
-                batch_size,
-                num_games,
-                num_threads,
-                device,
-            ) {
-                tracing::error!(error = %e, "failed to apply CLI overrides");
-                std::process::exit(1);
-            }
-            tracing::info!(
-                resume,
-                checkpoint_dir = ?cfg.training.checkpoint_dir,
-                batch_size = cfg.training.batch_size,
-                num_games = cfg.self_play.num_games,
-                num_threads = cfg.self_play.num_threads,
-                total_iterations = cfg.training.total_iterations,
-                fixed_player_count = ?cfg.self_play.fixed_player_count,
-                "train — driver starting"
-            );
-            if let Err(e) = run_train(cfg, resume) {
-                tracing::error!(error = %e, "training run failed");
-                std::process::exit(1);
-            }
-        }
-        Command::Evaluate {
-            model_a,
-            model_b,
-            num_games,
-            num_players,
-            cards_dealt,
-            config,
-            seed,
-        } => {
-            if let Err(e) = run_evaluate(
-                &model_a,
-                &model_b,
-                num_games,
-                num_players,
-                cards_dealt,
-                config.as_deref(),
-                seed,
-            ) {
-                tracing::error!(error = %e, "evaluation failed");
-                std::process::exit(1);
-            }
-        }
-        Command::SelfPlay {
-            model,
-            num_games,
+    let result = match cli.command {
+        Command::Export {
+            checkpoint,
             output,
-        } => {
-            tracing::info!(?model, num_games, ?output, "self-play — driver wiring lands in later session");
-        }
-        Command::Export { checkpoint, output } => {
-            tracing::info!(?checkpoint, ?output, "export — driver wiring lands in later session");
-        }
-        Command::Profile {
-            model,
-            games_per_thread,
-            num_threads,
-            num_players,
-            cards_dealt,
-            config,
-            seed,
-        } => {
-            if let Err(e) = run_profile(
-                &model,
-                games_per_thread,
-                num_threads,
-                num_players,
-                cards_dealt,
-                config.as_deref(),
-                seed,
-            ) {
-                tracing::error!(error = %e, "profile run failed");
-                std::process::exit(1);
-            }
+            check,
+        } => export(&checkpoint, &output, check),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }

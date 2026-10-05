@@ -1,6 +1,6 @@
-//! Session 3.5 — ONNX Runtime-backed `Evaluator`.
+//! ONNX Runtime-backed `Evaluator`.
 //!
-//! Production inference path for self-play (Section 5.3) and the deployment
+//! Production inference path for search, `bench`, `play` and the deployment
 //! binary. Each rayon thread should create its own `OnnxEvaluator` because
 //! `ort::Session` is not itself thread-safe for concurrent `run()` calls
 //! without locking — per-thread sessions with `intra_op_num_threads=1` give
@@ -9,8 +9,7 @@
 //! Expected ONNX graph I/O (produced by `scripts/export_onnx.py`):
 //!
 //! Inputs:
-//! - `features: [batch, seq, F]` f32, `F` = the encoder layout's padded
-//!   width: `encoder::FEAT_DIM` for gen-2 models, 48 for gen-1 ones
+//! - `features: [batch, seq, FEAT_DIM]` f32 (`encoder::FEAT_DIM`)
 //! - `token_types: [batch, seq]` i64
 //! - `chrono_indices: [batch, seq]` i64
 //! - `attention_mask: [batch, seq]` bool
@@ -24,9 +23,8 @@
 //! rather than relying on the graph-internal mask, so one exported model
 //! works for any phase and any hand size.
 //!
-//! The encoder layout is read from the model: `F` names the
-//! [`EncoderVersion`], so gen-1 checkpoints keep running on the frozen
-//! [`crate::encoder::v1`] layout next to gen-2 models.
+//! A model whose `features` width differs from `FEAT_DIM` was trained on
+//! another encoder layout and is refused at load time (gen-2.md §4).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -36,7 +34,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 
 use crate::bidding::legal_bids;
-use crate::encoder::{EncodedState, EncoderVersion, TOKEN_TYPE_HAND};
+use crate::encoder::{encode, EncodedState, FEAT_DIM, TOKEN_TYPE_HAND};
 use crate::evaluator::{Evaluator, NUM_BIDS};
 use crate::playing::legal_plays;
 use crate::state::{BlobState, GamePhase};
@@ -44,14 +42,11 @@ use crate::state::{BlobState, GamePhase};
 /// ONNX-backed evaluator. Own one per thread for self-play.
 pub struct OnnxEvaluator {
     session: Mutex<Session>,
-    encoder: EncoderVersion,
 }
 
 impl std::fmt::Debug for OnnxEvaluator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnnxEvaluator")
-            .field("encoder", &self.encoder)
-            .finish_non_exhaustive()
+        f.debug_struct("OnnxEvaluator").finish_non_exhaustive()
     }
 }
 
@@ -60,8 +55,7 @@ impl OnnxEvaluator {
     /// `intra_op_num_threads=1` so multiple rayon threads can each hold
     /// their own session without contention.
     ///
-    /// Fails if the model's `features` input width matches no
-    /// [`EncoderVersion`].
+    /// Fails if the model's `features` input width isn't [`FEAT_DIM`].
     pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
         crate::profiling::time(&crate::profiling::SESSION_CONSTRUCTION, || {
             let session = Session::builder()?
@@ -74,31 +68,23 @@ impl OnnxEvaluator {
                 .find(|i| i.name() == "features")
                 .and_then(|i| i.dtype().tensor_shape())
                 .and_then(|shape| shape.last().copied());
-            let encoder = width
-                .and_then(|w| usize::try_from(w).ok())
-                .and_then(EncoderVersion::from_feat_dim)
-                .ok_or_else(|| {
-                    ort::Error::new(format!(
-                        "model `features` input width {width:?} matches no encoder version"
-                    ))
-                })?;
+            if width != Some(FEAT_DIM as i64) {
+                return Err(ort::Error::new(format!(
+                    "model `features` input width {width:?} is not the encoder's {FEAT_DIM}: \
+                     it was trained on another encoder layout"
+                )));
+            }
             Ok(Self {
                 session: Mutex::new(session),
-                encoder,
             })
         })
-    }
-
-    /// Feature layout this model was trained on.
-    pub fn encoder_version(&self) -> EncoderVersion {
-        self.encoder
     }
 
     fn run_encoded(&self, enc: &EncodedState) -> ort::Result<(Vec<f32>, Vec<f32>, f32)> {
         let s = enc.num_tokens;
 
         let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
-            let mut features = Array3::<f32>::zeros((1, s, self.encoder.feat_dim()));
+            let mut features = Array3::<f32>::zeros((1, s, FEAT_DIM));
             let mut token_types = Array2::<i64>::zeros((1, s));
             let mut chrono = Array2::<i64>::zeros((1, s));
             let mut mask = Array2::<bool>::from_elem((1, s), false);
@@ -167,7 +153,7 @@ impl OnnxEvaluator {
         let s_max = encs.iter().map(|e| e.num_tokens).max().unwrap_or(0);
 
         let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
-            let mut features = Array3::<f32>::zeros((b, s_max, self.encoder.feat_dim()));
+            let mut features = Array3::<f32>::zeros((b, s_max, FEAT_DIM));
             let mut token_types = Array2::<i64>::zeros((b, s_max));
             let mut chrono = Array2::<i64>::zeros((b, s_max));
             let mut mask = Array2::<bool>::from_elem((b, s_max), false);
@@ -328,7 +314,7 @@ impl Evaluator for OnnxEvaluator {
             return (Vec::new(), 0.0);
         }
 
-        let enc = self.encoder.encode(state, state.current_player);
+        let enc = encode(state, state.current_player);
         let (raw_bid, raw_play, value) = match self.run_encoded(&enc) {
             Ok(t) => t,
             Err(e) => panic!("ONNX inference failed: {e}"),
@@ -355,7 +341,7 @@ impl Evaluator for OnnxEvaluator {
 
         let encs: Vec<EncodedState> = states
             .iter()
-            .map(|s| self.encoder.encode(s, s.current_player))
+            .map(|s| encode(s, s.current_player))
             .collect();
 
         let triples = match self.run_encoded_batch(&encs) {
@@ -402,7 +388,7 @@ mod tests {
         let _ = e;
     }
 
-    /// Session 7.4c stage-1: batched ONNX inference must agree with looping
+    /// Batched ONNX inference must agree with looping
     /// `evaluate` on the same states, modulo FP rounding from the GEMM
     /// batch shape (well below the 1e-5 element gate `scripts/export_onnx`
     /// already uses for tch ↔ ORT parity). Skips when `BLOB_ONNX_MODEL`

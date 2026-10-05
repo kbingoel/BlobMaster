@@ -1,14 +1,14 @@
 //! Replay buffer for self-play training examples.
 //!
-//! Session 5.1: stores raw `BlobState` snapshots along with their MCTS
-//! policies, backfilled value targets, and the `GamePhase` the decision was
-//! taken in. The buffer is a circular FIFO — once capacity is reached, new
+//! Stores raw `BlobState` snapshots along with their MCTS policies,
+//! backfilled value targets, and the `GamePhase` the decision was taken
+//! in. The buffer is a circular FIFO — once capacity is reached, new
 //! writes overwrite the oldest entries.
 //!
-//! Design rationale (see development-plan.md §5.1): storing raw states plus
-//! sparse policies costs ~410B + small policy per example, so 500K examples
-//! fits in ~250MB. Re-encoding to entity tokens happens at batch construction
-//! time, which decouples encoder changes from buffer compatibility.
+//! Design rationale: storing raw states plus sparse policies costs ~410B +
+//! small policy per example, so 500K examples fits in ~250MB. Re-encoding
+//! to entity tokens happens at batch construction time, which decouples
+//! encoder changes from buffer compatibility.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};

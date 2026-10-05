@@ -56,7 +56,7 @@ Commands at your turn:
   quit         leave the game
 Scoring: make your bid exactly for 10 + bid points, otherwise 0.
 The dealer bids last and may not bid so that the bids add up to the cards dealt.
-\"value\" is the gen-1 network's estimate of that seat's final-game z-score (−1..+1).";
+\"value\" is the network's value estimate for that seat (−1..+1).";
 
 enum Command {
     Number(u8),

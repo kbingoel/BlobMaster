@@ -1,25 +1,11 @@
-//! blob-nn — neural network training crate (Linux / libtorch).
+//! blob-nn — the network and its training code (Linux / libtorch).
 //!
-//! Populated in Section 3 of `development-plan.md`. Session 1.1 leaves this
-//! crate as an empty stub so the workspace compiles.
-//!
-//! The entity encoder lives in `blob-engine::encoder` (moved there from
-//! blob-nn after Section 2 so that MCTS in blob-engine can encode states
-//! without creating a circular crate dependency).
-//!
-//! Re-exported here for backwards compatibility during the transition.
+//! The only crate that depends on `tch`. The entity encoder lives in
+//! `blob-engine::encoder`, so search and inference never need libtorch.
 
-pub use blob_engine::encoder;
-
-pub mod input;
-pub mod transformer;
 pub mod heads;
+pub mod input;
+pub mod learner;
 pub mod model;
-pub mod self_play;
-pub mod engine;
 pub mod train;
-pub mod training_loop;
-pub mod eval;
-
-pub use self_play::{backfill_values, play_one_game, sample_game_params, TrainingExample};
-pub use engine::{self_play_iteration, SelfPlayConfig, DEFAULT_NUM_THREADS};
+pub mod transformer;

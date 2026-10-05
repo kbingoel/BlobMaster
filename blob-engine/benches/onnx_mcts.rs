@@ -1,13 +1,11 @@
-//! Session 6.3 — benches that require an ONNX model.
+//! Benches that require an ONNX model.
 //!
 //! Gated on the `BLOB_ONNX_MODEL` environment variable (path to an exported
 //! `model.onnx`). When unset the benches become no-ops so `cargo bench` still
 //! runs green on machines without a trained model.
 //!
-//! Targets:
-//! - ONNX inference (batch=1): < 0.2 ms
-//! - MCTS 100 sims (single determinization, ONNX eval): < 20 ms
-//! - Full move (5 det × 100 sims): < 100 ms
+//! Benches: ONNX inference (batch 1), MCTS with 1 × 100 sims, and a full
+//! 5 × 100 move. Gen-1 numbers on this machine are in gen-2.md §3.1.
 
 use std::hint::black_box;
 use std::path::PathBuf;

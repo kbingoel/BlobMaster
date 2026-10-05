@@ -1,7 +1,7 @@
 //! Composite BlobNet model — input projection + Transformer + three heads.
 //!
-//! This is a thin owning wrapper around the building blocks from Sessions
-//! 3.1–3.3 so that training code (Session 3.4) has a single object to pass
+//! This is a thin owning wrapper around the input, transformer and head
+//! building blocks so that training code has a single object to pass
 //! around. Parameters are registered into one `VarStore`, which the caller
 //! owns and passes to the optimizer.
 
@@ -30,7 +30,7 @@ impl BlobNet {
     ///
     /// `value_head` parameters are registered into param group
     /// `VALUE_HEAD_GROUP` so the training loop can scale the value-head
-    /// learning rate independently (Session 7.3a: 0.5× peak_lr).
+    /// learning rate independently.
     pub fn new(vs: &nn::Path) -> Self {
         Self {
             input: InputProjection::new(&(vs / "input")),

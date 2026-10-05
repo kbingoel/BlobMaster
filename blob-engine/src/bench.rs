@@ -14,9 +14,9 @@
 //! Every deal and every game is seeded from [`BenchConfig::seed`], so two
 //! models benched with the same config play the same cards.
 //!
-//! Gen-1 reference (`run-2026-05-14/iter_000167`, 5 players / 7 cards):
-//! about −9 points per game with 5×100 search and −13.5 network-only, both
-//! vs the rule bot (gen-2.md §2.1).
+//! Gen-1 reference (final model, 5 players / 7 cards, default deals, vs the
+//! rule bot): −10.2 ± 2.9 points per game with 5×100 search and −12.1 ± 2.0
+//! network-only (gen-2.md §5.7).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -92,8 +92,8 @@ impl Default for BenchConfig {
     }
 }
 
-/// The gen-1 search recipe (`run-2026-05-14`) without root noise or a
-/// temperature schedule; the caller plays the most-visited move.
+/// The gen-1 search recipe without root noise or a temperature schedule;
+/// the caller plays the most-visited move.
 pub fn eval_mcts_config(num_determinizations: u32, sims_per_determinization: u32) -> MctsConfig {
     MctsConfig {
         c_puct: 1.5,

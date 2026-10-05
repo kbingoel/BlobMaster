@@ -122,13 +122,6 @@ enum Command {
         #[arg(long)]
         no_color: bool,
     },
-    /// Single-state policy+value dump for debugging (not yet implemented).
-    Analyze {
-        #[arg(long)]
-        model: PathBuf,
-        #[arg(long)]
-        state: PathBuf,
-    },
 }
 
 /// Rule bot 2r settings (`blob_engine::rule_bot_2::Rollouts`).
@@ -161,10 +154,17 @@ fn parse_opponent(s: &str, rollouts: Rollouts) -> Agent {
     }
 }
 
-fn require_file(agent: &Agent) {
+/// Exit early if `agent`'s model is missing or can't load (e.g. it was
+/// trained on another encoder layout), instead of panicking in every
+/// bench thread.
+fn require_model(agent: &Agent) {
     if let Some(p) = agent.model() {
         if !p.is_file() {
             eprintln!("error: model {} not found", p.display());
+            std::process::exit(2);
+        }
+        if let Err(e) = blob_engine::OnnxEvaluator::from_file(p) {
+            eprintln!("error: load ONNX model {}: {e}", p.display());
             std::process::exit(2);
         }
     }
@@ -196,8 +196,8 @@ fn cmd_bench(
         }
     };
     let opponent = parse_opponent(&opponent, rollouts);
-    require_file(&focal);
-    require_file(&opponent);
+    require_model(&focal);
+    require_model(&opponent);
     let searching = matches!(focal, Agent::Search(_));
     let mut cfg = BenchConfig {
         num_players: players,
@@ -258,7 +258,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            require_file(&bot);
+            require_model(&bot);
             let seed = seed.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -280,10 +280,6 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-        }
-        Command::Analyze { model, state } => {
-            eprintln!("analyze is not implemented yet ({} / {})", model.display(), state.display());
-            std::process::exit(2);
         }
     }
 }

@@ -28,7 +28,7 @@ pub const fn trump_for_round(round_idx: u32) -> u8 {
 /// Total rounds in a game: `2C + num_players − 2`.
 ///
 /// **Note**: this differs from `legacy/game-engine/constants.py`, which
-/// produces one extra 1-card round. See `development-plan.md` Session 1.2.
+/// produces one extra 1-card round.
 #[inline]
 pub const fn total_rounds(start_cards: u8, num_players: u8) -> u8 {
     2 * start_cards + num_players - 2

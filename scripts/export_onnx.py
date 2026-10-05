@@ -1,6 +1,6 @@
 """Export a trained BlobNet to ONNX.
 
-Session 3.5 workflow:
+Workflow:
     1. In Rust, call `blob_nn::train::save_checkpoint(&vs, iter, dir)` — this
        writes `{dir}/model.ot`, a libtorch-compatible tensor archive.
     2. Run this script:
@@ -41,10 +41,8 @@ N_LAYERS = 8
 DROPOUT = 0.1
 LN_EPS = 1e-5
 
-# Token widths of the encoder layout (`blob-engine/src/encoder.rs`, gen-2
-# layout v2). The Rust test `export_script_mirrors_feature_widths` checks
-# these lines. Gen-1 checkpoints used 30/48/29/13 (padded to 48) and can't be
-# re-exported with this script.
+# Token widths of the encoder layout (`blob-engine/src/encoder.rs`). The Rust
+# test `export_script_mirrors_feature_widths` checks these lines.
 HAND_DIM = 32
 PLAYED_DIM = 49
 PLAYER_DIM = 28

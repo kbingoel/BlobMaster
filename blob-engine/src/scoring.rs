@@ -1,34 +1,29 @@
-//! C2-fix helpers: in-tree terminal value computation aligned with
-//! `blob_nn::self_play::backfill_values` so MCTS terminal leaves and the
-//! training-target values live on a single coherent scale.
+//! In-tree terminal value computation aligned with the gen-1 value target
+//! (the z-scored final game score, clipped to ±1) so MCTS terminal leaves
+//! and the training-target values live on a single coherent scale.
 //!
-//! See [fix-mcts-plan.md](../../../fix-mcts-plan.md) Step 2 for the
-//! rationale; the bundled C2a/C2b/C2c callouts in that plan map to:
-//! - **C2a** — multi-seat backprop: covered by
+//! - Multi-seat backprop: covered by
 //!   [`crate::mcts::backprop_terminal`], which consumes the per-seat
 //!   vector this module emits.
-//! - **C2b** — round-boundary truncation: out of scope. MCTS's
+//! - Round-boundary truncation: out of scope. MCTS's
 //!   `apply_action` no-ops on `Scoring`/`Complete`, so a round-1 search
 //!   sees no signal from rounds 2..N. [`terminal_z_scores`] returns the
 //!   closest single-statistic approximation available without rolling a
 //!   fresh deal forward.
-//! - **C2c** — scale alignment: [`z_score_clip`] is the single source of
-//!   truth for the z-score statistic; both [`terminal_z_scores`] and
-//!   `backfill_values` call it on `cumulative_scores`-derived inputs so
-//!   in-tree Q and the training value target cannot drift in scale.
+//! - Scale alignment: [`z_score_clip`] is the single source of
+//!   truth for the z-score statistic; [`terminal_z_scores`] calls it on
+//!   `cumulative_scores`-derived inputs, the same statistic as the value
+//!   target, so in-tree Q and the training value target cannot drift in
+//!   scale.
 
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
-/// Floor on the standard-deviation denominator. Mirrors
-/// `blob_nn::self_play::backfill_values` so this helper produces
-/// identical output for any final state.
+/// Floor on the standard-deviation denominator.
 pub const Z_SCORE_EPS: f32 = 1e-6;
 
 /// Z-score `scores[..n]` and clip to `[-1, 1]`. Returns all-zero when
 /// the std underflows `Z_SCORE_EPS` (all-equal scores: z-score is
 /// undefined). Slots `>= n` stay zero.
-///
-/// Shared with `backfill_values` (single source of truth for C2c).
 #[inline]
 pub fn z_score_clip(scores: &[f32; MAX_PLAYERS], n: usize) -> [f32; MAX_PLAYERS] {
     let mut z = [0.0f32; MAX_PLAYERS];
@@ -58,9 +53,8 @@ pub fn z_score_clip(scores: &[f32; MAX_PLAYERS], n: usize) -> [f32; MAX_PLAYERS]
 ///   where `this_round_score[i] = (tricks_won[i] == bid[i]) ? 10 + bid[i]
 ///   : 0`. `advance_round` is what folds the round into
 ///   `cumulative_scores`; MCTS hits the `Scoring` boundary *before* that
-///   call ([self_play.rs:209-211](../../../blob-nn/src/self_play.rs)),
-///   so we pre-add the payout locally to keep the in-tree Q consistent
-///   with what `backfill_values` would emit if the game ended now.
+///   call, so we pre-add the payout locally to keep the in-tree Q
+///   consistent with the value target the game would get if it ended now.
 ///
 /// Slots `>= num_players` are zero. Non-terminal phases return all-zero
 /// — callers are expected to gate this behind [`crate::mcts::is_terminal`].

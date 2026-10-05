@@ -1,13 +1,13 @@
-//! Session 3.4 — losses, optimizer, LR schedule, training step, checkpoints.
+//! Losses, optimizer, LR schedule, training step, checkpoints.
 //!
 //! - Policy loss: cross-entropy against an MCTS-visit-count distribution,
 //!   `-Σ t · log(p + ε)`. Illegal actions have `t = 0`, contributing nothing.
-//! - Value loss: MSE against a z-scored cumulative-score target clipped to
-//!   `[-1, 1]`.
+//! - Value loss: MSE against the value target (gen 1: the z-scored final
+//!   game score, clipped to `[-1, 1]`).
 //! - Combined: `policy_loss + 2.0 · value_loss`.
 //! - Optimizer: AdamW (β₁=0.9, β₂=0.999, wd=1e-4).
-//! - LR schedule: linear warmup to 3e-4 over `warmup_steps`, then cosine
-//!   annealing to 1e-5 over the remaining steps.
+//! - LR schedule: linear warmup to 3e-4 over `warmup_steps` in iteration 0,
+//!   then cosine annealing to 1e-5 over iterations ([`LrSchedule`]).
 //! - Grad clip: global norm 1.0.
 //! - Checkpoints: `VarStore::save` + sidecar JSON with iteration.
 
@@ -35,10 +35,9 @@ pub const WEIGHT_DECAY: f64 = 1e-4;
 /// this group stays in the default group 0.
 pub const VALUE_HEAD_GROUP: usize = 1;
 /// Multiplier applied to the value-head param group's LR, relative to
-/// `peak_lr`. Phase-A (7.3c) reverts to 1.0: the 7.2 baseline ran at 1.0
-/// with `grad_norms.value_head ≈ 5` and reached 0.77 eval win rate. The
-/// 7.3b attempt at 0.5 decoupled value from policy — see
-/// `7.3b-analysis.md` §7.2.
+/// `peak_lr`. Reverted to 1.0: the run-7.2 baseline ran at 1.0 with
+/// `grad_norms.value_head ≈ 5` and reached 0.77 eval win rate. The
+/// run-7.3b attempt at 0.5 decoupled value from policy.
 pub const VALUE_HEAD_LR_SCALE: f64 = 1.0;
 
 /// Apply `lr` to the default param group and `lr * VALUE_HEAD_LR_SCALE`
@@ -95,8 +94,7 @@ pub fn value_mse(pred: &Tensor, target: &Tensor) -> Tensor {
 
 /// Z-score a slice of cumulative scores into `[-1, 1]`.
 ///
-/// `clip((x - mean) / max(std, eps), -1, 1)`. Exposed for test fixtures
-/// and for the self-play pipeline in Section 5.
+/// `clip((x - mean) / max(std, eps), -1, 1)`. Exposed for test fixtures.
 pub fn z_score_clip(scores: &[f32], eps: f32) -> Vec<f32> {
     let n = scores.len() as f32;
     if n == 0.0 {
@@ -113,12 +111,12 @@ pub fn z_score_clip(scores: &[f32], eps: f32) -> Vec<f32> {
 
 /// Learning-rate schedule: linear warmup → iteration-relative cosine.
 ///
-/// Phase-A (Session 7.3c) replaces the old step-based schedule because it
-/// silently coupled LR decay to `epoch_early_stop_rel` — 7.3b ran ~4× more
-/// steps per iter than 7.2, which dragged the cosine to `min_lr` by iter
-/// 14 even though the iteration count was the same. The new schedule
+/// This replaces the old step-based schedule because it silently coupled
+/// LR decay to `epoch_early_stop_rel` — run 7.3b ran ~4× more steps per
+/// iter than run 7.2, which dragged the cosine to `min_lr` by iter 14
+/// even though the iteration count was the same. The new schedule
 /// decays per-iteration, so changing the epoch cap can no longer warp the
-/// LR trajectory. See `7.3b-analysis.md` §7.3 for the failure mode.
+/// LR trajectory (gen-2.md §3.3).
 ///
 /// Within iteration 0 we still linearly warm up over the first
 /// `warmup_steps` batches (protects the freshly-initialised bootstrap
@@ -218,7 +216,7 @@ pub fn train_step(
 /// buffers for serialization. On resume we rebuild the optimizer and
 /// re-enter the LR schedule at `iteration`. The first few post-resume
 /// steps will see warmup-like transient moments; this is an acceptable
-/// trade-off given this project's short training horizons (Section 5).
+/// trade-off given this project's short training horizons.
 pub fn save_checkpoint(
     vs: &VarStore,
     iteration: u64,
@@ -363,16 +361,16 @@ mod tests {
     /// The resume TOML had `total_iterations = 14` (count of iters to
     /// run this session), but `LrSchedule::new(14)` sets a cosine span
     /// of [0, 13]. The absolute iteration counter started at 16 (= K+1
-    /// after `try_resume` from iter_15), so `t = 16/13 > 1.0` → clamped
+    /// after resuming from iter_15), so `t = 16/13 > 1.0` → clamped
     /// to t=1 → cos=0 → LR pinned at MIN_LR for all 14 iters. Model
     /// effectively frozen; iter_29 vs iter_15 head-to-head was 0.484
     /// win rate (no learning).
     ///
-    /// The fix is at the call-site (`main.rs` switched to absolute-target
-    /// semantics: `total_iterations` is the cosine span, the loop runs
-    /// `while tl.iteration < total`). This test documents what the LR
-    /// schedule produces under correct usage so we never re-enable the
-    /// failure mode by accident.
+    /// The fix was at the call-site (the gen-1 driver switched to
+    /// absolute-target semantics: `total_iterations` is the cosine span,
+    /// the loop ran `while iteration < total`). This test documents what
+    /// the LR schedule produces under correct usage so we never re-enable
+    /// the failure mode by accident.
     #[test]
     fn lr_schedule_continuous_across_resume_with_absolute_target() {
         // 100-iter run (absolute target). Resume from iter 15 → loop

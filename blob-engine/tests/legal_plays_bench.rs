@@ -4,8 +4,8 @@
 //! cargo test -p blob-engine --release -- --ignored --nocapture legal_plays_bench
 //! ```
 //!
-//! Target from `development-plan.md` Session 1.4: legal-move generation
-//! must be cheap enough that MCTS expansion isn't bottlenecked. The
+//! Target: legal-move generation must be cheap enough that MCTS
+//! expansion isn't bottlenecked. The
 //! implementation in `playing.rs` is a single suit-mask AND, so we expect
 //! handfuls of nanoseconds per call. As with the state-copy bench this is
 //! informational — no hard assert, because CI hardware varies.

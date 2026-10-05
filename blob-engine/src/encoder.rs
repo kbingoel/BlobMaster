@@ -5,7 +5,7 @@
 //! token type IDs, chronological indices for played cards, and the
 //! hand-card index mapping.
 //!
-//! Feature layout v2 (gen-2.md §5.5). Everything is seen from
+//! Feature layout (gen-2.md §5.5). Everything is seen from
 //! `perspective`:
 //! - **Seats are relative.** "Me" is seat 0, then the seats after me in
 //!   play order. Player tokens are emitted in that order.
@@ -16,9 +16,6 @@
 //!   and "beats the current winner" on hand cards.
 //! - Counts are scaled to [0, 1]; "highest/lowest in suit" ignore my own
 //!   cards; cumulative scores are not an input.
-//!
-//! Gen-1 checkpoints were trained on the frozen layout in [`v1`];
-//! [`EncoderVersion`] selects between them.
 
 use crate::belief::void_suits;
 use crate::bidding::{bid_order_position, forbidden_bid, has_bid};
@@ -28,8 +25,6 @@ use crate::playing::{beats, current_trick_winner};
 use crate::round::total_rounds;
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 use smallvec::SmallVec;
-
-pub mod v1;
 
 /// Dimensionality of a hand-card token.
 pub const HAND_CARD_DIM: usize = 32;
@@ -64,47 +59,6 @@ pub const TOKEN_TYPE_CONTEXT: u8 = 1;
 pub const TOKEN_TYPE_PLAYER: u8 = 2;
 pub const TOKEN_TYPE_HAND: u8 = 3;
 pub const TOKEN_TYPE_PLAYED: u8 = 4;
-
-/// Feature layout a model was trained on. The token sequence is the same in
-/// both; only the per-token features differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncoderVersion {
-    /// Gen 1 ([`v1`], 48 features per token).
-    V1,
-    /// Gen 2 (this module, [`FEAT_DIM`] features per token).
-    V2,
-}
-
-impl EncoderVersion {
-    /// The layout new models are trained on.
-    pub const CURRENT: Self = Self::V2;
-
-    /// The version whose padded token width is `feat_dim`, as read from a
-    /// model's `features` input. `None` for an unknown width.
-    pub fn from_feat_dim(feat_dim: usize) -> Option<Self> {
-        match feat_dim {
-            v1::FEAT_DIM => Some(Self::V1),
-            FEAT_DIM => Some(Self::V2),
-            _ => None,
-        }
-    }
-
-    /// Padded per-token feature width.
-    pub fn feat_dim(self) -> usize {
-        match self {
-            Self::V1 => v1::FEAT_DIM,
-            Self::V2 => FEAT_DIM,
-        }
-    }
-
-    /// Encode `state` from `perspective` in this layout.
-    pub fn encode(self, state: &BlobState, perspective: u8) -> EncodedState {
-        match self {
-            Self::V1 => v1::encode(state, perspective),
-            Self::V2 => encode(state, perspective),
-        }
-    }
-}
 
 /// Seat of `player` relative to `perspective`: 0 for `perspective`, then 1,
 /// 2, … for the seats after it in play order.
@@ -211,7 +165,7 @@ pub fn encode_hand_cards(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_C
 /// A played-card token with its chronological position index.
 ///
 /// The `chrono_index` (0–51) is used by the neural network to look up a
-/// learned chronological embedding (Session 3.1, 52×128 table).
+/// learned chronological embedding (52×128 table).
 #[derive(Debug, Clone)]
 pub struct PlayedCardToken {
     pub features: [f32; PLAYED_CARD_DIM],
@@ -1153,7 +1107,7 @@ mod tests {
     }
 
     // ===============================================================
-    // Session 2.2 — Played card token tests
+    // Played card token tests
     // ===============================================================
 
     /// Helper: make a TrickRecord from play sequence.
@@ -1393,7 +1347,7 @@ mod tests {
     }
 
     // ===============================================================
-    // Session 2.2 — Player state token tests
+    // Player state token tests
     // ===============================================================
 
     #[test]
@@ -1741,7 +1695,7 @@ mod tests {
     }
 
     // ===============================================================
-    // Session 2.3 — Context token tests
+    // Context token tests
     // ===============================================================
 
     #[test]
@@ -1946,7 +1900,7 @@ mod tests {
     }
 
     // ===============================================================
-    // Session 2.3 — Full encode() tests
+    // Full encode() tests
     // ===============================================================
 
     #[test]
@@ -2367,7 +2321,7 @@ mod tests {
     }
 
     // ===============================================================
-    // Layout v2 — properties over real game states
+    // Properties over real game states
     // ===============================================================
 
     #[test]
@@ -2490,20 +2444,6 @@ mod tests {
                     _ => {}
                 }
             }
-        }
-    }
-
-    #[test]
-    fn encoder_version_follows_feature_width() {
-        assert_eq!(FEAT_DIM, 49);
-        assert_eq!(EncoderVersion::from_feat_dim(48), Some(EncoderVersion::V1));
-        assert_eq!(EncoderVersion::from_feat_dim(FEAT_DIM), Some(EncoderVersion::V2));
-        assert_eq!(EncoderVersion::from_feat_dim(64), None);
-        assert_eq!(EncoderVersion::CURRENT.feat_dim(), FEAT_DIM);
-        for v in [EncoderVersion::V1, EncoderVersion::V2] {
-            let s = random_game_states()[40];
-            let enc = v.encode(&s, s.current_player);
-            assert!(enc.features.iter().all(|f| f.len() <= v.feat_dim()));
         }
     }
 

@@ -1,21 +1,14 @@
-//! blob-engine — card, hand, and state primitives for BlobMaster.
+//! blob-engine — game rules, encoder, search and inference for BlobMaster.
 //!
-//! Session 1.1 covers the low-level card representation (`Card`, `Suit`),
-//! `u64` bitmask hand ops (`Hand`), and the `BlobState` stack struct along
-//! with its supporting types (`GamePhase`, `TrickRecord`).
+//! - Rules: `card`, `hand` (`u64` bitmask), `state` (`BlobState`, a `Copy`
+//!   stack struct), `round`, `dealing`, `bidding`, `playing`, `game`.
+//! - Network input: `encoder` (variable-length typed token sequences).
+//! - Search: `mcts` over sampled deals from `belief`, scored by an
+//!   `evaluator::Evaluator` (`onnx::OnnxEvaluator` in production).
+//! - Training data: `replay`.
+//! - Yardsticks: `rule_bot`, `rule_bot_2` and `bench` (gen-2.md §5.7).
 //!
-//! Session 1.2 adds dealing, the bidding phase, and trump rotation
-//! (`round`, `dealing`, `bidding` modules).
-//!
-//! Session 1.3 adds trick-taking and per-round scoring (`playing` module):
-//! `legal_plays`, `apply_play`, and `score_round`.
-//!
-//! Session 1.4 wires the per-phase primitives into the full multi-round game
-//! loop (`game` module): `new_game`, `advance_round`, and `is_game_over`.
-//!
-//! Session 2.1–2.3 adds the entity encoder (`encoder` module): variable-length
-//! token sequences for neural network input, with hand card, played card,
-//! player state, and context tokens.
+//! Pure Rust plus `ort`; never depends on `tch` (that lives in `blob-nn`).
 
 pub mod belief;
 pub mod bench;
@@ -38,7 +31,7 @@ pub mod scoring;
 pub mod state;
 
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
-pub use evaluator::{DummyEvaluator, Evaluator, HeuristicEvaluator, NUM_BIDS};
+pub use evaluator::{DummyEvaluator, Evaluator, NUM_BIDS};
 pub use onnx::OnnxEvaluator;
 pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, start_round};

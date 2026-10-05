@@ -4,10 +4,9 @@
 //! cargo test -p blob-engine --release -- --ignored --nocapture blobstate_copy_bench
 //! ```
 //!
-//! Target from `development-plan.md` Session 1.1: ~100 ns per copy
-//! (~410 B across ~6 cache lines). This is informational — no hard assert,
-//! because CI hardware varies wildly. A `criterion` harness lands in a later
-//! session once benchmarking infrastructure is set up.
+//! Target: ~100 ns per copy (~410 B across ~6 cache lines). This is
+//! informational — no hard assert, because CI hardware varies wildly. The
+//! `criterion` harness is `benches/core.rs`.
 
 use std::hint::black_box;
 use std::time::Instant;

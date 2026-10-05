@@ -1,8 +1,8 @@
-//! Session 3.1 — per-token-type input projections.
+//! Per-token-type input projections.
 //!
 //! Projects the variable-length token sequence produced by
 //! `blob_engine::encoder::encode` into a uniform `[batch, seq, 128]` tensor
-//! that the Transformer encoder (Session 3.2) consumes.
+//! that the Transformer encoder consumes.
 //!
 //! Input tensors (constructed by callers; see [`pad_batch`]):
 //! - `features: [B, S, FEAT_DIM]` f32 — per-token features, right-padded to

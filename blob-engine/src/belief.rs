@@ -1,11 +1,9 @@
-//! Session 4.3 — Belief tracking and determinization for imperfect
-//! information MCTS.
+//! Belief tracking and determinization for imperfect information MCTS.
 //!
 //! Blob is imperfect information: each player sees only their own hand.
 //! MCTS operates on fully-observable states, so we sample plausible
 //! opponent hands ("determinizations") and run an independent tree on
-//! each, aggregating the root visit counts at the end (Section 4.3 of
-//! the development plan).
+//! each, aggregating the root visit counts at the end.
 //!
 //! Belief information is conservative: the only public inference rule
 //! used is the suit-void signal (an opponent who didn't follow the led

@@ -4,11 +4,11 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 
 ## Status
 
-**Generation 1 is concluded; generation 2 is being planned.** See **[gen-2.md](gen-2.md)**, the single source of truth.
+**Generation 1 is concluded; generation 2 is under way.** See **[gen-2.md](gen-2.md)**, the single source of truth.
 
 - **Gen 0 (Python, 2025–2026-03):** correct engine; never learned. Archived in [legacy/](legacy/).
-- **Gen 1 (Rust, 2026-03 → 2026-05):** fast engine and pipeline, 168-iteration final run. On 2026-10-02 it was measured against a fixed rule bot, and it loses (−9 points per game with full search). The causes are in the value targets and in the search's value backup, not in compute (gen-2.md §2).
-- **Gen 2:** per-round, per-seat values; a value network that sees the sampled deal; evaluation against a fixed yardstick; async actor–learner training.
+- **Gen 1 (Rust, 2026-03 → 2026-05):** fast engine and pipeline, 168-iteration final run. On 2026-10-02 it was measured against a fixed rule bot, and it loses (−10 points per game with full search). The causes are in the value targets and in the search's value backup, not in compute (gen-2.md §2). Its code is at git tags `gen-1-final` and `gen-1-compat`.
+- **Gen 2:** per-round, per-seat values; a value network that sees the sampled deal; evaluation against a fixed yardstick; async actor–learner training. Done so far (2026-10-05): the yardsticks (`bench`, `play`, two rule bots), the encoder and determinization fixes, and the removal of gen-1 support. Next: the gen-2 search and evaluators (Phase 3).
 
 ## Vocabulary
 
@@ -34,11 +34,11 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 | Path | What it is |
 |---|---|
 | `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bots, strength benchmark. No libtorch dependency. |
-| `blob-nn/` | Transformer model (tch / libtorch), self-play, training loop, evaluation. |
-| `blob-train/` | `blobmaster-train` CLI: train, evaluate, self-play, export, profile. |
-| `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bot) and `play` (you vs bots in the terminal). |
-| `scripts/` | ONNX export (Python), plotting, launch helpers. |
-| `checkpoints/`, `logs/` | Gen-1 reference checkpoints (pruned 2026-10-02; gen-2.md §9) and run logs. `run-2026-05-14/iter_000167` is the gen-1 final model. |
+| `blob-nn/` | Transformer model (tch / libtorch), losses and optimizer, learner building blocks. |
+| `blob-train/` | `blobmaster-train` CLI. For now only `export` (tch checkpoint → ONNX); `pretrain` and `train` come in Phases 4–5. |
+| `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bots) and `play` (you vs bots in the terminal). |
+| `scripts/` | ONNX export (Python) and plotting. |
+| `logs/` | Measurement outputs (rule bot 2 rollout sweeps). |
 | `legacy/` | Gen-0 Python reference code (read-only). |
 | [gen-2.md](gen-2.md) | Findings, design and roadmap. |
 | [AGENTS.md](AGENTS.md) | Working notes for Claude Code: runtime environment, commands, conventions. |
@@ -48,11 +48,12 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 ```bash
 cargo build --release
 cargo test -p blob-engine          # debug profile — some tests expect debug assertions
-./target/release/blobmaster bench checkpoints/run-2026-05-14/iter_000167/model.onnx --mode network
-./target/release/blobmaster play --model checkpoints/run-2026-05-14/iter_000167/model.onnx
+cargo test -p blob-bin
+./target/release/blobmaster bench rulebot2 --deals 4000   # rule bot 2 vs 4 rule bots: +14.5 ± 0.3
+./target/release/blobmaster play                          # you vs 4 rule bots
 ```
 
-Training needs the pinned Python venv and the downloaded libtorch on the library path; see [AGENTS.md](AGENTS.md#runtime-environment-training-runs-on-this-machine).
+There is no trained gen-2 model yet. The `blob-nn` tests and the ONNX export need the pinned Python venv and the downloaded libtorch on the library path; [AGENTS.md](AGENTS.md) has the setup and a recipe for a random-init model.
 
 ## Hardware
 
