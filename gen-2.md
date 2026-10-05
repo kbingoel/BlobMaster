@@ -481,13 +481,13 @@ Each training phase starts from the previous phase's benchmarked model, so every
 **Phase 2 — Clean break** (done 2026-10-05, no training)
 
 Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
-- [x] Tag `c6f0c2a` as `gen-1-final` and the last commit before the deletions as `gen-1-compat` (§10).
+- [x] Tag the last gen-1 commit as `gen-1-final` and the last commit before the deletions as `gen-1-compat` (§10).
 - [x] Decide whether to archive `checkpoints/run-2026-05-14/` outside the repo: archived (below), then deleted.
 - [x] Salvage from the gen-1 driver: the batch construction (`bid_train_batch`, `play_train_batch`) and the held-out-loss code, with their tests, are in a `learner` module for Phase 4. `blob-train` keeps only `export` until Phase 4.
 - [x] Delete everything in §4 "Delete in Phase 2".
 - [x] Make the config schema reject unknown keys.
 - [x] Rewrite `AGENTS.md`, `README.md` and `scripts/README.md` for gen 2. Drop the gen-1 driver section, the gen-1 reference model and its parity recipe, and the `encoder::v1` notes.
-- [ ] Optional: the `.git` rewrite (§9).
+- [x] Optional: the `.git` rewrite (§9), done 2026-10-05: 4.9 GB → 31 MB.
 - Not yet: `scoring.rs`, the per-seat counts in `mcts.rs` and the single-value `Evaluator` stay until Phase 3 replaces them, because the search needs a value until then.
 - *Exit, met:*
   - `cargo build --release` has no warnings. Tests pass: `blob-engine` 279 unit + 44 integration (debug), `blob-nn` 27 (release), `blob-bin` 6.
@@ -655,7 +655,7 @@ Optional covariates: standing (behind/ahead), stage of the game, missed the last
 
 **Phase 2:** the deletions listed in §4.
 
-**Shrinking `.git` (4.9 GB).**
+**Shrinking `.git` (4.9 GB → 31 MB, done 2026-10-05).**
 - **What's in it:** about 4.6 GB of model blobs in history:
   - `sweep-2026-04-28-anchor` 1.4 GB, `run-2026-05-14` 1.1 GB, `run-2026-05-06` 1.0 GB;
   - smaller runs, plus 0.24 GB of gen-0 `.pth` files.
@@ -668,6 +668,13 @@ Optional covariates: standing (behind/ahead), stage of the game, missed the last
   4. Run `git filter-repo --force --prune-empty never --invert-paths --path-glob '*.onnx' --path-glob '*.pth' --path-glob '*calibration.bin' --path-glob '*decision_stats.jsonl'` on all branches.
   5. Verify: commit count, HEAD tree, `git show gen-1-final:fix-mcts-plan.md`.
   6. Force-push `master`, `gui` and both tags. Other clones must re-clone.
+- **Result (2026-10-05):**
+  - **Size:** `.git` went from 4.9 GB to 31 MB; `fsck` is clean.
+  - **History:** commit counts are unchanged on every ref (`--prune-empty never`), and `master`'s tree is byte-identical.
+  - **Tips:** `gui`, `gen-1-final` and `gen-1-compat` lost exactly their 272, 265 and 14 model files.
+  - **Local-only branch:** `feature/gpu-server-experiment` was rewritten too; its history held no matching files.
+  - **Remote:** `master`, `gui` and both tags were force-pushed.
+  - Every commit hash before the deletions changed; the tags keep pointing at the right commits. A clone from before 2026-10-05 must re-clone.
 
 ---
 
@@ -676,8 +683,8 @@ Optional covariates: standing (behind/ahead), stage of the game, missed the last
 All retired documents are recoverable with `git show gen-1-final:<file>`.
 
 The retired code lives at two tags:
-- **`gen-1-final`** (`c6f0c2a`): the gen-1 pipeline as it was trained.
-- **`gen-1-compat`** (`3f5a83f`): the last commit whose tooling still runs gen-1 models (`encoder::v1`, `examples/diagnostics.rs`). Appendix A uses it.
+- **`gen-1-final`** (`3cecbb3`; `c6f0c2a` before the §9 rewrite): the gen-1 pipeline as it was trained.
+- **`gen-1-compat`** (`302b8f8`; `3f5a83f` before the §9 rewrite): the last commit whose tooling still runs gen-1 models (`encoder::v1`, `examples/diagnostics.rs`). Appendix A uses it.
 
 | Document | What it was | Where its live content went |
 |---|---|---|
@@ -696,7 +703,7 @@ The retired code lives at two tags:
 
 ## Appendix A — Reproducing the gen-1 measurements
 
-After Phase 2 the gen-1 models no longer run on `master`. Use a worktree at `gen-1-compat`. It contains the four reference ONNX models until the `.git` rewrite (§9). The whole directory, including `iter_000167/buffer.bin` (never committed; `diagnostics value` needs it), is archived at `~/blobmaster-archive/run-2026-05-14/` on the training machine; copy it into the worktree's `checkpoints/`.
+After Phase 2 the gen-1 models no longer run on `master`. Use a worktree at `gen-1-compat`. Since the `.git` rewrite (§9) it holds no models. The whole reference directory, including `iter_000167/buffer.bin` (never committed; `diagnostics value` needs it), is archived at `~/blobmaster-archive/run-2026-05-14/` on the training machine; copy it into the worktree's `checkpoints/`.
 
 Run from the worktree root with nothing else busy (the tools use every core).
 

@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Code: tag `gen-1-final` (as trained) and tag `gen-1-compat` (the last commit whose tooling runs gen-1 models). Retired documents: `git show gen-1-final:<file>` (gen-2.md §10).
   - Reference models, `buffer.bin`, `model.ot` and metrics: archived outside the repo in `~/blobmaster-archive/run-2026-05-14/` (this machine only). gen-2.md Appendix A reproduces the gen-1 measurements from it.
 - **No training driver and no trained gen-2 model exist until Phase 4.** `bench` and `play` run with rule bots or a random-init model (recipe under Tests).
-- **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. `.git` still holds 4.9 GB of gen-1 model blobs; the rewrite recipe is in gen-2.md §9 (it must include the `gui` branch).
+- **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. History was rewritten on 2026-10-05 to drop the gen-1 model blobs (`.git` 4.9 GB → 31 MB, gen-2.md §9); a clone from before then must re-clone.
 
 ## Documents
 
