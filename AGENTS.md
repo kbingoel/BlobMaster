@@ -33,7 +33,7 @@ cargo build --release -p blob-bin
 
 `bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. Opponents default to the rule bot; `--opponent <model.onnx>` uses a checkpoint's raw policy (bots never search).
 
-`rulebot2` (`blob-engine/src/rule_bot_2.rs`: card counting, bid-aware, +14.5 vs the rule bot) works as the focal player or as `--opponent`. It is a harder second yardstick; the rule bot stays the reference, so never retune `rule_bot.rs`.
+`rulebot2` (`blob-engine/src/rule_bot_2.rs`: card counting, bid-aware, +14.5 vs the rule bot) works as the focal player or as `--opponent`. It is a harder second yardstick; the rule bot stays the reference, so never retune `rule_bot.rs`. `rulebot2r` is rule bot 2 with rollouts (`--samples`, default 128; `--depth`, default full; `--play-only`); its bench label carries the settings. Its gains vs `rulebot2` are in the `rule_bot_2.rs` header.
 
 The reference is gen-1 final (`run-2026-05-14/iter_000167`): with search **−10.2 ± 2.9**, network only −12.1 ± 2.0 (`bench`, 2026-10-02). The older non-duplicate `diagnostics match` numbers were −9.2 ± 2.6 and −13.5 ± 1.9. The tool uses every core, so don't run it next to a training run.
 

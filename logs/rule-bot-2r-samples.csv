@@ -1,0 +1,4 @@
+label,samples,depth,bids,diff,ci,made_all,made_1,made_24,made_58,user_s,wall_s,deals
+both-K256-dfull,256,full,both,+10.1,0.5,0.723,0.777,0.717,0.684,10240.92,325.263397016,1000
+both-K512-dfull,512,full,both,+10.3,0.5,0.724,0.777,0.717,0.688,20640.30,652.281435635,1000
+both-K1024-dfull,1024,full,both,+10.6,0.7,0.725,0.776,0.719,0.690,20645.28,653.206726705,500

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, DEFAULT_SEED};
+use blob_engine::rule_bot_2::Rollouts;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -44,6 +45,8 @@ enum Bot {
     Network,
     Rulebot,
     Rulebot2,
+    /// Rule bot 2 with rollouts (`--samples`, `--depth`).
+    Rulebot2r,
 }
 
 #[derive(Subcommand, Debug)]
@@ -52,13 +55,14 @@ enum Command {
     /// is played once from each seat. Reports points/game with a 95% CI over
     /// deals, win share and bid statistics by hand size.
     Bench {
-        /// Focal player: an ONNX model, `rulebot` or `rulebot2`.
+        /// Focal player: an ONNX model, `rulebot`, `rulebot2` or `rulebot2r`
+        /// (rule bot 2 with rollouts: `--samples`, `--depth`, `--play-only`).
         focal: String,
         /// How a focal model plays. Required unless the focal player is a rule bot.
         #[arg(long, value_enum)]
         mode: Option<Mode>,
-        /// Opponents: `rulebot`, `rulebot2`, or an ONNX model playing its
-        /// raw policy (bots never search).
+        /// Opponents: `rulebot`, `rulebot2`, `rulebot2r`, or an ONNX model
+        /// playing its raw policy (only rule bot 2r looks ahead).
         #[arg(long, default_value = "rulebot")]
         opponent: String,
         /// Deal seeds; games = deals × players. Default 64 with search
@@ -75,6 +79,8 @@ enum Command {
         /// Search: simulations per sampled deal.
         #[arg(long, default_value_t = 100)]
         sims: u32,
+        #[command(flatten)]
+        rollouts: RolloutArgs,
         /// Worker threads (default: every core).
         #[arg(long)]
         threads: Option<usize>,
@@ -109,6 +115,8 @@ enum Command {
         dets: u32,
         #[arg(long, default_value_t = 100)]
         sims: u32,
+        #[command(flatten)]
+        rollouts: RolloutArgs,
         /// Disable ANSI colours (also off when NO_COLOR is set or stdout is
         /// not a terminal).
         #[arg(long)]
@@ -123,10 +131,32 @@ enum Command {
     },
 }
 
-fn parse_opponent(s: &str) -> Agent {
+/// Rule bot 2r settings (`blob_engine::rule_bot_2::Rollouts`).
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct RolloutArgs {
+    /// Rule bot 2r: sampled deals per decision.
+    #[arg(long, default_value_t = Rollouts::default().samples)]
+    samples: u32,
+    /// Rule bot 2r: tricks each rollout looks ahead, counting the current
+    /// one (default: to the end of the round).
+    #[arg(long)]
+    depth: Option<u8>,
+    /// Rule bot 2r: roll out plays only; bids are rule bot 2's.
+    #[arg(long)]
+    play_only: bool,
+}
+
+impl RolloutArgs {
+    fn config(self) -> Rollouts {
+        Rollouts { samples: self.samples, depth: self.depth, bids: !self.play_only }
+    }
+}
+
+fn parse_opponent(s: &str, rollouts: Rollouts) -> Agent {
     match s {
         "rulebot" => Agent::RuleBot,
         "rulebot2" => Agent::RuleBot2,
+        "rulebot2r" => Agent::RuleBot2R(rollouts),
         _ => Agent::Network(PathBuf::from(s)),
     }
 }
@@ -150,12 +180,14 @@ fn cmd_bench(
     cards: u8,
     dets: u32,
     sims: u32,
+    rollouts: Rollouts,
     threads: Option<usize>,
     seed: u64,
 ) {
     let focal = match (focal.as_str(), mode) {
         ("rulebot", _) => Agent::RuleBot,
         ("rulebot2", _) => Agent::RuleBot2,
+        ("rulebot2r", _) => Agent::RuleBot2R(rollouts),
         (p, Some(Mode::Search)) => Agent::Search(PathBuf::from(p)),
         (p, Some(Mode::Network)) => Agent::Network(PathBuf::from(p)),
         (_, None) => {
@@ -163,7 +195,7 @@ fn cmd_bench(
             std::process::exit(2);
         }
     };
-    let opponent = parse_opponent(&opponent);
+    let opponent = parse_opponent(&opponent, rollouts);
     require_file(&focal);
     require_file(&opponent);
     let searching = matches!(focal, Agent::Search(_));
@@ -211,13 +243,14 @@ fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench { focal, mode, opponent, deals, players, cards, dets, sims, threads, seed } => {
-            cmd_bench(focal, mode, opponent, deals, players, cards, dets, sims, threads, seed)
+        Command::Bench { focal, mode, opponent, deals, players, cards, dets, sims, rollouts, threads, seed } => {
+            cmd_bench(focal, mode, opponent, deals, players, cards, dets, sims, rollouts.config(), threads, seed)
         }
-        Command::Play { model, bot, players, cards, seat, seed, show, dets, sims, no_color } => {
+        Command::Play { model, bot, players, cards, seat, seed, show, dets, sims, rollouts, no_color } => {
             let bot = match (bot, model) {
                 (Some(Bot::Rulebot), _) | (None, None) => Agent::RuleBot,
                 (Some(Bot::Rulebot2), _) => Agent::RuleBot2,
+                (Some(Bot::Rulebot2r), _) => Agent::RuleBot2R(rollouts.config()),
                 (Some(Bot::Search) | None, Some(m)) => Agent::Search(m),
                 (Some(Bot::Network), Some(m)) => Agent::Network(m),
                 (Some(_), None) => {

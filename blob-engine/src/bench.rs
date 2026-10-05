@@ -36,7 +36,7 @@ use crate::mcts::{mcts_search, MctsConfig, MctsResult};
 use crate::onnx::OnnxEvaluator;
 use crate::playing::{apply_play, legal_plays};
 use crate::rule_bot::rule_bot_action;
-use crate::rule_bot_2::rule_bot_2_action;
+use crate::rule_bot_2::{rule_bot_2_action, rule_bot_2r_action, Rollouts};
 use crate::state::{BlobState, GamePhase};
 
 /// Who sits in a seat.
@@ -46,6 +46,8 @@ pub enum Agent {
     RuleBot,
     /// The card-counting rule bot (`rule_bot_2.rs`).
     RuleBot2,
+    /// Rule bot 2 with rollouts ("v2r").
+    RuleBot2R(Rollouts),
     /// A network's greedy raw policy, no search.
     Network(PathBuf),
     /// A network driving greedy MCTS with [`BenchConfig::mcts`].
@@ -55,7 +57,7 @@ pub enum Agent {
 impl Agent {
     pub fn model(&self) -> Option<&Path> {
         match self {
-            Agent::RuleBot | Agent::RuleBot2 => None,
+            Agent::RuleBot | Agent::RuleBot2 | Agent::RuleBot2R(_) => None,
             Agent::Network(p) | Agent::Search(p) => Some(p),
         }
     }
@@ -269,6 +271,7 @@ pub fn agent_action(
     match agent {
         Agent::RuleBot => rule_bot_action(state),
         Agent::RuleBot2 => rule_bot_2_action(state),
+        Agent::RuleBot2R(cfg) => rule_bot_2r_action(state, cfg, rng),
         Agent::Network(_) => {
             let ev = eval.expect("network agent needs an evaluator");
             greedy_action(state, &ev.evaluate(state).0)
@@ -445,6 +448,7 @@ fn agent_label(a: &Agent, budget: (u32, u32)) -> String {
     match a {
         Agent::RuleBot => "rule bot".to_string(),
         Agent::RuleBot2 => "rule bot 2".to_string(),
+        Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("network {}", p.display()),
         Agent::Search(p) => format!("search {}x{} {}", budget.0, budget.1, p.display()),
     }

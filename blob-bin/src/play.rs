@@ -14,7 +14,7 @@ use blob_engine::bench::{greedy_action, search_action, Agent};
 use blob_engine::card::NUM_RANKS;
 use blob_engine::mcts::{mcts_search, MctsConfig};
 use blob_engine::rule_bot::{expected_tricks, rule_bot_action};
-use blob_engine::rule_bot_2::{bid_chances, play_chances, rule_bot_2_action};
+use blob_engine::rule_bot_2::{bid_chances, play_chances, rollout_values, rule_bot_2_action, rule_bot_2r_action};
 use blob_engine::{
     advance_round, apply_bid, apply_play, legal_bids, legal_plays, new_game, start_round, total_rounds,
     BlobState, Evaluator, GamePhase, Hand, OnnxEvaluator, NO_TRUMP,
@@ -328,6 +328,20 @@ impl<R: BufRead, W: Write> Table<R, W> {
                 });
                 (a, why)
             }
+            Agent::RuleBot2R(cfg) => {
+                let cfg = *cfg;
+                let a = rule_bot_2r_action(&s, &cfg, &mut self.rng);
+                let why = explain.then(|| {
+                    let mut items: Vec<(String, f32)> = rollout_values(&s, &cfg, &mut self.rng)
+                        .iter()
+                        .map(|&(x, v)| (if bidding { format!("bid {x}") } else { self.card(x) }, v))
+                        .collect();
+                    items.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let line: Vec<String> = items.iter().take(6).map(|(a, v)| format!("{a} {v:+.1}")).collect();
+                    format!("rule bot 2r: points vs the table's mean: {}", line.join(" · "))
+                });
+                (a, why)
+            }
             Agent::Network(_) => {
                 let ev = self.eval.as_ref().expect("network bot has a model");
                 let (policy, v) = ev.evaluate(&s);
@@ -586,6 +600,7 @@ pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Re
     let bot = match &opts.bot {
         Agent::RuleBot => "the rule bot".to_string(),
         Agent::RuleBot2 => "rule bot 2".to_string(),
+        Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("{} (network only)", p.display()),
         Agent::Search(p) => format!(
             "{} with {}x{} search",

@@ -81,13 +81,57 @@
 //!
 //! Use [`bid_chances`] / [`play_chances`] for per-action scores (soft
 //! teacher targets, `blobmaster play --bot rulebot2 --show`).
+//!
+//! # v2r: with rollouts
+//!
+//! [`rule_bot_2r_action`] ("v2r", `blobmaster bench rulebot2r`) tries each
+//! legal action on deals sampled from what the seat has seen, plays every
+//! seat forward with rule bot 2 and keeps the best mean of "my round score
+//! minus the table's mean" ([`Rollouts`]). Measured vs 4× rule bot 2 at
+//! 5p/7c, 10 000 games per row (2026-10-05); CPU time is averaged over all
+//! moves, forced ones included:
+//!
+//! | samples | depth | rolls out    | pts/game vs v2 | CPU ms/move |
+//! |---------|-------|--------------|----------------|-------------|
+//! | 32      | 1     | bids + plays | +0.8 ± 0.3     | 1.6 |
+//! | 32      | 2     | bids + plays | +4.8 ± 0.4     | 2.5 |
+//! | 32      | 3     | bids + plays | +6.6 ± 0.4     | 3.0 |
+//! | 32      | 4–6   | bids + plays | +6.3 … +6.4    | 3.3 |
+//! | 32      | full  | bids + plays | +6.7 ± 0.4     | 3.3 |
+//! | 32      | full  | plays only   | +3.5 ± 0.2     | 1.3 |
+//! | 8       | full  | bids + plays | +0.0 ± 0.4     | 0.8 |
+//! | 16      | full  | bids + plays | +3.8 ± 0.4     | 1.6 |
+//! | 64      | full  | bids + plays | +8.6 ± 0.4     | 6.6 |
+//! | 128     | full  | bids + plays | +9.6 ± 0.3     | 13.1 |
+//! | 256     | full  | bids + plays | +10.1 ± 0.5    | 27 (5000 games) |
+//! | 512     | full  | bids + plays | +10.3 ± 0.5    | 54 (5000 games) |
+//! | 1024    | full  | bids + plays | +10.6 ± 0.7    | 109 (2500 games) |
+//! | 128     | 2     | bids + plays | +5.9 ± 0.4     | 10.1 |
+//!
+//! - **Depth saturates at 3 tricks**, and playing the round out costs no
+//!   more: scoring a cut-off position with the static estimate for every
+//!   seat costs about as much as playing the last tricks. So the default is
+//!   full depth, 128 samples: the knee of the samples curve (+9.6 of the
+//!   ~+10.5 plateau, 13 ms per move).
+//! - **Samples are the lever, up to ~128.** Below 16 the noise in
+//!   comparing actions costs more than the rollouts gain. Each doubling
+//!   then adds less (+2.9, +1.9, +1.0), and past 128 only a few tenths:
+//!   the plateau is about +10.5, the value of a noise-free one-step
+//!   improvement over rule bot 2 with uniform deal sampling.
+//! - **Rolled-out bids carry half the gain** but are worse in 1-card
+//!   rounds (bids made 0.773 vs 0.783): the sampled deals ignore what
+//!   earlier bids reveal, which rule bot 2's 1-card formula uses.
+//! - **Best case for rollouts:** the opponents here *are* the rollout
+//!   policy. Against other players the gain will be smaller.
 
+use rand::Rng;
 use smallvec::{smallvec, SmallVec};
 
-use crate::belief::void_suits;
-use crate::bidding::{has_bid, legal_bids};
+use crate::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
+use crate::bidding::{apply_bid, has_bid, legal_bids};
 use crate::card::{NUM_RANKS, NUM_SUITS};
-use crate::playing::{beats, current_trick_winner, legal_plays};
+use crate::mcts::apply_action;
+use crate::playing::{apply_play, beats, current_trick_winner, legal_plays};
 use crate::round::NO_TRUMP;
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
@@ -114,6 +158,10 @@ const BID_NOISE: f32 = 0.15;
 const MAKE_TOL: f32 = 1e-3;
 /// Iterations of the seats × suits fit in `Knowledge::new`.
 const FIT_ITERS: usize = 25;
+/// v2r: weight of the other seats' mean round score in a rollout's value
+/// (λ of gen-2.md §5.1; 1 = "my points minus the table's", as `bench`
+/// scores it).
+const SPITE: f32 = 1.0;
 
 const DECK: u64 = (1u64 << 52) - 1;
 const SUITS: usize = NUM_SUITS as usize;
@@ -236,8 +284,8 @@ fn will(g: Goal) -> f32 {
     }
 }
 
-/// What the seat to act knows, rebuilt at every decision. Reads only its
-/// own hand and public information.
+/// What one seat knows, rebuilt at every decision. Reads only that seat's
+/// hand and public information.
 struct Knowledge {
     me: usize,
     n: usize,
@@ -257,9 +305,9 @@ struct Knowledge {
 }
 
 impl Knowledge {
-    fn new(s: &BlobState) -> Self {
+    /// What seat `me` knows in `s`.
+    fn new(s: &BlobState, me: usize) -> Self {
         let n = s.num_players as usize;
-        let me = s.current_player as usize;
         let hand = s.hands[me];
         let unseen = DECK & !hand & !s.played_this_round;
         let voids = void_suits(s);
@@ -599,7 +647,7 @@ pub fn bid_chances(state: &BlobState) -> SmallVec<[f32; 14]> {
         let p = one_card_win(state);
         return smallvec![1.0 - p, p];
     }
-    let kn = Knowledge::new(state);
+    let kn = Knowledge::new(state, state.current_player as usize);
     let mut outs = kn.hand_outlook(kn.hand);
     kn.bid_pressure(state, &mut outs);
     let dp = spread(&outs);
@@ -624,7 +672,7 @@ pub fn rule_bot_2_bid(state: &BlobState) -> u8 {
 /// ascending card index. All zero for a doomed seat.
 pub fn play_chances(state: &BlobState) -> SmallVec<[(u8, f32); 13]> {
     debug_assert_eq!(state.phase(), GamePhase::Playing);
-    let kn = Knowledge::new(state);
+    let kn = Knowledge::new(state, state.current_player as usize);
     let need = state.bids[kn.me] as i32 - state.tricks_won[kn.me] as i32;
     cards(legal_plays(state))
         .map(|card| {
@@ -670,6 +718,128 @@ pub fn rule_bot_2_action(state: &BlobState) -> u8 {
         GamePhase::Playing => rule_bot_2_play(state),
         phase => panic!("rule bot 2 asked to act in {phase:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// v2r: rule bot 2 with rollouts
+// ---------------------------------------------------------------------------
+
+/// Rollout settings for v2r: rule bot 2 that, at every unforced decision,
+/// tries each legal action on deals sampled from what it has seen and plays
+/// the rest of the round forward with rule bot 2 at every seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rollouts {
+    /// Sampled deals per decision. Every action is rolled out on the same
+    /// deals, so their comparison doesn't depend on which deals came up.
+    pub samples: u32,
+    /// Tricks each rollout looks ahead before the static estimate scores
+    /// the position, counting the current trick (for a bid: the first
+    /// trick). A trick in progress is always finished. `None` plays the
+    /// round out and scores it exactly.
+    pub depth: Option<u8>,
+    /// Use rollouts for bids too; otherwise bids are rule bot 2's.
+    pub bids: bool,
+}
+
+impl Default for Rollouts {
+    fn default() -> Self {
+        Rollouts { samples: 128, depth: None, bids: true }
+    }
+}
+
+impl std::fmt::Display for Rollouts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.depth {
+            Some(d) => write!(f, "{} samples, depth {d}", self.samples)?,
+            None => write!(f, "{} samples, full depth", self.samples)?,
+        }
+        if !self.bids {
+            write!(f, ", plays only")?;
+        }
+        Ok(())
+    }
+}
+
+/// Expected round score of `seat` from its own view: exact once the round
+/// is over, else `(10 + bid) · P(make)` from rule bot 2's estimate. `s`
+/// must be between tricks.
+fn expected_score(s: &BlobState, seat: usize) -> f32 {
+    let bid = s.bids[seat];
+    if s.phase() != GamePhase::Playing {
+        return if s.tricks_won[seat] == bid { 10.0 + bid as f32 } else { 0.0 };
+    }
+    let kn = Knowledge::new(s, seat);
+    let need = bid as i32 - s.tricks_won[seat] as i32;
+    (10.0 + bid as f32) * exact(&spread(&kn.hand_outlook(kn.hand)), need)
+}
+
+/// Plays `w` forward with rule bot 2 at every seat until `stop` tricks are
+/// complete or the round ends, and returns its value for `me`.
+fn rollout(mut w: BlobState, me: usize, stop: u8) -> f32 {
+    loop {
+        match w.phase() {
+            GamePhase::Bidding => {
+                let b = rule_bot_2_bid(&w);
+                apply_bid(&mut w, b);
+            }
+            GamePhase::Playing if w.trick_cards_played == 0 && w.tricks_completed >= stop => break,
+            GamePhase::Playing => {
+                let c = rule_bot_2_play(&w);
+                apply_play(&mut w, c);
+            }
+            GamePhase::Scoring | GamePhase::Complete => break,
+        }
+    }
+    let n = w.num_players as usize;
+    let others: f32 = (0..n).filter(|&j| j != me).map(|j| expected_score(&w, j)).sum();
+    expected_score(&w, me) - SPITE * others / (n - 1) as f32
+}
+
+/// Mean rollout value of each legal action of the current player (bid
+/// value or card index): its expected round score minus [`SPITE`] × the
+/// other seats' mean, over `cfg.samples` deals consistent with its hand,
+/// the cards played and the known voids.
+pub fn rollout_values<R: Rng + ?Sized>(state: &BlobState, cfg: &Rollouts, rng: &mut R) -> SmallVec<[(u8, f32); 14]> {
+    let me = state.current_player as usize;
+    let actions: SmallVec<[u8; 14]> = match state.phase() {
+        GamePhase::Bidding => {
+            let mask = legal_bids(state);
+            (0..=state.cards_dealt).filter(|&b| (mask >> b) & 1 == 1).collect()
+        }
+        GamePhase::Playing => cards(legal_plays(state)).collect(),
+        phase => panic!("rule bot 2r asked to act in {phase:?}"),
+    };
+    let stop = cfg.depth.map_or(u8::MAX, |d| state.tricks_completed.saturating_add(d));
+    let voids = void_suits(state);
+    let mut totals: SmallVec<[f32; 14]> = smallvec![0.0; actions.len()];
+    for _ in 0..cfg.samples {
+        let world = determinize(state, me as u8, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+        for (total, &a) in totals.iter_mut().zip(&actions) {
+            let mut w = world;
+            apply_action(&mut w, a);
+            *total += rollout(w, me, stop);
+        }
+    }
+    let k = cfg.samples.max(1) as f32;
+    actions.iter().zip(totals).map(|(&a, t)| (a, t / k)).collect()
+}
+
+/// v2r: the action with the best [`rollout_values`], ties to rule bot 2's
+/// own choice. Forced moves (and bids, unless `cfg.bids`) skip the
+/// rollouts.
+pub fn rule_bot_2r_action<R: Rng + ?Sized>(state: &BlobState, cfg: &Rollouts, rng: &mut R) -> u8 {
+    let plain = rule_bot_2_action(state);
+    let options = match state.phase() {
+        GamePhase::Bidding if !cfg.bids => 1,
+        GamePhase::Bidding => legal_bids(state).count_ones(),
+        _ => legal_plays(state).count_ones(),
+    };
+    if options <= 1 || cfg.samples == 0 {
+        return plain;
+    }
+    let values = rollout_values(state, cfg, rng);
+    let base = values.iter().find(|v| v.0 == plain).map_or(f32::NEG_INFINITY, |v| v.1);
+    values.iter().fold((plain, base), |best, &(a, v)| if v > best.1 { (a, v) } else { best }).0
 }
 
 #[cfg(test)]
@@ -786,7 +956,7 @@ mod tests {
             if s.phase() != GamePhase::Playing {
                 return;
             }
-            let kn = Knowledge::new(s);
+            let kn = Knowledge::new(s, s.current_player as usize);
             let voids = void_suits(s);
             for j in kn.opponents() {
                 let expected: f32 = (0..NUM_SUITS).map(|x| kn.q[j][x as usize] * kn.unseen_in(x) as f32).sum();
@@ -839,6 +1009,90 @@ mod tests {
         let s = playing_state(3, &hand, &trick, [1, 0, 1, 0, 1], 0);
         assert_eq!(rule_bot_2_play(&s), card(SPADES, KING));
         assert_eq!(rule_bot_action(&s), card(SPADES, 7));
+    }
+
+    const QUICK: Rollouts = Rollouts { samples: 4, depth: Some(2), bids: true };
+
+    /// Seat 0 plays v2r with `cfg`, the others rule bot 2; `check` sees each
+    /// of seat 0's decisions.
+    fn play_v2r_game(n: u8, c: u8, cfg: Rollouts, seed: u64, mut check: impl FnMut(&BlobState, u8)) {
+        let mut cards_rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        let mut decide = Xoshiro256PlusPlus::seed_from_u64(seed ^ 0xD1CE);
+        let mut s = new_game(n, c).unwrap();
+        start_round(&mut s, &mut cards_rng);
+        while !is_game_over(&s) {
+            match s.phase() {
+                GamePhase::Bidding | GamePhase::Playing => {
+                    let a = if s.current_player == 0 {
+                        let a = rule_bot_2r_action(&s, &cfg, &mut decide);
+                        check(&s, a);
+                        a
+                    } else {
+                        rule_bot_2_action(&s)
+                    };
+                    apply_action(&mut s, a);
+                }
+                GamePhase::Scoring => advance_round(&mut s, &mut cards_rng),
+                GamePhase::Complete => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn rollouts_play_legal_games() {
+        for (n, c) in [(3, 8), (5, 7), (8, 6)] {
+            for cfg in [QUICK, Rollouts { samples: 2, depth: None, bids: true }] {
+                play_v2r_game(n, c, cfg, n as u64, |s, a| {
+                    let legal = match s.phase() {
+                        GamePhase::Bidding => (legal_bids(s) >> a) & 1 == 1,
+                        _ => (legal_plays(s) >> a) & 1 == 1,
+                    };
+                    assert!(legal, "illegal action {a} at {n}p/{c}c");
+                });
+            }
+        }
+    }
+
+    /// With the same RNG, re-dealing the hidden cards never changes a v2r
+    /// decision: it samples deals from its own view only.
+    #[test]
+    fn rollouts_never_read_hidden_hands() {
+        let mut deal = Xoshiro256PlusPlus::seed_from_u64(0x5EE);
+        play_v2r_game(5, 4, QUICK, 1, |s, _| {
+            let voids = void_suits(s);
+            let other = determinize(s, s.current_player, &voids, &mut deal, DEFAULT_DETERMINIZE_ATTEMPTS);
+            let pick = |st: &BlobState| rule_bot_2r_action(st, &QUICK, &mut Xoshiro256PlusPlus::seed_from_u64(9));
+            assert_eq!(pick(s), pick(&other), "decision changed with the hidden cards");
+        });
+    }
+
+    #[test]
+    fn depth_past_the_round_end_plays_it_out() {
+        let mut checked = 0;
+        play_v2r_game(5, 4, QUICK, 2, |s, _| {
+            let deep = Rollouts { samples: 3, depth: Some(13), bids: true };
+            let full = Rollouts { depth: None, ..deep };
+            let values = |cfg: &Rollouts| rollout_values(s, cfg, &mut Xoshiro256PlusPlus::seed_from_u64(3));
+            assert_eq!(values(&deep), values(&full));
+            checked += 1;
+        });
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn expected_score_is_exact_once_the_round_is_over() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(4);
+        let mut s = new_game(5, 7).unwrap();
+        start_round(&mut s, &mut rng);
+        while s.phase() != GamePhase::Scoring {
+            let a = rule_bot_2_action(&s);
+            apply_action(&mut s, a);
+        }
+        for seat in 0..5 {
+            let (bid, won) = (s.bids[seat], s.tricks_won[seat]);
+            let want = if bid == won { 10.0 + bid as f32 } else { 0.0 };
+            assert_eq!(expected_score(&s, seat), want);
+        }
     }
 
     /// Guards against a change that silently weakens the bot. Full scale

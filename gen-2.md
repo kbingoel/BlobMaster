@@ -2,7 +2,9 @@
 
 The single source of truth for the remake. It replaces every gen-1 planning document (`development-plan.md`, `fix-mcts-plan.md`, `async.md`, `self-play-profile.md` and others), which were retired on 2026-10-02. §10 maps each one to where its surviving content went and how to read the original from git.
 
-Status, 2026-10-05: gen 1 is concluded; Phase 0 (§6) is done except the human playtest and the deferred `.git` rewrite; Phase 1 is done; Phase 2 is next.
+**Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
+
+Status, 2026-10-05: gen 1 is concluded; Phases 0 and 1 are done; next is Phase 2, the clean break (§4, §6).
 
 ---
 
@@ -21,11 +23,12 @@ Status, 2026-10-05: gen 1 is concluded; Phase 0 (§6) is done except the human p
 None of this showed up. Every evaluation compared the model with its own earlier checkpoints, and every loss was measured on the data the model was trained on.
 
 **What gen 2 does.**
-- **Keeps:** the engine, the encoder skeleton, the transformer, ONNX inference, replay storage and the run tooling.
+- **Keeps:** the engine, the encoder skeleton, the transformer, ONNX inference, replay storage, the rule bots, `bench`, `play` and the run tooling.
+- **Drops:** everything that exists only to run, train or compare gen-1 models (§4).
 - **Changes what the value means:** per round and per seat.
 - **Changes how the search uses it:** every seat gets a value at every leaf, from a value network that sees the sampled deal.
 - **Changes how strength is measured:** a fixed external opponent plus held-out data.
-- **Replaces the training driver:** async actor–learner, playing rounds instead of whole games.
+- **Replaces the training driver:** a supervised warm start from rule bot 2, then async actor–learner self-play over single rounds instead of whole games.
 
 ---
 
@@ -128,7 +131,7 @@ The signal ratio is 1 − H(visits)/ln(number of legal moves); 0 means visits sp
   - "Bimodal" is fine: predicting the *expected* round score of a bimodal outcome is ordinary regression.
 - **Every seat gets a value at every leaf.** `development-plan.md` §4.1–4.2 credited each leaf only to the seat to move, explicitly to avoid "diluting" Q. That avoided dilution by starving the root (§2.3).
 
-### 2.8 Other confirmed defects (fix during gen 2)
+### 2.8 Other confirmed defects
 
 | Defect | Where | Effect | Status |
 |---|---|---|---|
@@ -140,10 +143,10 @@ The signal ratio is 1 − H(visits)/ln(number of legal moves); 0 means visits sp
 | Greedy pick breaks ties to the **last** index | `mcts.rs::visits_to_policy` (`max_by_key`) | with flat bid visits, ties go to the highest bid | fixed, Phase 1 |
 | `void_suits` ignores the current trick | `belief.rs` | sampled deals contradict the encoder's void flags | fixed, Phase 1 |
 | After 32 failed attempts, sampling drops **all** void constraints | `belief.rs` | about 3–7% of sampled deals ignore known voids | fixed, Phase 1 |
-| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims | open |
-| `HeuristicEvaluator` ignores its own bid when playing | `evaluator.rs` | weak, incoherent baseline | open (drop it, §9) |
+| Eval "heuristic" seats actually run 5×100 search | `blob-nn/src/eval.rs` | the eval opponent is not what it claims | goes with `eval.rs`, Phase 2 |
+| `HeuristicEvaluator` ignores its own bid when playing | `evaluator.rs` | weak, incoherent baseline | deleted, Phase 2 |
 | `DynEval` doesn't forward `evaluate_batch` | `eval.rs` | speed only | fixed, Phase 1 (wrapper removed) |
-| `blobmaster play` / `analyze` are stubs | `blob-bin` | no way to play the bot properly | `play` built in Phase 0; `analyze` open |
+| `blobmaster play` / `analyze` are stubs | `blob-bin` | no way to play the bot properly | `play` built in Phase 0; `analyze` stub deleted, Phase 2 |
 
 ---
 
@@ -160,7 +163,7 @@ These hold for a model with d_model = 128, 8 layers and 1.63M parameters, on a R
 | `BlobState` copy | 43.6 ns |
 | `legal_plays` | 1.0 ns |
 | `legal_bids` | 1.2 ns |
-| `encode` (5p7c, mid-trick) | 297 ns |
+| `encode` (5p7c, mid-trick) | 297 ns (272 ns with the Phase-1 layout) |
 
 **ONNX inference:**
 - **One sample, one thread:** 0.6–0.8 ms per call.
@@ -206,42 +209,74 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 
 ### 3.3 Process lessons from gen-1 runs
 
-- **Change one thing at a time.** Run 7.3b bundled four changes and regressed, and nobody could tell which change did it.
+- **Change one thing at a time.** Run 7.3b bundled four changes and regressed, and nobody could tell which change did it. Gen 2 keeps this without keeping gen-1 code: each training phase starts from the previous phase's benchmarked model (§6).
 - **Key the LR schedule to the real progress counter.**
   - Run 7.3b: more epochs per iteration silently compressed the cosine schedule.
   - "Bug #2" (2026-04-28): on resume, the iteration counter and the schedule span disagreed, so the learning rate stayed pinned at its minimum for 14 iterations.
   - In gen 2 the schedule is keyed to learner steps, and the learning rate is logged every metrics row.
 - **"Never go below 5×100 simulations" was measured under gen-1's broken values.** Re-measure it once the values carry signal.
-- **Keep:** the STOP file, resume with the replay buffer, the `[mcts]` budget being driven by config, `decision_stats.jsonl` (summarize it when a run ends; the raw file reached 0.73 GB for one run), and the two visualization scripts.
+- **Carry into the gen-2 driver:** the STOP file; resume with the replay buffer; search budgets driven by config; a per-decision log that is summarized when a run ends (gen 1's raw `decision_stats.jsonl` reached 0.73 GB for one run); and the two visualization scripts, re-pointed at gen-2 outputs.
 
 ---
 
-## 4. Component inventory
+## 4. Component inventory (gen 2 only)
 
-| Component | Verdict | Notes |
-|---|---|---|
-| Game rules: `card`, `hand`, `state`, `dealing`, `bidding`, `playing`, `round`, `game` + 143 ported tests | **Keep** | Correct and fast. Add a helper to start a single round directly (§5.2) |
-| `scoring.rs` z-score helpers | **Replace** | Use the per-round utility (§5.1) |
-| `belief.rs` determinization | **Keep + fix** | Current-trick voids and partial fallback done (Phase 1). Later, weight sampled deals by the observed bids (§8) |
-| `encoder.rs` | **Keep structure, change features** | §5.5 items 1–6 done (Phase 1, layout v2); gen-1 layout frozen as `encoder::v1`. Still to do: suit augmentation, full-deal mode for the value net |
-| `mcts.rs` arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, separate τ for targets and sampling | **Keep** | Tie-break done (Phase 1). Change the backup to all seats and the end-of-round value (§5.4). Delete per-seat counts |
-| `onnx.rs` `OnnxEvaluator` | **Keep + extend** | Two sessions (policy and value), per-seat value output |
-| `rule_bot.rs` (new, 2026-10-02) | **Keep** | Fixed benchmark opponent and warm-start teacher |
-| `rule_bot_2.rs` (new, 2026-10-05) | **Keep** | Card-counting, bid-aware rule bot, no search: +14.5 ± 0.3 points/game vs the rule bot (5p/7c). A harder second yardstick and a stronger warm-start teacher; `bid_chances` / `play_chances` give per-action scores for soft targets. `rule_bot.rs` stays the reference yardstick |
-| `bench.rs` (new, 2026-10-02) | **Keep** | The §5.7 yardstick as a library: duplicate deals, CI over deals, bid stats by hand size. CLI: `blobmaster bench` |
-| `evaluator.rs` `HeuristicEvaluator` | **Drop** once eval uses the rule bot | Incoherent baseline |
-| `replay.rs` storage (raw `BlobState` + sparse policy) | **Keep layout** | Per-seat round scores instead of one value; concurrent wrapper; round-level validation split; delta persistence |
-| `blob-nn` transformer, input projections, heads | **Keep** | Per-seat value head; second (value) model |
-| `blob-nn` `self_play.rs` | **Rewrite** | Per-round targets; play rounds, not games |
-| `blob-nn` `training_loop.rs`, `blob-train` driver | **Replace** with an async driver | Reuse the batch construction, train step, metrics, STOP, export call |
-| `blob-nn` `eval.rs` | **Replace** with `bench` | Keep the Wilson CI helper. Still drives the gen-1 driver's in-loop eval and `blobmaster-train evaluate` |
-| `muon.rs`, INT8 path (`use_int8`, `validate_int8.py`, `int8_levers.py`, `--int8-out`) | **Deleted** 2026-10-02 | Ruled out (§3.2). Muon's param group went with it; AdamW already updated those weights at the default LR |
-| `scripts/export_onnx.py` | **Keep + extend** | Second model; per-seat value; the Python mirror must match the Rust model |
-| `scripts/visualize_*.py` | **Keep** | Re-key to learner steps |
-| Gen-1 sweep, overnight and diagnostic scripts | **Deleted** 2026-10-02 | Tied to gen-1 runs; their configs (`blob-train/sweep-2026-04-28/`, `diagnostic-2026-05-11/`) too. The run launchers and `run-2026-05-*.toml` remain |
-| `blob-bin` | **Built** (Phase 0) | `bench` and `play`; `analyze` is still a stub |
-| `gui` branch on GitHub: `blob-gui/` app + `gui-development-plan.md`, 9 commits not in `master` | **Reviewed** 2026-10-02 | A Tauri + Svelte copilot for a *real* table: the user enters their hand and every played card, and the app shows policy / MCTS visits per card. It adds no engine code (only `blob-gui/` and the workspace entry) and runs its own per-deal MCTS loop. Not a simulator, so `play` was written fresh. Revisit for Phase 7; it holds the history that blocks the `.git` rewrite (§9) |
-| `blob-engine/examples/diagnostics.rs` | **Keep** | Reproduces §2; `match` is superseded by `blobmaster bench` |
+**Clean-break rules.**
+- **One of everything.** One encoder layout, one model format (P + V, §5.3), one training driver, one config schema. No version switches, compatibility shims or legacy code paths.
+- **A model belongs to the code that trained it.** A layout or head change means retraining. Exported models carry a layout id, and the evaluator refuses a mismatch instead of adapting (§5.5).
+- **Gen 1 is evidence, not a dependency.** Its `bench` numbers were measured on the default deals, so gen-2 results compare with them without running a gen-1 model (§5.7). Its code and documents stay reachable through tags (§10).
+- **Stale config fails loudly.** The gen-2 config rejects unknown keys, so a gen-1 TOML can't half-load.
+- **Code goes when its last caller goes.** Don't park it behind a flag; git history is the archive.
+
+**Keep** (as is, or with small additions)
+
+| Component | Notes |
+|---|---|
+| Game rules: `card`, `hand`, `state`, `dealing`, `bidding`, `playing`, `round`, `game` + 143 ported tests | Correct and fast. Add a helper that starts one round with given parameters (§5.2). `game.rs` and `cumulative_scores` stay because `bench` and `play` play whole games; no network input reads them |
+| `belief.rs` determinization | Fixed in Phase 1. Later: weight sampled deals by the observed bids (§8) |
+| `rule_bot.rs`, `rule_bot_2.rs` | Fixed yardsticks (never retune `rule_bot.rs`) and warm-start teachers. Rule bot 2: +14.5 ± 0.3 points/game vs the rule bot (5p/7c); `bid_chances` / `play_chances` give per-action scores for soft targets |
+| `bench.rs`, `blobmaster bench` | The §5.7 yardstick. Keeps playing whole games, so results stay comparable with §2 and with rule bot 2. Loads a gen-2 model directory (§5.3) |
+| `blobmaster play` | Human vs bots in the terminal; loads a gen-2 model directory |
+| `mcts.rs` skeleton: arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, τ split, tie-break, `signal_ratio` | Backup and leaf evaluation change (next table) |
+| `profiling.rs` buckets | Re-attached to the actors (Phase 5) |
+| `blob-nn` building blocks: `input.rs`, `transformer.rs`, `heads.rs`; `train.rs` losses, AdamW, grad clip, checkpoint I/O | Shared by both networks |
+| `blob-engine/benches/core.rs`; `blob-nn` tests `numerical_stability`, `onnx_tch_parity`, `save_random_checkpoint` | The parity and random-checkpoint tests extend to both networks |
+
+**Rewrite for gen 2**
+
+| Component | Becomes |
+|---|---|
+| `encoder.rs` (layout v2) | The only layout; drop the "v2" naming. Add §5.5 items 7, 8 and 10 |
+| `evaluator.rs` | Two batched traits: a policy evaluator (own view → priors) and a value evaluator (sampled deal → ŝ for every seat). `DummyEvaluator` stays for tests |
+| `onnx.rs` `OnnxEvaluator` | One session per network; checks the layout id. No layout detection by feature width |
+| `scoring.rs` z-score helpers | The per-round utility `u_s` (§5.1) |
+| `mcts.rs` backup and leaves | All-seat backup, exact `u_s` at round end, V at leaves, per-phase budgets (§5.4). Per-seat counts, `backprop_terminal`'s z-scores and the "Q = 0 when empty" fallback go |
+| `replay.rs` | Same raw-state layout. Per-seat round scores instead of one value, a round id for the validation split, a concurrent wrapper, delta persistence (§5.6) |
+| `blob-nn` `model.rs` | P: today's net with the policy heads only. V: a new 4-layer net with an input projection for opponents' hand cards and a per-seat ŝ head |
+| `blob-nn` `train.rs` | LR schedule keyed to learner steps; per-seat value MSE on ŝ. `z_score_clip` and the value-head LR group go |
+| `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs` | A learner module (seeded with the batch construction and held-out-loss code from `training_loop.rs`) and an actor module that plays single rounds (§5.2). Whole-game self-play, `backfill_values` and the synchronous iteration loop are deleted |
+| `blob-train`: `main.rs`, `config.rs`, `config.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export`, on a new config schema. `evaluate`, `self-play` and `profile` are deleted |
+| `scripts/export_onnx.py` | Exports P and V and writes the layout id into the ONNX metadata; `export_script_mirrors_feature_widths` covers both |
+| `scripts/visualize_strength.py`, `visualize_weight_evolution.py` | Read gen-2 metrics (keyed by learner step) and model directories; gen-1 formats dropped |
+| `blob-engine/benches/onnx_mcts.rs` | P + V search bench. Absorbs the cost-by-sequence-length measurement (`tokens`) from `diagnostics.rs` |
+| `AGENTS.md`, `README.md`, `scripts/README.md` | Gen-1 driver, reference-model and `encoder::v1` notes removed; the gen-2 launch template once the driver exists |
+
+**Delete in Phase 2**
+
+| Component | Why it can go |
+|---|---|
+| `encoder::v1` and its golden-hash test; `EncoderVersion` and width-based layout detection in `onnx.rs` | Existed only to run gen-1 models |
+| `evaluator.rs` `HeuristicEvaluator` | Incoherent baseline (§2.8); the rule bots replace it |
+| `blob-nn` `eval.rs`: checkpoint-vs-checkpoint harness, anchor promotion, `strength.csv` | Replaced by `bench`; its "heuristic" seats secretly searched (§2.8). Checkpoint-vs-checkpoint stays possible as `bench --opponent <model>` |
+| `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs`; `blob-train` `evaluate`, `self-play`, `profile` | The gen-1 driver. Salvage first: see Phase 2 |
+| `blob-engine/examples/diagnostics.rs` | Reproduces gen-1 measurements only; kept at tag `gen-1-compat` (Appendix A) |
+| `blobmaster analyze` stub | Never implemented; `play --show` and `hint` cover position analysis |
+| `blob-train/run-2026-05-*.toml`, `scripts/run-2026-05-*.sh`, `scripts/run-train.sh` | Gen-1 run configs and launchers |
+| `checkpoints/run-2026-05-14/` | Gen-1 models stop loading once `encoder::v1` is gone; their numbers are in §2 |
+| `logs/` (every tracked gen-1 log, including 10 INT8 ONNX files) | Gen-1 run output; reachable at tag `gen-1-final` |
+| Code comments citing retired documents (~50, half in `mcts.rs`) | Most sit in files deleted or rewritten here; remove the rest in the same pass |
+
+**Not in `master`: the `gui` branch** (reviewed 2026-10-02). It is a Tauri + Svelte copilot for a *real* table: the user enters their hand and every played card, and the app shows policy / MCTS visits per card. It adds only `blob-gui/` and a workspace entry, and runs its own per-deal MCTS loop on gen-1 engine APIs, so it won't build against gen 2. Port it in Phase 8. It shares this history, so the `.git` rewrite must include it (§9).
 
 ---
 
@@ -265,25 +300,27 @@ u_s = ŝ_s − λ · mean_{j≠s} ŝ_j          ŝ = round score / (10 + cards_d
 
 Per-round targets leave nothing linking rounds, so self-play plays **single rounds**:
 - **Sampling:** draw (player count, cards dealt, trump, dealer) from the mix found in real games, or oversample the larger rounds, where bidding matters most.
-- **Targets are written as soon as the round ends** (10–40 decisions later). Today an example waits for a whole 17-round game.
-- **Cumulative scores are not an input in gen 2.**
+- **Targets are written as soon as the round ends** (10–40 decisions later). Gen 1 made an example wait for a whole 17-round game.
+- **No game-level input:** cumulative scores are gone (Phase 1) and `round_number` goes in Phase 3.
 - **Engine change:** add a helper that starts one round with given parameters.
 
 ### 5.3 Two networks
 
 | | Policy net P | Value net V |
 |---|---|---|
-| Sees | the acting player's own view (as today) | the whole deal: every hand plus everything public |
-| Outputs | bid distribution / per-card scores | expected round score ŝ for every seat |
+| Sees | the acting player's own view | the whole deal: every hand plus everything public |
+| Outputs | bid distribution / per-card scores; no value head | expected round score ŝ for every seat |
 | Used for | move priors at every expanded node; the fast no-search player | the value at every search leaf, on the *sampled* deal |
-| Trained on | visit distributions at real decisions (τ = 1) | the true full state at each decision → the actual per-seat round scores |
-| Size | today's (d = 128, 8 layers) | start at d = 128, 4 layers; grow only if validation loss says so |
+| Trained on | visit distributions at real decisions (τ = 1); bot policies in the warm start | the true full state at each decision → the actual per-seat round scores |
+| Size | d = 128, 8 layers (gen 1's) | start at d = 128, 4 layers; grow only if validation loss says so |
 
 **Why V may see every hand.** Inside a sampled deal the search already treats all cards as known. V never sees the *real* hidden cards at play time, only deals sampled from what the player knows.
 
 **Why V doesn't over-promise.** V is trained on rounds played by players who did *not* see each other's hands. So it predicts realistic outcomes, not "everyone plays perfectly with open cards" ones.
 
 **Why V is easier to learn.** With all hands known, a round's outcome is nearly decided. In 1-card rounds, every play is forced, so after bidding the outcome is fully determined. That gives a free exactness test (§7).
+
+**Packaging.** A model is a directory: `policy.onnx`, `value.onnx` and `meta.json` (layout id, learner step, config). `bench`, `play` and the actors take the directory; network-only mode reads only `policy.onnx`.
 
 ### 5.4 Search
 
@@ -303,21 +340,23 @@ Per-round targets leave nothing linking rounds, so self-play plays **single roun
   - A bid's value depends mostly on the hidden cards, so bids use more deals and fewer simulations: start at 20 × 25.
   - Plays keep 5 × 100 until measurements say otherwise.
   - Both are config values per phase.
-- **Greedy play** = most visits; ties go to the higher prior.
-- **Determinization fixes:** voids from the current trick; on fallback, relax only the seat that can't be satisfied.
+- **Greedy play** = most visits; ties go to the higher prior (done, Phase 1).
+- **Determinization:** voids from the current trick; on fallback, relax only the seat that can't be satisfied (done, Phase 1).
 
-### 5.5 Encoder changes
+### 5.5 Encoder
 
-P and V share the encoder code.
+P and V share the encoder code. Items 1–6 were done in Phase 1 (as built: §6 Phase 1).
 
-1. **`has_bid` per player.** Derive it from the dealer and the current player; no state change needed.
-2. **Bid context:** sum of bids so far, bids still to come, (sum − cards)/cards, and my position in bidding order. The dealer-constraint bit already exists.
+1. **`has_bid` per player.** Derived from the dealer and the current player; no state change needed.
+2. **Bid context:** sum of bids so far, bids still to come, (sum − cards)/cards, and my position in bidding order. The dealer-constraint bit already existed.
 3. **Seat-relative encoding:** rotate so "me" is seat 0, with a one-hot relative seat on player and played-card tokens. Required for mixed table sizes.
 4. **Trick features:** a "winning so far" flag on cards in the current trick; "legal" and "beats current winner" flags on hand cards.
-5. **Small fixes:** scale counts to [0, 1]; `is_highest_in_suit` ignores my own cards.
-6. **Remove cumulative-score features.**
-7. **V mode:** opponents' hand cards become a new token type, tagged with the owner's relative seat.
-8. **Suit-permutation augmentation** when sampling training batches: relabel suits consistently, including trump; 24 permutations. Cheap, and it multiplies data variety against memorization.
+5. **Small fixes:** counts scaled to [0, 1]; `is_highest_in_suit` ignores my own cards.
+6. **Cumulative-score features removed.**
+7. **Remove `round_number`** from the context token. With single rounds (§5.2) it describes nothing, and no trained model depends on it.
+8. **V mode:** opponents' hand cards become a new token type, tagged with the owner's relative seat.
+9. **Suit-permutation augmentation** when sampling training batches: relabel suits consistently, including trump; 24 permutations. Cheap, and it multiplies data variety against memorization.
+10. **One layout, guarded.** `encoder.rs` holds the only layout. Its `LAYOUT_ID` goes into every exported ONNX file, and `OnnxEvaluator` refuses a model whose id differs. A golden-hash test over fixed states fails on any encoding change, so a change can't land without bumping the id. No old layout is kept: a bump means retraining.
 
 ### 5.6 Training: async actor–learner
 
@@ -331,30 +370,32 @@ P and V share the encoder code.
  evaluator (2–4 reserved cores): network-only bench at every publish, search bench ~hourly
 ```
 
+- **One learner, two feeds.** The warm start (Phase 4) runs the same learner on a fixed buffer of bot rounds; the async driver (Phase 5) adds the actors, publisher and evaluator around it.
 - **Replay-ratio governor.** The learner may use at most R samples per sample produced, starting at R ≈ 4–8; it sleeps when it gets ahead. This replaces "epochs" and directly limits memorization. Log the actual ratio.
-- **Validation set by round, not by position.** Positions from one round share a label, so a position-level split would leak.
+- **Validation set by round, not by position.** Positions from one round share a label, so a position-level split would leak. Gen 1 split by whole game, because its label was the game score.
 - **Warm-up gate.** The learner starts once the buffer holds at least 50k examples. LR warm-up applies on top.
 - **Publishing.** Export both networks every K learner steps (the Python bridge takes ~25 s; run it off the learner thread). Actors swap networks between rounds, never mid-round.
 - **STOP file.** Drain the actors, save, exit. Resume continues with the same buffer, so no cold-buffer special case.
 - **Buffer persistence as delta chunks.** Save one file per ~N new examples instead of a full 200 MB snapshot every iteration. Resume reloads the newest chunks up to capacity. Tolerate a missing or corrupt chunk by skipping it.
-- **Metrics:** one row per minute or so, keyed by learner step.
+- **Metrics:** one row per minute or so, keyed by learner step. Validation losses next to the same losses on an equal-size training sample, both with dropout off; the logged training losses are not comparable.
 - **Not bit-reproducible;** accepted.
 
 ### 5.7 Evaluation and diagnostics
 
 **Primary yardstick:** one model seat against four rule bots.
-- **`bench` command** (grown from `examples/diagnostics.rs`):
+- **`bench` command:**
   - **Modes:** search, or network-only.
-  - **Opponents:** rule bot, the gen-1 final checkpoint, or any checkpoint. Bots never run search.
+  - **Opponents:** the rule bot (the reference), rule bot 2, or any gen-2 model's raw policy. Bots never run search.
   - **Duplicate deals:** a fixed list of deal seeds, each played once from every seat position, so card luck cancels out.
   - **Reports:**
     - points per game ± 95% CI;
     - win share;
     - bids made, split by cards dealt (1 / 2–4 / 5–8);
     - share of 0-bids, and a histogram of bid errors.
+- **Gen-1 reference, as recorded:** −10.2 ± 2.9 with 5×100 search, −12.1 ± 2.0 network only, on `bench`'s default deals. Gen-2 results compare with these directly.
 - **Cadence:**
   - **Network-only bench at every publish:** about 10 s for 640 games. Gen-1 data shows it tracks strength well (§2.1).
-  - **Search bench about hourly:** ~4–5 min for 300 games at 5 × 100 today.
+  - **Search bench about hourly:** ~4–5 min for 320 games at 5 × 100 with gen 1's single network; expect about twice that with P + V (§5.8).
 - **Held-out checks:**
   - validation losses for P and V;
   - V's correlation with the actual round outcome;
@@ -365,12 +406,12 @@ P and V share the encoder code.
 
   Read these only alongside the bench: decisive ≠ right.
 - **Human playtests** via `blobmaster play`.
-- **Checkpoint-vs-checkpoint** stays only as a secondary signal.
+- **Checkpoint-vs-checkpoint** (`bench --opponent <model>`) only as a secondary signal.
 
 ### 5.8 Compute budget
 
-**Per-leaf cost** (from §3.1): today a leaf is one call at ~17 tokens. In gen 2 it's a P call (~17 tokens) plus a V call (~31 tokens):
-- **≈ 2.8×** today's cost with a V the same size as P;
+**Per-leaf cost** (from §3.1): a gen-1 leaf is one call at ~17 tokens. In gen 2 it's a P call (~17 tokens) plus a V call (~31 tokens):
+- **≈ 2.8×** gen 1's cost with a V the same size as P;
 - **≈ 1.9×** with a 4-layer V.
 
 **Throughput:**
@@ -395,89 +436,113 @@ Playing a human stays fast: two networks per move is still a fraction of a secon
 
 ## 6. Roadmap
 
-Each phase ends with a measurable exit criterion. Short validation runs (10–20 iterations, a few hours) between phases; the long run only after Phase 4.
+Each phase ends with a measurable exit criterion. The order follows build dependencies:
+1. Delete gen 1 first, so no later change has to keep it compiling.
+2. Build the gen-2 engine, then the networks.
+3. Run a supervised warm start: the first measurement of the new value design and search, with no RL.
+4. Build the async driver for RL, then do the long run.
 
-**Phase 0 — Yardsticks first (no training)**
-- [x] Rule bot `blob-engine/src/rule_bot.rs` (2026-10-02).
-- [x] Gen-1 diagnostics `blob-engine/examples/diagnostics.rs` (2026-10-02).
-- [x] `bench` subcommand (2026-10-02): `blobmaster bench`, logic in `blob-engine/src/bench.rs`. Duplicate deals, both modes, by-hand-size bid stats, 0-bid share, bid-error histogram.
-- [x] `blobmaster play` (2026-10-02): human vs bot in the terminal; `--show` prints every bot decision's search visits, network policy and value, `hint` does the same for your seat. The `gui` branch is a real-table copilot, not a simulator (§4).
-- [x] Validation split and validation losses in the gen-1 driver (2026-10-02). Split by **whole game**, not round: the gen-1 target is the final game score and cumulative scores are encoder inputs, so a round split would leak. Switch the key to (game, round) in Phase 2. Details below.
-- [x] Repo hygiene (§9) except the `.git` rewrite, which is still deferred.
-- *Exit:* `bench` reproduces −9 ± 3 for the gen-1 final checkpoint; you can play a full game against it.
-  - **`bench`: met.** Gen-1 final with 5×100 search: **−10.2 ± 2.9** (64 deals × 5 seats = 320 games, 262 s). Network only: −12.1 ± 2.0 (128 deals, 7 s). Both agree with §2.1.
-  - **`play`: verified by script, not by a person.** Full 17-round games ran through the terminal UI against the rule bot and against gen-1 with 5×100 search (52 s per game, with `--show`). A human playtest is still open.
+Each training phase starts from the previous phase's benchmarked model, so every step's gain is measured on its own (§3.3).
+
+**Phase 0 — Yardsticks first** (done 2026-10-02)
+- [x] Rule bots: `rule_bot.rs` (2026-10-02, the reference) and `rule_bot_2.rs` (2026-10-05, +14.5 ± 0.3 vs the rule bot).
+- [x] `blobmaster bench` (logic in `bench.rs`): duplicate deals, both modes, bid stats by hand size, 0-bid share, bid-error histogram.
+- [x] `blobmaster play`: human vs bots in the terminal. `--show` prints every bot decision's search visits, network policy and value; `hint` does the same for your seat.
+- [x] Gen-1 diagnostics (`examples/diagnostics.rs`) and a validation split in the gen-1 driver. Both go in Phase 2; the split's lesson is kept in §5.6.
+- [x] Repo hygiene (§9).
+- *Exit, met:*
+  - `bench` on gen-1 final: **−10.2 ± 2.9** with 5×100 search (64 deals × 5 seats = 320 games, 262 s), −12.1 ± 2.0 network only (128 deals, 7 s). Both agree with §2.1.
+  - Full 17-round games ran through `play`'s terminal UI by script. The human playtest moves to gen-2 models (Phase 5).
 - *Findings:*
   - **Duplicate deals barely narrow the CI here:** ±2.0 over 128 deals vs ±1.9 for 640 independent games. In Blob, outcome variance comes mostly from play, not from card quality. Keep them anyway: they cost nothing and models are compared on identical cards.
   - **Gen-1 bids 0 in 84% of rounds,** 84% even in 5–8-card rounds, against the rule bot's 25%. It makes only 41% of 5–8-card bids, against the rule bot's 55%.
 
-*Validation split, as built:*
-- `validation_fraction` (default 0.03) in `[training]` holds out games by a hash of their seed (`training_loop::is_validation_game`). Their examples fill `val_buffer` (capacity `buffer_capacity × fraction`), saved as `val_buffer.bin` and restored on resume. They are never trained on.
-- Each iteration, `metrics.jsonl` gets:
-  - `val_*`: bid/play policy CE, value MSE, and the predict-0 MSE, over the whole validation buffer.
-  - `train_eval_*`: the same measurement on an equal-size sample of the replay buffer.
-
-  Both are measured after training, with dropout off. The logged training losses are not comparable: they are averaged over the iteration with dropout on.
-- `scripts/visualize_strength.py` plots both as `07_generalization.png`.
-
 **Phase 1 — Cheap correctness fixes** (done 2026-10-05)
 - [x] Encoder items 1–6 from §5.5 (layout v2, below).
 - [x] Determinization fixes.
-- [x] Greedy tie-break; `DynEval` batch forwarding.
-- *Exit:* unit tests pass. No training run needed.
-  - **Met.** `blob-engine` 272 unit + 44 integration tests, `blob-nn` 48 (including `five_games_produce_valid_examples`, failing since 2026-05-17, §9), `blob-bin` 6. ONNX↔tch parity passes on a freshly exported v2 model.
-  - **Gen 1 still runs as before:** `bench --mode network` on iter 167 gives −12.1 ± 2.0, identical to Phase 0.
+- [x] Greedy tie-break; `DynEval` removed.
+- *Exit, met:* `blob-engine` 272 unit + 44 integration tests, `blob-nn` 48, `blob-bin` 6. ONNX↔tch parity passes on a freshly exported random v2 model.
 
 *As built:*
-- **Encoder layout v2** (`encoder.rs`). Token widths: hand 32, played 49, player 28, context 17; padded width `FEAT_DIM` = 49 (gen 1: 48).
+- **Encoder layout v2** (`encoder.rs`). Token widths: hand 32, played 49, player 28, context 17; padded width `FEAT_DIM` = 49.
   - **Player tokens** come in relative-seat order (me first), with a relative-seat one-hot, `has_bid` and `is_to_move`. Bid, tricks needed and bid status stay 0 until the seat has bid. `has_bid` and `bid_order_position` are in `bidding.rs`.
   - **Played cards:** relative-seat one-hot; `winning_so_far` on the trick in progress.
-  - **Hand cards:** counts / 13; `is_legal`; `beats_current_winner`, from `playing::beats` and `current_trick_winner`, which `apply_play` also uses. `is_highest` and `is_lowest` both ignore my own cards (§5.5 names only `is_highest`; the same reasoning applies to both).
-  - **Context:** bid sum / 13, seats still to bid / players, (sum − cards) / cards, my bidding position.
-  - **Removed:** cumulative scores. Void flags now read `belief::void_suits`.
+  - **Hand cards:** counts / 13; `is_legal`; `beats_current_winner`, from `playing::beats` and `current_trick_winner`, which `apply_play` also uses. `is_highest` and `is_lowest` both ignore my own cards.
+  - **Context:** bid sum / 13, seats still to bid / players, (sum − cards) / cards, my bidding position. Cumulative scores removed. Void flags read `belief::void_suits`.
   - **Tests** check `is_legal` against `legal_plays`, `beats_current_winner` against actually playing the card, and that rotating every seat leaves the encoding unchanged.
-- **Gen-1 compatibility.** The gen-1 layout is frozen as `encoder::v1` and pinned bit-for-bit by a golden-hash test. `OnnxEvaluator` reads the model's `features` width (48 → v1, 49 → v2), so `bench`, `play`, diagnostics and `blobmaster-train evaluate` run either generation, mixed in one table too. Gen-1 `model.ot` weights no longer load into `BlobNet`: they can't be trained further or re-exported.
+  - The gen-1 layout was frozen as `encoder::v1` so gen-1 models kept running; Phase 2 deletes it.
 - **Determinization** (`belief.rs`): `void_suits` includes the trick in progress. After 32 failed rejection attempts, `constrained_deal` deals seat by seat and only draws cards that keep the rest of the deal feasible (Hall's condition over suit sets). It relaxes only seats whose voids can't all be met together, which for a real game state is none.
 - **Greedy play:** most visits, ties to the higher root prior, then the lower index. This applies to τ→0 sampling, `root_action_probs` and `bench::search_action` (used by `bench` and `play`). `MctsResult.root_prior` holds the root priors averaged over sampled deals.
-- **`DynEval` removed:** `mcts_search` takes `&dyn Evaluator` directly, so batches reach `OnnxEvaluator::evaluate_batch`. MCTS also no longer encodes a whole state just to get the hand order (`encoder::hand_card_indices`).
+- **`DynEval` removed:** `mcts_search` takes `&dyn Evaluator` directly, so batches reach `OnnxEvaluator::evaluate_batch`. MCTS gets the hand order from `encoder::hand_card_indices` instead of encoding a whole state.
 - **`scripts/export_onnx.py`** uses the v2 widths; the Rust test `export_script_mirrors_feature_widths` keeps them in sync.
 
-*Findings and open points:*
-- **Encoding got no slower:** 272 ns for `encode` (5p7c, mid-trick), against 297 ns for gen 1 (§3.1).
-- **`export_onnx.py --check` reports 1.9e-5 on a random tch init,** over its 1e-5 gate. tch's random init has ~2.5× the weight scale of torch's; with torch's init the new script gives 4.8e-7 (the old one 4.0e-7), so the layout isn't the cause. Trained gen-1 weights gave 4.5e-6. The training driver doesn't run `--check`.
-- **Context `round_number` is still an input.** §5.5 doesn't list it, and per-round targets don't need it. Once self-play plays single rounds (Phase 4) it no longer describes anything; decide then.
-- **A v2 layout change invalidates every v2 model.** Once Phase 2 has trained one, add a v3 next to it instead of editing v2.
+*Open point carried forward:* `export_onnx.py --check` reports 1.9e-5 on a random tch init, over its 1e-5 gate. tch's random init has ~2.5× the weight scale of torch's; with torch's init the script gives 4.8e-7, so the layout isn't the cause. Trained gen-1 weights gave 4.5e-6. Set the gate when the export is rewritten for P and V (Phase 4).
 
-**Phase 2 — Per-round, per-seat values (cheap version, gen-1 driver)**
-- [ ] Per-round `u_s` targets; per-seat value head on P (own view); all-seat backup; exact end-of-round `u_s`.
-- [ ] Training passes cut to a replay ratio of ~8.
-- [ ] 20-iteration run at 5p7c.
-- *Exit:* the search bench clearly beats gen-1 final's −9 by iter 20 and is still rising; V's held-out correlation with round outcome above 0.5.
-- This phase isolates the effect of the target change. Expect plays to improve more than bids: an opponent's view can't judge my bid, because it doesn't see my hand.
+**Phase 2 — Clean break** (no training)
 
-**Phase 3 — Full-deal value net + warm start**
-- [ ] V model + encoder V-mode + export + two-session evaluator; search leaves use V for all seats.
-- [ ] Supervised pre-training on rule-bot rounds: V on outcomes, P imitating the bot. This is also V's first test: held-out error, plus exactness on 1-card rounds. Rule bot 2 (§4) is the stronger teacher to imitate.
-- [ ] Bench the pre-trained P+V with search before any RL.
-- [ ] Short RL run (gen-1 driver).
-- *Exit:* search bench ≥ +10 points per game vs the rule bot.
-
-**Phase 4 — Async driver**
-- [ ] Actor–learner per §5.6, rounds-not-games self-play, replay-ratio governor, delta persistence, continuous bench, suit augmentation.
+Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
+- [ ] Tag `c6f0c2a` as `gen-1-final` and the last commit before the deletions as `gen-1-compat` (§10).
+- [ ] Decide whether to archive `checkpoints/run-2026-05-14/` outside the repo. Its `model.ot` and `buffer.bin` were never committed, so deleting them is final. The ONNX models and CSVs stay in git until the `.git` rewrite (§9).
+- [ ] Salvage from the gen-1 driver: move the batch construction (`bid_train_batch`, `play_train_batch`) and the held-out-loss code, with their tests, into a `learner` module for Phase 4. `blob-train` keeps only `export` until Phase 4.
+- [ ] Delete everything in §4 "Delete in Phase 2".
+- [ ] Make the config schema reject unknown keys.
+- [ ] Rewrite `AGENTS.md`, `README.md` and `scripts/README.md` for gen 2. Drop the gen-1 driver section, the gen-1 reference model and its parity recipe, and the `encoder::v1` notes.
+- [ ] Optional: the `.git` rewrite (§9).
+- Not yet: `scoring.rs`, the per-seat counts in `mcts.rs` and the single-value `Evaluator` stay until Phase 3 replaces them, because the search needs a value until then.
 - *Exit:*
-  - it reproduces the Phase-3 result in less wall time;
-  - STOP/resume is clean, with no loss spike;
-  - the replay ratio holds at target.
+  - `cargo build --release` and every test suite pass (`blob-engine` in debug, `blob-nn`, `blob-bin`).
+  - `bench` and `play` run with rule bots and with a random-init model from `save_random_checkpoint`.
+  - `bench rulebot2` reproduces +14.5 ± 0.3.
+  - No code refers to `encoder::v1`, `HeuristicEvaluator`, `backfill_values`, `blob_nn::eval` or a retired document.
 
-**Phase 5 — Long run, 5 players / 7 cards**
-- *Exit:* ≥ +20 points per game vs the rule bot; far ahead of gen-1 final; bids made in 5–8-card rounds clearly above the rule bot's; human playtests feel strong.
+**Phase 3 — Gen-2 engine** (no training)
+- [ ] Start-one-round helper and the round sampler (§5.2).
+- [ ] Per-round utility `u_s` (§5.1), replacing `scoring.rs`.
+- [ ] Policy and value evaluator traits; `OnnxEvaluator` with one session per network and the layout-id check (§4, §5.5).
+- [ ] Search: all-seat backup, exact `u_s` at round end, V at leaves, per-phase budgets (§5.4). Delete the per-seat counts and the "Q = 0 when empty" fallback.
+- [ ] Encoder: V mode, `round_number` removed, layout id with its golden test (§5.5 items 7, 8, 10).
+- [ ] Replay: per-seat round scores, round id, concurrent wrapper; suit-permutation augmentation when sampling (§5.5 item 9).
+- *Exit:* unit tests pass, including these:
+  - every explored root option carries a value for the deciding seat (100%, by construction);
+  - for the last bidder in a fully known 1-card round, each bid's search value equals its exact `u_s`;
+  - a suit permutation leaves legal moves, trick winners and scores unchanged;
+  - V mode encodes every hand; P mode encodes none of the opponents' cards;
+  - `bench` and `play` run on the new search with a random-init P + V pair.
 
-**Phase 6 — Mixed table sizes**
+**Phase 4 — Two networks + supervised warm start**
+- [ ] P and V models (§5.3); `export_onnx.py` for both, writing the layout id; ONNX↔tch parity for both; the model directory.
+- [ ] Learner: alternating P / V steps from a buffer, LR keyed to learner steps, validation split by round, a metrics row every N steps, checkpoints. CLI: `blobmaster-train pretrain`.
+- [ ] Teacher data: rounds played by rule bot 2, with some rule-bot seats mixed in for variety, stored in the replay format. P imitates rule bot 2's `bid_chances` / `play_chances`; V learns the actual per-seat round scores.
+- [ ] G1 on held-out teacher rounds.
+- [ ] Bench P network-only and P + V with search, against the rule bot and against rule bot 2.
+- *Exit:* G1 and G2 pass.
+- *Record:*
+  - how much search adds over network-only (gen 1: about 4 points, §2.1);
+  - the 0-bid share;
+  - bids made by hand size, against both bots.
+- No RL yet. This phase measures the new value design and search on their own, which is what the dropped "per-round values in the gen-1 driver" step was meant to isolate.
+
+**Phase 5 — Async self-play RL**
+- [ ] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train`.
+- [ ] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run.
+- [ ] Short run (a few hours, 5p7c) from the Phase-4 checkpoint.
+- [ ] First human playtest (`blobmaster play`).
+- *Exit:*
+  - G3 and G4 pass;
+  - STOP / resume is clean, with no loss spike;
+  - the validation–training gap stays flat.
+
+**Phase 6 — Long run, 5 players / 7 cards**
+- *Exit:* G5. That means ≥ +20 points per game vs the rule bot, ahead of rule bot 2, bids made in 5–8-card rounds clearly above the rule bot's, and human playtests that feel strong.
+
+**Phase 7 — Mixed table sizes**
 - n = 4–7 players, C = 7–8 cards (seat-relative encoding is the prerequisite).
 - Fine-tune per table size only if one model lags.
 
-**Phase 7 — Deployment**
-- Play UI; Windows + Intel iGPU via ONNX Runtime (consider the OpenVINO execution provider); per-table-size models if Phase 6 needed them.
+**Phase 8 — Deployment**
+- Play UI: port the `gui` branch (§4) to the gen-2 model directory and search API.
+- Windows + Intel iGPU via ONNX Runtime (consider the OpenVINO execution provider).
+- Per-table-size models if Phase 7 needed them.
 
 ---
 
@@ -485,12 +550,14 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 
 | Gate | Measure | Pass |
 |---|---|---|
-| G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced — **passed 2026-10-02: −10.2 ± 2.9** |
-| G1 value learnable | V on held-out rule-bot rounds | correlation with outcome > 0.7; 1-card rounds after bidding ≈ exact |
-| G2 per-round values help | Phase-2 run, search bench | > −9 by iter 20, rising |
+| G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced — **passed 2026-10-02: −10.2 ± 2.9**. Historic: gen-1 models are deleted in Phase 2 |
+| G1 value learnable | V on held-out teacher rounds (Phase 4) | correlation with the actual round outcome > 0.7; 1-card rounds after bidding ≈ exact |
+| G2 search helps | Phase-4 warm start: P + V with search vs P network-only, same deals | search clearly ahead (95% CIs separate) |
 | G3 beats the rule bot | search bench | ≥ +10 points/game |
-| G4 async parity | Phase-4 run | G3 result in less wall time; replay ratio on target |
-| G5 strong | long run | ≥ +20 points/game vs rule bot; human playtests |
+| G4 RL adds strength | Phase-5 run, search bench | clearly above the Phase-4 warm start (CIs separate) and still rising; replay ratio on target |
+| G5 strong | long run, search bench | ≥ +20 points/game vs the rule bot; > 0 vs four rule-bot-2 opponents; human playtests |
+
+G3 may already pass at the warm start: rule bot 2 itself scores +14.5. That is fine. G4 is the gate that shows RL adding strength.
 
 **Always also check:**
 - the share of root options with a deciding-seat value is 100%;
@@ -508,6 +575,48 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 - **Training-step efficiency.** ~150 ms per 512 samples for 1.6M params is far above the arithmetic cost. Profile (kernel count, mixed precision, batch size) before buying hardware time.
 - **Model size.** The GPU is mostly idle and CPU inference sets the limit (§5.8).
 - **Plan B.** DouZero-style "Deep Monte-Carlo": no search; learn Q(state, action) directly from round scores. Worth running as a comparison if search-based training stalls.
+- **Opponent modelling across rounds.** Learn each player's style during a game and use it in sampling, rollouts and (later) the networks. See §8.1.
+
+### 8.1 Opponent modelling across rounds
+
+Rounds stay independent for training (§5.2), but people carry habits from round to round. A few per-player style numbers, estimated during the game, carry that information across rounds without coupling them.
+
+**Why it's tractable in Blob.** Every card in a hand gets played, so when a round ends every opponent's full hand is known. Each of their decisions in that round can be replayed from their own view: what they could see, what rule bot 2 would have done there, what they did. Every past decision becomes a labelled example.
+
+**Style parameters**, each measured against rule bot 2 on the reconstructed view:
+
+| Parameter | Measured as | Captures |
+|---|---|---|
+| Bid bias | bid − rule bot 2's bid on the same hand, seat and earlier bids | systematic over- or under-bidding |
+| Bid spread | spread of that residual | erratic vs consistent bidding |
+| Control | made (0/1) − rule bot 2's P(make) for that hand and bid | play skill |
+| Duck will | share of avoidable tricks taken while at the bid | how reliably they shed tricks (`WILL_DONE` per player) |
+| Spite | share of plays that hurt a hungry seat or the leader at a cost to themselves | sabotage, possibly aimed at the leader |
+| Temperature | noise of their choices around rule bot 2's ranking of the options | randomness |
+
+Optional covariates: standing (behind/ahead), stage of the game, missed the last round.
+
+**Estimation.**
+- Online, with a prior centred on the population: every estimate starts at "average player" and moves only with evidence. Slow forgetting, since people adapt too.
+- **Skewed vs random:** a skew is a bias whose credible interval excludes 0; randomness is a high temperature with no bias. The deciding test is prediction: the per-player model must predict that player's *later* decisions better than the population model on held-out rounds. Otherwise shrink back to the population.
+- **Data budget (rough):** an opponent gives ~17 bids and ~35 unforced plays per game. If the bid residual has a spread of ~0.7 tricks, one game gives a standard error of ~0.17 tricks on the bias. Strong skews show within a game; subtle ones need several games against the same person.
+
+**Use in the rule bot (first).**
+- **Sampling:** weight sampled deals by the likelihood of each opponent's actual bids and plays under *their* model. This is the per-player form of "bid inference in sampling" above.
+- **Rollouts:** in v2r, play each opponent as a rule bot 2 with that player's fitted settings. This needs rule bot 2's constants as per-seat parameters (a `Style` input) instead of constants.
+- **Strategy:** dump tricks on poor duckers, expect more contested tricks at a table of overbidders, and prefer bids that can be steered either way when leading the game against a known saboteur.
+- **Safety:** blend the fitted model with the baseline, so a wrong model costs little.
+
+**Use in the networks (later).** A network trained only to be strong can't adapt mid-game; style has to be an input.
+- **Training population:** rule bot 2s with randomly drawn styles (bias, duck will, spite, temperature), mixed with past checkpoints.
+- **Inputs:** add per-seat style features (estimate plus uncertainty or observation count) to the player tokens of P and V.
+- **Train on estimates, not true styles:** during self-play, run the same online estimator on each opponent's observed history and feed its noisy early-game guesses, so the networks learn how far to trust them.
+- **Rounds stay independent:** a training round just carries a style vector per seat. A learned history encoder over past rounds is the stronger but data-hungrier alternative; it would re-couple rounds.
+
+**Order and gates.**
+1. **Synthetic opponents with known styles.** The estimator recovers each style within N rounds and doesn't flag random opponents. A style-aware v2r beats a style-blind v2r on `bench`, opponent type by opponent type.
+2. **Human games via `play`.** Log decisions; estimates are stable across games for the same person and predict held-out rounds.
+3. **Only then** condition P and V on styles, measured against the same synthetic population.
 
 ---
 
@@ -516,44 +625,45 @@ Each phase ends with a measurable exit criterion. Short validation runs (10–20
 **Done 2026-10-02.**
 - **`checkpoints/` pruned from 41 GB to 0.22 GB.** All that remains is `run-2026-05-14/`:
   - `iter_000000`, `iter_000025`, `iter_000125`, `iter_000167` (`model.onnx` + `meta.json`; the four rows of §2.1);
-  - `iter_000167/model.ot` (for the ONNX↔tch parity test) and `iter_000167/buffer.bin` (for `diagnostics value`);
+  - `iter_000167/model.ot` and `iter_000167/buffer.bin` (never committed);
   - `metrics.jsonl`, `strength.csv`;
   - `signal_ratio_by_iter.csv`, which replaces the 0.73 GB `decision_stats.jsonl`.
 
-  All other runs and iterations were deleted. Their small text files (metrics, strength.csv, meta.json) are still in git history.
-- **`*.onnx` is ignored by git.** Reference models go in with `git add -f`; per-iteration weights are never committed.
+  Phase 2 deletes the directory.
+- **`*.onnx` is ignored by git.** Per-iteration weights are never committed; a deliberate reference model goes in with `git add -f`.
+- **Deleted:** the INT8 path (calibration capture, `--int8-out`, `use_int8`, `validate_int8.py`, `int8_levers.py`), Muon (`muon.rs`, its param group, `enable_muon`), and the gen-1 sweep, overnight and diagnostic scripts with their configs.
 - **Machine-level clean-up:** `target/debug` (13 GB) and the pip download cache (12 GB) were removed. Free disk went from 22 GB to 86 GB.
 
-**Deferred: shrinking `.git` (4.9 GB).**
+**Phase 2:** the deletions listed in §4.
+
+**Shrinking `.git` (4.9 GB).**
 - **What's in it:** about 4.6 GB of model blobs in history:
   - `sweep-2026-04-28-anchor` 1.4 GB, `run-2026-05-14` 1.1 GB, `run-2026-05-06` 1.0 GB;
   - smaller runs, plus 0.24 GB of gen-0 `.pth` files.
-- **Why it waits:** reclaiming it needs a history rewrite and force-push. That must include the `gui` branch on GitHub, which shares this history (see §4). Rewriting `master` alone would leave `gui` with diverged history and wouldn't shrink GitHub.
-- **Recipe when ready:**
-  1. Tag `c6f0c2a` as `gen-1-final` and point the §10 / `AGENTS.md` references at the tag.
-  2. Check out `gui` locally.
-  3. Run `git filter-repo --force --prune-empty never --invert-paths --path-glob '*.onnx' --path-glob '*.pth' --path-glob '*calibration.bin' --path-glob '*decision_stats.jsonl'` on all branches.
-  4. Back up the reference models before running it: the rewrite removes them from the working tree. Then re-add them with `git add -f`.
+- **When:** any time after Phase 2's deletions are committed. Nothing needs re-adding afterwards, because no gen-1 model is kept.
+- **Why it needs care:** it is a history rewrite and a force-push. It must include the `gui` branch on GitHub, which shares this history (§4). Rewriting `master` alone would leave `gui` with diverged history and wouldn't shrink GitHub.
+- **Recipe:**
+  1. Check that the tags `gen-1-final` and `gen-1-compat` exist (Phase 2).
+  2. If §2 should stay reproducible, archive the four gen-1 ONNX models outside the repo. The rewrite removes them from history for good.
+  3. Check out `gui` locally.
+  4. Run `git filter-repo --force --prune-empty never --invert-paths --path-glob '*.onnx' --path-glob '*.pth' --path-glob '*calibration.bin' --path-glob '*decision_stats.jsonl'` on all branches.
   5. Verify: commit count, HEAD tree, `git show gen-1-final:fix-mcts-plan.md`.
-  6. Force-push `master`, `gui` and the tag. Other clones must re-clone.
-
-**Done 2026-10-02 (Phase 0):** deleted the INT8 path (calibration capture, `--int8-out`, `use_int8`, `validate_int8.py`, `int8_levers.py`), Muon (`muon.rs`, its param group, `enable_muon`), and the gen-1 sweep, overnight and diagnostic scripts with their configs. Old TOMLs that still set `enable_muon` or `use_int8` load fine; serde ignores the unknown keys.
-
-**Still to do:**
-- **`HeuristicEvaluator`:** drop it once the driver's in-loop eval and `blobmaster-train evaluate` use `bench` (§4).
-- **Code comments still cite the retired documents,** about 50 references, most to `fix-mcts-plan.md`. Rewrite them as the code changes; until then use §10.
-- ~~**Pre-existing test failure:** `blob-nn` `self_play::tests::five_games_produce_valid_examples`.~~ Fixed 2026-10-05: its 1×1 search budget gave no visits once the budget became config-driven (2026-05-17); it now uses 1×4.
+  6. Force-push `master`, `gui` and both tags. Other clones must re-clone.
 
 ---
 
-## 10. Retired documents (2026-10-02)
+## 10. Retired documents and code
 
-All are recoverable with `git show c6f0c2a:<file>`.
+All retired documents are recoverable with `git show c6f0c2a:<file>`, or `git show gen-1-final:<file>` once Phase 2 has created the tag.
+
+The retired code lives at two tags:
+- **`gen-1-final`** (`c6f0c2a`): the gen-1 pipeline as it was trained.
+- **`gen-1-compat`**: the last commit whose tooling still runs gen-1 models (`encoder::v1`, `examples/diagnostics.rs`). Appendix A uses it.
 
 | Document | What it was | Where its live content went |
 |---|---|---|
-| `development-plan.md` | Gen-1 session-by-session plan and specs | Reversed decisions §2.7; perf facts §3.1; ruled-out list §3.2; deployment and fine-tuning ideas §6 Phase 6–7; crate boundaries in `AGENTS.md` |
-| `fix-mcts-plan.md` | 2026-05-12 diagnosis (Dirichlet, terminal values, τ split, warm start, forced moves) | Implemented parts kept (§4 `mcts.rs` row); warm start → Phase 3; superseded diagnosis → §2 |
+| `development-plan.md` | Gen-1 session-by-session plan and specs | Reversed decisions §2.7; perf facts §3.1; ruled-out list §3.2; deployment and fine-tuning ideas §6 Phases 7–8; crate boundaries in `AGENTS.md` |
+| `fix-mcts-plan.md` | 2026-05-12 diagnosis (Dirichlet, terminal values, τ split, warm start, forced moves) | Implemented parts kept (§4 `mcts.rs` row); warm start → Phase 4; superseded diagnosis → §2 |
 | `async.md` | V2 actor–learner design notes | §5.6 (numbers corrected to `run-2026-05-14` measurements) |
 | `self-play-profile.md` | Thread, batch, INT8, determinization-count sweeps | §3.1, §3.2 |
 | `7.3b-analysis.md` | Why run 7.3b regressed | §3.3 |
@@ -567,9 +677,12 @@ All are recoverable with `git show c6f0c2a:<file>`.
 
 ## Appendix A — Reproducing the gen-1 measurements
 
-Run from the repo root with nothing else busy (the tool uses every core).
+After Phase 2 the gen-1 models no longer run on `master`. Use a worktree at `gen-1-compat`. It contains the four reference ONNX models until the `.git` rewrite; after that, restore them from your archive (§9). `diagnostics value` also needs `iter_000167/buffer.bin`, which was never committed.
+
+Run from the worktree root with nothing else busy (the tools use every core).
 
 ```bash
+git worktree add ../blob-gen1 gen-1-compat && cd ../blob-gen1
 cargo build --release -p blob-bin -p blob-engine --example diagnostics
 B=./target/release/blobmaster
 D=./target/release/examples/diagnostics
