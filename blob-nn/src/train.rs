@@ -2,8 +2,8 @@
 //!
 //! - Policy loss: cross-entropy against an MCTS-visit-count distribution,
 //!   `-Σ t · log(p + ε)`. Illegal actions have `t = 0`, contributing nothing.
-//! - Value loss: MSE against the value target (gen 1: the z-scored final
-//!   game score, clipped to `[-1, 1]`).
+//! - Value loss: MSE against the value target: until Phase 4 splits P and
+//!   V, the seat to move's ŝ from the replay buffer (`learner.rs`).
 //! - Combined: `policy_loss + 2.0 · value_loss`.
 //! - Optimizer: AdamW (β₁=0.9, β₂=0.999, wd=1e-4).
 //! - LR schedule: linear warmup to 3e-4 over `warmup_steps` in iteration 0,
@@ -62,7 +62,7 @@ pub enum Phase {
 ///   `S` matches `input.attention_mask.size()[1]`. Non-hand and illegal
 ///   positions must be 0 in the target and `false` in the mask.
 ///
-/// `value_target: [B]` f32 in `[-1, 1]` (z-scored, already clipped).
+/// `value_target: [B]` f32, the seat to move's ŝ in `[0, 1]` until Phase 4.
 pub struct TrainBatch {
     pub input: InputBatch,
     pub phase: Phase,

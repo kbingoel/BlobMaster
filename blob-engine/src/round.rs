@@ -6,10 +6,16 @@
 //!
 //! The "no-trump" round encodes as [`NO_TRUMP`] = 4 in `BlobState.trump_suit`,
 //! sitting just past the four [`crate::card::Suit`] values (0..=3).
+//!
+//! Self-play plays single rounds (gen-2.md §5.2); [`RoundMix`] draws their
+//! parameters from the rounds of real games.
 
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::card::{MAX_CARDS_DEALT, NUM_CARDS};
+use crate::dealing::RoundParams;
 use crate::state::{MAX_PLAYERS, MIN_PLAYERS};
 
 /// Sentinel value stored in `BlobState.trump_suit` for no-trump rounds.
@@ -41,6 +47,12 @@ pub enum RoundParamsError {
     StartCardsZero,
     StartCardsExceedsCap,
     DeckExceeded,
+    /// Trump above [`NO_TRUMP`].
+    TrumpOutOfRange,
+    /// Dealer seat not below the player count.
+    DealerOutOfRange,
+    /// A [`RoundMix`] with no table sizes or a non-finite exponent.
+    InvalidMix,
 }
 
 /// Validate `(start_cards, num_players)` per game rules:
@@ -109,10 +121,135 @@ pub fn cards_dealt_for_round(round_idx: u8, start_cards: u8, num_players: u8) ->
     }
 }
 
+/// The rounds single-round self-play draws from (gen-2.md §5.2).
+///
+/// - **Table size:** uniform over `players`.
+/// - **Cards dealt:** one of the rounds of a game starting at `start_cards`
+///   at that table, so 1-card rounds come up once per player and the others
+///   twice. Each round is weighted by `cards_dealt ^ large_round_exponent`:
+///   0 keeps real games' mix, larger values oversample the larger rounds,
+///   where bidding matters most.
+/// - **Trump:** uniform over the four suits and no-trump, the rotation's
+///   share over a game.
+/// - **Dealer:** uniform.
+///
+/// Unknown keys are an error, so a stale config can't half-load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundMix {
+    pub players: Vec<u8>,
+    pub start_cards: u8,
+    #[serde(default)]
+    pub large_round_exponent: f32,
+}
+
+impl Default for RoundMix {
+    /// 5 players starting at 7 cards, real games' mix.
+    fn default() -> Self {
+        Self { players: vec![5], start_cards: 7, large_round_exponent: 0.0 }
+    }
+}
+
+impl RoundMix {
+    /// Every table size must make a valid game at `start_cards`.
+    pub fn validate(&self) -> Result<(), RoundParamsError> {
+        if self.players.is_empty() || !self.large_round_exponent.is_finite() {
+            return Err(RoundParamsError::InvalidMix);
+        }
+        for &n in &self.players {
+            validate_round_params(self.start_cards, n)?;
+        }
+        Ok(())
+    }
+
+    /// Draw one round's parameters. The mix must pass [`RoundMix::validate`].
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> RoundParams {
+        let num_players = self.players[rng.gen_range(0..self.players.len())];
+        let rounds = round_structure(self.start_cards, num_players);
+        let weight = |c: u8| (c as f64).powf(self.large_round_exponent as f64);
+        let total: f64 = rounds.iter().map(|&c| weight(c)).sum();
+        let mut x = rng.gen::<f64>() * total;
+        let mut cards_dealt = rounds[rounds.len() - 1];
+        for &c in &rounds {
+            if x < weight(c) {
+                cards_dealt = c;
+                break;
+            }
+            x -= weight(c);
+        }
+        RoundParams {
+            num_players,
+            cards_dealt,
+            trump: rng.gen_range(0..TRUMP_CYCLE_LEN),
+            dealer: rng.gen_range(0..num_players),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::card::Suit;
+    use rand_xoshiro::rand_core::SeedableRng;
+    use rand_xoshiro::Xoshiro256PlusPlus;
+
+    fn shares(mix: &RoundMix, draws: usize) -> [f64; 14] {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x5A3);
+        let mut count = [0usize; 14];
+        for _ in 0..draws {
+            count[mix.sample(&mut rng).cards_dealt as usize] += 1;
+        }
+        count.map(|c| c as f64 / draws as f64)
+    }
+
+    #[test]
+    fn round_mix_reproduces_a_games_rounds() {
+        // 5p/7c: 17 rounds, five of them 1-card, two of every other size.
+        let p = shares(&RoundMix::default(), 100_000);
+        assert!((p[1] - 5.0 / 17.0).abs() < 0.01, "1-card share {}", p[1]);
+        for (c, share) in p.iter().enumerate().take(8).skip(2) {
+            assert!((share - 2.0 / 17.0).abs() < 0.01, "{c}-card share {share}");
+        }
+        assert_eq!(p[8..].iter().sum::<f64>(), 0.0);
+    }
+
+    #[test]
+    fn round_mix_exponent_oversamples_large_rounds() {
+        // Weight c per round: 1-card rounds 5 × 1, others 2 × c; total 59.
+        let mix = RoundMix { large_round_exponent: 1.0, ..RoundMix::default() };
+        let p = shares(&mix, 100_000);
+        assert!((p[1] - 5.0 / 59.0).abs() < 0.01, "1-card share {}", p[1]);
+        assert!((p[7] - 14.0 / 59.0).abs() < 0.01, "7-card share {}", p[7]);
+    }
+
+    #[test]
+    fn round_mix_draws_valid_rounds() {
+        let mix = RoundMix { players: vec![3, 4, 6], start_cards: 8, large_round_exponent: 0.5 };
+        mix.validate().unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        let mut trumps = [0usize; 5];
+        for _ in 0..5_000 {
+            let r = mix.sample(&mut rng);
+            r.validate().unwrap();
+            assert!([3, 4, 6].contains(&r.num_players));
+            assert!((1..=8).contains(&r.cards_dealt));
+            trumps[r.trump as usize] += 1;
+        }
+        assert!(trumps.iter().all(|&t| t > 800), "trumps {trumps:?}");
+    }
+
+    #[test]
+    fn round_mix_rejects_bad_configs() {
+        assert_eq!(RoundMix { players: vec![], ..RoundMix::default() }.validate(), Err(RoundParamsError::InvalidMix));
+        let nan = RoundMix { large_round_exponent: f32::NAN, ..RoundMix::default() };
+        assert_eq!(nan.validate(), Err(RoundParamsError::InvalidMix));
+        let big = RoundMix { players: vec![8], start_cards: 7, large_round_exponent: 0.0 };
+        assert_eq!(big.validate(), Err(RoundParamsError::DeckExceeded));
+        let toml_ok = "players = [4, 5]\nstart_cards = 7\n";
+        let mix: RoundMix = toml::from_str(toml_ok).unwrap();
+        assert_eq!(mix.large_round_exponent, 0.0);
+        assert!(toml::from_str::<RoundMix>(&format!("{toml_ok}round_number = 3\n")).is_err());
+    }
 
     #[test]
     fn trump_cycles_through_five() {

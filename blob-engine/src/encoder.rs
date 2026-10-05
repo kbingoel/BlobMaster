@@ -1,9 +1,14 @@
-//! Entity encoder: raw per-token feature vectors for the network.
+//! Entity encoder: raw per-token feature vectors for the networks.
 //!
-//! `encode(state, perspective)` → [`EncodedState`]: the variable-length
-//! sequence `[CLS, context, players…, hand cards…, played cards…]` with
-//! token type IDs, chronological indices for played cards, and the
-//! hand-card index mapping.
+//! Two modes share the code (gen-2.md §5.3):
+//! - **P mode**, [`encode`]: the acting player's own view. The sequence is
+//!   `[CLS, context, players…, hand cards…, played cards…]`.
+//! - **V mode**, [`encode_value`]: the whole deal, for the value net on a
+//!   sampled deal. The same sequence with every opponent's hand cards
+//!   inserted after mine: `[…, hand cards…, opponents' cards…, played…]`.
+//!
+//! Both come with token type IDs, chronological indices for played cards,
+//! and the hand-card index mapping.
 //!
 //! Feature layout (gen-2.md §5.5). Everything is seen from
 //! `perspective`:
@@ -15,16 +20,26 @@
 //! - **Trick features:** "winning so far" on current-trick cards; "legal"
 //!   and "beats the current winner" on hand cards.
 //! - Counts are scaled to [0, 1]; "highest/lowest in suit" ignore my own
-//!   cards; cumulative scores are not an input.
+//!   cards. Nothing describes the game beyond the round: no cumulative
+//!   scores, no round number.
+//!
+//! **One layout, guarded** (§5.5 item 10): [`LAYOUT_ID`] names this layout.
+//! Every exported model carries it and the ONNX evaluator refuses any
+//! other. The golden-hash test fails on any change to the encoding, so a
+//! change can't land without bumping the id, and a bump means retraining.
 
 use crate::belief::void_suits;
 use crate::bidding::{bid_order_position, forbidden_bid, has_bid};
 use crate::card::{Card, NUM_RANKS, NUM_SUITS};
 use crate::hand::Hand;
 use crate::playing::{beats, current_trick_winner};
-use crate::round::total_rounds;
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 use smallvec::SmallVec;
+
+/// Name of this encoder layout. Bump it with any change to the encoding:
+/// models trained on another layout must not load. Layouts 1 (gen 1) and 2
+/// (gen-2 Phase 1) predate the id and are never accepted.
+pub const LAYOUT_ID: &str = "layout-3";
 
 /// Dimensionality of a hand-card token.
 pub const HAND_CARD_DIM: usize = 32;
@@ -36,7 +51,10 @@ pub const PLAYED_CARD_DIM: usize = 49;
 pub const PLAYER_STATE_DIM: usize = 28;
 
 /// Dimensionality of the context token.
-pub const CONTEXT_DIM: usize = 17;
+pub const CONTEXT_DIM: usize = 16;
+
+/// Dimensionality of an opponent's hand-card token (V mode only).
+pub const OPP_HAND_CARD_DIM: usize = 41;
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b {
@@ -49,16 +67,18 @@ const fn max(a: usize, b: usize) -> usize {
 /// Per-token feature width of the network input: every token is
 /// right-padded to the widest token type.
 pub const FEAT_DIM: usize = max(
-    max(HAND_CARD_DIM, PLAYED_CARD_DIM),
-    max(PLAYER_STATE_DIM, CONTEXT_DIM),
+    max(max(HAND_CARD_DIM, PLAYED_CARD_DIM), max(PLAYER_STATE_DIM, CONTEXT_DIM)),
+    OPP_HAND_CARD_DIM,
 );
 
-/// Token type IDs (0–4) for each position in the assembled sequence.
+/// Token type IDs (0–5) for each position in the assembled sequence.
 pub const TOKEN_TYPE_CLS: u8 = 0;
 pub const TOKEN_TYPE_CONTEXT: u8 = 1;
 pub const TOKEN_TYPE_PLAYER: u8 = 2;
 pub const TOKEN_TYPE_HAND: u8 = 3;
 pub const TOKEN_TYPE_PLAYED: u8 = 4;
+/// An opponent's hand card; V mode only.
+pub const TOKEN_TYPE_OPP_HAND: u8 = 5;
 
 /// Seat of `player` relative to `perspective`: 0 for `perspective`, then 1,
 /// 2, … for the seats after it in play order.
@@ -158,6 +178,33 @@ pub fn encode_hand_cards(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_C
         feat[31] = flag(trick.is_some_and(|(led, best)| beats(idx, best, led, trump)));
 
         tokens.push(feat);
+    }
+    tokens
+}
+
+/// Encode every opponent's hand cards (V mode), seat by seat in
+/// relative-seat order, each hand in `Hand::iter()` order.
+///
+/// Each token:
+/// - `[0..16)`: rank one-hot (13 values + 3 padding)
+/// - `[16..24)`: suit one-hot (4 values + 4 padding)
+/// - `[24..40)`: the owner's relative seat one-hot (1..num_players; up to 8
+///   values + 8 padding)
+/// - `[40]`: is_trump
+pub fn encode_opponent_cards(state: &BlobState, perspective: u8) -> Vec<[f32; OPP_HAND_CARD_DIM]> {
+    let np = state.num_players;
+    let trump = state.trump_suit;
+    let mut tokens = Vec::new();
+    for rel in 1..np {
+        let owner = (perspective + rel) % np;
+        for card in Hand::new(state.hands[owner as usize]).iter() {
+            let mut feat = [0.0f32; OPP_HAND_CARD_DIM];
+            feat[card.rank() as usize] = 1.0;
+            feat[16 + card.suit().index() as usize] = 1.0;
+            feat[24 + rel as usize] = 1.0;
+            feat[40] = flag(trump < NUM_SUITS && card.suit().index() == trump);
+            tokens.push(feat);
+        }
     }
     tokens
 }
@@ -316,7 +363,8 @@ pub fn encode_player_states(
 
 /// Assembled variable-length sequence output from the encoder.
 ///
-/// Sequence order: `[CLS, context, player_states…, hand_cards…, played_cards…]`.
+/// Sequence order: `[CLS, context, player_states…, hand_cards…, played_cards…]`,
+/// with opponents' hand cards before the played cards in V mode.
 ///
 /// `hand_card_indices` maps hand-card token positions back to card indices
 /// so MCTS can translate playing-head scores to actions without re-iterating
@@ -331,7 +379,7 @@ pub struct EncodedState {
     pub num_tokens: usize,
 }
 
-/// Encode the 17-dim context token from `perspective`.
+/// Encode the 16-dim context token from `perspective`.
 ///
 /// Layout:
 /// - `[0..5)`: trump_suit one-hot (♠=0, ♥=1, ♣=2, ♦=3, NoTrump=4)
@@ -339,15 +387,16 @@ pub struct EncodedState {
 /// - `[6]`: current_trick (tricks_completed / cards_dealt)
 /// - `[7]`: tricks_remaining ((cards_dealt − tricks_completed) / cards_dealt)
 /// - `[8]`: num_players (normalized by 8, the max)
-/// - `[9]`: round_number (round_idx / total_rounds(start_cards, num_players))
-/// - `[10..12)`: game_phase one-hot: \[is_bidding, is_playing\]
-/// - `[12]`: bidding_constraint_active (1.0 iff bidding, current player is
+/// - `[9..11)`: game_phase one-hot: \[is_bidding, is_playing\]
+/// - `[11]`: bidding_constraint_active (1.0 iff bidding, current player is
 ///   dealer, and the forbidden-bid constraint applies)
-/// - `[13]`: bid_sum / 13: total of the bids made so far
-/// - `[14]`: seats_to_bid / num_players: seats that haven't bid yet
-/// - `[15]`: (bid_sum − cards_dealt) / cards_dealt: over- (> 0) or under-bid
-/// - `[16]`: my bidding position / (num_players − 1): 0 bids first, 1 is
+/// - `[12]`: bid_sum / 13: total of the bids made so far
+/// - `[13]`: seats_to_bid / num_players: seats that haven't bid yet
+/// - `[14]`: (bid_sum − cards_dealt) / cards_dealt: over- (> 0) or under-bid
+/// - `[15]`: my bidding position / (num_players − 1): 0 bids first, 1 is
 ///   the dealer
+///
+/// No round number: rounds are played as independent deals (gen-2.md §5.2).
 pub fn encode_context(state: &BlobState, perspective: u8) -> [f32; CONTEXT_DIM] {
     let mut feat = [0.0f32; CONTEXT_DIM];
 
@@ -368,26 +417,22 @@ pub fn encode_context(state: &BlobState, perspective: u8) -> [f32; CONTEXT_DIM] 
     // num_players [8]: normalized by MAX_PLAYERS (8).
     feat[8] = state.num_players as f32 / MAX_PLAYERS as f32;
 
-    // round_number [9]: round_idx / total_rounds.
-    let total_r = total_rounds(state.start_cards.max(1), state.num_players.max(3));
-    feat[9] = state.round_idx as f32 / total_r as f32;
-
-    // game_phase one-hot [10..12): [is_bidding, is_playing].
+    // game_phase one-hot [9..11): [is_bidding, is_playing].
     match state.phase() {
-        GamePhase::Bidding => feat[10] = 1.0,
-        GamePhase::Playing => feat[11] = 1.0,
+        GamePhase::Bidding => feat[9] = 1.0,
+        GamePhase::Playing => feat[10] = 1.0,
         _ => {} // debug_assert in encode() prevents this path
     }
 
-    // bidding_constraint_active [12].
+    // bidding_constraint_active [11].
     if state.phase() == GamePhase::Bidding
         && state.current_player == state.dealer
         && forbidden_bid(state).is_some()
     {
-        feat[12] = 1.0;
+        feat[11] = 1.0;
     }
 
-    // Bid context [13..17).
+    // Bid context [12..16).
     let np = state.num_players;
     let (mut bid_sum, mut to_bid) = (0u32, 0u32);
     for p in 0..np {
@@ -397,25 +442,39 @@ pub fn encode_context(state: &BlobState, perspective: u8) -> [f32; CONTEXT_DIM] 
             to_bid += 1;
         }
     }
-    feat[13] = bid_sum as f32 / 13.0;
-    feat[14] = to_bid as f32 / np.max(1) as f32;
-    feat[15] = (bid_sum as f32 - state.cards_dealt as f32) / cd;
-    feat[16] = bid_order_position(state, perspective) as f32 / np.saturating_sub(1).max(1) as f32;
+    feat[12] = bid_sum as f32 / 13.0;
+    feat[13] = to_bid as f32 / np.max(1) as f32;
+    feat[14] = (bid_sum as f32 - state.cards_dealt as f32) / cd;
+    feat[15] = bid_order_position(state, perspective) as f32 / np.saturating_sub(1).max(1) as f32;
 
     feat
 }
 
-/// Full encoder entry point. Assembles the variable-length token sequence
-/// from the perspective of the given player.
+/// P-mode encoder entry point: the token sequence `perspective` can see.
 ///
 /// Sequence: `[CLS, context, player_states…, hand_cards…, played_cards…]`.
+/// Opponents' cards appear only once played.
 ///
 /// The `perspective` argument is the player whose viewpoint the encoding
-/// represents. MCTS always passes `state.current_player`; other call sites
-/// (e.g. eval tooling) may pass a fixed seat.
+/// represents. Search always passes `state.current_player`; other call
+/// sites (e.g. eval tooling) may pass a fixed seat.
 ///
 /// Panics in debug if called from `Scoring` or `Complete` phase.
 pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
+    assemble(state, perspective, false)
+}
+
+/// V-mode encoder entry point: the whole deal seen from `perspective`, for
+/// the value net. [`encode`]'s sequence with every opponent's hand cards
+/// ([`encode_opponent_cards`], [`TOKEN_TYPE_OPP_HAND`]) between my hand
+/// cards and the played cards.
+///
+/// Panics in debug if called from `Scoring` or `Complete` phase.
+pub fn encode_value(state: &BlobState, perspective: u8) -> EncodedState {
+    assemble(state, perspective, true)
+}
+
+fn assemble(state: &BlobState, perspective: u8, every_hand: bool) -> EncodedState {
     crate::profiling::time(&crate::profiling::ENCODE, || {
         debug_assert!(
             matches!(state.phase(), GamePhase::Bidding | GamePhase::Playing),
@@ -424,14 +483,14 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
         );
 
         let hand_cards = encode_hand_cards(state, perspective);
+        let opponent_cards =
+            if every_hand { encode_opponent_cards(state, perspective) } else { Vec::new() };
         let played_cards = encode_played_cards(state, perspective);
         let player_states = encode_player_states(state, perspective);
         let context = encode_context(state, perspective);
 
         let np = state.num_players as usize;
-        let num_hand = hand_cards.len();
-        let num_played = played_cards.len();
-        let num_tokens = 1 + 1 + np + num_hand + num_played;
+        let num_tokens = 1 + 1 + np + hand_cards.len() + opponent_cards.len() + played_cards.len();
 
         let mut features = Vec::with_capacity(num_tokens);
         let mut token_types = Vec::with_capacity(num_tokens);
@@ -458,6 +517,13 @@ pub fn encode(state: &BlobState, perspective: u8) -> EncodedState {
         for hc in &hand_cards {
             features.push(hc.to_vec());
             token_types.push(TOKEN_TYPE_HAND);
+            chrono_indices.push(0);
+        }
+
+        // Opponents' hand cards (V mode).
+        for oc in &opponent_cards {
+            features.push(oc.to_vec());
+            token_types.push(TOKEN_TYPE_OPP_HAND);
             chrono_indices.push(0);
         }
 
@@ -1768,15 +1834,6 @@ mod tests {
     }
 
     #[test]
-    fn context_token_round_number_normalization() {
-        // 4 players, start_cards=5 → total_rounds = 2*5+4-2 = 12.
-        let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
-        s.round_idx = 3;
-        let ctx = encode_context(&s, 0);
-        assert!((ctx[9] - 3.0 / 12.0).abs() < 1e-6, "round_idx=3/12");
-    }
-
-    #[test]
     fn context_token_phase_bidding() {
         let mut s = BlobState::empty();
         s.num_players = 4;
@@ -1784,16 +1841,16 @@ mod tests {
         s.start_cards = 5;
         s.game_phase = GamePhase::Bidding as u8;
         let ctx = encode_context(&s, 0);
-        assert_eq!(ctx[10], 1.0, "is_bidding");
-        assert_eq!(ctx[11], 0.0, "not is_playing");
+        assert_eq!(ctx[9], 1.0, "is_bidding");
+        assert_eq!(ctx[10], 0.0, "not is_playing");
     }
 
     #[test]
     fn context_token_phase_playing() {
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
         let ctx = encode_context(&s, 0);
-        assert_eq!(ctx[10], 0.0, "not is_bidding");
-        assert_eq!(ctx[11], 1.0, "is_playing");
+        assert_eq!(ctx[9], 0.0, "not is_bidding");
+        assert_eq!(ctx[10], 1.0, "is_playing");
     }
 
     #[test]
@@ -1811,7 +1868,7 @@ mod tests {
         s.bids[2] = 0;
         s.bids[3] = 0;
         let ctx = encode_context(&s, 0);
-        assert_eq!(ctx[12], 1.0, "bidding constraint active for dealer");
+        assert_eq!(ctx[11], 1.0, "bidding constraint active for dealer");
     }
 
     #[test]
@@ -1825,7 +1882,7 @@ mod tests {
         s.dealer = 3;
         s.current_player = 1; // not dealer
         let ctx = encode_context(&s, 0);
-        assert_eq!(ctx[12], 0.0, "non-dealer has no constraint");
+        assert_eq!(ctx[11], 0.0, "non-dealer has no constraint");
     }
 
     #[test]
@@ -1833,7 +1890,7 @@ mod tests {
         // Playing phase → constraint not active regardless.
         let s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
         let ctx = encode_context(&s, 0);
-        assert_eq!(ctx[12], 0.0, "no constraint in playing phase");
+        assert_eq!(ctx[11], 0.0, "no constraint in playing phase");
     }
 
     #[test]
@@ -1851,18 +1908,17 @@ mod tests {
         assert!(ctx[6] >= 0.0 && ctx[6] <= 1.0, "current_trick in [0,1]");
         assert!(ctx[7] >= 0.0 && ctx[7] <= 1.0, "tricks_remaining in [0,1]");
         assert!(ctx[8] > 0.0 && ctx[8] <= 1.0, "num_players in (0,1]");
-        assert!(ctx[9] >= 0.0 && ctx[9] < 1.0, "round_number in [0,1)");
 
-        // Phase one-hot: exactly one 1.0 in [10..12).
-        let phase_sum: f32 = ctx[10..12].iter().sum();
+        // Phase one-hot: exactly one 1.0 in [9..11).
+        let phase_sum: f32 = ctx[9..11].iter().sum();
         assert_eq!(phase_sum, 1.0);
 
         // Bidding constraint is binary.
-        assert!(ctx[12] == 0.0 || ctx[12] == 1.0);
+        assert!(ctx[11] == 0.0 || ctx[11] == 1.0);
 
         // Bid context: everyone has bid during play.
-        assert_eq!(ctx[14], 0.0, "no seats left to bid");
-        assert!(ctx[16] >= 0.0 && ctx[16] <= 1.0, "bidding position in [0,1]");
+        assert_eq!(ctx[13], 0.0, "no seats left to bid");
+        assert!(ctx[15] >= 0.0 && ctx[15] <= 1.0, "bidding position in [0,1]");
     }
 
     #[test]
@@ -1879,13 +1935,13 @@ mod tests {
         s.bids[0] = 1;
         s.current_player = 1;
         let ctx = encode_context(&s, 1);
-        assert!((ctx[13] - 3.0 / 13.0).abs() < 1e-6, "bid_sum 3");
-        assert!((ctx[14] - 3.0 / 5.0).abs() < 1e-6, "seats 1, 2, 3 still to bid");
-        assert!((ctx[15] - (3.0 - 7.0) / 7.0).abs() < 1e-6, "4 tricks unclaimed");
-        assert!((ctx[16] - 2.0 / 4.0).abs() < 1e-6, "seat 1 bids third of five");
+        assert!((ctx[12] - 3.0 / 13.0).abs() < 1e-6, "bid_sum 3");
+        assert!((ctx[13] - 3.0 / 5.0).abs() < 1e-6, "seats 1, 2, 3 still to bid");
+        assert!((ctx[14] - (3.0 - 7.0) / 7.0).abs() < 1e-6, "4 tricks unclaimed");
+        assert!((ctx[15] - 2.0 / 4.0).abs() < 1e-6, "seat 1 bids third of five");
         // The dealer bids last.
-        assert_eq!(encode_context(&s, 3)[16], 1.0);
-        assert_eq!(encode_context(&s, 4)[16], 0.0);
+        assert_eq!(encode_context(&s, 3)[15], 1.0);
+        assert_eq!(encode_context(&s, 4)[15], 0.0);
     }
 
     #[test]
@@ -1894,9 +1950,9 @@ mod tests {
         let mut s = state_with_tricks(4, 5, 5, NO_TRUMP, 0, &[], &[]);
         s.bids = [2, 0, 3, 2, 0, 0, 0, 0];
         let ctx = encode_context(&s, 0);
-        assert!((ctx[13] - 7.0 / 13.0).abs() < 1e-6);
-        assert_eq!(ctx[14], 0.0);
-        assert!((ctx[15] - 2.0 / 5.0).abs() < 1e-6);
+        assert!((ctx[12] - 7.0 / 13.0).abs() < 1e-6);
+        assert_eq!(ctx[13], 0.0);
+        assert!((ctx[14] - 2.0 / 5.0).abs() < 1e-6);
     }
 
     // ===============================================================
@@ -1970,7 +2026,7 @@ mod tests {
     fn encode_context_token_has_correct_dim() {
         let s = state_with_tricks(4, 5, 5, Suit::Hearts as u8, 0, &[], &[]);
         let enc = encode(&s, 0);
-        assert_eq!(enc.features[1].len(), CONTEXT_DIM, "context is 17-dim");
+        assert_eq!(enc.features[1].len(), CONTEXT_DIM, "context is 16-dim");
     }
 
     #[test]
@@ -2146,8 +2202,8 @@ mod tests {
         assert_eq!(enc.hand_card_indices.len(), 5);
 
         // Context token should show bidding phase.
-        assert_eq!(enc.features[1][10], 1.0, "is_bidding");
-        assert_eq!(enc.features[1][11], 0.0, "not is_playing");
+        assert_eq!(enc.features[1][9], 1.0, "is_bidding");
+        assert_eq!(enc.features[1][10], 0.0, "not is_playing");
     }
 
     // ---------------------------------------------------------------
@@ -2170,8 +2226,8 @@ mod tests {
         // Bidding: encode during bidding phase.
         let perspective = s.current_player;
         let enc_bid = encode(&s, perspective);
-        assert_eq!(enc_bid.features[1][10], 1.0, "bidding phase");
-        assert_eq!(enc_bid.features[1][11], 0.0, "not playing");
+        assert_eq!(enc_bid.features[1][9], 1.0, "bidding phase");
+        assert_eq!(enc_bid.features[1][10], 0.0, "not playing");
 
         // Complete bidding.
         while s.phase() == GamePhase::Bidding {
@@ -2260,7 +2316,7 @@ mod tests {
         assert_eq!(enc.num_tokens, expected);
 
         // Context features: playing phase, mid-round.
-        assert_eq!(enc.features[1][11], 1.0, "playing phase");
+        assert_eq!(enc.features[1][10], 1.0, "playing phase");
         assert!((enc.features[1][6] - s.tricks_completed as f32 / 7.0).abs() < 1e-6);
 
         // All features are finite and non-NaN.
@@ -2414,9 +2470,9 @@ mod tests {
             let k = 1 + (i as u8 % (s.num_players - 1));
             let rotated = rotate_seats(s, k);
             for p in [s.current_player, (s.dealer + 1) % s.num_players] {
-                let a = encode(s, p);
-                let b = encode(&rotated, (p + k) % s.num_players);
-                assert_eq!(a.features, b.features, "state {i}, seat {p}, shift {k}");
+                let q = (p + k) % s.num_players;
+                assert_eq!(encode(s, p).features, encode(&rotated, q).features, "state {i}, seat {p}, shift {k}");
+                assert_eq!(encode_value(s, p).features, encode_value(&rotated, q).features, "V, state {i}");
             }
         }
     }
@@ -2424,7 +2480,7 @@ mod tests {
     #[test]
     fn features_are_finite_and_one_hots_are_exact() {
         for s in random_game_states() {
-            let enc = encode(&s, s.current_player);
+            let enc = encode_value(&s, s.current_player);
             for (i, feat) in enc.features.iter().enumerate() {
                 assert!(feat.iter().all(|v| v.is_finite()), "token {i}");
                 let one_hot = |r: std::ops::Range<usize>| feat[r].iter().sum::<f32>();
@@ -2433,7 +2489,7 @@ mod tests {
                         assert_eq!((one_hot(0..16), one_hot(16..24)), (1.0, 1.0));
                         assert!(feat.iter().all(|v| (0.0..=1.0).contains(v)));
                     }
-                    TOKEN_TYPE_PLAYED => {
+                    TOKEN_TYPE_PLAYED | TOKEN_TYPE_OPP_HAND => {
                         let hots = (one_hot(0..16), one_hot(16..24), one_hot(24..40));
                         assert_eq!(hots, (1.0, 1.0, 1.0));
                     }
@@ -2447,25 +2503,148 @@ mod tests {
         }
     }
 
-    /// `scripts/export_onnx.py` rebuilds the network in PyTorch; its token
+    /// Card index of a token whose rank and suit one-hots sit at `[0..16)`
+    /// and `[16..24)` (hand, opponent and played cards).
+    fn token_card(feat: &[f32]) -> u8 {
+        let rank = feat[..16].iter().position(|&v| v == 1.0).unwrap() as u8;
+        let suit = feat[16..24].iter().position(|&v| v == 1.0).unwrap() as u8;
+        suit * NUM_RANKS + rank
+    }
+
+    /// Exit criterion (gen-2.md §6 Phase 3): V mode encodes every hand.
+    /// Its sequence is P mode's with each opponent's cards, tagged with the
+    /// owner's relative seat, between my hand and the played cards.
+    #[test]
+    fn value_mode_encodes_every_hand() {
+        for s in random_game_states() {
+            let me = s.current_player;
+            let n = s.num_players;
+            let p = encode(&s, me);
+            let v = encode_value(&s, me);
+            let mut held = [0u64; MAX_PLAYERS];
+            for (feat, &tt) in v.features.iter().zip(&v.token_types) {
+                match tt {
+                    TOKEN_TYPE_HAND => held[me as usize] |= 1 << token_card(feat),
+                    TOKEN_TYPE_OPP_HAND => {
+                        let rel = feat[24..40].iter().position(|&x| x == 1.0).unwrap() as u8;
+                        assert!((1..n).contains(&rel), "owner seat {rel}");
+                        held[((me + rel) % n) as usize] |= 1 << token_card(feat);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(held, s.hands, "every card of every hand, with its owner");
+
+            let others: Vec<usize> =
+                (0..v.num_tokens).filter(|&i| v.token_types[i] != TOKEN_TYPE_OPP_HAND).collect();
+            let strip = |x: &Vec<Vec<f32>>| others.iter().map(|&i| x[i].clone()).collect::<Vec<_>>();
+            assert_eq!(strip(&v.features), p.features, "V mode is P mode plus opponents' cards");
+            assert_eq!(v.hand_card_indices, p.hand_card_indices);
+            // The player to move always holds a card, so opponents' cards
+            // follow a hand card.
+            if let Some(i) = v.token_types.iter().position(|&t| t == TOKEN_TYPE_OPP_HAND) {
+                assert_eq!(v.token_types[i - 1], TOKEN_TYPE_HAND);
+            }
+        }
+    }
+
+    /// Exit criterion (gen-2.md §6 Phase 3): P mode encodes none of the
+    /// opponents' cards. Re-dealing the hidden cards among the opponents
+    /// (same hand sizes) leaves the encoding unchanged.
+    #[test]
+    fn policy_mode_hides_opponents_cards() {
+        use rand::seq::SliceRandom;
+        use rand_xoshiro::rand_core::SeedableRng;
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(0x41DE);
+        let mut redealt_any = 0;
+        for s in random_game_states() {
+            let me = s.current_player as usize;
+            let opponents: Vec<usize> = (0..s.num_players as usize).filter(|&p| p != me).collect();
+            let mut hidden: Vec<u8> =
+                opponents.iter().flat_map(|&p| Hand::new(s.hands[p]).iter().map(|c| c.index())).collect();
+            hidden.shuffle(&mut rng);
+            let mut t = s;
+            let mut next = hidden.into_iter();
+            for &p in &opponents {
+                t.hands[p] = (0..s.hands[p].count_ones()).fold(0, |m, _| m | 1 << next.next().unwrap());
+            }
+            redealt_any += (t.hands != s.hands) as usize;
+            let (a, b) = (encode(&s, me as u8), encode(&t, me as u8));
+            assert_eq!(a.features, b.features);
+            assert_eq!(a.token_types, b.token_types);
+            for (feat, &tt) in a.features.iter().zip(&a.token_types) {
+                if tt == TOKEN_TYPE_HAND {
+                    assert!(s.hands[me] >> token_card(feat) & 1 == 1, "hand token is my card");
+                }
+                assert_ne!(tt, TOKEN_TYPE_OPP_HAND);
+            }
+        }
+        assert!(redealt_any > 300, "only {redealt_any} states re-dealt");
+    }
+
+    /// FNV-1a over both modes' encodings of every state of
+    /// [`random_game_states`]: token types, chronological indices and
+    /// feature bits.
+    fn layout_hash() -> u64 {
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+            }
+        };
+        for s in random_game_states() {
+            for enc in [encode(&s, s.current_player), encode_value(&s, s.current_player)] {
+                eat(&enc.token_types);
+                eat(&enc.chronological_indices);
+                for feat in &enc.features {
+                    eat(&(feat.len() as u32).to_le_bytes());
+                    for v in feat {
+                        eat(&v.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+        h
+    }
+
+    /// The layout guard (gen-2.md §5.5 item 10). If this fails, the encoding
+    /// changed: bump [`LAYOUT_ID`] (models trained on the old layout must
+    /// stop loading) and record the new id and hash here. A `rand` upgrade
+    /// changes the test states and fails it too; then only the hash moves.
+    #[test]
+    fn golden_layout_hash() {
+        const GOLDEN: (&str, u64) = ("layout-3", 0x3FD8_2F36_9277_ADB5);
+        assert_eq!(
+            (LAYOUT_ID, layout_hash()),
+            GOLDEN,
+            "encoder output changed: bump LAYOUT_ID and update GOLDEN (and scripts/export_onnx.py)"
+        );
+    }
+
+    /// `scripts/export_onnx.py` rebuilds the networks in PyTorch; its token
     /// widths must equal the encoder's or the exported model can't load
-    /// the trained weights.
+    /// the trained weights, and it stamps [`LAYOUT_ID`] into every model.
     #[test]
     fn export_script_mirrors_feature_widths() {
         let script = include_str!("../../scripts/export_onnx.py");
-        let value = |name: &str| -> usize {
+        let value = |name: &str| -> &str {
             let prefix = format!("{name} = ");
             let line = script
                 .lines()
                 .find(|l| l.starts_with(&prefix))
                 .unwrap_or_else(|| panic!("{name} not defined in export_onnx.py"));
-            let rest = line[prefix.len()..].split('#').next().unwrap();
-            rest.trim().parse().unwrap_or_else(|_| panic!("not an integer: {line}"))
+            line[prefix.len()..].split('#').next().unwrap().trim()
         };
-        assert_eq!(value("HAND_DIM"), HAND_CARD_DIM);
-        assert_eq!(value("PLAYED_DIM"), PLAYED_CARD_DIM);
-        assert_eq!(value("PLAYER_DIM"), PLAYER_STATE_DIM);
-        assert_eq!(value("CONTEXT_DIM"), CONTEXT_DIM);
-        assert_eq!(value("FEAT_DIM"), FEAT_DIM);
+        let int = |name: &str| -> usize {
+            value(name).parse().unwrap_or_else(|_| panic!("{name} is not an integer"))
+        };
+        assert_eq!(int("HAND_DIM"), HAND_CARD_DIM);
+        assert_eq!(int("PLAYED_DIM"), PLAYED_CARD_DIM);
+        assert_eq!(int("PLAYER_DIM"), PLAYER_STATE_DIM);
+        assert_eq!(int("CONTEXT_DIM"), CONTEXT_DIM);
+        assert_eq!(int("OPP_HAND_DIM"), OPP_HAND_CARD_DIM);
+        assert_eq!(int("FEAT_DIM"), FEAT_DIM);
+        assert_eq!(int("TT_OPP_HAND"), TOKEN_TYPE_OPP_HAND as usize);
+        assert_eq!(value("LAYOUT_ID"), format!("\"{LAYOUT_ID}\""));
     }
 }

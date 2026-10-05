@@ -1,30 +1,37 @@
-//! ONNX Runtime-backed `Evaluator`.
+//! ONNX Runtime inference for the two gen-2 networks (gen-2.md §5.3).
 //!
-//! Production inference path for search, `bench`, `play` and the deployment
-//! binary. Each rayon thread should create its own `OnnxEvaluator` because
-//! `ort::Session` is not itself thread-safe for concurrent `run()` calls
-//! without locking — per-thread sessions with `intra_op_num_threads=1` give
-//! clean scaling.
+//! A model is a directory written by `scripts/export_onnx.py`:
+//! - `policy.onnx`: the policy net P, read by [`OnnxPolicy`];
+//! - `value.onnx`: the value net V, read by [`OnnxValue`];
+//! - `meta.json`: layout id, learner step and config, for people.
 //!
-//! Expected ONNX graph I/O (produced by `scripts/export_onnx.py`):
+//! [`OnnxEvaluator`] holds both, for search; network-only play loads only
+//! P. Each network owns one session with one intra-op thread, so give every
+//! worker thread its own.
 //!
-//! Inputs:
+//! Graph inputs, both networks:
 //! - `features: [batch, seq, FEAT_DIM]` f32 (`encoder::FEAT_DIM`)
 //! - `token_types: [batch, seq]` i64
 //! - `chrono_indices: [batch, seq]` i64
 //! - `attention_mask: [batch, seq]` bool
 //!
-//! Outputs:
-//! - `bid_policy: [batch, 14]` f32 (masked softmax, needs re-masking)
-//! - `play_scores: [batch, seq]` f32 (raw; caller masks + softmaxes)
-//! - `value: [batch]` f32 ∈ [-1, 1]
+//! P reads [`encode`] (the seat to move's view) and outputs:
+//! - `bid_policy: [batch, 14]` f32, a softmax over every bid;
+//! - `play_scores: [batch, seq]` f32, raw per-token scores.
 //!
-//! The evaluator re-applies legality masking from the current `BlobState`
-//! rather than relying on the graph-internal mask, so one exported model
-//! works for any phase and any hand size.
+//! The evaluator re-masks both to the state's legal moves rather than
+//! relying on the graph, so one model serves both phases and any hand size.
 //!
-//! A model whose `features` width differs from `FEAT_DIM` was trained on
-//! another encoder layout and is refused at load time (gen-2.md §4).
+//! V reads [`encode_value`] (every hand, seen from the seat to move) and
+//! outputs:
+//! - `seat_values: [batch, seq]` f32, per token. At the player tokens it is
+//!   the expected ŝ of that seat, in relative-seat order (me first); the
+//!   evaluator maps it back to absolute seats.
+//!
+//! **Layout guard** (gen-2.md §5.5 item 10). Each file's ONNX metadata
+//! carries `blob_layout_id` and `blob_network` (`policy` or `value`). A file
+//! is refused unless its id is [`LAYOUT_ID`] and its network is the one
+//! being loaded: a model belongs to the code that trained it.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -34,121 +41,83 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 
 use crate::bidding::legal_bids;
-use crate::encoder::{encode, EncodedState, FEAT_DIM, TOKEN_TYPE_HAND};
-use crate::evaluator::{Evaluator, NUM_BIDS};
+use crate::encoder::{
+    encode, encode_value, EncodedState, FEAT_DIM, LAYOUT_ID, TOKEN_TYPE_HAND, TOKEN_TYPE_PLAYER,
+};
+use crate::evaluator::{PolicyEvaluator, ValueEvaluator, NUM_BIDS};
 use crate::playing::legal_plays;
-use crate::state::{BlobState, GamePhase};
+use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
-/// ONNX-backed evaluator. Own one per thread for self-play.
-pub struct OnnxEvaluator {
+/// P's file in a model directory.
+pub const POLICY_FILE: &str = "policy.onnx";
+/// V's file in a model directory.
+pub const VALUE_FILE: &str = "value.onnx";
+/// ONNX metadata key holding the encoder layout the model was trained on.
+pub const LAYOUT_ID_KEY: &str = "blob_layout_id";
+/// ONNX metadata key naming the network: `policy` or `value`.
+pub const NETWORK_KEY: &str = "blob_network";
+
+/// Why a model file can't serve as `network` for this encoder, if it can't.
+fn check_metadata(
+    path: &Path,
+    network: &str,
+    layout: Option<&str>,
+    kind: Option<&str>,
+) -> Result<(), String> {
+    let p = path.display();
+    match layout {
+        None => {
+            return Err(format!(
+                "{p}: no {LAYOUT_ID_KEY} in the model metadata; it predates the gen-2 layout guard"
+            ))
+        }
+        Some(id) if id != LAYOUT_ID => {
+            return Err(format!(
+                "{p}: model layout {id:?} is not this encoder's {LAYOUT_ID:?}; retrain, or use the \
+                 code that trained it"
+            ))
+        }
+        Some(_) => {}
+    }
+    if kind != Some(network) {
+        return Err(format!("{p}: {NETWORK_KEY} is {kind:?}, expected {network:?}"));
+    }
+    Ok(())
+}
+
+/// One session that passed the layout check.
+struct Net {
     session: Mutex<Session>,
 }
 
-impl std::fmt::Debug for OnnxEvaluator {
+impl std::fmt::Debug for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnnxEvaluator").finish_non_exhaustive()
+        f.debug_struct("Net").finish_non_exhaustive()
     }
 }
 
-impl OnnxEvaluator {
-    /// Load a model from `path`. Uses `CpuExecutionProvider` with
-    /// `intra_op_num_threads=1` so multiple rayon threads can each hold
-    /// their own session without contention.
-    ///
-    /// Fails if the model's `features` input width isn't [`FEAT_DIM`].
-    pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
+impl Net {
+    fn load(path: &Path, network: &str) -> ort::Result<Self> {
         crate::profiling::time(&crate::profiling::SESSION_CONSTRUCTION, || {
             let session = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .with_intra_threads(1)?
                 .commit_from_file(path)?;
-            let width = session
-                .inputs()
-                .iter()
-                .find(|i| i.name() == "features")
-                .and_then(|i| i.dtype().tensor_shape())
-                .and_then(|shape| shape.last().copied());
-            if width != Some(FEAT_DIM as i64) {
-                return Err(ort::Error::new(format!(
-                    "model `features` input width {width:?} is not the encoder's {FEAT_DIM}: \
-                     it was trained on another encoder layout"
-                )));
-            }
-            Ok(Self {
-                session: Mutex::new(session),
-            })
+            let (layout, kind) = {
+                let meta = session.metadata()?;
+                (meta.custom(LAYOUT_ID_KEY), meta.custom(NETWORK_KEY))
+            };
+            check_metadata(path, network, layout.as_deref(), kind.as_deref())
+                .map_err(ort::Error::new)?;
+            Ok(Self { session: Mutex::new(session) })
         })
     }
 
-    fn run_encoded(&self, enc: &EncodedState) -> ort::Result<(Vec<f32>, Vec<f32>, f32)> {
-        let s = enc.num_tokens;
-
-        let inputs = crate::profiling::time(&crate::profiling::ONNX_TENSOR_BUILD, || {
-            let mut features = Array3::<f32>::zeros((1, s, FEAT_DIM));
-            let mut token_types = Array2::<i64>::zeros((1, s));
-            let mut chrono = Array2::<i64>::zeros((1, s));
-            let mut mask = Array2::<bool>::from_elem((1, s), false);
-
-            for i in 0..s {
-                let row = &enc.features[i];
-                for (j, v) in row.iter().enumerate() {
-                    features[[0, i, j]] = *v;
-                }
-                token_types[[0, i]] = enc.token_types[i] as i64;
-                chrono[[0, i]] = enc.chronological_indices[i] as i64;
-                mask[[0, i]] = true;
-            }
-
-            let inputs = ort::inputs![
-                "features" => Value::from_array(features)?,
-                "token_types" => Value::from_array(token_types)?,
-                "chrono_indices" => Value::from_array(chrono)?,
-                "attention_mask" => Value::from_array(mask)?,
-            ];
-            Ok::<_, ort::Error>(inputs)
-        })?;
-
-        let mut sess = self
-            .session
-            .lock()
-            .expect("OnnxEvaluator session mutex poisoned");
-
-        let outputs = crate::profiling::time(&crate::profiling::ONNX_INFERENCE, || {
-            sess.run(inputs)
-        })?;
-
-        crate::profiling::time(&crate::profiling::ONNX_OUTPUT_EXTRACT, || {
-            let bid = outputs["bid_policy"]
-                .try_extract_array::<f32>()?
-                .to_owned();
-            let play = outputs["play_scores"]
-                .try_extract_array::<f32>()?
-                .to_owned();
-            let value = outputs["value"].try_extract_array::<f32>()?.to_owned();
-
-            let bid_vec: Vec<f32> = bid.iter().copied().take(NUM_BIDS).collect();
-            let play_vec: Vec<f32> = play.iter().copied().take(s).collect();
-            let v: f32 = *value.iter().next().unwrap_or(&0.0);
-            Ok((bid_vec, play_vec, v))
-        })
-    }
-
-    /// Batched inference over `encs.len()` encoded states. Builds one
-    /// `[B, S_max, F]` zero-padded tensor, one `sess.run`, and splits
-    /// the per-state outputs back. Sequence padding is masked by the
-    /// `attention_mask` input (padded positions don't participate in
-    /// attention), so per-state outputs are indistinguishable from running
-    /// each state through `run_encoded` independently — modulo FP rounding
-    /// from the GEMM batch shape, which is below the 1e-5 element gate.
-    ///
-    /// Per-state `play_scores` are truncated to that state's `num_tokens`
-    /// before return so callers don't need to know about padding.
-    fn run_encoded_batch(
-        &self,
-        encs: &[EncodedState],
-    ) -> ort::Result<Vec<(Vec<f32>, Vec<f32>, f32)>> {
-        debug_assert!(!encs.is_empty(), "run_encoded_batch called with empty batch");
-
+    /// Run one zero-padded `[B, S_max, FEAT_DIM]` batch and return each
+    /// requested output flattened row-major, with `S_max`. Padding is masked
+    /// by `attention_mask`, so each row matches running its state alone up
+    /// to FP rounding from the batch shape.
+    fn run(&self, encs: &[EncodedState], outputs: &[&str]) -> ort::Result<(usize, Vec<Vec<f32>>)> {
         let b = encs.len();
         let s_max = encs.iter().map(|e| e.num_tokens).max().unwrap_or(0);
 
@@ -157,11 +126,9 @@ impl OnnxEvaluator {
             let mut token_types = Array2::<i64>::zeros((b, s_max));
             let mut chrono = Array2::<i64>::zeros((b, s_max));
             let mut mask = Array2::<bool>::from_elem((b, s_max), false);
-
             for (bi, enc) in encs.iter().enumerate() {
                 for i in 0..enc.num_tokens {
-                    let row = &enc.features[i];
-                    for (j, v) in row.iter().enumerate() {
+                    for (j, v) in enc.features[i].iter().enumerate() {
                         features[[bi, i, j]] = *v;
                     }
                     token_types[[bi, i]] = enc.token_types[i] as i64;
@@ -169,67 +136,88 @@ impl OnnxEvaluator {
                     mask[[bi, i]] = true;
                 }
             }
-
-            let inputs = ort::inputs![
+            Ok::<_, ort::Error>(ort::inputs![
                 "features" => Value::from_array(features)?,
                 "token_types" => Value::from_array(token_types)?,
                 "chrono_indices" => Value::from_array(chrono)?,
                 "attention_mask" => Value::from_array(mask)?,
-            ];
-            Ok::<_, ort::Error>(inputs)
+            ])
         })?;
 
-        let mut sess = self
-            .session
-            .lock()
-            .expect("OnnxEvaluator session mutex poisoned");
+        let mut sess = self.session.lock().expect("ONNX session mutex poisoned");
+        let out = crate::profiling::time(&crate::profiling::ONNX_INFERENCE, || sess.run(inputs))?;
 
-        let outputs = crate::profiling::time(&crate::profiling::ONNX_INFERENCE, || {
-            sess.run(inputs)
+        let flat = crate::profiling::time(&crate::profiling::ONNX_OUTPUT_EXTRACT, || {
+            outputs
+                .iter()
+                .map(|&name| Ok(out[name].try_extract_array::<f32>()?.iter().copied().collect()))
+                .collect::<ort::Result<Vec<Vec<f32>>>>()
         })?;
-
-        crate::profiling::time(&crate::profiling::ONNX_OUTPUT_EXTRACT, || {
-            // bid_policy [B, NUM_BIDS], play_scores [B, S_max], value [B].
-            // ORT outputs are standard layout; iterate row-major.
-            let bid = outputs["bid_policy"].try_extract_array::<f32>()?.to_owned();
-            let play = outputs["play_scores"].try_extract_array::<f32>()?.to_owned();
-            let value = outputs["value"].try_extract_array::<f32>()?.to_owned();
-
-            let bid_iter: Vec<f32> = bid.iter().copied().collect();
-            let play_iter: Vec<f32> = play.iter().copied().collect();
-            let value_iter: Vec<f32> = value.iter().copied().collect();
-
-            debug_assert_eq!(bid_iter.len(), b * NUM_BIDS);
-            debug_assert_eq!(play_iter.len(), b * s_max);
-            debug_assert_eq!(value_iter.len(), b);
-
-            let mut out = Vec::with_capacity(b);
-            for (bi, enc) in encs.iter().enumerate() {
-                let bid_off = bi * NUM_BIDS;
-                let play_off = bi * s_max;
-                let bid_vec: Vec<f32> = bid_iter[bid_off..bid_off + NUM_BIDS].to_vec();
-                let play_vec: Vec<f32> =
-                    play_iter[play_off..play_off + enc.num_tokens].to_vec();
-                let v = value_iter[bi];
-                out.push((bid_vec, play_vec, v));
-            }
-            Ok(out)
-        })
+        Ok((s_max, flat))
     }
 }
 
-/// Phase-aware mask + (re)normalization shared by `evaluate` and
-/// `evaluate_batch`. `raw_bid` is the network's bid_policy row (length
-/// `NUM_BIDS`); `raw_play` is the play_scores row truncated to the state's
-/// `num_tokens`. Returns the dense legal-action policy.
+/// The policy net P (`policy.onnx`).
+#[derive(Debug)]
+pub struct OnnxPolicy(Net);
+
+impl OnnxPolicy {
+    pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
+        Net::load(path.as_ref(), "policy").map(Self)
+    }
+
+    /// P of the model directory `dir`.
+    pub fn from_dir(dir: impl AsRef<Path>) -> ort::Result<Self> {
+        Self::from_file(dir.as_ref().join(POLICY_FILE))
+    }
+}
+
+/// The value net V (`value.onnx`).
+#[derive(Debug)]
+pub struct OnnxValue(Net);
+
+impl OnnxValue {
+    pub fn from_file(path: impl AsRef<Path>) -> ort::Result<Self> {
+        Net::load(path.as_ref(), "value").map(Self)
+    }
+
+    /// V of the model directory `dir`.
+    pub fn from_dir(dir: impl AsRef<Path>) -> ort::Result<Self> {
+        Self::from_file(dir.as_ref().join(VALUE_FILE))
+    }
+}
+
+/// Both networks of a model directory, for search.
+#[derive(Debug)]
+pub struct OnnxEvaluator {
+    pub policy: OnnxPolicy,
+    pub value: OnnxValue,
+}
+
+impl OnnxEvaluator {
+    pub fn from_dir(dir: impl AsRef<Path>) -> ort::Result<Self> {
+        let dir = dir.as_ref();
+        Ok(Self { policy: OnnxPolicy::from_dir(dir)?, value: OnnxValue::from_dir(dir)? })
+    }
+}
+
+fn assert_decision_states(states: &[&BlobState]) {
+    debug_assert!(
+        states.iter().all(|s| matches!(s.phase(), GamePhase::Bidding | GamePhase::Playing)),
+        "network called on a finished round; search scores those exactly"
+    );
+}
+
+/// Legal-move mask and (re)normalization of P's raw outputs for one state.
+/// `raw_bid` is its `bid_policy` row (length `NUM_BIDS`); `raw_play` its
+/// `play_scores` row truncated to the state's `num_tokens`.
 fn postprocess_policy(
     state: &BlobState,
     enc: &EncodedState,
     raw_bid: &[f32],
     raw_play: &[f32],
 ) -> Vec<f32> {
-    let phase = GamePhase::from_u8(state.game_phase).unwrap_or(GamePhase::Scoring);
-    match phase {
+    match state.phase() {
         GamePhase::Bidding => {
             let mask = legal_bids(state);
             let mut policy = vec![0.0f32; NUM_BIDS];
@@ -307,55 +295,71 @@ fn postprocess_policy(
     }
 }
 
-impl Evaluator for OnnxEvaluator {
-    fn evaluate(&self, state: &BlobState) -> (Vec<f32>, f32) {
-        let phase = GamePhase::from_u8(state.game_phase).unwrap_or(GamePhase::Scoring);
-        if matches!(phase, GamePhase::Scoring | GamePhase::Complete) {
-            return (Vec::new(), 0.0);
-        }
+/// V's per-token row for one state, read at the player tokens and mapped
+/// from relative seats (me first) back to absolute seats.
+fn seat_values(state: &BlobState, enc: &EncodedState, row: &[f32]) -> [f32; MAX_PLAYERS] {
+    let n = state.num_players as usize;
+    let me = state.current_player as usize;
+    let mut out = [0.0f32; MAX_PLAYERS];
+    let players = (0..enc.num_tokens).filter(|&i| enc.token_types[i] == TOKEN_TYPE_PLAYER);
+    for (rel, pos) in players.enumerate() {
+        out[(me + rel) % n] = row[pos];
+    }
+    out
+}
 
-        let enc = encode(state, state.current_player);
-        let (raw_bid, raw_play, value) = match self.run_encoded(&enc) {
-            Ok(t) => t,
-            Err(e) => panic!("ONNX inference failed: {e}"),
-        };
-
-        (postprocess_policy(state, &enc, &raw_bid, &raw_play), value)
+impl PolicyEvaluator for OnnxPolicy {
+    fn policy(&self, state: &BlobState) -> Vec<f32> {
+        self.policy_batch(&[state]).pop().expect("one policy per state")
     }
 
-    fn evaluate_batch(&self, states: &[&BlobState]) -> Vec<(Vec<f32>, f32)> {
+    fn policy_batch(&self, states: &[&BlobState]) -> Vec<Vec<f32>> {
         if states.is_empty() {
             return Vec::new();
         }
-
-        // Caller (`mcts_search` lockstep driver) filters terminal states
-        // before queueing — assert and skip the trivial single-state path
-        // through `evaluate` so all batch slots flow through `sess.run`.
-        debug_assert!(
-            states.iter().all(|s| {
-                let p = GamePhase::from_u8(s.game_phase).unwrap_or(GamePhase::Scoring);
-                matches!(p, GamePhase::Bidding | GamePhase::Playing)
-            }),
-            "evaluate_batch called with terminal state — caller must filter"
-        );
-
-        let encs: Vec<EncodedState> = states
-            .iter()
-            .map(|s| encode(s, s.current_player))
-            .collect();
-
-        let triples = match self.run_encoded_batch(&encs) {
-            Ok(t) => t,
-            Err(e) => panic!("ONNX batched inference failed: {e}"),
-        };
-
+        assert_decision_states(states);
+        let encs: Vec<EncodedState> = states.iter().map(|s| encode(s, s.current_player)).collect();
+        let (s_max, out) = self
+            .0
+            .run(&encs, &["bid_policy", "play_scores"])
+            .unwrap_or_else(|e| panic!("ONNX policy inference failed: {e}"));
+        let (bid, play) = (&out[0], &out[1]);
+        debug_assert_eq!((bid.len(), play.len()), (states.len() * NUM_BIDS, states.len() * s_max));
         states
             .iter()
-            .zip(encs.iter())
-            .zip(triples.into_iter())
-            .map(|((s, e), (raw_bid, raw_play, value))| {
-                (postprocess_policy(s, e, &raw_bid, &raw_play), value)
+            .zip(&encs)
+            .enumerate()
+            .map(|(i, (s, e))| {
+                let raw_bid = &bid[i * NUM_BIDS..(i + 1) * NUM_BIDS];
+                let raw_play = &play[i * s_max..i * s_max + e.num_tokens];
+                postprocess_policy(s, e, raw_bid, raw_play)
             })
+            .collect()
+    }
+}
+
+impl ValueEvaluator for OnnxValue {
+    fn values(&self, state: &BlobState) -> [f32; MAX_PLAYERS] {
+        self.values_batch(&[state])[0]
+    }
+
+    fn values_batch(&self, states: &[&BlobState]) -> Vec<[f32; MAX_PLAYERS]> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+        assert_decision_states(states);
+        let encs: Vec<EncodedState> =
+            states.iter().map(|s| encode_value(s, s.current_player)).collect();
+        let (s_max, out) = self
+            .0
+            .run(&encs, &["seat_values"])
+            .unwrap_or_else(|e| panic!("ONNX value inference failed: {e}"));
+        debug_assert_eq!(out[0].len(), states.len() * s_max);
+        states
+            .iter()
+            .zip(&encs)
+            .enumerate()
+            .map(|(i, (s, e))| seat_values(s, e, &out[0][i * s_max..i * s_max + e.num_tokens]))
             .collect()
     }
 }
@@ -363,82 +367,111 @@ impl Evaluator for OnnxEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bidding::apply_bid;
+    use crate::dealing::deal;
+    use crate::game::new_game;
+    use rand_xoshiro::rand_core::SeedableRng;
+    use rand_xoshiro::Xoshiro256PlusPlus;
     use std::path::PathBuf;
 
-    fn model_path() -> Option<PathBuf> {
-        let p = std::env::var("BLOB_ONNX_MODEL").ok()?;
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            Some(pb)
-        } else {
-            None
-        }
+    /// A model directory from `BLOB_MODEL_DIR`; the tests that need one
+    /// skip without it.
+    fn model_dir() -> Option<PathBuf> {
+        let pb = PathBuf::from(std::env::var("BLOB_MODEL_DIR").ok()?);
+        pb.is_dir().then_some(pb)
     }
 
-    #[test]
-    fn loads_model_if_present() {
-        // Skips when BLOB_ONNX_MODEL is unset; real end-to-end parity with
-        // the tch model is verified by `scripts/export_onnx.py`'s own
-        // sanity check after export.
-        let Some(path) = model_path() else {
-            eprintln!("BLOB_ONNX_MODEL unset; skipping");
-            return;
-        };
-        let e = OnnxEvaluator::from_file(&path).expect("load model");
-        let _ = e;
-    }
-
-    /// Batched ONNX inference must agree with looping
-    /// `evaluate` on the same states, modulo FP rounding from the GEMM
-    /// batch shape (well below the 1e-5 element gate `scripts/export_onnx`
-    /// already uses for tch ↔ ORT parity). Skips when `BLOB_ONNX_MODEL`
-    /// isn't set, matching the rest of this file.
-    #[test]
-    fn evaluate_batch_matches_serial() {
-        use crate::bidding::apply_bid;
-        use crate::dealing::deal;
-        use crate::game::new_game;
-        use rand_xoshiro::rand_core::SeedableRng;
-        use rand_xoshiro::Xoshiro256PlusPlus;
-
-        let Some(path) = model_path() else {
-            eprintln!("BLOB_ONNX_MODEL unset; skipping");
-            return;
-        };
-        let e = OnnxEvaluator::from_file(&path).expect("load model");
-
-        // Build a small mixed batch: a freshly-dealt bidding state plus a
-        // playing state, each from a different RNG seed so sequence
-        // lengths diverge (forces zero-padding to S_max).
+    /// A bidding and a playing state of different lengths, so batching pads.
+    fn mixed_states() -> Vec<BlobState> {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(31337);
         let mut bidding = new_game(4, 5).unwrap();
         deal(&mut bidding, &mut rng);
-
+        // Seat 1 leads, so relative and absolute seats differ.
         let mut playing = new_game(5, 7).unwrap();
         deal(&mut playing, &mut rng);
-        while playing.phase() == crate::state::GamePhase::Bidding {
-            let mask = crate::bidding::legal_bids(&playing);
-            let b = mask.trailing_zeros() as u8;
+        while playing.phase() == GamePhase::Bidding {
+            let b = legal_bids(&playing).trailing_zeros() as u8;
             apply_bid(&mut playing, b);
         }
+        vec![bidding, playing]
+    }
 
-        let states = vec![&bidding, &playing];
-        let batched = e.evaluate_batch(&states);
-        let serial: Vec<(Vec<f32>, f32)> = states.iter().map(|s| e.evaluate(s)).collect();
+    #[test]
+    fn metadata_check_refuses_other_layouts_and_networks() {
+        let p = Path::new("m/policy.onnx");
+        assert!(check_metadata(p, "policy", Some(LAYOUT_ID), Some("policy")).is_ok());
+        let none = check_metadata(p, "policy", None, None).unwrap_err();
+        assert!(none.contains("predates"), "{none}");
+        let old = check_metadata(p, "policy", Some("layout-2"), Some("policy")).unwrap_err();
+        assert!(old.contains("retrain"), "{old}");
+        let swapped = check_metadata(p, "value", Some(LAYOUT_ID), Some("policy")).unwrap_err();
+        assert!(swapped.contains("expected \"value\""), "{swapped}");
+    }
 
-        assert_eq!(batched.len(), serial.len());
-        for (i, ((bp, bv), (sp, sv))) in batched.iter().zip(serial.iter()).enumerate() {
-            assert_eq!(bp.len(), sp.len(), "state {i}: policy length differs");
-            for (j, (a, b)) in bp.iter().zip(sp.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() < 1e-4,
-                    "state {i} policy[{j}]: batched={a}, serial={b}"
-                );
+    #[test]
+    fn seat_values_map_relative_seats_back() {
+        let s = &mixed_states()[1];
+        let enc = encode_value(s, s.current_player);
+        // Row value at a player token = 10 × its relative seat + 1.
+        let mut row = vec![-1.0f32; enc.num_tokens];
+        let players: Vec<usize> =
+            (0..enc.num_tokens).filter(|&i| enc.token_types[i] == TOKEN_TYPE_PLAYER).collect();
+        for (rel, &pos) in players.iter().enumerate() {
+            row[pos] = 10.0 * rel as f32 + 1.0;
+        }
+        let v = seat_values(s, &enc, &row);
+        let n = s.num_players;
+        for seat in 0..n {
+            let rel = (seat + n - s.current_player) % n;
+            assert_eq!(v[seat as usize], 10.0 * rel as f32 + 1.0, "seat {seat}");
+        }
+        assert!(v[n as usize..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn loads_model_dir_and_refuses_swapped_files() {
+        let Some(dir) = model_dir() else {
+            eprintln!("BLOB_MODEL_DIR unset; skipping");
+            return;
+        };
+        OnnxEvaluator::from_dir(&dir).expect("load model dir");
+        assert!(OnnxValue::from_file(dir.join(POLICY_FILE)).is_err());
+        assert!(OnnxPolicy::from_file(dir.join(VALUE_FILE)).is_err());
+    }
+
+    /// Batched inference agrees with one state at a time, modulo FP rounding
+    /// from the batch shape; V gives every seat a ŝ in [0, 1].
+    #[test]
+    fn batches_match_single_states() {
+        let Some(dir) = model_dir() else {
+            eprintln!("BLOB_MODEL_DIR unset; skipping");
+            return;
+        };
+        let e = OnnxEvaluator::from_dir(&dir).expect("load model dir");
+        let states = mixed_states();
+        let refs: Vec<&BlobState> = states.iter().collect();
+
+        let batched = e.policy.policy_batch(&refs);
+        for (i, s) in states.iter().enumerate() {
+            let single = e.policy.policy(s);
+            assert_eq!(batched[i].len(), single.len());
+            for (a, b) in batched[i].iter().zip(&single) {
+                assert!((a - b).abs() < 1e-4, "state {i}: batched {a}, single {b}");
             }
-            assert!(
-                (bv - sv).abs() < 1e-4,
-                "state {i} value: batched={bv}, serial={sv}"
-            );
+            assert!((single.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        }
+
+        let batched = e.value.values_batch(&refs);
+        for (i, s) in states.iter().enumerate() {
+            let single = e.value.values(s);
+            for seat in 0..MAX_PLAYERS {
+                assert!((batched[i][seat] - single[seat]).abs() < 1e-4, "state {i} seat {seat}");
+                if seat < s.num_players as usize {
+                    assert!((0.0..=1.0).contains(&single[seat]), "ŝ {}", single[seat]);
+                } else {
+                    assert_eq!(single[seat], 0.0);
+                }
+            }
         }
     }
 }

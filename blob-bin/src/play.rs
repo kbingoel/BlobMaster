@@ -1,23 +1,24 @@
 //! `blobmaster play` — one human against bots in the terminal.
 //!
 //! The engine deals every hand, but bots only ever see their own view: the
-//! network encodes the acting seat's perspective and search samples the
-//! hidden hands (`belief.rs`). `--show` prints each bot's policy and value,
-//! which reveals its cards through the policy; it is an analysis aid.
+//! policy net encodes the acting seat's perspective, and search samples the
+//! hidden hands (`belief.rs`) before the value net sees a deal. `--show`
+//! prints each bot's policy and search values, which reveals its cards
+//! through the policy; it is an analysis aid.
 //!
 //! The game loop is generic over its input and output so tests can drive
 //! a whole game through it.
 
 use std::io::{self, BufRead, Write};
 
-use blob_engine::bench::{greedy_action, search_action, Agent};
+use blob_engine::bench::{greedy_action, search_action, Agent, Nets};
 use blob_engine::card::NUM_RANKS;
 use blob_engine::mcts::{mcts_search, MctsConfig};
 use blob_engine::rule_bot::{expected_tricks, rule_bot_action};
 use blob_engine::rule_bot_2::{bid_chances, play_chances, rollout_values, rule_bot_2_action, rule_bot_2r_action};
 use blob_engine::{
     advance_round, apply_bid, apply_play, legal_bids, legal_plays, new_game, start_round, total_rounds,
-    BlobState, Evaluator, GamePhase, Hand, OnnxEvaluator, NO_TRUMP,
+    BlobState, GamePhase, Hand, PolicyEvaluator, NO_TRUMP,
 };
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -31,7 +32,7 @@ pub struct Options {
     /// Plays every other seat; also answers `hint` and `auto`.
     pub bot: Agent,
     pub mcts: MctsConfig,
-    /// Print each bot decision's policy and value.
+    /// Print each bot decision's policy and search values.
     pub show: bool,
     pub color: bool,
 }
@@ -49,14 +50,15 @@ Commands at your turn:
   <bid>        a number, e.g. 2
   <card>       rank + suit, e.g. AS, 10h, Td, q♥ (suit first works too: S10)
   <n>          while playing: the n-th card of the numbered list
-  hint         what the bot would do in your seat, with its policy and value
+  hint         what the bot would do in your seat, and why
   auto         let the bot make this move for you
   table        show bids, tricks and scores
   help         this text
   quit         leave the game
 Scoring: make your bid exactly for 10 + bid points, otherwise 0.
 The dealer bids last and may not bid so that the bids add up to the cards dealt.
-\"value\" is the network's value estimate for that seat (−1..+1).";
+Search values are a move's worth to the seat in this round: its points minus
+the other seats' mean, in units of 10 + cards dealt (−1..+1).";
 
 enum Command {
     Number(u8),
@@ -122,7 +124,7 @@ const SUITS: [&str; 4] = ["♠", "♥", "♣", "♦"];
 
 struct Table<R, W> {
     opts: Options,
-    eval: Option<OnnxEvaluator>,
+    nets: Nets,
     state: BlobState,
     cards: Xoshiro256PlusPlus,
     rng: Xoshiro256PlusPlus,
@@ -265,26 +267,30 @@ impl<R: BufRead, W: Write> Table<R, W> {
     }
 
     /// Top legal actions of a dense policy: `K♠ 62% · 9♠ 30%` or `1 62% · 0 30%`.
-    fn policy_line(&self, s: &BlobState, policy: &[f32]) -> String {
+    /// With `values` (indexed like `policy`), each action's value follows:
+    /// `K♠ 62% +0.31`.
+    fn policy_line(&self, s: &BlobState, policy: &[f32], values: Option<&[f32]>) -> String {
+        let value = |i: usize| values.map_or(String::new(), |v| format!(" {:+.2}", v[i]));
         let mut items: Vec<(String, f32)> = if s.phase() == GamePhase::Bidding {
             let mask = legal_bids(s);
             policy
                 .iter()
                 .enumerate()
                 .filter(|(b, _)| (mask >> b) & 1 == 1)
-                .map(|(b, &p)| (b.to_string(), p))
+                .map(|(b, &p)| (format!("{b} {:.0}%{}", 100.0 * p, value(b)), p))
                 .collect()
         } else {
             let legal = legal_plays(s);
             Hand::new(s.hands[s.current_player as usize])
                 .iter()
                 .zip(policy)
-                .filter(|(c, _)| (legal >> c.index()) & 1 == 1)
-                .map(|(c, &p)| (self.card(c.index()), p))
+                .enumerate()
+                .filter(|(_, (c, _))| (legal >> c.index()) & 1 == 1)
+                .map(|(i, (c, &p))| (format!("{} {:.0}%{}", self.card(c.index()), 100.0 * p, value(i)), p))
                 .collect()
         };
         items.sort_by(|a, b| b.1.total_cmp(&a.1));
-        items.iter().take(6).map(|(a, p)| format!("{a} {:.0}%", 100.0 * p)).collect::<Vec<_>>().join(" · ")
+        items.iter().take(6).map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(" · ")
     }
 
     /// The bot's action for the current player, plus a description of its
@@ -343,26 +349,25 @@ impl<R: BufRead, W: Write> Table<R, W> {
                 (a, why)
             }
             Agent::Network(_) => {
-                let ev = self.eval.as_ref().expect("network bot has a model");
-                let (policy, v) = ev.evaluate(&s);
+                let policy = self.nets.policy.as_ref().expect("network bot has a policy net").policy(&s);
                 let a = greedy_action(&s, &policy);
-                (a, explain.then(|| format!("network: {}   value {v:+.2}", self.policy_line(&s, &policy))))
+                (a, explain.then(|| format!("network: {}", self.policy_line(&s, &policy, None))))
             }
             Agent::Search(_) => {
-                let ev = self.eval.as_ref().expect("search bot has a model");
-                let r = mcts_search(&s, ev, &self.opts.mcts, &mut self.rng, 0);
+                let p = self.nets.policy.as_ref().expect("search bot has a policy net");
+                let v = self.nets.value.as_ref().expect("search bot has a value net");
+                let r = mcts_search(&s, p, v, &self.opts.mcts, &mut self.rng, 0);
                 let a = search_action(&s, &r);
                 let why = explain.then(|| {
-                    let (prior, v) = ev.evaluate(&s);
                     if r.total_visits == 0 {
-                        return format!("forced   network value {v:+.2}");
+                        return "forced".to_string();
                     }
                     format!(
-                        "search:  {}   ({} visits, value {:+.2})\n      network: {}   value {v:+.2}",
-                        self.policy_line(&s, &r.policy_target),
+                        "search:  {}   ({} visits, value {:+.2})\n      network: {}",
+                        self.policy_line(&s, &r.policy_target, Some(&r.action_values)),
                         r.total_visits,
                         r.value_estimate,
-                        self.policy_line(&s, &prior),
+                        self.policy_line(&s, &p.policy(&s), None),
                     )
                 });
                 (a, why)
@@ -583,13 +588,7 @@ impl<R: BufRead, W: Write> Table<R, W> {
 
 /// Play one game. Loads the bot's model if it has one.
 pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Result<Finish> {
-    let eval = match opts.bot.model() {
-        Some(p) => Some(
-            OnnxEvaluator::from_file(p)
-                .map_err(|e| io::Error::other(format!("load ONNX model {}: {e}", p.display())))?,
-        ),
-        None => None,
-    };
+    let nets = Nets::load(&opts.bot).map_err(|e| io::Error::other(format!("load model: {e}")))?;
     let mut state = new_game(opts.num_players, opts.start_cards)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
     if opts.human_seat >= opts.num_players {
@@ -603,10 +602,10 @@ pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Re
         Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("{} (network only)", p.display()),
         Agent::Search(p) => format!(
-            "{} with {}x{} search",
+            "{} with search (bids {}, plays {})",
             p.display(),
-            opts.mcts.num_determinizations,
-            opts.mcts.sims_per_determinization
+            opts.mcts.bid_budget,
+            opts.mcts.play_budget
         ),
     };
     writeln!(
@@ -616,7 +615,7 @@ pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Re
     )?;
     let mut t = Table {
         opts: opts.clone(),
-        eval,
+        nets,
         state,
         cards,
         rng: Xoshiro256PlusPlus::seed_from_u64(opts.seed ^ 0x5EA2_C400),
@@ -656,6 +655,7 @@ pub fn run<R: BufRead, W: Write>(opts: &Options, input: R, mut out: W) -> io::Re
 mod tests {
     use super::*;
     use blob_engine::bench::eval_mcts_config;
+    use blob_engine::mcts::{DEFAULT_BID_BUDGET, DEFAULT_PLAY_BUDGET};
 
     fn opts(seed: u64) -> Options {
         Options {
@@ -664,7 +664,7 @@ mod tests {
             human_seat: 0,
             seed,
             bot: Agent::RuleBot,
-            mcts: eval_mcts_config(5, 100),
+            mcts: eval_mcts_config(DEFAULT_BID_BUDGET, DEFAULT_PLAY_BUDGET),
             show: true,
             color: false,
         }
@@ -783,7 +783,7 @@ mod tests {
         let o = opts(21);
         let mut t = Table {
             opts: o.clone(),
-            eval: None,
+            nets: Nets::default(),
             state: new_game(5, 7).unwrap(),
             cards: Xoshiro256PlusPlus::seed_from_u64(21),
             rng: Xoshiro256PlusPlus::seed_from_u64(0),

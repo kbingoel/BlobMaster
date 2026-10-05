@@ -1,232 +1,124 @@
-//! In-tree terminal value computation aligned with the gen-1 value target
-//! (the z-scored final game score, clipped to ±1) so MCTS terminal leaves
-//! and the training-target values live on a single coherent scale.
+//! Per-round utility (gen-2.md §5.1).
 //!
-//! - Multi-seat backprop: covered by
-//!   [`crate::mcts::backprop_terminal`], which consumes the per-seat
-//!   vector this module emits.
-//! - Round-boundary truncation: out of scope. MCTS's
-//!   `apply_action` no-ops on `Scoring`/`Complete`, so a round-1 search
-//!   sees no signal from rounds 2..N. [`terminal_z_scores`] returns the
-//!   closest single-statistic approximation available without rolling a
-//!   fresh deal forward.
-//! - Scale alignment: [`z_score_clip`] is the single source of
-//!   truth for the z-score statistic; [`terminal_z_scores`] calls it on
-//!   `cumulative_scores`-derived inputs, the same statistic as the value
-//!   target, so in-tree Q and the training value target cannot drift in
-//!   scale.
+//! Each round is a fresh deal and round scores add up, so search and the
+//! value target score a seat by the round being played alone:
+//!
+//! ```text
+//! u_s = ŝ_s − λ · mean_{j≠s} ŝ_j          ŝ = round points / (10 + cards dealt)
+//! ```
+//!
+//! - Round points are `10 + bid` for an exact bid and 0 otherwise, so ŝ lies
+//!   in [0, 1] on a fixed scale: nothing is clipped and nothing depends on
+//!   the rest of the game.
+//! - λ = 1 ([`DEFAULT_LAMBDA`]) is "my points minus the table's", so spoiling
+//!   an opponent's bid has value; λ = 0 is "my points only".
+//! - The value net predicts ŝ for every seat and search applies λ, so λ can
+//!   change without retraining.
 
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
-/// Floor on the standard-deviation denominator.
-pub const Z_SCORE_EPS: f32 = 1e-6;
+/// Default λ: my points minus the table's mean.
+pub const DEFAULT_LAMBDA: f32 = 1.0;
 
-/// Z-score `scores[..n]` and clip to `[-1, 1]`. Returns all-zero when
-/// the std underflows `Z_SCORE_EPS` (all-equal scores: z-score is
-/// undefined). Slots `>= n` stay zero.
-#[inline]
-pub fn z_score_clip(scores: &[f32; MAX_PLAYERS], n: usize) -> [f32; MAX_PLAYERS] {
-    let mut z = [0.0f32; MAX_PLAYERS];
-    if n == 0 {
-        return z;
+/// Points each seat scores in a finished round: `10 + bid` if it took
+/// exactly its bid, else 0. Slots `>= num_players` are 0.
+pub fn round_points(state: &BlobState) -> [u8; MAX_PLAYERS] {
+    debug_assert!(
+        matches!(state.phase(), GamePhase::Scoring | GamePhase::Complete),
+        "round_points on an unfinished round ({:?})",
+        state.phase()
+    );
+    let mut out = [0u8; MAX_PLAYERS];
+    for (i, slot) in out.iter_mut().enumerate().take(state.num_players as usize) {
+        if state.tricks_won[i] == state.bids[i] {
+            *slot = 10 + state.bids[i];
+        }
     }
-    debug_assert!(n <= MAX_PLAYERS);
-    let mean: f32 = scores[..n].iter().sum::<f32>() / n as f32;
-    let var: f32 =
-        scores[..n].iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n as f32;
-    let std = var.sqrt();
-    if std < Z_SCORE_EPS {
-        return z;
-    }
-    let denom = std.max(Z_SCORE_EPS);
-    for i in 0..n {
-        z[i] = ((scores[i] - mean) / denom).clamp(-1.0, 1.0);
-    }
-    z
+    out
 }
 
-/// Per-seat z-scored value for a terminal MCTS leaf, on the same scale
-/// as the training value target.
-///
-/// - `Complete`: z-score `cumulative_scores[..n]` directly.
-/// - `Scoring`: z-score `cumulative_scores[..n] + this_round_score[..n]`,
-///   where `this_round_score[i] = (tricks_won[i] == bid[i]) ? 10 + bid[i]
-///   : 0`. `advance_round` is what folds the round into
-///   `cumulative_scores`; MCTS hits the `Scoring` boundary *before* that
-///   call, so we pre-add the payout locally to keep the in-tree Q
-///   consistent with the value target the game would get if it ended now.
-///
-/// Slots `>= num_players` are zero. Non-terminal phases return all-zero
-/// — callers are expected to gate this behind [`crate::mcts::is_terminal`].
-pub fn terminal_z_scores(state: &BlobState) -> [f32; MAX_PLAYERS] {
-    let n = state.num_players as usize;
-    debug_assert!(n <= MAX_PLAYERS);
+/// The most a seat can score in a round with `cards_dealt` cards; ŝ is
+/// round points divided by this.
+#[inline]
+pub fn score_scale(cards_dealt: u8) -> f32 {
+    10.0 + cards_dealt as f32
+}
 
-    let mut scores = [0.0f32; MAX_PLAYERS];
-    match state.phase() {
-        GamePhase::Complete => {
-            for i in 0..n {
-                scores[i] = state.cumulative_scores[i] as f32;
-            }
-        }
-        GamePhase::Scoring => {
-            for i in 0..n {
-                let round_payout = if state.tricks_won[i] == state.bids[i] {
-                    10 + state.bids[i] as u32
-                } else {
-                    0
-                };
-                scores[i] = state.cumulative_scores[i] as f32 + round_payout as f32;
-            }
-        }
-        GamePhase::Bidding | GamePhase::Playing => return scores,
+/// ŝ for every seat from its round points.
+pub fn normalized_scores(points: &[u8; MAX_PLAYERS], cards_dealt: u8) -> [f32; MAX_PLAYERS] {
+    let scale = score_scale(cards_dealt);
+    points.map(|p| p as f32 / scale)
+}
+
+/// `u_s` for every seat from each seat's ŝ (expected or actual). Slots
+/// `>= num_players` are 0.
+pub fn utilities(s_hat: &[f32; MAX_PLAYERS], num_players: u8, lambda: f32) -> [f32; MAX_PLAYERS] {
+    let n = num_players as usize;
+    let total: f32 = s_hat[..n].iter().sum();
+    let others = n.max(2) as f32 - 1.0;
+    let mut u = [0.0f32; MAX_PLAYERS];
+    for s in 0..n {
+        u[s] = s_hat[s] - lambda * (total - s_hat[s]) / others;
     }
+    u
+}
 
-    z_score_clip(&scores, n)
+/// Exact `u_s` for every seat of a finished round.
+pub fn terminal_utilities(state: &BlobState, lambda: f32) -> [f32; MAX_PLAYERS] {
+    let s_hat = normalized_scores(&round_points(state), state.cards_dealt);
+    utilities(&s_hat, state.num_players, lambda)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scores(n: usize, vals: &[u16]) -> [u16; MAX_PLAYERS] {
-        let mut out = [0u16; MAX_PLAYERS];
-        for (i, &v) in vals.iter().take(n).enumerate() {
-            out[i] = v;
-        }
-        out
-    }
-
-    fn terminal_state(
-        phase: GamePhase,
-        num_players: u8,
-        cumulative: [u16; MAX_PLAYERS],
-        bids: [u8; MAX_PLAYERS],
-        tricks_won: [u8; MAX_PLAYERS],
-    ) -> BlobState {
+    fn finished(bids: &[u8], tricks: &[u8], cards_dealt: u8) -> BlobState {
         let mut s = BlobState::empty();
-        s.num_players = num_players;
-        s.cumulative_scores = cumulative;
-        s.bids = bids;
-        s.tricks_won = tricks_won;
-        s.game_phase = phase as u8;
+        s.num_players = bids.len() as u8;
+        s.cards_dealt = cards_dealt;
+        s.game_phase = GamePhase::Scoring as u8;
+        s.bids[..bids.len()].copy_from_slice(bids);
+        s.tricks_won[..tricks.len()].copy_from_slice(tricks);
         s
     }
 
     #[test]
-    fn z_score_clip_returns_zero_when_all_equal() {
-        let mut s = [0.0f32; MAX_PLAYERS];
-        for i in 0..4 {
-            s[i] = 7.0;
-        }
-        let z = z_score_clip(&s, 4);
-        for i in 0..4 {
-            assert_eq!(z[i], 0.0, "seat {i}");
-        }
+    fn round_points_pay_exact_bids_only() {
+        let s = finished(&[2, 1, 0, 3], &[2, 0, 0, 2], 5);
+        assert_eq!(round_points(&s)[..5], [12, 0, 10, 0, 0]);
     }
 
     #[test]
-    fn z_score_clip_is_zero_mean_unit_variance_before_clip() {
-        let mut s = [0.0f32; MAX_PLAYERS];
-        // Spread: 10, 20, 30, 40 → mean 25, std sqrt(125) ≈ 11.18
-        for (i, v) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
-            s[i] = *v;
+    fn utility_is_my_share_minus_the_tables_mean() {
+        // 4 seats, 5 cards: scale 15. Points 12, 0, 10, 0.
+        let s = finished(&[2, 1, 0, 3], &[2, 0, 0, 2], 5);
+        let u = terminal_utilities(&s, 1.0);
+        let s_hat = [12.0 / 15.0, 0.0, 10.0 / 15.0, 0.0];
+        for seat in 0..4 {
+            let others: f32 = (0..4).filter(|&j| j != seat).map(|j| s_hat[j]).sum::<f32>() / 3.0;
+            assert!((u[seat] - (s_hat[seat] - others)).abs() < 1e-6, "seat {seat}");
         }
-        let z = z_score_clip(&s, 4);
-        let sum: f32 = z[..4].iter().sum();
-        assert!(sum.abs() < 1e-4, "mean of z={sum}, expected ~0");
-        // Symmetric pairs.
-        assert!((z[0] + z[3]).abs() < 1e-5);
-        assert!((z[1] + z[2]).abs() < 1e-5);
-        for zi in &z[..4] {
-            assert!(*zi >= -1.0 && *zi <= 1.0);
-        }
-    }
-
-    /// Complete phase: scores already final; z-score directly.
-    #[test]
-    fn terminal_z_scores_complete_matches_z_score_clip() {
-        let cum = scores(4, &[30, 0, 10, 50]);
-        let s = terminal_state(
-            GamePhase::Complete,
-            4,
-            cum,
-            [0; MAX_PLAYERS],
-            [0; MAX_PLAYERS],
-        );
-        let got = terminal_z_scores(&s);
-        let mut expected_in = [0.0f32; MAX_PLAYERS];
-        for i in 0..4 {
-            expected_in[i] = cum[i] as f32;
-        }
-        let expected = z_score_clip(&expected_in, 4);
-        for i in 0..MAX_PLAYERS {
-            assert!((got[i] - expected[i]).abs() < 1e-6, "seat {i}");
-        }
-    }
-
-    /// Scoring phase: must pre-add the just-finished round's payout
-    /// before z-scoring (cumulative_scores hasn't absorbed it yet).
-    #[test]
-    fn terminal_z_scores_scoring_pre_adds_round_payout() {
-        // 4-player Scoring snapshot.
-        // - Seat 0 bid 3, won 3 → +13
-        // - Seat 1 bid 2, won 1 → 0
-        // - Seat 2 bid 0, won 0 → +10
-        // - Seat 3 bid 4, won 4 → +14
-        let cum = scores(4, &[20, 30, 20, 0]); // pre-round totals
-        let bids_arr = {
-            let mut b = [0u8; MAX_PLAYERS];
-            b[0] = 3;
-            b[1] = 2;
-            b[2] = 0;
-            b[3] = 4;
-            b
-        };
-        let tw_arr = {
-            let mut t = [0u8; MAX_PLAYERS];
-            t[0] = 3;
-            t[1] = 1;
-            t[2] = 0;
-            t[3] = 4;
-            t
-        };
-        let s = terminal_state(GamePhase::Scoring, 4, cum, bids_arr, tw_arr);
-        let got = terminal_z_scores(&s);
-
-        // Reference: build the post-round totals by hand and z-score them.
-        let mut post = [0.0f32; MAX_PLAYERS];
-        post[0] = 20.0 + 13.0; // 33
-        post[1] = 30.0 + 0.0; // 30
-        post[2] = 20.0 + 10.0; // 30
-        post[3] = 0.0 + 14.0; // 14
-        let expected = z_score_clip(&post, 4);
-        for i in 0..MAX_PLAYERS {
-            assert!(
-                (got[i] - expected[i]).abs() < 1e-6,
-                "seat {i}: got {} expected {}",
-                got[i],
-                expected[i]
-            );
-        }
-        // Slot beyond num_players stays zero.
-        for i in 4..MAX_PLAYERS {
-            assert_eq!(got[i], 0.0);
-        }
+        assert!(u[4..].iter().all(|&v| v == 0.0));
+        // λ = 0 is my points only.
+        let mine = terminal_utilities(&s, 0.0);
+        assert_eq!(mine[..4], s_hat);
     }
 
     #[test]
-    fn terminal_z_scores_returns_zero_for_non_terminal_phase() {
-        let s = terminal_state(
-            GamePhase::Playing,
-            4,
-            scores(4, &[10, 20, 30, 40]),
-            [0; MAX_PLAYERS],
-            [0; MAX_PLAYERS],
-        );
-        let z = terminal_z_scores(&s);
-        for v in z.iter() {
-            assert_eq!(*v, 0.0);
-        }
+    fn utilities_sum_to_zero_at_lambda_one() {
+        // Each ŝ_j appears in n − 1 means with weight 1/(n − 1).
+        let s_hat = [0.9, 0.1, 0.0, 0.7, 0.35, 0.0, 0.0, 0.0];
+        let u = utilities(&s_hat, 5, 1.0);
+        assert!(u.iter().sum::<f32>().abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalized_scores_lie_in_unit_interval() {
+        // The best possible round: bid every card and make it.
+        let s = finished(&[7, 0, 0], &[7, 0, 0], 7);
+        let s_hat = normalized_scores(&round_points(&s), 7);
+        assert_eq!(s_hat[0], 1.0);
+        assert!((s_hat[1] - 10.0 / 17.0).abs() < 1e-6);
     }
 }

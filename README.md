@@ -8,7 +8,7 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 
 - **Gen 0 (Python, 2025–2026-03):** correct engine; never learned. Archived in [legacy/](legacy/).
 - **Gen 1 (Rust, 2026-03 → 2026-05):** fast engine and pipeline, 168-iteration final run. On 2026-10-02 it was measured against a fixed rule bot, and it loses (−10 points per game with full search). The causes are in the value targets and in the search's value backup, not in compute (gen-2.md §2). Its code is at git tags `gen-1-final` and `gen-1-compat`.
-- **Gen 2:** per-round, per-seat values; a value network that sees the sampled deal; evaluation against a fixed yardstick; async actor–learner training. Done so far (2026-10-05): the yardsticks (`bench`, `play`, two rule bots), the encoder and determinization fixes, and the removal of gen-1 support. Next: the gen-2 search and evaluators (Phase 3).
+- **Gen 2:** per-round, per-seat values; a value network that sees the sampled deal; evaluation against a fixed yardstick; async actor–learner training. Done so far (2026-10-05): the yardsticks (`bench`, `play`, two rule bots), the encoder and determinization fixes, the removal of gen-1 support, and the gen-2 engine (per-round utility, search that backs values up to every seat, policy and value evaluators, a guarded encoder layout). Next: the two networks and a supervised warm start (Phase 4).
 
 ## Vocabulary
 
@@ -33,9 +33,9 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 
 | Path | What it is |
 |---|---|
-| `blob-engine/` | Game rules, entity encoder, determinization, MCTS, ONNX inference, replay buffer, rule bots, strength benchmark. No libtorch dependency. |
+| `blob-engine/` | Game rules, entity encoder (policy and value modes), determinization, MCTS, ONNX inference, replay buffer, rule bots, strength benchmark. No libtorch dependency. |
 | `blob-nn/` | Transformer model (tch / libtorch), losses and optimizer, learner building blocks. |
-| `blob-train/` | `blobmaster-train` CLI. For now only `export` (tch checkpoint → ONNX); `pretrain` and `train` come in Phases 4–5. |
+| `blob-train/` | `blobmaster-train` CLI. For now only `export` (writes a model directory: policy and value nets as ONNX); `pretrain` and `train` come in Phases 4–5. |
 | `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bots) and `play` (you vs bots in the terminal). |
 | `scripts/` | ONNX export (Python) and plotting. |
 | `logs/` | Measurement outputs (rule bot 2 rollout sweeps). |
@@ -53,7 +53,7 @@ cargo test -p blob-bin
 ./target/release/blobmaster play                          # you vs 4 rule bots
 ```
 
-There is no trained gen-2 model yet. The `blob-nn` tests and the ONNX export need the pinned Python venv and the downloaded libtorch on the library path; [AGENTS.md](AGENTS.md) has the setup and a recipe for a random-init model.
+There is no trained gen-2 model yet. A model is a directory (`policy.onnx`, `value.onnx`, `meta.json`); `blobmaster-train export --output <dir>` writes a random-init one, which `bench` and `play --model <dir>` accept. The export needs the pinned Python venv, and the `blob-nn` tests need the downloaded libtorch on the library path; [AGENTS.md](AGENTS.md) has the setup.
 
 ## Hardware
 

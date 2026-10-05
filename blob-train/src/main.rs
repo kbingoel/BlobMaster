@@ -1,7 +1,8 @@
 //! blob-train — training CLI.
 //!
 //! Until the gen-2 learner lands (gen-2.md §6 Phase 4: `pretrain`; Phase 5:
-//! `train`), the only subcommand is `export`: tch checkpoint → ONNX through
+//! `train`), the only subcommand is `export`: a model directory
+//! (`policy.onnx`, `value.onnx`, `meta.json`) through
 //! `scripts/export_onnx.py`.
 
 use std::path::{Path, PathBuf};
@@ -18,15 +19,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Export a tch checkpoint to ONNX with `scripts/export_onnx.py`.
+    /// Write a model directory with `scripts/export_onnx.py`: the policy net
+    /// from a tch checkpoint (random-init without one) and the value net
+    /// (random-init until the Phase-4 learner trains it).
     Export {
-        /// `model.ot`, or a checkpoint directory containing it.
+        /// The policy net's `model.ot`, or a checkpoint directory containing it.
         #[arg(long)]
-        checkpoint: PathBuf,
-        /// Output `.onnx` path.
+        checkpoint: Option<PathBuf>,
+        /// Model directory to write (created if missing).
         #[arg(long)]
         output: PathBuf,
-        /// Also compare the exported graph with the PyTorch forward pass.
+        /// Also compare the exported graphs with the PyTorch forward passes.
         #[arg(long)]
         check: bool,
     },
@@ -48,22 +51,20 @@ fn python() -> PathBuf {
 
 /// Run `scripts/export_onnx.py`. `LD_PRELOAD` is removed: a preloaded tch
 /// libtorch crashes the venv's `import torch` (different C++ ABI).
-fn export(checkpoint: &Path, output: &Path, check: bool) -> Result<(), String> {
-    let weights = if checkpoint.is_dir() {
-        checkpoint.join("model.ot")
-    } else {
-        checkpoint.to_path_buf()
-    };
-    if !weights.is_file() {
-        return Err(format!("no checkpoint at {}", weights.display()));
-    }
+fn export(checkpoint: Option<&Path>, output: &Path, check: bool) -> Result<(), String> {
     let mut cmd = ProcCommand::new(python());
     cmd.env_remove("LD_PRELOAD")
         .arg(workspace_root().join("scripts/export_onnx.py"))
-        .arg("--weights")
-        .arg(&weights)
-        .arg("--out")
+        .arg("--out-dir")
         .arg(output);
+    if let Some(checkpoint) = checkpoint {
+        let weights =
+            if checkpoint.is_dir() { checkpoint.join("model.ot") } else { checkpoint.to_path_buf() };
+        if !weights.is_file() {
+            return Err(format!("no checkpoint at {}", weights.display()));
+        }
+        cmd.arg("--weights").arg(weights);
+    }
     if check {
         cmd.arg("--check");
     }
@@ -83,7 +84,7 @@ fn main() -> ExitCode {
             checkpoint,
             output,
             check,
-        } => export(&checkpoint, &output, check),
+        } => export(checkpoint.as_deref(), &output, check),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

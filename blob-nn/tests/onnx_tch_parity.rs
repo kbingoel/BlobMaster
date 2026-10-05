@@ -1,24 +1,30 @@
-//! ONNX ↔ tch output parity.
+//! ONNX ↔ tch policy parity.
 //!
-//! Loads a saved VarStore checkpoint (via `BLOB_TCH_CHECKPOINT` → directory
-//! containing `model.ot` + `meta.json`) and the ONNX model exported from the
-//! same weights (via `BLOB_ONNX_MODEL`), then pushes a handful of real game
-//! states through both and asserts per-element agreement within 1e-5 on the
-//! value head. The ONNX play policy is only range-checked, not compared.
+//! Loads a saved VarStore checkpoint (`BLOB_TCH_CHECKPOINT`: a directory
+//! with `model.ot` + `meta.json`) and the model directory exported from the
+//! same weights (`BLOB_MODEL_DIR`), then pushes bidding and playing states
+//! through the tch network and the ONNX policy net P and asserts the legal
+//! policies agree within 1e-5.
 //!
-//! Skipped when either env var is unset so CI stays green on machines without
-//! a trained model. The python-side `scripts/export_onnx.py --check` covers
-//! the tch→ONNX export edge of the same chain.
+//! The value net has no tch counterpart until Phase 4, so only P is
+//! compared; `scripts/export_onnx.py --check` covers the PyTorch→ONNX edge
+//! of both networks.
+//!
+//! Skipped when either env var is unset so CI stays green on machines
+//! without an exported model.
 
 use std::path::PathBuf;
 
 use blob_engine::encoder::{encode, TOKEN_TYPE_HAND};
-use blob_engine::{dealing::deal, game::new_game, Evaluator, OnnxEvaluator};
+use blob_engine::{
+    apply_bid, apply_play, legal_bids, legal_plays, new_round, BlobState, GamePhase, OnnxPolicy,
+    PolicyEvaluator, RoundParams,
+};
 use blob_nn::input::pad_batch;
 use blob_nn::model::BlobNet;
 use blob_nn::train::load_checkpoint;
 use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
-use tch::{nn::VarStore, Device, Kind};
+use tch::{nn::VarStore, Device, Tensor};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     let p = std::env::var(key).ok()?;
@@ -26,69 +32,72 @@ fn env_path(key: &str) -> Option<PathBuf> {
     pb.exists().then_some(pb)
 }
 
+/// The tch network's legal policy for `s`, in `PolicyEvaluator` layout.
+fn tch_policy(model: &BlobNet, s: &BlobState) -> Vec<f32> {
+    let enc = encode(s, s.current_player);
+    let input = pad_batch(std::slice::from_ref(&enc), Device::Cpu);
+    tch::no_grad(|| match s.phase() {
+        GamePhase::Bidding => {
+            let legal = legal_bids(s);
+            let mask: Vec<bool> = (0..14).map(|b| (legal >> b) & 1 == 1).collect();
+            let mask = Tensor::from_slice(&mask).view([1, 14]);
+            let probs = model.forward_bid(&input, &mask, false).0;
+            Vec::<f32>::try_from(probs.flatten(0, -1)).unwrap()
+        }
+        _ => {
+            let legal = legal_plays(s);
+            let mut hand = enc.hand_card_indices.iter();
+            let mask: Vec<bool> = enc
+                .token_types
+                .iter()
+                .map(|&t| t == TOKEN_TYPE_HAND && (legal >> hand.next().unwrap()) & 1 == 1)
+                .collect();
+            let mask = Tensor::from_slice(&mask).view([1, enc.num_tokens as i64]);
+            let probs: Vec<f32> = model.forward_play(&input, &mask, false).0.flatten(0, -1).try_into().unwrap();
+            (0..enc.num_tokens).filter(|&i| enc.token_types[i] == TOKEN_TYPE_HAND).map(|i| probs[i]).collect()
+        }
+    })
+}
+
 #[test]
-fn onnx_tch_value_parity() {
+fn onnx_tch_policy_parity() {
     let Some(tch_dir) = env_path("BLOB_TCH_CHECKPOINT") else {
         eprintln!("BLOB_TCH_CHECKPOINT unset; skipping parity test");
         return;
     };
-    let Some(onnx_path) = env_path("BLOB_ONNX_MODEL") else {
-        eprintln!("BLOB_ONNX_MODEL unset; skipping parity test");
+    let Some(model_dir) = env_path("BLOB_MODEL_DIR") else {
+        eprintln!("BLOB_MODEL_DIR unset; skipping parity test");
         return;
     };
 
     let mut vs = VarStore::new(Device::Cpu);
     let model = BlobNet::new(&vs.root());
     load_checkpoint(&mut vs, &tch_dir).expect("load tch checkpoint");
-
-    let onnx = OnnxEvaluator::from_file(&onnx_path).expect("load ONNX model");
+    let onnx = OnnxPolicy::from_dir(&model_dir).expect("load ONNX policy net");
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xBEEF_F00D);
-    let mut max_value_diff = 0.0f64;
-    let mut max_policy_diff = 0.0f64;
-    let trials = 16;
-
-    for t in 0..trials {
-        let n_players = 4 + (t % 4) as u8;
-        let cards = 3 + (t % 5) as u8;
-        let mut s = new_game(n_players, cards).expect("valid params");
-        deal(&mut s, &mut rng);
-
-        let enc = encode(&s, s.current_player);
-        let input = pad_batch(std::slice::from_ref(&enc), Device::Cpu);
-        // All hand tokens legal for a bidding-phase comparison we don't use;
-        // we rely on value parity only (masking-free).
-        let hand_mask = input.token_types.eq(TOKEN_TYPE_HAND as i64);
-        let (_, tch_value) = model.forward_play(&input, &hand_mask, false);
-        let tch_v = tch_value.double_value(&[0]);
-
-        let (onnx_policy, onnx_v) = onnx.evaluate(&s);
-        let vd = (tch_v - onnx_v as f64).abs();
-        max_value_diff = max_value_diff.max(vd);
-
-        // Sanity on the ONNX policy: non-negative, sums to ~1 when any legal
-        // action exists.
-        let sum: f32 = onnx_policy.iter().sum();
-        if !onnx_policy.is_empty() && sum > 0.0 {
-            assert!((sum - 1.0).abs() < 1e-3, "ONNX policy not normalized: {sum}");
-            let (pmin, pmax) = onnx_policy
-                .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
-                    (lo.min(*v), hi.max(*v))
-                });
-            assert!(pmin >= -1e-6 && pmax <= 1.0 + 1e-6,
-                "ONNX policy out of [0,1]: [{pmin}, {pmax}]");
-            max_policy_diff = max_policy_diff.max(0.0); // recorded as a smoke check.
-            let _ = (pmin, pmax);
+    let (mut max_diff, mut compared) = (0.0f32, [0usize; 2]);
+    for t in 0..24u8 {
+        let n = 4 + t % 4;
+        let params = RoundParams { num_players: n, cards_dealt: 3 + t % 5, trump: t % 5, dealer: t % n };
+        let mut s = new_round(params, &mut rng).expect("valid params");
+        // Walk a few moves in, so both phases get compared.
+        for _ in 0..(3 * t) % (2 * n) {
+            if s.phase() == GamePhase::Bidding {
+                let b = legal_bids(&s).trailing_zeros() as u8;
+                apply_bid(&mut s, b);
+            } else {
+                let c = legal_plays(&s).trailing_zeros() as u8;
+                apply_play(&mut s, c);
+            }
         }
+        let (want, got) = (tch_policy(&model, &s), onnx.policy(&s));
+        assert_eq!(want.len(), got.len(), "trial {t}: policy lengths");
+        for (a, b) in want.iter().zip(&got) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        compared[(s.phase() == GamePhase::Playing) as usize] += 1;
     }
-
-    let _ = max_policy_diff;
-    assert!(
-        max_value_diff < 1e-5,
-        "value head parity exceeds tolerance: max diff = {max_value_diff:.3e}"
-    );
-    // Ensure kind is still float (guard against accidental dtype drift).
-    let dummy = tch::Tensor::zeros([1], (Kind::Float, Device::Cpu));
-    assert_eq!(dummy.kind(), Kind::Float);
+    assert!(compared[0] > 0 && compared[1] > 0, "both phases compared: {compared:?}");
+    assert!(max_diff < 1e-5, "policy parity exceeds tolerance: max diff = {max_diff:.3e}");
 }

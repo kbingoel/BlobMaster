@@ -34,12 +34,12 @@
 //! The per-card weights are hand-picked, not tuned, and have only been
 //! measured at 5p/7c.
 //!
-//! Use the functions here directly. Wrapping the bot in an [`Evaluator`]
-//! and running it through `mcts_search` turns it into a different player
-//! (one-hot priors + value 0 + 500 sims), which is what gen 1's eval
-//! "heuristic" seats did (gen-2.md §2.8).
+//! Use the functions here directly. Wrapping the bot in a
+//! [`PolicyEvaluator`] and running it through `mcts_search` turns it into a
+//! different player (one-hot priors plus search), which is what gen 1's
+//! eval "heuristic" seats did (gen-2.md §2.8).
 //!
-//! [`Evaluator`]: crate::evaluator::Evaluator
+//! [`PolicyEvaluator`]: crate::evaluator::PolicyEvaluator
 
 use smallvec::SmallVec;
 

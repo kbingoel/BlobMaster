@@ -8,6 +8,9 @@
 //! - `bench`: absolute strength vs fixed opponents on duplicate deals
 //!   (gen-2.md §5.7, `blob_engine::bench`).
 //! - `play`: one human against bots in the terminal (`play.rs`).
+//!
+//! A model is a directory (`policy.onnx`, `value.onnx`, `meta.json`;
+//! gen-2.md §5.3), written by `blobmaster-train export`.
 
 mod play;
 
@@ -16,7 +19,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, DEFAULT_SEED};
+use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, Nets, DEFAULT_SEED};
+use blob_engine::mcts::{MctsConfig, SearchBudget};
 use blob_engine::rule_bot_2::Rollouts;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -33,9 +37,10 @@ struct Cli {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
-    /// Greedy MCTS (`--dets` × `--sims`).
+    /// Greedy search with the policy and value nets (`--bid-dets` ×
+    /// `--bid-sims` for bids, `--dets` × `--sims` for plays).
     Search,
-    /// The network's raw policy, no search.
+    /// The policy net alone, no search.
     Network,
 }
 
@@ -55,14 +60,16 @@ enum Command {
     /// is played once from each seat. Reports points/game with a 95% CI over
     /// deals, win share and bid statistics by hand size.
     Bench {
-        /// Focal player: an ONNX model, `rulebot`, `rulebot2` or `rulebot2r`
-        /// (rule bot 2 with rollouts: `--samples`, `--depth`, `--play-only`).
+        /// Focal player: a model directory, `rulebot`, `rulebot2` or
+        /// `rulebot2r` (rule bot 2 with rollouts: `--samples`, `--depth`,
+        /// `--play-only`).
         focal: String,
         /// How a focal model plays. Required unless the focal player is a rule bot.
         #[arg(long, value_enum)]
         mode: Option<Mode>,
-        /// Opponents: `rulebot`, `rulebot2`, `rulebot2r`, or an ONNX model
-        /// playing its raw policy (only rule bot 2r looks ahead).
+        /// Opponents: `rulebot`, `rulebot2`, `rulebot2r`, or a model
+        /// directory whose policy net plays greedily (only rule bot 2r looks
+        /// ahead).
         #[arg(long, default_value = "rulebot")]
         opponent: String,
         /// Deal seeds; games = deals × players. Default 64 with search
@@ -73,12 +80,8 @@ enum Command {
         players: u8,
         #[arg(long, default_value_t = 7)]
         cards: u8,
-        /// Search: sampled deals per decision.
-        #[arg(long, default_value_t = 5)]
-        dets: u32,
-        /// Search: simulations per sampled deal.
-        #[arg(long, default_value_t = 100)]
-        sims: u32,
+        #[command(flatten)]
+        search: SearchArgs,
         #[command(flatten)]
         rollouts: RolloutArgs,
         /// Worker threads (default: every core).
@@ -91,7 +94,7 @@ enum Command {
     },
     /// Play a game in the terminal against bots.
     Play {
-        /// ONNX model for the bots. Without it the bots are rule bots.
+        /// Model directory for the bots. Without it the bots are rule bots.
         #[arg(long)]
         model: Option<PathBuf>,
         /// Bot type (default: search with a model, else rulebot).
@@ -107,14 +110,12 @@ enum Command {
         /// Deal seed (default: from the clock).
         #[arg(long)]
         seed: Option<u64>,
-        /// Print every bot decision's policy and value. Reveals the bots'
-        /// cards through their policies.
+        /// Print every bot decision's policy and search values. Reveals the
+        /// bots' cards through their policies.
         #[arg(long)]
         show: bool,
-        #[arg(long, default_value_t = 5)]
-        dets: u32,
-        #[arg(long, default_value_t = 100)]
-        sims: u32,
+        #[command(flatten)]
+        search: SearchArgs,
         #[command(flatten)]
         rollouts: RolloutArgs,
         /// Disable ANSI colours (also off when NO_COLOR is set or stdout is
@@ -122,6 +123,30 @@ enum Command {
         #[arg(long)]
         no_color: bool,
     },
+}
+
+/// Search budgets (gen-2.md §5.4): bids default to more sampled deals and
+/// fewer simulations, because a bid's value depends mostly on hidden cards.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct SearchArgs {
+    /// Search, plays: sampled deals per decision.
+    #[arg(long, default_value_t = 5)]
+    dets: u32,
+    /// Search, plays: simulations per sampled deal.
+    #[arg(long, default_value_t = 100)]
+    sims: u32,
+    /// Search, bids: sampled deals per decision.
+    #[arg(long, default_value_t = 20)]
+    bid_dets: u32,
+    /// Search, bids: simulations per sampled deal.
+    #[arg(long, default_value_t = 25)]
+    bid_sims: u32,
+}
+
+impl SearchArgs {
+    fn config(self) -> MctsConfig {
+        eval_mcts_config(SearchBudget::new(self.bid_dets, self.bid_sims), SearchBudget::new(self.dets, self.sims))
+    }
 }
 
 /// Rule bot 2r settings (`blob_engine::rule_bot_2::Rollouts`).
@@ -154,17 +179,17 @@ fn parse_opponent(s: &str, rollouts: Rollouts) -> Agent {
     }
 }
 
-/// Exit early if `agent`'s model is missing or can't load (e.g. it was
-/// trained on another encoder layout), instead of panicking in every
+/// Exit early if `agent`'s model directory is missing or can't load (e.g.
+/// it was trained on another encoder layout), instead of panicking in every
 /// bench thread.
 fn require_model(agent: &Agent) {
     if let Some(p) = agent.model() {
-        if !p.is_file() {
-            eprintln!("error: model {} not found", p.display());
+        if !p.is_dir() {
+            eprintln!("error: model directory {} not found", p.display());
             std::process::exit(2);
         }
-        if let Err(e) = blob_engine::OnnxEvaluator::from_file(p) {
-            eprintln!("error: load ONNX model {}: {e}", p.display());
+        if let Err(e) = Nets::load(agent) {
+            eprintln!("error: load model {}: {e}", p.display());
             std::process::exit(2);
         }
     }
@@ -178,8 +203,7 @@ fn cmd_bench(
     deals: Option<usize>,
     players: u8,
     cards: u8,
-    dets: u32,
-    sims: u32,
+    mcts: MctsConfig,
     rollouts: Rollouts,
     threads: Option<usize>,
     seed: u64,
@@ -204,7 +228,7 @@ fn cmd_bench(
         start_cards: cards,
         deals: deals.unwrap_or(if searching { 64 } else { 128 }),
         seed,
-        mcts: eval_mcts_config(dets, sims),
+        mcts,
         ..BenchConfig::default()
     };
     if let Some(t) = threads {
@@ -243,10 +267,10 @@ fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench { focal, mode, opponent, deals, players, cards, dets, sims, rollouts, threads, seed } => {
-            cmd_bench(focal, mode, opponent, deals, players, cards, dets, sims, rollouts.config(), threads, seed)
+        Command::Bench { focal, mode, opponent, deals, players, cards, search, rollouts, threads, seed } => {
+            cmd_bench(focal, mode, opponent, deals, players, cards, search.config(), rollouts.config(), threads, seed)
         }
-        Command::Play { model, bot, players, cards, seat, seed, show, dets, sims, rollouts, no_color } => {
+        Command::Play { model, bot, players, cards, seat, seed, show, search, rollouts, no_color } => {
             let bot = match (bot, model) {
                 (Some(Bot::Rulebot), _) | (None, None) => Agent::RuleBot,
                 (Some(Bot::Rulebot2), _) => Agent::RuleBot2,
@@ -271,7 +295,7 @@ fn main() {
                 human_seat: seat,
                 seed,
                 bot,
-                mcts: eval_mcts_config(dets, sims),
+                mcts: search.config(),
                 show,
                 color: !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal(),
             };

@@ -1,17 +1,27 @@
-//! Arena-allocated MCTS tree and UCB1 selection.
+//! Arena-allocated MCTS over sampled deals (gen-2.md §5.4).
 //!
 //! Nodes are stored contiguously in `MctsArena::nodes`. Children are indices
 //! into that vec, kept inline with `SmallVec<[u32; 14]>` (worst-case fan-out
 //! is 14 bids; up to 13 plays).
 //!
-//! Per-player value storage is load-bearing for multiplayer: the network
-//! evaluates a leaf from `state.current_player`'s perspective only, so a
-//! single scalar would be diluted non-uniformly across subtrees. Each node
-//! tracks `value_sums[seat]` and `value_counts[seat]` and UCB1 reads the
-//! **acting** player's slot.
+//! **Every visit carries a value for every seat.** A leaf is scored for all
+//! seats at once and turned into per-round utilities `u_s` (`scoring.rs`):
+//! - at the end of the round, from the exact round scores;
+//! - otherwise from the value net's expected ŝ on the sampled deal.
 //!
-//! Expansion, evaluation, backpropagation, and the full search loop sit
-//! on top of the selection primitives above.
+//! Backup adds `u_s` to seat `s`'s sum at every node on the path, and UCB
+//! reads the acting seat's mean, so a node's mean for any seat is over all
+//! of its visits. Gen 1 credited a network leaf only to the seat about to
+//! move there, and the deciding seat rarely heard about its own options
+//! (gen-2.md §2.3).
+//!
+//! **Leaves** cost one policy call (priors for the seat to move, from its own
+//! view) and one value call (every seat, on the sampled deal), each batched
+//! across the sampled deals.
+//!
+//! **Budgets** are per phase (`MctsConfig::bid_budget`, `play_budget`): a
+//! bid's value depends mostly on the hidden cards, so bids default to more
+//! sampled deals and fewer simulations each.
 //!
 //! Action encoding on each child is phase-stable (not re-indexed across
 //! depth):
@@ -25,8 +35,9 @@ use smallvec::SmallVec;
 use crate::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
 use crate::bidding::{apply_bid, legal_bids};
 use crate::encoder::hand_card_indices;
-use crate::evaluator::{Evaluator, NUM_BIDS};
+use crate::evaluator::{PolicyEvaluator, ValueEvaluator, NUM_BIDS};
 use crate::playing::{apply_play, legal_plays};
+use crate::scoring::{terminal_utilities, utilities, DEFAULT_LAMBDA};
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
 /// Default `c_puct` exploration constant.
@@ -35,51 +46,44 @@ pub const DEFAULT_C_PUCT: f32 = 1.5;
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
 
-/// Default leaves-per-`evaluate_batch` target for the lockstep driver.
-/// Set to `num_determinizations` (5) — the 2026-04-27 sweep
-/// (`{5, 8, 12, 16}` at T=32, gen-2.md §3.2) showed this is
-/// the per-game-wall optimum on the 7950X / 1.63M-param transformer; per-
-/// call ONNX cost rises super-linearly past `num_dets` because the CPU
-/// is already saturated by 32 concurrent batched forwards. At
-/// `target_batch == num_determinizations` the round-robin keeps every
-/// path's `in_flight` ≤ 1, so the virtual-loss term in UCB1 is dormant
-/// and the search behaves as plain cross-determinization batching.
-/// Raising past `num_dets` is parked behind a model-size revisit
-/// (d_model ≥ 256 would tip the GEMM regime to genuinely batch-bound).
+/// Default leaves per batched network call in the lockstep driver: 5, one
+/// per sampled deal at the play budget. Gen 1 measured this as the
+/// per-game-wall optimum on the 7950X / 1.63M-param transformer: per-call
+/// ONNX cost rises super-linearly past it because the CPU is already
+/// saturated by 32 concurrent batched forwards (gen-2.md §3.2). While
+/// `target_batch` is at most the number of sampled deals, every tree has at
+/// most one descent in flight, so virtual loss stays dormant. Raising it
+/// is parked behind a model-size revisit (d_model ≥ 256).
 pub const DEFAULT_TARGET_BATCH: usize = 5;
 
-/// Virtual-loss weight. Each in-flight leaf along
-/// a path subtracts this from `value_sums[acting]` during UCB1 selection,
-/// so concurrent descents in the same det's tree pick different leaves.
-/// 1.0 is the standard AlphaZero choice (assume in-flight = loss).
+/// Virtual-loss weight. Each in-flight leaf along a path subtracts this
+/// from `value_sums[acting]` during UCB1 selection, so concurrent descents
+/// in the same tree pick different leaves. Utilities lie in [−1, 1] at
+/// λ = 1, so 1.0 treats an in-flight leaf as a loss.
 pub const VIRTUAL_LOSS_WEIGHT: f32 = 1.0;
 
 /// Single MCTS tree node.
 ///
-/// - `visit_count`: total simulations that passed through this node. Used as
-///   `N_parent`/`N_child` in the UCB1 exploration term.
-/// - `value_sums` / `value_counts`: per-seat accumulators. Leaf value `v`
-///   evaluated from seat `p` is added to `value_sums[p]` with
-///   `value_counts[p] += 1` on every node along the path.
-///   `Q(acting) = value_sums[acting] / value_counts[acting]` with `Q = 0`
-///   when that player has not yet been evaluated in this subtree.
-/// - `prior`: network policy probability for the edge leading *into* this
-///   node (populated at expansion).
+/// - `visit_count`: simulations that passed through this node. Used as
+///   `N_parent`/`N_child` in the UCB1 exploration term and as the
+///   denominator of every seat's mean.
+/// - `value_sums`: per-seat sums of backed-up utilities; every visit adds
+///   one value for every seat.
+/// - `prior`: policy probability for the edge leading *into* this node
+///   (populated at expansion).
 /// - `action`: phase-stable edge label (see module docs). Root stores `0`.
 /// - `children`: arena indices of child nodes; empty until expansion.
-/// - `in_flight`: number of currently-pending descents that hold this
-///   node on their path. Bumped along the path
-///   when a leaf is queued for a batched `evaluate` call and decremented
-///   right before that leaf's `expand`/`backprop` runs. UCB1 reads it as
-///   a temporary pessimistic visit so concurrent descents inside the
-///   same tree pick different leaves. Single-thread mutation only — one
-///   rayon worker owns the arena, no atomic needed. `u16` is enough to
-///   cover any plausible `target_batch`.
+/// - `in_flight`: number of currently-pending descents that hold this node
+///   on their path. Bumped along the path when a leaf is queued for a
+///   batched network call and decremented right before that leaf's
+///   expand/backup runs. UCB1 reads it as a temporary pessimistic visit so
+///   concurrent descents inside the same tree pick different leaves.
+///   Single-thread mutation only (one worker owns the arena), and `u16`
+///   covers any plausible `target_batch`.
 #[derive(Debug, Clone)]
 pub struct MctsNode {
     pub visit_count: u32,
     pub value_sums: [f32; MAX_PLAYERS],
-    pub value_counts: [u32; MAX_PLAYERS],
     pub prior: f32,
     pub action: u8,
     pub children: SmallVec<[u32; 14]>,
@@ -94,7 +98,6 @@ impl MctsNode {
         Self {
             visit_count: 0,
             value_sums: [0.0; MAX_PLAYERS],
-            value_counts: [0; MAX_PLAYERS],
             prior,
             action,
             children: SmallVec::new(),
@@ -102,16 +105,11 @@ impl MctsNode {
         }
     }
 
-    /// Mean value from `seat`'s perspective, or `0.0` if that seat has not
-    /// been evaluated in this subtree. See UCB1 docs.
+    /// Mean utility of `seat` over this node's visits; `None` before the
+    /// first visit.
     #[inline]
-    pub fn q(&self, seat: u8) -> f32 {
-        let n = self.value_counts[seat as usize];
-        if n == 0 {
-            0.0
-        } else {
-            self.value_sums[seat as usize] / n as f32
-        }
+    pub fn q(&self, seat: u8) -> Option<f32> {
+        (self.visit_count > 0).then(|| self.value_sums[seat as usize] / self.visit_count as f32)
     }
 
     /// True once the node has at least one child (i.e. has been expanded).
@@ -168,46 +166,32 @@ impl MctsArena {
     }
 }
 
-/// UCB1 score for `child` under `parent` from the acting player's viewpoint,
+/// UCB1 score for `child` under `parent` from the acting seat's viewpoint,
 /// including virtual-loss decoration from in-flight descents.
 ///
-/// Without any in-flight leaves (`child.in_flight == 0`) this is the standard
-/// AlphaZero score:
+/// Without in-flight leaves (`child.in_flight == 0`) this is the standard
+/// AlphaZero score
 ///
 /// `score = Q(acting) + c_puct * P * sqrt(N_parent) / (1 + N_child)`
 ///
-/// where `Q(acting) = value_sums[acting] / value_counts[acting]` and an
-/// unvisited child (`visit_count == 0`) returns `f32::INFINITY` so it is
-/// picked before any visited sibling.
+/// where `Q(acting) = value_sums[acting] / visit_count`. An unvisited child
+/// returns `f32::INFINITY`, so every option is tried once before priors
+/// and values rank them.
 ///
-/// When `child.in_flight > 0`, virtual loss kicks in:
-/// the child's effective denominator becomes `value_counts[acting] +
-/// in_flight`, the numerator subtracts `VIRTUAL_LOSS_WEIGHT * in_flight`
-/// (treat each pending leaf as a loss until the real value lands), and the
-/// exploration term divides by `1 + visit_count + in_flight` so paths that
-/// already have queued descents look more thoroughly explored. This
-/// degenerates exactly to the no-VL formula at `in_flight == 0`, so callers
-/// that never decorate paths (`run_search`, the parity tests) keep their
-/// existing behavior bit-for-bit.
+/// With `in_flight > 0`, each pending leaf counts as a visit worth
+/// `−VIRTUAL_LOSS_WEIGHT` until its real value lands, in both the mean and
+/// the exploration term.
 #[inline]
 pub fn ucb1_score(parent: &MctsNode, child: &MctsNode, acting: u8, c_puct: f32) -> f32 {
     let in_flight = child.in_flight as u32;
-    if child.visit_count == 0 && in_flight == 0 {
+    let n = child.visit_count + in_flight;
+    if n == 0 {
         return f32::INFINITY;
     }
-    let value_n = child.value_counts[acting as usize] + in_flight;
-    let q_eff = if value_n == 0 {
-        // Visited via path-throughs but never as the acting seat's leaf,
-        // and not in-flight: fall back to Q = 0 (existing `q()` semantics).
-        0.0
-    } else {
-        let vloss = VIRTUAL_LOSS_WEIGHT * in_flight as f32;
-        (child.value_sums[acting as usize] - vloss) / value_n as f32
-    };
+    let vloss = VIRTUAL_LOSS_WEIGHT * in_flight as f32;
+    let q = (child.value_sums[acting as usize] - vloss) / n as f32;
     let n_parent = parent.visit_count.max(1) as f32;
-    let n_child_eff = child.visit_count + in_flight;
-    let explore = c_puct * child.prior * n_parent.sqrt() / (1.0 + n_child_eff as f32);
-    q_eff + explore
+    q + c_puct * child.prior * n_parent.sqrt() / (1.0 + n as f32)
 }
 
 /// Pick the child of `parent_idx` with the highest UCB1 score. Ties go to
@@ -233,9 +217,8 @@ pub fn select_best_child(arena: &MctsArena, parent_idx: u32, acting: u8, c_puct:
 /// reaching an unexpanded node. Returns `(leaf_idx, path)` where `path`
 /// contains every node index from root to leaf inclusive.
 ///
-/// `acting_at` maps each depth (distance from root) to the seat that acts
-/// at that node. Callers derive this by replaying actions on a scratch
-/// `BlobState`.
+/// `acting_at` maps each node to the seat that acts at it. Callers derive
+/// this by replaying actions on a scratch `BlobState`.
 pub fn select_leaf<F>(
     arena: &MctsArena,
     c_puct: f32,
@@ -281,7 +264,7 @@ pub fn is_terminal(state: &BlobState) -> bool {
 /// Return `Some(action)` when exactly one legal move exists at `state`
 /// (i.e. the position is forced), else `None`.
 ///
-/// Used by the leaf-descent fast-path to skip the NN call entirely on
+/// Used by the leaf-descent fast-path to skip the network calls entirely on
 /// forced nodes — the prior carries no information when there is only
 /// one child to put it on, so a placeholder child with `prior = 1.0` is
 /// equivalent in expectation and saves the inference. Forced moves are
@@ -292,30 +275,17 @@ pub fn is_terminal(state: &BlobState) -> bool {
 /// [`is_terminal`] before consulting this helper anyway.
 #[inline]
 pub fn forced_action(state: &BlobState) -> Option<u8> {
-    match state.phase() {
-        GamePhase::Bidding => {
-            let mask = legal_bids(state);
-            if mask.count_ones() == 1 {
-                Some(mask.trailing_zeros() as u8)
-            } else {
-                None
-            }
-        }
-        GamePhase::Playing => {
-            let mask = legal_plays(state);
-            if mask.count_ones() == 1 {
-                Some(mask.trailing_zeros() as u8)
-            } else {
-                None
-            }
-        }
-        GamePhase::Scoring | GamePhase::Complete => None,
-    }
+    let mask = match state.phase() {
+        GamePhase::Bidding => legal_bids(state) as u64,
+        GamePhase::Playing => legal_plays(state),
+        GamePhase::Scoring | GamePhase::Complete => return None,
+    };
+    (mask.count_ones() == 1).then(|| mask.trailing_zeros() as u8)
 }
 
 /// Expand `node_idx` by creating one child per legal action.
 ///
-/// `policy` is the evaluator output for `state` (bidding: length
+/// `policy` is the policy evaluator's output for `state` (bidding: length
 /// `NUM_BIDS` over bid values; playing: length `hand_card_indices.len()`
 /// over hand positions — see [`crate::evaluator`]).
 ///
@@ -359,146 +329,34 @@ pub fn expand(arena: &mut MctsArena, node_idx: u32, state: &BlobState, policy: &
     })
 }
 
-/// Backpropagate a leaf value `v` evaluated from seat `leaf_seat`'s
-/// perspective along every node in `path` (root → leaf inclusive).
-///
-/// - `visit_count += 1` at every node (used by UCB1's exploration term).
-/// - `value_sums[leaf_seat] += v`, `value_counts[leaf_seat] += 1` only in
-///   that seat's slot. UCB1's `Q` averages per-seat, so other seats stay
-///   undiluted. See module docs.
-pub fn backprop(arena: &mut MctsArena, path: &[u32], leaf_seat: u8, v: f32) {
-    crate::profiling::time(&crate::profiling::BACKPROP, || {
-        for &idx in path {
-            let node = arena.node_mut(idx);
-            node.visit_count += 1;
-            node.value_sums[leaf_seat as usize] += v;
-            node.value_counts[leaf_seat as usize] += 1;
-        }
-    })
-}
-
-/// Backpropagate a per-seat terminal value vector along every node in
-/// `path` (root → leaf inclusive). Increments `visit_count` once per
-/// node and adds `values[s]` to `value_sums[s]` for every active seat
-/// `s ∈ 0..num_players`.
-///
-/// Terminal leaves have ground truth for **every** seat (z-scored from
-/// the actual scores), so per-seat credit is correct
-/// — unlike network leaves where only one perspective is known and
-/// [`backprop`] credits the leaf seat only.
-///
-/// Slots beyond `num_players` are left untouched even if `values[s]`
-/// contains a nonzero entry there (defensive — [`crate::scoring::terminal_z_scores`]
-/// always zeroes them, so this is just a safety net).
-pub fn backprop_terminal(
-    arena: &mut MctsArena,
-    path: &[u32],
-    values: &[f32; MAX_PLAYERS],
-    num_players: u8,
-) {
+/// Back up one simulation along `path` (root → leaf inclusive): count the
+/// visit and add `utilities[s]` to every active seat's sum at every node.
+/// Slots `>= num_players` are left untouched.
+pub fn backup(arena: &mut MctsArena, path: &[u32], utilities: &[f32; MAX_PLAYERS], num_players: u8) {
     crate::profiling::time(&crate::profiling::BACKPROP, || {
         let n = (num_players as usize).min(MAX_PLAYERS);
         for &idx in path {
             let node = arena.node_mut(idx);
             node.visit_count += 1;
-            for s in 0..n {
-                node.value_sums[s] += values[s];
-                node.value_counts[s] += 1;
+            for (sum, u) in node.value_sums[..n].iter_mut().zip(utilities) {
+                *sum += u;
             }
         }
     })
-}
-
-/// Run `num_simulations` MCTS iterations against `root_state`.
-///
-/// Each iteration: walk from the root picking UCB1-best children (using
-/// the acting seat stored in a replayed `BlobState`), evaluate the leaf
-/// with `eval`, expand it, and backpropagate the value. Terminal leaves
-/// skip expansion and backprop the evaluator's value as-is.
-///
-/// The initial root expansion is performed inside the first simulation
-/// (path is just `[0]` when the tree is empty).
-pub fn run_search<E: Evaluator + ?Sized>(
-    arena: &mut MctsArena,
-    root_state: &BlobState,
-    eval: &E,
-    num_simulations: u32,
-    c_puct: f32,
-) {
-    for _ in 0..num_simulations {
-        let mut state = *root_state;
-        let mut path: Vec<u32> = Vec::with_capacity(16);
-        let mut idx: u32 = 0;
-        path.push(idx);
-
-        // Walk from root. At each step:
-        //  - terminal → stop, terminal backprop downstream.
-        //  - expanded → UCB1-best child (acting seat read from
-        //    `state.current_player`, the seat that will act *from* this
-        //    node).
-        //  - unexpanded but forced (exactly one legal action) → forced-move
-        //    fast-path: synthesize a placeholder child with `prior=1.0`
-        //    inline and keep descending. No NN call.
-        //  - unexpanded and multi-legal → stop, fall through to NN eval.
-        loop {
-            if is_terminal(&state) {
-                break;
-            }
-            if arena.node(idx).is_expanded() {
-                let acting = state.current_player;
-                let child_idx = select_best_child(arena, idx, acting, c_puct);
-                let action = arena.node(child_idx).action;
-                apply_action(&mut state, action);
-                idx = child_idx;
-                path.push(idx);
-                continue;
-            }
-            if let Some(action) = forced_action(&state) {
-                let child_idx = arena.alloc(1.0, action);
-                arena.node_mut(idx).children.push(child_idx);
-                apply_action(&mut state, action);
-                idx = child_idx;
-                path.push(idx);
-                continue;
-            }
-            break;
-        }
-
-        // Terminal leaves backprop the per-seat z-scored real outcome
-        // (same scale as the value target), and credit lands on every
-        // active seat — not just `leaf_seat` — since ground truth exists
-        // for all of them. The single-perspective `backprop` is still
-        // used for network leaves where the value comes from one seat's
-        // eval only.
-        if is_terminal(&state) {
-            let z = crate::scoring::terminal_z_scores(&state);
-            backprop_terminal(arena, &path, &z, state.num_players);
-        } else {
-            let (policy, value) = eval.evaluate(&state);
-            let leaf_seat = state.current_player;
-            expand(arena, idx, &state, &policy);
-            backprop(arena, &path, leaf_seat, value);
-        }
-    }
 }
 
 /// Walk from the root of `arena` along UCB1-best children, replaying
 /// actions on a clone of `root_state`, until reaching either an
 /// unexpanded multi-legal node or a terminal state. Returns
 /// `(leaf_idx, path, leaf_state)` where `path` includes both endpoints
-/// (root and leaf inclusive). Mirrors the per-sim descent inside
-/// `run_search` exactly so callers can round-trip through batched
-/// evaluation without changing semantics.
+/// (root and leaf inclusive).
 ///
-/// **Forced-move fast-path:** when descent lands on an
-/// unexpanded node whose state has exactly one legal action, the
-/// placeholder child is allocated inline with `prior = 1.0` and descent
-/// continues — no NN evaluation is queued for the forced node. The
-/// returned leaf is therefore guaranteed to be either terminal or
-/// multi-legal-unexpanded; both are valid eval candidates and the
-/// existing terminal-vs-eval dispatch in `run_lockstep_search` handles
-/// them without further changes. Takes `&mut MctsArena` because the
-/// fast-path allocates placeholder nodes during descent.
+/// **Forced-move fast-path:** when descent lands on an unexpanded node
+/// whose state has exactly one legal action, the placeholder child is
+/// allocated inline with `prior = 1.0` and descent continues — no network
+/// call is queued for the forced node. The returned leaf is therefore
+/// either terminal or multi-legal-unexpanded. Takes `&mut MctsArena`
+/// because the fast-path allocates placeholder nodes during descent.
 pub fn select_leaf_state(
     arena: &mut MctsArena,
     root_state: &BlobState,
@@ -533,80 +391,97 @@ pub fn select_leaf_state(
     }
 }
 
-/// Generalized lockstep search across multiple determinization trees with
-/// a configurable per-`evaluate_batch` target leaf count.
+/// Run `num_simulations` simulations on one tree, one leaf at a time.
 ///
-/// Plain cross-det batching takes one descent per det per step, so the
-/// batch size is capped at `num_dets`. This function raises the cap to
-/// `target_batch`, queueing additional descents *within* the same det's
-/// tree behind a virtual-loss decoration so concurrent descents pick
-/// different leaves.
+/// Each simulation descends with [`select_leaf_state`]. A terminal leaf
+/// backs up the exact utilities; any other leaf is expanded with the
+/// policy's priors and backs up the utilities of the value net's ŝ. The
+/// first simulation expands the root.
+///
+/// Reads `cfg.c_puct` and `cfg.lambda`. Search proper runs
+/// [`run_lockstep_search`] over many trees; this is its serial reference.
+pub fn run_search<P, V>(
+    arena: &mut MctsArena,
+    root_state: &BlobState,
+    policy: &P,
+    value: &V,
+    num_simulations: u32,
+    cfg: &MctsConfig,
+) where
+    P: PolicyEvaluator + ?Sized,
+    V: ValueEvaluator + ?Sized,
+{
+    for _ in 0..num_simulations {
+        let (leaf_idx, path, state) = select_leaf_state(arena, root_state, cfg.c_puct);
+        let u = if is_terminal(&state) {
+            terminal_utilities(&state, cfg.lambda)
+        } else {
+            expand(arena, leaf_idx, &state, &policy.policy(&state));
+            utilities(&value.values(&state), state.num_players, cfg.lambda)
+        };
+        backup(arena, &path, &u, state.num_players);
+    }
+}
+
+/// Lockstep search across several trees (one per sampled deal), batching
+/// their leaves into shared network calls of up to `cfg.target_batch`
+/// states.
 ///
 /// Driver loop:
 ///
-/// 1. Round-robin pick the not-yet-exhausted det with the fewest
-///    sims-so-far. Tie break on lowest det index, so with
-///    `target_batch >= num_dets` the first batch fills as
-///    `[det 0, det 1, …, det num_dets-1, det 0, det 1, …]` — the same
-///    order plain cross-det batching uses.
-/// 2. Walk root → unexpanded leaf using the standard UCB1 scorer, which
-///    already reads `MctsNode::in_flight` so descents already in this
-///    batch bias subsequent descents away from their paths.
-/// 3. Terminal leaves backprop the per-seat z-scored outcome from
-///    [`crate::scoring::terminal_z_scores`] via [`backprop_terminal`]
-///    immediately (no eval, no `in_flight` decoration), matching
-///    `run_search`.
-/// 4. Non-terminal leaves: increment `in_flight` along the path and push
-///    onto the pending batch.
+/// 1. Round-robin pick the not-yet-exhausted tree with the fewest
+///    simulations so far, ties to the lowest index, so with
+///    `target_batch >= trees` the first batch fills as
+///    `[tree 0, tree 1, …, tree 0, tree 1, …]`.
+/// 2. Walk root → leaf with [`select_leaf_state`]; UCB1 reads
+///    `MctsNode::in_flight`, so descents already in this batch steer
+///    later ones away from their paths.
+/// 3. Terminal leaves back up their exact utilities immediately (no
+///    network call, no `in_flight` decoration).
+/// 4. Other leaves bump `in_flight` along the path and join the batch.
 /// 5. **Cold-start duplicate guard.** If a fresh descent lands on a leaf
-///    whose `in_flight > 0` (only possible while a det's root is still
+///    whose `in_flight > 0` (only possible while a tree's root is still
 ///    unexpanded — virtual loss can't redirect *through* an unexpanded
-///    node), mark that det blocked for this batch and try the next. The
-///    blocked det is unblocked once eval runs and its root is expanded.
-/// 6. When `pending.len() == target_batch` (or every eligible det is
-///    exhausted/blocked), call `evaluate_batch`, decrement `in_flight`
-///    along each pending path, expand, and backprop in queue order.
+///    node), that tree sits out the rest of this batch.
+/// 6. When the batch is full (or every eligible tree is exhausted or
+///    sitting out), call the policy and value evaluators once each on the
+///    whole batch, then, leaf by leaf in queue order: undo `in_flight`,
+///    expand with the priors, back up the value net's utilities.
 ///
-/// **Special cases for callers / tests:**
-/// - `target_batch = 1`: only one descent in flight at a time, so
-///   virtual loss never engages and the per-det node sequence matches
-///   `run_search` bit-for-bit on the same inputs (pinned by
-///   `target_batch_one_matches_serial_per_det`).
-/// - `target_batch = num_dets`: at most one descent per det per outer
-///   iteration, so virtual loss again never engages and per-det node
-///   sequences match `run_search` bit-for-bit (pinned by
-///   `lockstep_search_matches_serial_per_det`).
-/// - `target_batch > num_dets`: virtual loss biases concurrent descents
-///   inside the same det's tree away from each other. Visit-count
-///   distributions on identical inputs will *not* match serial MCTS — the
-///   policy target is the visit distribution either way and softmax
-///   absorbs small biases.
+/// **Special cases:**
+/// - `target_batch = 1`: one descent in flight at a time, so each tree's
+///   node sequence matches [`run_search`] bit-for-bit.
+/// - `target_batch = trees`: at most one descent per tree per batch, so
+///   virtual loss never engages and node sequences again match
+///   [`run_search`]. Both are pinned by `lockstep_search_matches_serial_per_det`.
+/// - `target_batch > trees`: virtual loss steers concurrent descents inside
+///   one tree apart, so visit counts no longer match serial search.
 ///
-/// Post-condition: every node in every arena has `in_flight == 0` (every
-/// path that incremented it ran the matching decrement before backprop).
-/// `debug_assert!`ed at the end so a future bug in path bookkeeping fails
-/// loudly in tests.
-pub fn run_lockstep_search<E: Evaluator + ?Sized>(
+/// Post-condition: every node in every arena has `in_flight == 0`;
+/// `debug_assert!`ed at the end so a path-bookkeeping bug fails loudly.
+pub fn run_lockstep_search<P, V>(
     arenas: &mut [MctsArena],
     root_states: &[BlobState],
-    eval: &E,
+    policy: &P,
+    value: &V,
     num_simulations: u32,
-    c_puct: f32,
-    target_batch: usize,
-) {
+    cfg: &MctsConfig,
+) where
+    P: PolicyEvaluator + ?Sized,
+    V: ValueEvaluator + ?Sized,
+{
     debug_assert_eq!(arenas.len(), root_states.len());
     let num_dets = arenas.len();
     if num_dets == 0 || num_simulations == 0 {
         return;
     }
-    let target_batch = target_batch.max(1);
+    let target_batch = cfg.target_batch.max(1);
 
     struct Pending {
         det: usize,
         leaf_idx: u32,
         path: Vec<u32>,
         leaf_state: BlobState,
-        leaf_seat: u8,
     }
 
     let mut pending: Vec<Pending> = Vec::with_capacity(target_batch);
@@ -623,14 +498,7 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
         }
 
         // Fill one batch.
-        loop {
-            if pending.len() >= target_batch {
-                break;
-            }
-            // Round-robin: pick the lowest-sims_done det that's neither
-            // exhausted nor blocked-this-batch. `min_by_key` ties on the
-            // first match, which gives det-index-ascending order at any
-            // tied sims count — preserving the plain cross-det fill order.
+        while pending.len() < target_batch {
             let next_det = (0..num_dets)
                 .filter(|&d| sims_done[d] < num_simulations && !blocked[d])
                 .min_by_key(|&d| sims_done[d]);
@@ -639,38 +507,19 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
             };
 
             let (leaf_idx, path, leaf_state) =
-                select_leaf_state(&mut arenas[det], &root_states[det], c_puct);
-            let leaf_seat = leaf_state.current_player;
+                select_leaf_state(&mut arenas[det], &root_states[det], cfg.c_puct);
 
             if is_terminal(&leaf_state) {
-                // Terminal leaves never need eval or expand; backprop the
-                // per-seat z-scored real outcome (multi-seat credit,
-                // scale-aligned with the value target) immediately.
-                // Matches `run_search`'s terminal path. `leaf_seat` is
-                // unused here because credit lands on every active seat —
-                // only the non-terminal branch below still needs it (for
-                // the single-perspective `backprop` after `evaluate_batch`).
-                // No `in_flight` decoration since nothing was queued.
-                let z = crate::scoring::terminal_z_scores(&leaf_state);
-                backprop_terminal(
-                    &mut arenas[det],
-                    &path,
-                    &z,
-                    leaf_state.num_players,
-                );
+                let u = terminal_utilities(&leaf_state, cfg.lambda);
+                backup(&mut arenas[det], &path, &u, leaf_state.num_players);
                 sims_done[det] += 1;
                 continue;
             }
 
-            // Cold-start duplicate: an unexpanded root is reachable
-            // through itself (the descent loop bails at the first
-            // unexpanded node), so a second descent into the same det
-            // before its root expansion lands on the same leaf. UCB1's
-            // virtual-loss bias only redirects *between expanded
-            // siblings*, so the only fix is to skip this det until the
-            // pending batch flushes and its root is expanded. (Once the
-            // first batch returns, every root is expanded and the
-            // descent loop can use VL bias to diverge.)
+            // Cold-start duplicate: an unexpanded root is reachable only
+            // through itself, so a second descent before its expansion
+            // lands on the same leaf. Virtual loss only redirects between
+            // expanded siblings, so skip this tree until the batch flushes.
             if arenas[det].node(leaf_idx).in_flight > 0 {
                 blocked[det] = true;
                 continue;
@@ -679,47 +528,34 @@ pub fn run_lockstep_search<E: Evaluator + ?Sized>(
             for &n in &path {
                 arenas[det].node_mut(n).in_flight += 1;
             }
-            pending.push(Pending {
-                det,
-                leaf_idx,
-                path,
-                leaf_state,
-                leaf_seat,
-            });
+            pending.push(Pending { det, leaf_idx, path, leaf_state });
             sims_done[det] += 1;
         }
 
         if pending.is_empty() {
-            // Either every det is exhausted (outer `break` next iter) or
-            // every fill attempt this round resolved to a terminal leaf
-            // (sims_done already advanced by those). Either way, no eval
-            // call needed.
+            // Every tree is exhausted, or every descent this round ended
+            // at a terminal leaf (already backed up).
             continue;
         }
 
-        let states_ref: Vec<&BlobState> = pending.iter().map(|p| &p.leaf_state).collect();
-        let results = eval.evaluate_batch(&states_ref);
-        debug_assert_eq!(results.len(), pending.len());
+        let states: Vec<&BlobState> = pending.iter().map(|p| &p.leaf_state).collect();
+        let priors = policy.policy_batch(&states);
+        let values = value.values_batch(&states);
+        debug_assert_eq!((priors.len(), values.len()), (pending.len(), pending.len()));
 
-        for (p, (policy, value)) in pending.drain(..).zip(results.into_iter()) {
-            // Decrement in_flight *before* expand+backprop so the real
-            // visit replaces the virtual one cleanly. Order matters: the
-            // arenas being mutated are owned single-threaded so there is
-            // no race, but a future reader stepping through expansion
-            // order should see consistent counters.
+        for ((p, prior), v) in pending.drain(..).zip(priors).zip(values) {
+            // Undo the virtual visit before the real one lands.
             for &n in &p.path {
                 arenas[p.det].node_mut(n).in_flight -= 1;
             }
-            expand(&mut arenas[p.det], p.leaf_idx, &p.leaf_state, &policy);
-            backprop(&mut arenas[p.det], &p.path, p.leaf_seat, value);
+            let n = p.leaf_state.num_players;
+            expand(&mut arenas[p.det], p.leaf_idx, &p.leaf_state, &prior);
+            backup(&mut arenas[p.det], &p.path, &utilities(&v, n, cfg.lambda), n);
         }
     }
 
-    // Sanity: every virtual visit must have a matching decrement.
     debug_assert!(
-        arenas
-            .iter()
-            .all(|a| a.nodes.iter().all(|n| n.in_flight == 0)),
+        arenas.iter().all(|a| a.nodes.iter().all(|n| n.in_flight == 0)),
         "lockstep search left non-zero in_flight on some node",
     );
 }
@@ -794,6 +630,10 @@ pub fn root_action_probs(arena: &MctsArena, tau: f32) -> Vec<(u8, f32)> {
 
 fn default_target_batch() -> usize {
     DEFAULT_TARGET_BATCH
+}
+
+fn default_lambda() -> f32 {
+    DEFAULT_LAMBDA
 }
 
 fn default_root_dirichlet_alpha() -> f32 {
@@ -884,23 +724,21 @@ pub fn apply_root_dirichlet_noise<R: Rng + ?Sized>(
 
 /// Per-decision temperature schedule. When set, the effective τ used by
 /// `mcts_search` to convert root visit counts into the
-/// **action-sampling** distribution depends on the global decision index
-/// within the game (one increment per `mcts_search` call, covering both
-/// bid and play decisions of every seat — forced moves included, since
-/// each forced move still flows through one `mcts_search` call).
+/// **action-sampling** distribution depends on the decision index the
+/// caller passes (e.g. the decision's number within its round, forced
+/// moves included).
 ///
 /// Note: the τ-schedule applies **only** to `MctsResult.policy_sampling`.
 /// `MctsResult.policy_target` is held at τ=1 (proportional
 /// to visit counts) so the policy head trains against the full
-/// MCTS-visit distribution regardless of late-game sampling sharpness.
+/// search-visit distribution regardless of late sampling sharpness.
 /// Canonical AlphaZero: τ=1 for the target, τ→0 for sampling after the
 /// opening.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TemperatureSchedule {
     /// τ = `early` for `decision_index < switch_at`, otherwise `late`.
-    /// Suggested values: `early = 1.0`, `late = 0.1`,
-    /// `switch_at = 15`. AlphaZero-style hard step.
+    /// AlphaZero-style hard step.
     HardStep {
         early: f32,
         late: f32,
@@ -909,7 +747,7 @@ pub enum TemperatureSchedule {
 }
 
 impl TemperatureSchedule {
-    /// Resolve the effective τ for a given global decision index.
+    /// Resolve the effective τ for a given decision index.
     pub fn temperature_at(&self, decision_index: usize) -> f32 {
         match *self {
             TemperatureSchedule::HardStep {
@@ -927,10 +765,36 @@ impl TemperatureSchedule {
     }
 }
 
+/// How much search one decision gets: `determinizations` sampled deals,
+/// one tree each, with `sims_per_determinization` simulations per tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchBudget {
+    pub determinizations: u32,
+    pub sims_per_determinization: u32,
+}
+
+impl SearchBudget {
+    pub const fn new(determinizations: u32, sims_per_determinization: u32) -> Self {
+        Self { determinizations, sims_per_determinization }
+    }
+}
+
+impl std::fmt::Display for SearchBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}", self.determinizations, self.sims_per_determinization)
+    }
+}
+
+/// Default bid budget, 20 × 25: a bid's value depends mostly on the hidden
+/// cards, so more sampled deals and fewer simulations (gen-2.md §5.4).
+pub const DEFAULT_BID_BUDGET: SearchBudget = SearchBudget::new(20, 25);
+
+/// Default play budget, 5 × 100 as in gen 1, until measurements say
+/// otherwise (gen-2.md §5.4).
+pub const DEFAULT_PLAY_BUDGET: SearchBudget = SearchBudget::new(5, 100);
+
 /// Search-time configuration threaded through `mcts_search`.
-///
-/// Defaults give `5 × 100 = 500 sims` with a hard floor of 60 total
-/// simulations for any non-forced decision.
 ///
 /// Unknown keys are an error, so a typo or a stale config can't half-load
 /// (gen-2.md §4).
@@ -938,51 +802,40 @@ impl TemperatureSchedule {
 #[serde(deny_unknown_fields)]
 pub struct MctsConfig {
     pub c_puct: f32,
-    /// Default determinizations per decision; `adaptive_budget` may
-    /// raise this to satisfy per-branching-factor floors.
-    pub num_determinizations: u32,
-    /// Default simulations per determinization; `adaptive_budget` may
-    /// raise this too.
-    pub sims_per_determinization: u32,
-    /// Hard absolute floor on `num_determinizations * sims_per_det`.
-    /// Gen 0 (Python) showed that starving MCTS produces no
-    /// learning signal — this floor blocks that failure mode.
-    pub min_sims_floor: u32,
+    /// λ of the per-round utility (`scoring.rs`): the weight of the other
+    /// seats' mean ŝ. 1 = my points minus the table's (default); 0 = my
+    /// points only. Optional in config files.
+    #[serde(default = "default_lambda")]
+    pub lambda: f32,
+    /// Search for bids.
+    pub bid_budget: SearchBudget,
+    /// Search for card plays.
+    pub play_budget: SearchBudget,
     /// Constant temperature, used when `temperature_schedule` is `None`.
     /// Call sites read it through `MctsConfig::temperature_at`.
     pub temperature: f32,
-    /// Optional per-decision schedule. When `Some`,
-    /// overrides `temperature` and `mcts_search` resolves τ from the
-    /// schedule using the `decision_index` argument. Optional in config
-    /// files.
+    /// Optional per-decision schedule. When `Some`, overrides
+    /// `temperature` and `mcts_search` resolves τ from the schedule using
+    /// the `decision_index` argument. Optional in config files.
     #[serde(default)]
     pub temperature_schedule: Option<TemperatureSchedule>,
     pub arena_capacity: usize,
-    /// Target leaves per batched `evaluate` call.
-    /// The lockstep driver fills each batch round-robin from all dets,
-    /// using virtual loss to redirect concurrent descents inside the
-    /// same det's tree away from each other. `1` degenerates to fully
-    /// serial MCTS (one leaf per eval, no VL bias possible — pinned by
-    /// `target_batch_one_matches_serial_per_det`). `num_determinizations`
-    /// gives plain cross-det batching and is the default
-    /// (`DEFAULT_TARGET_BATCH`, gen-2.md §3.2). Optional in config files.
+    /// Target leaves per batched network call (see
+    /// [`DEFAULT_TARGET_BATCH`] and [`run_lockstep_search`]). `1`
+    /// degenerates to fully serial search. Optional in config files.
     #[serde(default = "default_target_batch")]
     pub target_batch: usize,
-    /// Dirichlet concentration α used to inject exploration noise into
-    /// root priors before search. When
-    /// `<= 0` the heuristic `α = 10 / num_legal` is used per call —
-    /// DeepMind's scaling rule, more robust across Blob's variable
-    /// branching (5 plays … 14 bids). A fixed value (e.g. 0.3) is also
-    /// supported. Mixing weight is controlled by
-    /// `root_dirichlet_epsilon`; noise is fully disabled whenever
-    /// `epsilon <= 0`, so leaving this at the default with epsilon=0
-    /// keeps root priors noise-free.
+    /// Dirichlet concentration α of the root-prior noise. When `<= 0` the
+    /// heuristic `α = 10 / num_legal` is used per call — DeepMind's scaling
+    /// rule, more robust across Blob's variable branching (2 plays … 14
+    /// bids). Noise is off whenever `root_dirichlet_epsilon <= 0`.
+    /// Optional in config files.
     #[serde(default = "default_root_dirichlet_alpha")]
     pub root_dirichlet_alpha: f32,
     /// Mixing weight ε for root Dirichlet noise:
-    /// `P'(a) = (1 − ε) · P(a) + ε · η(a)`. AlphaZero default is 0.25;
-    /// any value `<= 0` disables noise injection entirely. Per-det
-    /// (each determinization tree gets its own η sample).
+    /// `P'(a) = (1 − ε) · P(a) + ε · η(a)`. AlphaZero uses 0.25; any value
+    /// `<= 0` disables noise. Each tree draws its own η. Optional in config
+    /// files.
     #[serde(default = "default_root_dirichlet_epsilon")]
     pub root_dirichlet_epsilon: f32,
 }
@@ -996,15 +849,23 @@ impl MctsConfig {
             None => self.temperature,
         }
     }
+
+    /// The budget of a decision in `phase` (bidding or playing).
+    pub fn budget(&self, phase: GamePhase) -> SearchBudget {
+        match phase {
+            GamePhase::Bidding => self.bid_budget,
+            _ => self.play_budget,
+        }
+    }
 }
 
 impl Default for MctsConfig {
     fn default() -> Self {
         Self {
             c_puct: DEFAULT_C_PUCT,
-            num_determinizations: 5,
-            sims_per_determinization: 100,
-            min_sims_floor: 60,
+            lambda: DEFAULT_LAMBDA,
+            bid_budget: DEFAULT_BID_BUDGET,
+            play_budget: DEFAULT_PLAY_BUDGET,
             temperature: 1.0,
             temperature_schedule: None,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
@@ -1017,70 +878,41 @@ impl Default for MctsConfig {
 
 /// Aggregated result of an `mcts_search` call.
 ///
-/// Both `policy_target` and `policy_sampling` are dense vectors indexed
+/// The policy vectors and `root_prior` / `action_values` are dense, indexed
 /// by the phase's canonical action space: bids 0..14 in `Bidding`,
 /// hand-card positions (per `EncodedState::hand_card_indices`) in
 /// `Playing`.
 ///
 /// The training target and the action-sampling distribution are
-/// deliberately decoupled —
+/// deliberately decoupled:
 ///
 /// - **`policy_target`** is always computed at τ = 1.0 from aggregated
-///   root visit counts (`v_i / Σ v`). This is the training label and
-///   the diagnostic signal `visit_entropy` / `top1_visit_share` are
-///   computed from it. Keeping the target at τ=1 preserves entropy in
-///   the policy head's training signal even when the late-game sampler
-///   is sharp.
+///   root visit counts (`v_i / Σ v`). This is the training label, and
+///   `visit_entropy` / `top1_visit_share` are computed from it. Keeping the
+///   target at τ=1 preserves entropy in the policy's training signal even
+///   when the sampler is sharp.
 /// - **`policy_sampling`** is computed at
-///   `cfg.temperature_at(decision_index)`. Used only for action
-///   sampling in self-play (or by callers that override the cfg for
-///   greedy eval). At τ→0 this collapses to one-hot on the argmax-visit
-///   action. These two were once a single fused field, which
-///   meant the τ-schedule collapsed both — a gen-1 run regressed
-///   strength because of this fusion.
-///
-/// `visit_entropy`, `top1_visit_share`, and `value_estimate` are
-/// diagnostic signals.
+///   `cfg.temperature_at(decision_index)`. Used only for action sampling in
+///   self-play. At τ→0 this collapses to one-hot on the most-visited
+///   action. These two were once a single fused field, which meant the
+///   τ-schedule collapsed both — a gen-1 run regressed strength because of
+///   this fusion.
 #[derive(Debug, Clone)]
 pub struct MctsResult {
     pub policy_target: Vec<f32>,
     pub policy_sampling: Vec<f32>,
-    /// Root prior per action, indexed like `policy_target`, averaged over
-    /// the determinizations (after root noise, when on). Breaks visit ties
-    /// for greedy play.
+    /// Root prior per action, averaged over the sampled deals (after root
+    /// noise, when on). Breaks visit ties for greedy play.
     pub root_prior: Vec<f32>,
+    /// The deciding seat's mean utility per action, over every visit to it
+    /// in every tree; 0 for unvisited actions.
+    pub action_values: Vec<f32>,
     pub visit_entropy: f32,
     pub top1_visit_share: f32,
     pub total_visits: u32,
+    /// The deciding seat's mean utility at the roots, averaged over the
+    /// sampled deals.
     pub value_estimate: f32,
-}
-
-/// Pick per-decision `(num_determinizations, sims_per_determinization)`.
-///
-/// Reads `cfg.num_determinizations` and `cfg.sims_per_determinization`
-/// directly (since 2026-05-17): the previous implementation hardcoded
-/// `5 × 100 = 500` for every non-forced decision, so TOML overrides were
-/// silently ignored. An earlier bucketed schedule (60 / 90 sims at
-/// `nl ∈ {2, 3}`) starved low-branching decisions, so the practical floor
-/// remains 5 × 100 (gen-2.md §3.3), but the budget is now config-driven for
-/// diagnostics and future sweeps. Forced moves (`num_legal ≤ 1`) still
-/// short-circuit with `(1, 0)` so `mcts_search` can skip the tree.
-///
-/// `min_sims_floor` remains as a safety net in case a future config
-/// lowers these numbers.
-pub fn adaptive_budget(num_legal: usize, cfg: &MctsConfig) -> (u32, u32) {
-    if num_legal <= 1 {
-        return (1, 0);
-    }
-    let dets = cfg.num_determinizations.max(1);
-    let mut sims = cfg.sims_per_determinization;
-
-    let total = dets.saturating_mul(sims);
-    if total < cfg.min_sims_floor {
-        let needed = cfg.min_sims_floor.div_ceil(dets);
-        sims = sims.max(needed);
-    }
-    (dets, sims)
 }
 
 /// Shannon entropy of a probability vector (base e). Zero probabilities
@@ -1098,7 +930,8 @@ fn entropy(p: &[f32]) -> f32 {
 
 /// Normalized signal quality: `1 - H(policy) / ln(num_legal)`. Zero when
 /// the policy is uniform over legal actions, one when the policy is a
-/// delta function.
+/// delta function. Measures decisiveness, not correctness: read it only
+/// next to the bench (gen-2.md §5.7).
 pub fn signal_ratio(result: &MctsResult, num_legal: usize) -> f32 {
     if num_legal <= 1 {
         return 1.0;
@@ -1128,21 +961,26 @@ fn action_to_policy_index(
     }
 }
 
-/// Full multi-determinization MCTS search with diagnostics.
+/// Full search over sampled deals, with diagnostics.
 ///
-/// For each of `adaptive_budget`-selected determinizations, sample
-/// opponent hands consistent with void beliefs, run a fresh tree, and
-/// aggregate root visit counts into a single dense policy. Temperature, entropy, and
-/// top-1 share come from the aggregate, not per-tree.
-pub fn mcts_search<E, R>(
+/// The phase's budget (`cfg.budget`) sets how many deals are sampled for
+/// the hidden hands, consistent with known voids, and how many simulations
+/// each deal's tree gets. The trees run in lockstep ([`run_lockstep_search`])
+/// and their root visit counts are summed into one dense policy.
+/// Temperature, entropy and top-1 share come from the sum, not per tree.
+///
+/// A forced move returns at once, with no tree and no network call.
+pub fn mcts_search<P, V, R>(
     state: &BlobState,
-    eval: &E,
+    policy: &P,
+    value: &V,
     cfg: &MctsConfig,
     rng: &mut R,
     decision_index: usize,
 ) -> MctsResult
 where
-    E: Evaluator + ?Sized,
+    P: PolicyEvaluator + ?Sized,
+    V: ValueEvaluator + ?Sized,
     R: Rng + ?Sized,
 {
     crate::profiling::time(&crate::profiling::MCTS_SEARCH, || {
@@ -1152,6 +990,7 @@ where
                 policy_target: Vec::new(),
                 policy_sampling: Vec::new(),
                 root_prior: Vec::new(),
+                action_values: Vec::new(),
                 visit_entropy: 0.0,
                 top1_visit_share: 0.0,
                 total_visits: 0,
@@ -1162,45 +1001,30 @@ where
         let perspective = state.current_player;
 
         // Canonical action space + forced-move detection.
-        let (policy_len, hand_card_indices, num_legal, forced_action) = match phase {
+        let (policy_len, hand_card_indices, num_legal) = match phase {
             GamePhase::Bidding => {
-                let mask = legal_bids(state);
-                let n = mask.count_ones() as usize;
-                let forced = if n == 1 {
-                    Some(mask.trailing_zeros() as u8)
-                } else {
-                    None
-                };
-                (NUM_BIDS, SmallVec::<[u8; 13]>::new(), n, forced)
+                (NUM_BIDS, SmallVec::<[u8; 13]>::new(), legal_bids(state).count_ones() as usize)
             }
             GamePhase::Playing => {
                 let hand = hand_card_indices(state, perspective);
-                let legal = legal_plays(state);
-                let n = legal.count_ones() as usize;
-                let forced = if n == 1 {
-                    Some(legal.trailing_zeros() as u8)
-                } else {
-                    None
-                };
-                (hand.len(), hand, n, forced)
+                (hand.len(), hand, legal_plays(state).count_ones() as usize)
             }
             _ => unreachable!(),
         };
 
-        // Forced move: skip MCTS entirely. Signal ratio is 1 by convention.
-        // Both target and sampling distributions are one-hot on the only
-        // legal action — there is no τ-dependent decision to make.
-        if num_legal == 1 {
+        // Forced move: skip search entirely. Both target and sampling
+        // distributions are one-hot on the only legal action — there is no
+        // τ-dependent decision to make.
+        if let Some(action) = forced_action(state) {
             let mut policy = vec![0.0f32; policy_len];
-            if let Some(action) = forced_action {
-                if let Some(idx) = action_to_policy_index(phase, action, &hand_card_indices) {
-                    policy[idx] = 1.0;
-                }
+            if let Some(idx) = action_to_policy_index(phase, action, &hand_card_indices) {
+                policy[idx] = 1.0;
             }
             return MctsResult {
                 policy_target: policy.clone(),
                 policy_sampling: policy.clone(),
                 root_prior: policy,
+                action_values: vec![0.0; policy_len],
                 visit_entropy: 0.0,
                 top1_visit_share: 1.0,
                 total_visits: 0,
@@ -1208,113 +1032,72 @@ where
             };
         }
 
-        let (num_dets, sims_per) = adaptive_budget(num_legal, cfg);
+        let budget = cfg.budget(phase);
+        let num_dets = budget.determinizations.max(1) as usize;
+        let sims_per = budget.sims_per_determinization.max(1);
         let voids = void_suits(state);
 
-        // Target-batch lockstep with virtual loss.
-        //
-        // Allocate every det's state and arena up front, then drive in
-        // lockstep — each batch fills up to `cfg.target_batch` leaves
-        // round-robin across dets, using virtual loss to redirect
-        // multiple descents inside the same det's tree away from each
-        // other. Terminal leaves are backpropagated immediately with their
-        // exact per-seat values (`backprop_terminal`; no expand needed, no
-        // in_flight decoration). At
-        // `target_batch == cfg.num_determinizations` this degenerates to
-        // plain cross-det batching (one descent per det per batch, no VL engagement); at
-        // `target_batch == 1` it degenerates to fully serial MCTS.
-        let mut det_states: Vec<BlobState> = Vec::with_capacity(num_dets as usize);
-        let mut arenas: Vec<MctsArena> = Vec::with_capacity(num_dets as usize);
+        // One sampled deal and one arena per tree, driven in lockstep.
+        let mut det_states: Vec<BlobState> = Vec::with_capacity(num_dets);
+        let mut arenas: Vec<MctsArena> = Vec::with_capacity(num_dets);
         for _ in 0..num_dets {
-            let det_state =
-                determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
-            det_states.push(det_state);
+            det_states.push(determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS));
             arenas.push(MctsArena::with_capacity(perspective, cfg.arena_capacity));
         }
 
-        // Root Dirichlet noise: when
-        // enabled, pre-expand each det's root via a single batched eval
-        // call so we can decorate the network priors with
-        // `(1−ε)·P + ε·Dir(α)` before any UCB1 selection runs. The
-        // pre-step accounts for one simulation per det (matches what
-        // the first lockstep descent would have done anyway), so we
-        // pass `sims_per - 1` to `run_lockstep_search` to keep the
-        // total sim budget unchanged. Disabled when `epsilon <= 0` or
-        // `sims_per == 0` (forced-move branch is already short-circuited
-        // above, so this safeguards adaptive_budget edge cases).
-        let noise_on = cfg.root_dirichlet_epsilon > 0.0 && sims_per > 0;
+        // Root Dirichlet noise: expand every root with one batched call
+        // first, so the priors can be decorated with `(1−ε)·P + ε·Dir(α)`
+        // before any selection runs. That counts as each tree's first
+        // simulation (the one that would have expanded the root anyway), so
+        // the lockstep run gets one fewer.
+        let noise_on = cfg.root_dirichlet_epsilon > 0.0;
         let effective_sims = if noise_on {
-            // Resolve α: heuristic (10 / num_legal) when config sets a
-            // non-positive sentinel, fixed value otherwise.
             let alpha = if cfg.root_dirichlet_alpha > 0.0 {
                 cfg.root_dirichlet_alpha
             } else {
                 (10.0 / num_legal.max(1) as f32).max(1e-3)
             };
-            let states_ref: Vec<&BlobState> = det_states.iter().collect();
-            let results = eval.evaluate_batch(&states_ref);
-            debug_assert_eq!(results.len(), det_states.len());
-            for (det_idx, (policy, value)) in results.into_iter().enumerate() {
-                expand(&mut arenas[det_idx], 0, &det_states[det_idx], &policy);
-                apply_root_dirichlet_noise(
-                    &mut arenas[det_idx],
-                    0,
-                    alpha,
-                    cfg.root_dirichlet_epsilon,
-                    rng,
-                );
-                // Root visit is acted on by `perspective`; mirrors what
-                // `run_search`/`run_lockstep_search` would record on the
-                // first descent that hits the unexpanded root.
-                backprop(&mut arenas[det_idx], &[0], perspective, value);
+            let roots: Vec<&BlobState> = det_states.iter().collect();
+            let priors = policy.policy_batch(&roots);
+            let values = value.values_batch(&roots);
+            for (det, (prior, v)) in priors.into_iter().zip(values).enumerate() {
+                let n = det_states[det].num_players;
+                expand(&mut arenas[det], 0, &det_states[det], &prior);
+                apply_root_dirichlet_noise(&mut arenas[det], 0, alpha, cfg.root_dirichlet_epsilon, rng);
+                backup(&mut arenas[det], &[0], &utilities(&v, n, cfg.lambda), n);
             }
             sims_per - 1
         } else {
             sims_per
         };
 
-        run_lockstep_search(
-            &mut arenas,
-            &det_states,
-            eval,
-            effective_sims,
-            cfg.c_puct,
-            cfg.target_batch,
-        );
+        run_lockstep_search(&mut arenas, &det_states, policy, value, effective_sims, cfg);
 
         let mut agg_visits = vec![0u64; policy_len];
+        let mut value_sums = vec![0.0f32; policy_len];
         let mut root_prior = vec![0.0f32; policy_len];
-        let mut total_visits: u32 = 0;
         let mut value_sum = 0.0f32;
-        let mut value_n = 0u32;
-
         for arena in &arenas {
             let root = arena.root();
             for &c in root.children.iter() {
                 let child = arena.node(c);
-                if let Some(idx) =
-                    action_to_policy_index(phase, child.action, &hand_card_indices)
-                {
+                if let Some(idx) = action_to_policy_index(phase, child.action, &hand_card_indices) {
                     agg_visits[idx] += child.visit_count as u64;
-                    root_prior[idx] += child.prior / arenas.len() as f32;
-                    total_visits = total_visits.saturating_add(child.visit_count);
+                    value_sums[idx] += child.value_sums[perspective as usize];
+                    root_prior[idx] += child.prior / num_dets as f32;
                 }
             }
-            // Per-determinization root Q from the perspective seat. The
-            // root is always acted on by `perspective`, so that slot is
-            // the one UCB1 read during selection.
-            if root.value_counts[perspective as usize] > 0 {
-                value_sum += root.q(perspective);
-                value_n += 1;
-            }
+            value_sum += root.q(perspective).unwrap_or(0.0);
         }
+        let action_values: Vec<f32> = value_sums
+            .iter()
+            .zip(&agg_visits)
+            .map(|(&s, &n)| if n > 0 { s / n as f32 } else { 0.0 })
+            .collect();
 
-        // Emit *two* policy vectors over
-        // the aggregated visits — `policy_target` always at τ=1 for the
-        // training label, `policy_sampling` at the configured τ for
-        // action selection. At `temperature_at(decision_index) == 1.0`
-        // the two are identical (recovers the old fused
-        // behaviour bit-for-bit on those decisions).
+        // Two policy vectors over the summed visits: `policy_target` at
+        // τ=1 for the training label, `policy_sampling` at the configured τ
+        // for action selection (identical when that τ is 1).
         let tau_sampling = cfg.temperature_at(decision_index);
         let policy_target = visits_to_policy(&agg_visits, &root_prior, 1.0);
         let policy_sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
@@ -1323,27 +1106,21 @@ where
             visits_to_policy(&agg_visits, &root_prior, tau_sampling)
         };
 
-        // Diagnostics read from the τ=1 target: that's the canonical
-        // "what does MCTS prefer" signal. Computed from the τ-applied
-        // vector (as gen 1 once did), they collapsed to ~0
-        // entropy under the late-game schedule and masked the actual
-        // visit-count spread.
+        // Diagnostics read from the τ=1 target, the canonical "what does
+        // search prefer" signal; from the τ-applied vector they collapse to
+        // ~0 entropy under a late schedule.
         let visit_entropy = entropy(&policy_target);
         let top1_visit_share = policy_target.iter().cloned().fold(0.0f32, f32::max);
-        let value_estimate = if value_n > 0 {
-            value_sum / value_n as f32
-        } else {
-            0.0
-        };
 
         MctsResult {
             policy_target,
             policy_sampling,
             root_prior,
+            action_values,
             visit_entropy,
             top1_visit_share,
-            total_visits,
-            value_estimate,
+            total_visits: agg_visits.iter().sum::<u64>() as u32,
+            value_estimate: value_sum / num_dets as f32,
         }
     })
 }
@@ -1381,28 +1158,46 @@ fn visits_to_policy(agg_visits: &[u64], priors: &[f32], tau: f32) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::bidding::{apply_bid as bid_apply, legal_bids as bid_legal};
-    use crate::dealing::deal;
+    use crate::dealing::{deal, new_round, RoundParams};
     use crate::encoder::encode;
     use crate::evaluator::DummyEvaluator;
     use crate::game::new_game;
     use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const D: DummyEvaluator = DummyEvaluator;
+
+    fn cfg_with(bid: (u32, u32), play: (u32, u32)) -> MctsConfig {
+        MctsConfig {
+            bid_budget: SearchBudget::new(bid.0, bid.1),
+            play_budget: SearchBudget::new(play.0, play.1),
+            ..MctsConfig::default()
+        }
+    }
 
     /// An unknown key, from a typo or a stale config, fails to parse
-    /// instead of being ignored.
+    /// instead of being ignored — including gen 1's removed keys.
     #[test]
     fn mcts_config_rejects_unknown_keys() {
-        let ok = "c_puct = 1.5\nnum_determinizations = 5\nsims_per_determinization = 100\n\
-                  min_sims_floor = 60\ntemperature = 1.0\narena_capacity = 4096\n";
-        let cfg: MctsConfig = toml::from_str(ok).expect("valid config");
+        let top = "c_puct = 1.5\ntemperature = 1.0\narena_capacity = 4096\n";
+        let tables = "[bid_budget]\ndeterminizations = 20\nsims_per_determinization = 25\n\
+                      [play_budget]\ndeterminizations = 5\nsims_per_determinization = 100\n";
+        let cfg: MctsConfig = toml::from_str(&format!("{top}{tables}")).expect("valid config");
         assert_eq!(cfg.target_batch, DEFAULT_TARGET_BATCH);
-        let err = toml::from_str::<MctsConfig>(&format!("{ok}epochs_per_iteration = 10\n"))
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown field"), "{err}");
+        assert_eq!(cfg.lambda, DEFAULT_LAMBDA);
+        assert_eq!((cfg.bid_budget, cfg.play_budget), (DEFAULT_BID_BUDGET, DEFAULT_PLAY_BUDGET));
+        for stale in ["min_sims_floor = 60\n", "num_determinizations = 5\n", "epochs = 1\n"] {
+            let err = toml::from_str::<MctsConfig>(&format!("{top}{stale}{tables}")).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+        let typo = format!("{top}{tables}sims = 1\n");
+        assert!(toml::from_str::<MctsConfig>(&typo).is_err(), "unknown key in a budget");
 
         let sched = "kind = \"hard_step\"\nearly = 1.0\nlate = 0.1\nswitch_at = 15\n";
         assert!(toml::from_str::<TemperatureSchedule>(sched).is_ok());
         assert!(toml::from_str::<TemperatureSchedule>(&format!("{sched}typo = 1\n")).is_err());
     }
+
     #[test]
     fn arena_root_is_node_zero() {
         let a = MctsArena::new(3);
@@ -1424,27 +1219,15 @@ mod tests {
     }
 
     #[test]
-    fn q_defaults_to_zero_without_visits() {
-        let node = MctsNode::new(0.2, 4);
-        for seat in 0..MAX_PLAYERS as u8 {
-            assert_eq!(node.q(seat), 0.0);
-        }
-    }
-
-    #[test]
-    fn q_averages_only_acting_players_slot() {
+    fn q_is_each_seats_mean_over_all_visits() {
         let mut node = MctsNode::new(0.1, 0);
-        node.visit_count = 5;
-        // Seat 2 got three evaluations summing to 1.5 → mean 0.5.
-        node.value_sums[2] = 1.5;
-        node.value_counts[2] = 3;
-        // Seat 4 got two evaluations summing to -0.6 → mean -0.3.
-        node.value_sums[4] = -0.6;
-        node.value_counts[4] = 2;
-
-        assert!((node.q(2) - 0.5).abs() < 1e-6);
-        assert!((node.q(4) + 0.3).abs() < 1e-6);
-        assert_eq!(node.q(0), 0.0);
+        assert_eq!(node.q(0), None, "no value before the first visit");
+        node.visit_count = 4;
+        node.value_sums[2] = 2.0;
+        node.value_sums[4] = -1.2;
+        assert!((node.q(2).unwrap() - 0.5).abs() < 1e-6);
+        assert!((node.q(4).unwrap() + 0.3).abs() < 1e-6);
+        assert_eq!(node.q(0), Some(0.0));
     }
 
     #[test]
@@ -1462,12 +1245,16 @@ mod tests {
         parent.visit_count = 16;
         let mut child = MctsNode::new(0.25, 0);
         child.visit_count = 4;
-        child.value_sums[1] = 2.0;
-        child.value_counts[1] = 4; // Q = 0.5 for seat 1.
+        child.value_sums[1] = 2.0; // Q = 0.5 for seat 1.
+        child.value_sums[0] = -2.0;
         let c_puct = 1.5;
-        let expected = 0.5 + c_puct * 0.25 * (16f32).sqrt() / (1.0 + 4.0);
-        let got = ucb1_score(&parent, &child, 1, c_puct);
-        assert!((got - expected).abs() < 1e-6, "got {got}, expected {expected}");
+        let explore = c_puct * 0.25 * (16f32).sqrt() / (1.0 + 4.0);
+        assert!((ucb1_score(&parent, &child, 1, c_puct) - (0.5 + explore)).abs() < 1e-6);
+        assert!((ucb1_score(&parent, &child, 0, c_puct) - (-0.5 + explore)).abs() < 1e-6);
+        // One leaf in flight: a fifth visit worth −1.
+        child.in_flight = 1;
+        let with_vl = (2.0 - VIRTUAL_LOSS_WEIGHT) / 5.0 + c_puct * 0.25 * 4.0 / 6.0;
+        assert!((ucb1_score(&parent, &child, 1, c_puct) - with_vl).abs() < 1e-6);
     }
 
     #[test]
@@ -1477,35 +1264,20 @@ mod tests {
         let a = arena.alloc(0.3, 1);
         let b = arena.alloc(0.3, 2);
         let c = arena.alloc(0.3, 3);
-        {
-            let na = arena.node_mut(a);
-            na.visit_count = 4;
-            na.value_sums[0] = 0.4;
-            na.value_counts[0] = 4;
-        }
-        {
-            let nb = arena.node_mut(b);
-            nb.visit_count = 4;
-            nb.value_sums[0] = 3.2;
-            nb.value_counts[0] = 4; // much higher Q
-        }
+        arena.node_mut(a).visit_count = 4;
+        arena.node_mut(a).value_sums[0] = 0.4;
+        arena.node_mut(b).visit_count = 4;
+        arena.node_mut(b).value_sums[0] = 3.2; // much higher Q
         // c left unvisited
         arena.node_mut(0).visit_count = 8;
         arena.node_mut(0).children.extend_from_slice(&[a, b, c]);
 
         // Unvisited `c` wins on infinite UCB1.
-        let pick = select_best_child(&arena, 0, 0, DEFAULT_C_PUCT);
-        assert_eq!(pick, c);
+        assert_eq!(select_best_child(&arena, 0, 0, DEFAULT_C_PUCT), c);
 
         // Give c a visit; b (higher Q) should now win over a.
-        {
-            let nc = arena.node_mut(c);
-            nc.visit_count = 1;
-            nc.value_sums[0] = 0.0;
-            nc.value_counts[0] = 1;
-        }
-        let pick = select_best_child(&arena, 0, 0, DEFAULT_C_PUCT);
-        assert_eq!(pick, b);
+        arena.node_mut(c).visit_count = 1;
+        assert_eq!(select_best_child(&arena, 0, 0, DEFAULT_C_PUCT), b);
     }
 
     #[test]
@@ -1545,7 +1317,7 @@ mod tests {
         assert_eq!(s.phase(), GamePhase::Bidding);
 
         let mut arena = MctsArena::new(s.current_player);
-        let (policy, _) = DummyEvaluator.evaluate(&s);
+        let policy = D.policy(&s);
         expand(&mut arena, 0, &s, &policy);
 
         let mask = legal_bids(&s);
@@ -1568,8 +1340,7 @@ mod tests {
     fn expand_playing_uses_card_index_actions() {
         let s = playing_state(11);
         let mut arena = MctsArena::new(s.current_player);
-        let (policy, _) = DummyEvaluator.evaluate(&s);
-        expand(&mut arena, 0, &s, &policy);
+        expand(&mut arena, 0, &s, &D.policy(&s));
 
         let enc = encode(&s, s.current_player);
         let legal = legal_plays(&s);
@@ -1592,7 +1363,7 @@ mod tests {
     fn expand_is_noop_when_already_expanded_or_terminal() {
         let s = playing_state(3);
         let mut arena = MctsArena::new(s.current_player);
-        let (policy, _) = DummyEvaluator.evaluate(&s);
+        let policy = D.policy(&s);
         expand(&mut arena, 0, &s, &policy);
         let n = arena.nodes.len();
         expand(&mut arena, 0, &s, &policy);
@@ -1607,24 +1378,32 @@ mod tests {
     }
 
     #[test]
-    fn backprop_updates_path_and_only_leaf_seat_slot() {
+    fn backup_credits_every_active_seat_on_the_path() {
         let mut arena = MctsArena::new(0);
-        let c1 = arena.alloc(0.5, 1);
-        let c2 = arena.alloc(0.5, 2);
-        arena.node_mut(0).children.extend_from_slice(&[c1, c2]);
+        // Path root → A → B; C is off the path.
+        let a = arena.alloc(0.5, 1);
+        let b = arena.alloc(0.5, 2);
+        let c = arena.alloc(0.5, 3);
+        arena.node_mut(0).children.extend_from_slice(&[a, c]);
+        arena.node_mut(a).children.push(b);
 
-        backprop(&mut arena, &[0, c1], 3, 0.75);
-        assert_eq!(arena.node(0).visit_count, 1);
-        assert_eq!(arena.node(c1).visit_count, 1);
-        assert_eq!(arena.node(c2).visit_count, 0);
-        assert!((arena.node(0).value_sums[3] - 0.75).abs() < 1e-6);
-        assert_eq!(arena.node(0).value_counts[3], 1);
-        for seat in 0..MAX_PLAYERS {
-            if seat != 3 {
-                assert_eq!(arena.node(0).value_counts[seat], 0);
-                assert_eq!(arena.node(0).value_sums[seat], 0.0);
-            }
+        let mut u = [0.0f32; MAX_PLAYERS];
+        for (i, v) in u.iter_mut().enumerate() {
+            *v = i as f32 * 0.25 - 0.5; // distinct per seat, nonzero beyond 4
         }
+        let path = [0, a, b];
+        backup(&mut arena, &path, &u, 4);
+        backup(&mut arena, &path, &u, 4);
+
+        for &idx in &path {
+            let n = arena.node(idx);
+            assert_eq!(n.visit_count, 2);
+            for (s, x) in u.iter().enumerate().take(4) {
+                assert!((n.value_sums[s] - 2.0 * x).abs() < 1e-6, "seat {s}");
+            }
+            assert!(n.value_sums[4..].iter().all(|&v| v == 0.0), "inactive seats untouched");
+        }
+        assert_eq!(arena.node(c).visit_count, 0);
     }
 
     #[test]
@@ -1632,7 +1411,7 @@ mod tests {
         let s = playing_state(42);
         let mut arena = MctsArena::new(s.current_player);
         let sims = 100u32;
-        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+        run_search(&mut arena, &s, &D, &D, sims, &MctsConfig::default());
 
         // Every legal child of root should be visited at least once.
         for &c in arena.root().children.iter() {
@@ -1660,7 +1439,7 @@ mod tests {
     fn root_action_probs_match_visits_at_tau_one() {
         let s = playing_state(5);
         let mut arena = MctsArena::new(s.current_player);
-        run_search(&mut arena, &s, &DummyEvaluator, 80, DEFAULT_C_PUCT);
+        run_search(&mut arena, &s, &D, &D, 80, &MctsConfig::default());
 
         let probs = root_action_probs(&arena, 1.0);
         let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
@@ -1680,60 +1459,38 @@ mod tests {
         }
     }
 
+    /// Each phase searches with its own budget: every tree's root gets
+    /// `sims` visits, all but the first of which land on a child.
     #[test]
-    fn adaptive_budget_reads_cfg() {
-        // Forced move → (1, 0) regardless of cfg.
-        let any_cfg = MctsConfig::default();
-        assert_eq!(adaptive_budget(1, &any_cfg), (1, 0));
+    fn budgets_are_per_phase() {
+        let cfg = cfg_with((3, 10), (2, 12));
+        assert_eq!(cfg.budget(GamePhase::Bidding), SearchBudget::new(3, 10));
+        assert_eq!(cfg.budget(GamePhase::Playing), SearchBudget::new(2, 12));
+        let d = MctsConfig::default();
+        assert_eq!((d.bid_budget.to_string(), d.play_budget.to_string()), ("20x25".into(), "5x100".into()));
 
-        // Default cfg (5 × 100) → flat (5, 100) for every branching factor.
-        for n in 2..=25 {
-            assert_eq!(adaptive_budget(n, &any_cfg), (5, 100), "nl={n}");
-        }
-
-        // Doubled sims-per-determinization → flows through.
-        let cfg_2x_sims = MctsConfig {
-            sims_per_determinization: 200,
-            ..MctsConfig::default()
-        };
-        assert_eq!(adaptive_budget(4, &cfg_2x_sims), (5, 200));
-
-        // Doubled determinizations → flows through.
-        let cfg_2x_dets = MctsConfig {
-            num_determinizations: 10,
-            ..MctsConfig::default()
-        };
-        assert_eq!(adaptive_budget(4, &cfg_2x_dets), (10, 100));
-
-        // A larger `min_sims_floor` can still raise sims above the cfg value.
-        let cfg_floor = MctsConfig {
-            sims_per_determinization: 50,
-            min_sims_floor: 750,
-            ..MctsConfig::default()
-        };
-        let (dets, sims) = adaptive_budget(4, &cfg_floor);
-        assert_eq!(dets, 5);
-        assert!(dets * sims >= 750, "floor not enforced: {dets}×{sims}");
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(4);
+        let mut bidding = new_game(4, 5).unwrap();
+        deal(&mut bidding, &mut rng);
+        assert_eq!(mcts_search(&bidding, &D, &D, &cfg, &mut rng, 0).total_visits, 3 * 9);
+        let playing = playing_state(4);
+        assert_eq!(mcts_search(&playing, &D, &D, &cfg, &mut rng, 0).total_visits, 2 * 11);
     }
 
     #[test]
     fn mcts_search_forced_move_shortcut() {
-        // Build a state where only one bid is legal. Easiest: 0-card round
-        // not representable; instead craft a small synthetic bidding state
-        // where cards_dealt=0 forces bid=0 (mask = 0b1).
+        // A synthetic 0-card bidding state: only bid 0 is legal for a
+        // non-dealer.
         let mut s = BlobState::empty();
         s.num_players = 3;
         s.cards_dealt = 0;
         s.dealer = 2;
         s.current_player = 0;
         s.game_phase = GamePhase::Bidding as u8;
-        // legal_bids returns bits 0..=0 with dealer forbidden check; since
-        // current_player != dealer, mask = 1.
         assert_eq!(legal_bids(&s), 1);
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
-        let cfg = MctsConfig::default();
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &MctsConfig::default(), &mut rng, 0);
         assert_eq!(r.policy_target.len(), NUM_BIDS);
         assert!((r.policy_target[0] - 1.0).abs() < 1e-6);
         assert_eq!(r.total_visits, 0);
@@ -1748,13 +1505,7 @@ mod tests {
         assert_eq!(s.phase(), GamePhase::Bidding);
         let num_legal = legal_bids(&s).count_ones() as usize;
 
-        let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 40,
-            min_sims_floor: 60,
-            ..MctsConfig::default()
-        };
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &cfg_with((2, 40), (1, 1)), &mut rng, 0);
         assert_eq!(r.policy_target.len(), NUM_BIDS);
         let sum: f32 = r.policy_target.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
@@ -1782,13 +1533,7 @@ mod tests {
         let legal = legal_plays(&s);
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(77);
-        let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 30,
-            min_sims_floor: 60,
-            ..MctsConfig::default()
-        };
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &cfg_with((1, 1), (2, 30)), &mut rng, 0);
         assert_eq!(r.policy_target.len(), enc.hand_card_indices.len());
         let sum: f32 = r.policy_target.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum={sum}");
@@ -1801,6 +1546,140 @@ mod tests {
                 assert_eq!(r.policy_target[pos], 0.0, "illegal pos {pos} has nonzero policy");
             }
         }
+    }
+
+    /// ŝ = 1 for one fixed seat, 0 for the others.
+    struct SeatWins(u8);
+
+    impl ValueEvaluator for SeatWins {
+        fn values(&self, _: &BlobState) -> [f32; MAX_PLAYERS] {
+            let mut v = [0.0; MAX_PLAYERS];
+            v[self.0 as usize] = 1.0;
+            v
+        }
+    }
+
+    /// Exit criterion (gen-2.md §6 Phase 3): every explored root option
+    /// carries a value for the deciding seat, on every visit. V says the
+    /// decider makes 1 and everyone else 0, so the decider's utility is
+    /// exactly 1 at every leaf and each other seat's −1/(n−1). The round's
+    /// end is out of reach, so every backup comes from V. Gen 1 credited a
+    /// leaf only to the seat to move there, so most bid options never got
+    /// the decider's value (gen-2.md §2.3: 70%).
+    #[test]
+    fn every_explored_root_option_carries_the_deciders_value() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xD0);
+        let params = RoundParams { num_players: 5, cards_dealt: 7, trump: 1, dealer: 4 };
+        let s = new_round(params, &mut rng).unwrap();
+        let me = s.current_player;
+        let r = mcts_search(&s, &D, &SeatWins(me), &MctsConfig::default(), &mut rng, 0);
+
+        let mask = legal_bids(&s);
+        let mut explored = 0;
+        for b in 0..NUM_BIDS {
+            if (mask >> b) & 1 == 0 {
+                continue;
+            }
+            assert!(r.policy_target[b] > 0.0, "bid {b} never explored");
+            assert!((r.action_values[b] - 1.0).abs() < 1e-5, "bid {b}: {}", r.action_values[b]);
+            explored += 1;
+        }
+        assert_eq!(explored, 8);
+        assert!((r.value_estimate - 1.0).abs() < 1e-5);
+
+        // The other seats hear about every visit too.
+        let mut arena = MctsArena::new(me);
+        run_search(&mut arena, &s, &D, &SeatWins(me), 40, &MctsConfig::default());
+        for &c in &arena.root().children {
+            let child = arena.node(c);
+            for seat in 0..5u8 {
+                let want = if seat == me { 1.0 } else { -0.25 };
+                assert!((child.q(seat).unwrap() - want).abs() < 1e-5, "seat {seat}");
+            }
+        }
+    }
+
+    /// Exit criterion (gen-2.md §6 Phase 3): for the last bidder in a fully
+    /// known 1-card round, each bid's search value equals its exact `u_s`.
+    /// After the last bid every play is forced, so each bid's line runs to
+    /// the end of the round without a network call.
+    #[test]
+    fn last_bidder_in_known_one_card_round_values_each_bid_exactly() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x1C);
+        let mut checked = 0;
+        for game in 0..40u64 {
+            let n = 3 + (game % 4) as u8;
+            let params = RoundParams { num_players: n, cards_dealt: 1, trump: (game % 5) as u8, dealer: 0 };
+            let mut s = new_round(params, &mut rng).unwrap();
+            // Two bids of 1 leave the dealer a free choice of 0 or 1.
+            for k in 0..n - 1 {
+                bid_apply(&mut s, (k < 2) as u8);
+            }
+            assert_eq!(s.current_player, s.dealer);
+            assert_eq!(legal_bids(&s), 0b11);
+
+            for lambda in [1.0, 0.0] {
+                let cfg = MctsConfig { lambda, ..MctsConfig::default() };
+                let mut arena = MctsArena::new(s.dealer);
+                run_search(&mut arena, &s, &D, &D, 10, &cfg);
+                for &c in &arena.root().children {
+                    let child = arena.node(c);
+                    let mut end = s;
+                    bid_apply(&mut end, child.action);
+                    while let Some(card) = forced_action(&end) {
+                        apply_play(&mut end, card);
+                    }
+                    assert_eq!(end.phase(), GamePhase::Scoring);
+                    let exact = terminal_utilities(&end, lambda);
+                    for seat in 0..n {
+                        let q = child.q(seat).expect("every bid is visited");
+                        assert!((q - exact[seat as usize]).abs() < 1e-6, "bid {}, seat {seat}", child.action);
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 40 * 2 * 2);
+    }
+
+    /// Counts the states each network sees.
+    #[derive(Default)]
+    struct Counting {
+        policy_states: AtomicUsize,
+        value_states: AtomicUsize,
+    }
+
+    impl PolicyEvaluator for Counting {
+        fn policy(&self, state: &BlobState) -> Vec<f32> {
+            self.policy_states.fetch_add(1, Ordering::Relaxed);
+            D.policy(state)
+        }
+    }
+
+    impl ValueEvaluator for Counting {
+        fn values(&self, state: &BlobState) -> [f32; MAX_PLAYERS] {
+            assert!(!is_terminal(state));
+            let total: u32 = state.hands[..state.num_players as usize].iter().map(|h| h.count_ones()).sum();
+            assert_eq!(total, state.num_players as u32 * state.cards_dealt as u32
+                - (state.tricks_completed as u32 * state.num_players as u32 + state.trick_cards_played as u32),
+                "V sees a full deal");
+            self.value_states.fetch_add(1, Ordering::Relaxed);
+            [0.0; MAX_PLAYERS]
+        }
+    }
+
+    /// Each leaf costs one P call and one V call; terminal and forced
+    /// nodes cost none.
+    #[test]
+    fn each_leaf_costs_one_policy_and_one_value_call() {
+        let s = playing_state(8);
+        let c = Counting::default();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(8);
+        let r = mcts_search(&s, &c, &c, &cfg_with((1, 1), (3, 50)), &mut rng, 0);
+        let (p, v) = (c.policy_states.load(Ordering::Relaxed), c.value_states.load(Ordering::Relaxed));
+        assert_eq!(p, v);
+        assert!(p > 0 && p <= 3 * 50, "{p} leaves");
+        assert!(r.total_visits > 0);
     }
 
     #[test]
@@ -1833,38 +1712,29 @@ mod tests {
         assert_eq!(cfg.temperature_at(15), 0.1);
     }
 
-    /// Late-game τ→0 with a hard-step schedule must collapse the
-    /// **sampling** policy to one-hot on the argmax-visit action;
-    /// early-game τ=1 must spread sampling mass across all visited
-    /// children. Same state, same seed, two different `decision_index`
-    /// arguments — verifies the schedule actually wires through
-    /// `mcts_search`. The τ-schedule does not affect `policy_target`, so
-    /// this test additionally pins that
-    /// late-game `policy_target` is still spread (the training signal
-    /// stays τ=1).
+    /// A late τ→0 schedule collapses the **sampling** policy to one-hot on
+    /// the most-visited action; early τ=1 spreads sampling mass across all
+    /// visited children. Same state, same seed, two `decision_index`
+    /// values — verifies the schedule wires through `mcts_search`. The
+    /// target stays τ=1 either way.
     #[test]
     fn mcts_search_honors_temperature_schedule() {
         let s = playing_state(123);
         let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 60,
-            min_sims_floor: 60,
             temperature: 1.0,
             temperature_schedule: Some(TemperatureSchedule::HardStep {
                 early: 1.0,
                 late: 0.0,
                 switch_at: 15,
             }),
-            ..MctsConfig::default()
+            ..cfg_with((1, 1), (2, 60))
         };
 
         let mut rng_a = Xoshiro256PlusPlus::seed_from_u64(7);
-        let r_early = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng_a, 0);
+        let r_early = mcts_search(&s, &D, &D, &cfg, &mut rng_a, 0);
         let mut rng_b = Xoshiro256PlusPlus::seed_from_u64(7);
-        let r_late = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng_b, 50);
+        let r_late = mcts_search(&s, &D, &D, &cfg, &mut rng_b, 50);
 
-        // Early: τ=1 → sampling has spread mass; target equals sampling
-        // bit-for-bit (the fast-path branch in `mcts_search`).
         let nonzero_early = r_early
             .policy_sampling
             .iter()
@@ -1899,9 +1769,7 @@ mod tests {
             "late τ→0 sampling must be one-hot"
         );
 
-        // Late-game `policy_target` is *not* collapsed
-        // by the schedule — still τ=1 over the same visit counts, so it
-        // must keep spread mass across visited children.
+        // The late target is *not* collapsed by the schedule.
         let nonzero_late_target =
             r_late.policy_target.iter().filter(|&&p| p > 0.0).count();
         assert!(
@@ -1918,6 +1786,7 @@ mod tests {
             policy_target: vec![0.25, 0.25, 0.25, 0.25],
             policy_sampling: vec![0.25, 0.25, 0.25, 0.25],
             root_prior: vec![0.25, 0.25, 0.25, 0.25],
+            action_values: vec![0.0; 4],
             visit_entropy: (4f32).ln(),
             top1_visit_share: 0.25,
             total_visits: 40,
@@ -1927,78 +1796,31 @@ mod tests {
         assert!(sr.abs() < 1e-6, "sr={sr}");
     }
 
-    /// Cross-det parity: lockstep batching across multiple
-    /// independent dets must reproduce the per-det visit-count distribution
-    /// and per-seat value accumulators of the serial driver bit-for-bit.
-    ///
-    /// We run `run_search` on each `(arena, root_state)` independently and
-    /// compare against `run_lockstep_search` on the same inputs. The
-    /// `DummyEvaluator` makes `evaluate` and `evaluate_batch` produce
-    /// identical output (the trait's default `evaluate_batch` just loops
-    /// `evaluate`), so any divergence would indicate a logic bug in the
-    /// lockstep driver, not numerical noise from a real ONNX session.
-    #[test]
-    fn lockstep_search_matches_serial_per_det() {
-        let states = [
-            playing_state(101),
-            playing_state(202),
-            playing_state(303),
-        ];
-        let sims = 80u32;
+    /// Distinct, state-dependent values per seat, so a mixed-up backup
+    /// shows in the parity tests below.
+    struct HandValue;
 
-        // Serial baseline.
-        let mut serial_arenas: Vec<MctsArena> = states
-            .iter()
-            .map(|s| MctsArena::new(s.current_player))
-            .collect();
-        for (arena, state) in serial_arenas.iter_mut().zip(states.iter()) {
-            run_search(arena, state, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+    impl ValueEvaluator for HandValue {
+        fn values(&self, state: &BlobState) -> [f32; MAX_PLAYERS] {
+            let mut v = [0.0; MAX_PLAYERS];
+            for (s, x) in v.iter_mut().enumerate().take(state.num_players as usize) {
+                *x = (state.hands[s] % 97) as f32 / 97.0;
+            }
+            v
         }
+    }
 
-        // Lockstep driver. target_batch = num_dets keeps the driver in
-        // pure cross-det mode — at most one descent per det per
-        // outer iteration, so virtual loss never engages and per-det
-        // node sequences match `run_search` bit-for-bit.
-        let mut lockstep_arenas: Vec<MctsArena> = states
-            .iter()
-            .map(|s| MctsArena::new(s.current_player))
-            .collect();
-        let states_vec: Vec<BlobState> = states.to_vec();
-        run_lockstep_search(
-            &mut lockstep_arenas,
-            &states_vec,
-            &DummyEvaluator,
-            sims,
-            DEFAULT_C_PUCT,
-            states.len(),
-        );
-
-        // Each det's arena must match: same node count, same per-node
-        // visit counts, value sums, and child structure.
-        for (i, (a, b)) in serial_arenas.iter().zip(lockstep_arenas.iter()).enumerate() {
-            assert_eq!(
-                a.nodes.len(),
-                b.nodes.len(),
-                "det {i}: node count differs (serial={}, lockstep={})",
-                a.nodes.len(),
-                b.nodes.len()
-            );
-            for (j, (na, nb)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+    fn assert_same_trees(a: &[MctsArena], b: &[MctsArena]) {
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+            assert_eq!(a.nodes.len(), b.nodes.len(), "det {i}: node count differs");
+            for (j, (na, nb)) in a.nodes.iter().zip(&b.nodes).enumerate() {
                 assert_eq!(na.visit_count, nb.visit_count, "det {i} node {j} visit_count");
                 assert_eq!(na.action, nb.action, "det {i} node {j} action");
-                assert_eq!(
-                    na.children.as_slice(),
-                    nb.children.as_slice(),
-                    "det {i} node {j} children",
-                );
+                assert_eq!(na.children.as_slice(), nb.children.as_slice(), "det {i} node {j} children");
                 for seat in 0..MAX_PLAYERS {
-                    assert_eq!(
-                        na.value_counts[seat], nb.value_counts[seat],
-                        "det {i} node {j} value_counts[{seat}]"
-                    );
                     assert!(
-                        (na.value_sums[seat] - nb.value_sums[seat]).abs() < 1e-6,
-                        "det {i} node {j} value_sums[{seat}]: serial={}, lockstep={}",
+                        (na.value_sums[seat] - nb.value_sums[seat]).abs() < 1e-5,
+                        "det {i} node {j} value_sums[{seat}]: {} vs {}",
                         na.value_sums[seat],
                         nb.value_sums[seat],
                     );
@@ -2007,147 +1829,57 @@ mod tests {
         }
     }
 
-    /// Batch-1 parity: at `target_batch = 1` the lockstep
-    /// driver only ever has one descent in flight, so virtual loss never
-    /// engages and per-det node sequences match `run_search` bit-for-bit
-    /// — the same parity guarantee as at
-    /// `target_batch = num_dets` (pinned by
-    /// `lockstep_search_matches_serial_per_det`), extended to the
-    /// degenerate batch=1 setting that downstream callers can use to
-    /// disable VL entirely without touching the search code.
+    /// Lockstep batching across trees reproduces each tree of the serial
+    /// driver bit-for-bit while virtual loss never engages:
+    /// `target_batch` equal to the number of trees, or 1.
     #[test]
-    fn target_batch_one_matches_serial_per_det() {
-        let states = [
-            playing_state(101),
-            playing_state(202),
-            playing_state(303),
-        ];
+    fn lockstep_search_matches_serial_per_det() {
+        let states = [playing_state(101), playing_state(202), playing_state(303)];
         let sims = 80u32;
-
-        let mut serial_arenas: Vec<MctsArena> = states
-            .iter()
-            .map(|s| MctsArena::new(s.current_player))
-            .collect();
-        for (arena, state) in serial_arenas.iter_mut().zip(states.iter()) {
-            run_search(arena, state, &DummyEvaluator, sims, DEFAULT_C_PUCT);
-        }
-
-        let mut tb1_arenas: Vec<MctsArena> = states
-            .iter()
-            .map(|s| MctsArena::new(s.current_player))
-            .collect();
-        let states_vec: Vec<BlobState> = states.to_vec();
-        run_lockstep_search(
-            &mut tb1_arenas,
-            &states_vec,
-            &DummyEvaluator,
-            sims,
-            DEFAULT_C_PUCT,
-            1,
-        );
-
-        for (i, (a, b)) in serial_arenas.iter().zip(tb1_arenas.iter()).enumerate() {
-            assert_eq!(
-                a.nodes.len(),
-                b.nodes.len(),
-                "det {i}: node count differs",
-            );
-            for (j, (na, nb)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
-                assert_eq!(na.visit_count, nb.visit_count, "det {i} node {j} visit_count");
-                assert_eq!(na.action, nb.action, "det {i} node {j} action");
-                assert_eq!(
-                    na.children.as_slice(),
-                    nb.children.as_slice(),
-                    "det {i} node {j} children",
-                );
-                for seat in 0..MAX_PLAYERS {
-                    assert_eq!(
-                        na.value_counts[seat], nb.value_counts[seat],
-                        "det {i} node {j} value_counts[{seat}]"
-                    );
-                    assert!(
-                        (na.value_sums[seat] - nb.value_sums[seat]).abs() < 1e-6,
-                        "det {i} node {j} value_sums[{seat}]"
-                    );
-                }
+        for target_batch in [states.len(), 1] {
+            let cfg = MctsConfig { target_batch, ..MctsConfig::default() };
+            let mut serial: Vec<MctsArena> =
+                states.iter().map(|s| MctsArena::new(s.current_player)).collect();
+            for (arena, state) in serial.iter_mut().zip(states.iter()) {
+                run_search(arena, state, &D, &HandValue, sims, &cfg);
             }
+            let mut lockstep: Vec<MctsArena> =
+                states.iter().map(|s| MctsArena::new(s.current_player)).collect();
+            run_lockstep_search(&mut lockstep, &states, &D, &HandValue, sims, &cfg);
+            assert_same_trees(&serial, &lockstep);
         }
     }
 
-    /// Virtual-loss sanity: every virtual visit decoration must be undone by
-    /// the matching expand/backprop step. A non-zero `in_flight` left
-    /// over after search would corrupt subsequent UCB1 reads (the next
-    /// search reuses the same arena layout via `MctsArena::with_capacity`
-    /// only if the tree is freshly allocated, but the invariant is still
-    /// load-bearing for any future caller that recycles arenas — and
-    /// it's the simplest tripwire if a path-bookkeeping bug slips into
-    /// the driver).
+    /// Every virtual visit is undone by the matching expand/backup step,
+    /// also when several descents share one tree (`target_batch` above the
+    /// number of trees).
     #[test]
     fn lockstep_search_clears_in_flight_at_target_batch_above_num_dets() {
-        let states = [
-            playing_state(11),
-            playing_state(22),
-            playing_state(33),
-        ];
-        let sims = 60u32;
-        let mut arenas: Vec<MctsArena> = states
-            .iter()
-            .map(|s| MctsArena::new(s.current_player))
-            .collect();
-        let states_vec: Vec<BlobState> = states.to_vec();
-        // target_batch > num_dets exercises the intra-det virtual-loss
-        // path; if the decrement step misses any path entry the assert
-        // below trips.
-        run_lockstep_search(
-            &mut arenas,
-            &states_vec,
-            &DummyEvaluator,
-            sims,
-            DEFAULT_C_PUCT,
-            8,
-        );
+        let states = [playing_state(11), playing_state(22), playing_state(33)];
+        let mut arenas: Vec<MctsArena> =
+            states.iter().map(|s| MctsArena::new(s.current_player)).collect();
+        let cfg = MctsConfig { target_batch: 8, ..MctsConfig::default() };
+        run_lockstep_search(&mut arenas, &states, &D, &HandValue, 60, &cfg);
         for (i, arena) in arenas.iter().enumerate() {
             for (j, n) in arena.nodes.iter().enumerate() {
-                assert_eq!(
-                    n.in_flight, 0,
-                    "det {i} node {j} left with in_flight={}",
-                    n.in_flight,
-                );
+                assert_eq!(n.in_flight, 0, "det {i} node {j} left with in_flight={}", n.in_flight);
             }
         }
     }
 
-    /// Budget invariant: regardless of `target_batch`, each det's
-    /// root must end the search with exactly `num_simulations` total
-    /// visits (visit_count grows by 1 per descent, terminal or not).
-    /// This is the contract the policy aggregator in `mcts_search`
-    /// relies on — if a det undercounts visits, its share of the
-    /// aggregated visit distribution is wrong.
+    /// Whatever `target_batch`, each tree's root ends with exactly
+    /// `num_simulations` visits — the summed policy relies on it.
     #[test]
     fn lockstep_search_root_visit_count_matches_sim_budget() {
         let states = [playing_state(7), playing_state(13)];
         let sims = 50u32;
-        let states_vec: Vec<BlobState> = states.to_vec();
-
-        for &target_batch in &[1usize, 2, 5, 8] {
-            let mut arenas: Vec<MctsArena> = states
-                .iter()
-                .map(|s| MctsArena::new(s.current_player))
-                .collect();
-            run_lockstep_search(
-                &mut arenas,
-                &states_vec,
-                &DummyEvaluator,
-                sims,
-                DEFAULT_C_PUCT,
-                target_batch,
-            );
+        for target_batch in [1usize, 2, 5, 8] {
+            let cfg = MctsConfig { target_batch, ..MctsConfig::default() };
+            let mut arenas: Vec<MctsArena> =
+                states.iter().map(|s| MctsArena::new(s.current_player)).collect();
+            run_lockstep_search(&mut arenas, &states, &D, &D, sims, &cfg);
             for (i, arena) in arenas.iter().enumerate() {
-                assert_eq!(
-                    arena.root().visit_count,
-                    sims,
-                    "target_batch={target_batch} det {i}: root visits != sims",
-                );
+                assert_eq!(arena.root().visit_count, sims, "target_batch={target_batch} det {i}");
             }
         }
     }
@@ -2156,7 +1888,7 @@ mod tests {
     fn root_action_probs_argmax_at_tau_zero() {
         let s = playing_state(9);
         let mut arena = MctsArena::new(s.current_player);
-        run_search(&mut arena, &s, &DummyEvaluator, 60, DEFAULT_C_PUCT);
+        run_search(&mut arena, &s, &D, &D, 60, &MctsConfig::default());
 
         let probs = root_action_probs(&arena, 0.0);
         let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
@@ -2200,12 +1932,7 @@ mod tests {
         let mut s = new_game(4, 5).unwrap();
         deal(&mut s, &mut rng);
         let mask = bid_legal(&s);
-        let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 30,
-            ..MctsConfig::default()
-        };
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &cfg_with((2, 30), (1, 1)), &mut rng, 0);
         let n = mask.count_ones() as f32;
         for (b, &p) in r.root_prior.iter().enumerate() {
             let expected = if (mask >> b) & 1 == 1 { 1.0 / n } else { 0.0 };
@@ -2238,8 +1965,7 @@ mod tests {
     fn apply_root_dirichlet_noise_mixes_and_renormalizes() {
         let s = playing_state(11);
         let mut arena = MctsArena::new(s.current_player);
-        let (policy, _) = DummyEvaluator.evaluate(&s);
-        expand(&mut arena, 0, &s, &policy);
+        expand(&mut arena, 0, &s, &D.policy(&s));
 
         let raw_priors: Vec<f32> = arena
             .root()
@@ -2290,8 +2016,7 @@ mod tests {
     fn apply_root_dirichlet_noise_is_noop_when_epsilon_zero() {
         let s = playing_state(17);
         let mut arena = MctsArena::new(s.current_player);
-        let (policy, _) = DummyEvaluator.evaluate(&s);
-        expand(&mut arena, 0, &s, &policy);
+        expand(&mut arena, 0, &s, &D.policy(&s));
         let before: Vec<f32> = arena
             .root()
             .children
@@ -2311,25 +2036,14 @@ mod tests {
 
     /// With `temperature = 0.1`, `policy_target` (held at τ=1) must have
     /// **higher entropy** than `policy_sampling` (computed at τ=0.1)
-    /// for the same visit counts. With a single fused vector, only
-    /// `policy_sampling` would exist, and the training label would
-    /// inherit the sharpened distribution.
+    /// for the same visit counts.
     #[test]
     fn mcts_search_policy_target_has_higher_entropy_than_sampling_at_low_tau() {
         let s = playing_state(41);
-        let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 60,
-            min_sims_floor: 60,
-            temperature: 0.1,
-            temperature_schedule: None,
-            ..MctsConfig::default()
-        };
+        let cfg = MctsConfig { temperature: 0.1, ..cfg_with((1, 1), (2, 60)) };
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12);
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &cfg, &mut rng, 0);
 
-        // Skip if the position degenerated to a single legal action
-        // (forced-move path returns one-hot in both fields — by design).
         let nonzero_target = r.policy_target.iter().filter(|&&p| p > 0.0).count();
         assert!(
             nonzero_target >= 2,
@@ -2343,7 +2057,6 @@ mod tests {
             "policy_target entropy {h_target} should exceed policy_sampling entropy {h_sampling} at τ=0.1",
         );
 
-        // Both are valid distributions.
         let s_t: f32 = r.policy_target.iter().sum();
         let s_s: f32 = r.policy_sampling.iter().sum();
         assert!((s_t - 1.0).abs() < 1e-4, "target sum {s_t}");
@@ -2351,150 +2064,53 @@ mod tests {
     }
 
     /// At τ=1 the target and sampling distributions are equal
-    /// bit-for-bit (the fast-path branch in `mcts_search`). Pins the
-    /// invariant so a future refactor can't introduce a silent drift.
+    /// bit-for-bit (the fast-path branch in `mcts_search`).
     #[test]
     fn mcts_search_policy_target_equals_sampling_at_tau_one() {
         let s = playing_state(83);
-        let cfg = MctsConfig {
-            num_determinizations: 2,
-            sims_per_determinization: 30,
-            min_sims_floor: 60,
-            temperature: 1.0,
-            temperature_schedule: None,
-            ..MctsConfig::default()
-        };
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(99);
-        let r = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let r = mcts_search(&s, &D, &D, &cfg_with((1, 1), (2, 30)), &mut rng, 0);
         assert_eq!(
             r.policy_target, r.policy_sampling,
             "τ=1 should yield identical target and sampling vectors",
         );
     }
 
-    /// `backprop_terminal` credits every active seat along the path with
-    /// `values[s]` (rather than only the leaf seat as `backprop` does).
+    /// Terminal leaves back up the exact utilities for every seat; with
+    /// V = 0 everywhere else, the root's per-seat sums are exactly the
+    /// terminal utilities collected, so they sum to zero at λ = 1.
     #[test]
-    fn backprop_terminal_credits_every_active_seat() {
-        let mut arena = MctsArena::new(0);
-        // Path root → A → B.
-        let a = arena.alloc(0.5, 1);
-        let b = arena.alloc(0.5, 2);
-        arena.node_mut(0).children.push(a);
-        arena.node_mut(a).children.push(b);
-
-        let mut z = [0.0f32; MAX_PLAYERS];
-        // Distinct values per seat so seat-mixing bugs would show up.
-        for i in 0..4 {
-            z[i] = (i as f32) * 0.25 - 0.5; // -0.5, -0.25, 0.0, 0.25
+    fn terminal_leaves_back_up_exact_utilities() {
+        // Last trick of a 4p/5c round: every remaining play is forced.
+        let mut s = playing_state(31);
+        while s.tricks_completed < 4 {
+            let c = legal_plays(&s).trailing_zeros() as u8;
+            apply_play(&mut s, c);
         }
-
-        let path = [0, a, b];
-        backprop_terminal(&mut arena, &path, &z, 4);
-
-        for &idx in &path {
-            let n = arena.node(idx);
-            assert_eq!(n.visit_count, 1);
-            for s in 0..4usize {
-                assert_eq!(n.value_counts[s], 1, "seat {s} not credited");
-                assert!(
-                    (n.value_sums[s] - z[s]).abs() < 1e-6,
-                    "seat {s} sum {} ≠ {}",
-                    n.value_sums[s],
-                    z[s]
-                );
-            }
-            for s in 4..MAX_PLAYERS {
-                assert_eq!(n.value_counts[s], 0, "inactive seat {s} touched");
-                assert_eq!(n.value_sums[s], 0.0, "inactive seat {s} touched");
-            }
+        let mut end = s;
+        while let Some(c) = forced_action(&end) {
+            apply_play(&mut end, c);
         }
-    }
-
-    /// After `run_search` on a playing-phase state with enough sims to
-    /// reach terminal `Scoring` leaves, the root's `value_counts[s]` must
-    /// be > 0 for every active seat (proves multi-seat backprop fires from
-    /// terminal). Before multi-seat terminal backprop this would only have
-    /// been true for the perspective seat, since `v=0` went through
-    /// single-seat [`backprop`].
-    #[test]
-    fn run_search_terminal_value_counts_grow_for_all_seats() {
-        let s = playing_state(31);
+        let exact = terminal_utilities(&end, 1.0);
         let mut arena = MctsArena::new(s.current_player);
-        // 4P5C playing state at trick 1: 20 plays to terminal; 600 sims is
-        // plenty for the descent to reach Scoring through many branches.
-        let sims = 600u32;
-        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
-
-        let n = s.num_players as usize;
+        run_search(&mut arena, &s, &D, &D, 5, &MctsConfig::default());
         let root = arena.root();
-        for seat in 0..n {
-            assert!(
-                root.value_counts[seat] > 0,
-                "seat {seat} value_counts == 0 (terminal credit missing)",
-            );
+        assert_eq!(root.visit_count, 5);
+        for seat in 0..4u8 {
+            assert!((root.q(seat).unwrap() - exact[seat as usize]).abs() < 1e-6, "seat {seat}");
         }
-        // q(perspective) should land in the z-score band [-1, 1].
-        let q = root.q(s.current_player);
-        assert!(
-            (-1.0..=1.0).contains(&q),
-            "q(perspective) {q} outside [-1, 1]",
-        );
-    }
-
-    /// Parity: `terminal_z_scores` on a final-state snapshot must match
-    /// the per-seat gen-1 value target (the z-scored final game score from
-    /// `z_score_clip`). Built as an in-crate parity check so a future
-    /// refactor triggers a CI failure rather than a silent scale drift
-    /// in-tree.
-    #[test]
-    fn terminal_z_scores_matches_backfill_value_statistic() {
-        use crate::scoring::{terminal_z_scores, z_score_clip};
-
-        let mut s = BlobState::empty();
-        s.num_players = 4;
-        s.game_phase = GamePhase::Complete as u8;
-        s.cumulative_scores[0] = 60;
-        s.cumulative_scores[1] = 10;
-        s.cumulative_scores[2] = 30;
-        s.cumulative_scores[3] = 0;
-
-        let got = terminal_z_scores(&s);
-
-        // Reproduce the value-target computation locally.
-        let mut scores = [0.0f32; MAX_PLAYERS];
-        for i in 0..4 {
-            scores[i] = s.cumulative_scores[i] as f32;
-        }
-        let expected = z_score_clip(&scores, 4);
-
-        for i in 0..MAX_PLAYERS {
-            assert!(
-                (got[i] - expected[i]).abs() < 1e-6,
-                "seat {i}: got {} expected {}",
-                got[i],
-                expected[i],
-            );
-        }
+        assert!(root.value_sums.iter().sum::<f32>().abs() < 1e-5);
     }
 
     /// When the descent reaches an unexpanded node whose state has
-    /// exactly one legal action, the fast-path must allocate a placeholder
-    /// child inline with `prior = 1.0`, apply that action, and keep
-    /// descending — rather than returning the unexpanded node as a leaf
-    /// for NN eval.
+    /// exactly one legal action, the fast-path allocates a placeholder
+    /// child inline with `prior = 1.0`, applies that action and keeps
+    /// descending, rather than returning the unexpanded node as a leaf.
     ///
-    /// Constructed scenario: a 3P 0-card bidding state with
-    /// `current_player = 0`, `dealer = 2`. `legal_bids` returns `1`
-    /// (only bid 0) for the two non-dealers, so the descent should
-    /// chain through both non-dealer placeholders and stop at the
-    /// dealer (where `legal_bids = 0`, neither forced nor expandable
-    /// by NN — the existing `expand` no-ops on this degenerate state).
-    /// We pin two observable signals:
-    /// 1. The root grew a child with `action = 0` and `prior = 1.0`
-    ///    (placeholder synthesized rather than NN-derived).
-    /// 2. The returned path is deeper than `[root]` — the fast-path
-    ///    actually advanced descent past the unexpanded root.
+    /// Scenario: a 3P 0-card bidding state with `current_player = 0`,
+    /// `dealer = 2`. Only bid 0 is legal for the two non-dealers, so the
+    /// descent chains through both placeholders and stops at the dealer
+    /// (no legal bid: neither forced nor expandable).
     #[test]
     fn select_leaf_state_takes_forced_fast_path() {
         let mut s = BlobState::empty();
@@ -2503,8 +2119,6 @@ mod tests {
         s.dealer = 2;
         s.current_player = 0;
         s.game_phase = GamePhase::Bidding as u8;
-        // Sanity: matches the `mcts_search_forced_move_shortcut` setup —
-        // only bid 0 is legal at the root.
         assert_eq!(legal_bids(&s), 1);
         assert_eq!(forced_action(&s), Some(0));
 
@@ -2512,8 +2126,6 @@ mod tests {
         let (leaf_idx, path, _leaf_state) =
             select_leaf_state(&mut arena, &s, DEFAULT_C_PUCT);
 
-        // Root must have one child (the forced placeholder), and the
-        // descent must have walked at least one step.
         let root = arena.root();
         assert_eq!(root.children.len(), 1, "root should have one forced child");
         let forced_child = arena.node(root.children[0]);
@@ -2528,14 +2140,8 @@ mod tests {
         assert_ne!(leaf_idx, 0, "leaf should not be the root after fast-path");
     }
 
-    /// Forced-move perf contract: when the lockstep driver descends through
-    /// forced nodes, the *placeholders* must also receive `visit_count`
-    /// and `value_counts` updates on every sim that passes through them
-    /// — otherwise UCB1 reads garbage Q values on the forced chain and
-    /// later (non-forced) callers can't tell from the arena which nodes
-    /// were synthesized vs. NN-derived. Visit budget per root is
-    /// already pinned by `lockstep_search_root_visit_count_matches_sim_budget`;
-    /// this test additionally pins the per-chain accumulation behavior.
+    /// Placeholders on a forced chain are visited by every simulation that
+    /// passes through them, like any other node.
     #[test]
     fn forced_fast_path_credits_placeholders_along_path() {
         let mut s = BlobState::empty();
@@ -2547,19 +2153,9 @@ mod tests {
 
         let mut arena = MctsArena::new(s.current_player);
         let sims = 20u32;
-        run_search(&mut arena, &s, &DummyEvaluator, sims, DEFAULT_C_PUCT);
+        run_search(&mut arena, &s, &D, &D, sims, &MctsConfig::default());
 
-        // Root visited once per sim.
         assert_eq!(arena.root().visit_count, sims);
-        // The forced placeholder (root's only child) must have been
-        // visited on every sim — every descent past the root went
-        // through it (UCB1 has nothing else to pick), so its visit
-        // count should equal `sims` minus the one sim that stops at
-        // root before any child exists. The fast-path allocates the
-        // child on the first sim, then every subsequent sim descends
-        // through it; that's `sims` visits along the chain (no -1
-        // because the fast-path also visits the forced child on the
-        // initial sim).
         let forced = arena.node(arena.root().children[0]);
         assert!(
             forced.visit_count >= sims - 1,
@@ -2573,24 +2169,15 @@ mod tests {
     fn mcts_search_with_root_noise_preserves_budget_and_policy() {
         let s = playing_state(23);
         let cfg = MctsConfig {
-            num_determinizations: 3,
-            sims_per_determinization: 25,
-            min_sims_floor: 60,
             root_dirichlet_alpha: 0.3,
             root_dirichlet_epsilon: 0.25,
-            ..MctsConfig::default()
+            ..cfg_with((1, 1), (3, 25))
         };
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(2026_05_12_01);
-        let result = mcts_search(&s, &DummyEvaluator, &cfg, &mut rng, 0);
+        let result = mcts_search(&s, &D, &D, &cfg, &mut rng, 0);
         let sum: f32 = result.policy_target.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4, "policy_target sum {sum} ≠ 1");
-        // adaptive_budget may raise dets×sims to satisfy min_sims_floor,
-        // so just assert the aggregate is at least the configured floor.
-        assert!(
-            result.total_visits >= cfg.min_sims_floor,
-            "total_visits {} below floor {}",
-            result.total_visits,
-            cfg.min_sims_floor
-        );
+        // The noise pre-step is each tree's first simulation.
+        assert_eq!(result.total_visits, 3 * 24);
     }
 }

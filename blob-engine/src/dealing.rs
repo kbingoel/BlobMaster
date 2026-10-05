@@ -8,12 +8,60 @@
 //!
 //! RNG ownership lives **outside** `BlobState` (see `state.rs`) so the state
 //! itself stays `Copy` and per-thread self-play seeding remains deterministic.
+//!
+//! [`new_round`] starts one round on its own, for single-round self-play
+//! (gen-2.md §5.2).
 
 use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::card::NUM_CARDS;
+use crate::round::{validate_round_params, RoundParamsError, NO_TRUMP};
 use crate::state::{BlobState, GamePhase, TrickRecord, MAX_PLAYERS};
+
+/// Parameters of a round played on its own (gen-2.md §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoundParams {
+    pub num_players: u8,
+    pub cards_dealt: u8,
+    /// 0..=3 for ♠ ♥ ♣ ♦, or [`NO_TRUMP`].
+    pub trump: u8,
+    pub dealer: u8,
+}
+
+impl RoundParams {
+    pub fn validate(&self) -> Result<(), RoundParamsError> {
+        validate_round_params(self.cards_dealt, self.num_players)?;
+        if self.trump > NO_TRUMP {
+            return Err(RoundParamsError::TrumpOutOfRange);
+        }
+        if self.dealer >= self.num_players {
+            return Err(RoundParamsError::DealerOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// Deal one round with `params`, ready for the first bid.
+///
+/// The state reads as the first round of a one-round game (`start_cards =
+/// cards_dealt`, `round_idx = 0`, no cumulative scores); search and the
+/// encoder don't read those fields. The round ends in `Scoring`; it is not
+/// meant to be continued with `advance_round`.
+pub fn new_round<R: Rng + ?Sized>(
+    params: RoundParams,
+    rng: &mut R,
+) -> Result<BlobState, RoundParamsError> {
+    params.validate()?;
+    let mut s = BlobState::empty();
+    s.num_players = params.num_players;
+    s.cards_dealt = params.cards_dealt;
+    s.start_cards = params.cards_dealt;
+    s.trump_suit = params.trump;
+    s.dealer = params.dealer;
+    start_round(&mut s, rng);
+    Ok(s)
+}
 
 /// Shuffle a 52-card deck and distribute `state.cards_dealt` cards to each
 /// of the first `state.num_players` players. Hands are written as `u64`
@@ -185,6 +233,25 @@ mod tests {
         for p in 0..4 {
             assert_eq!(s.hands[p].count_ones(), 5);
         }
+    }
+
+    #[test]
+    fn new_round_deals_one_round_with_the_given_parameters() {
+        let params = RoundParams { num_players: 5, cards_dealt: 6, trump: NO_TRUMP, dealer: 4 };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(3);
+        let s = new_round(params, &mut rng).unwrap();
+        assert_eq!((s.num_players, s.cards_dealt, s.trump_suit, s.dealer), (5, 6, NO_TRUMP, 4));
+        assert_eq!(s.phase(), GamePhase::Bidding);
+        assert_eq!(s.current_player, 0, "left of the dealer bids first");
+        for p in 0..5 {
+            assert_eq!(s.hands[p].count_ones(), 6);
+        }
+        assert_eq!(s.cumulative_scores, [0; MAX_PLAYERS]);
+
+        let mut bad = |p: RoundParams| new_round(p, &mut rng).unwrap_err();
+        assert_eq!(bad(RoundParams { trump: 5, ..params }), RoundParamsError::TrumpOutOfRange);
+        assert_eq!(bad(RoundParams { dealer: 5, ..params }), RoundParamsError::DealerOutOfRange);
+        assert_eq!(bad(RoundParams { cards_dealt: 11, ..params }), RoundParamsError::DeckExceeded);
     }
 
     #[test]

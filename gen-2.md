@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-05: gen 1 is concluded; Phases 0, 1 and 2 are done; next is Phase 3, the gen-2 engine (§6).
+Status, 2026-10-05: gen 1 is concluded; Phases 0–3 are done; next is Phase 4, two networks and a supervised warm start (§6).
 
 ---
 
@@ -345,7 +345,7 @@ Per-round targets leave nothing linking rounds, so self-play plays **single roun
 
 ### 5.5 Encoder
 
-P and V share the encoder code. Items 1–6 were done in Phase 1 (as built: §6 Phase 1).
+P and V share the encoder code. Items 1–6 were done in Phase 1 and items 7–10 in Phase 3 (as built: §6).
 
 1. **`has_bid` per player.** Derived from the dealer and the current player; no state change needed.
 2. **Bid context:** sum of bids so far, bids still to come, (sum − cards)/cards, and my position in bidding order. The dealer-constraint bit already existed.
@@ -514,22 +514,69 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 - **Not moved:** the `tokens` measurement from `diagnostics.rs` joins the P + V `onnx_mcts` bench when that is rewritten. Until then it runs at `gen-1-compat` (Appendix A).
 - **Left alone:** 62 git-ignored gen-1 `*.log` files in `logs/`, which were never in git. `logs/` otherwise keeps only the rule bot 2 rollout measurements.
 
-**Phase 3 — Gen-2 engine** (no training)
-- [ ] Start-one-round helper and the round sampler (§5.2).
-- [ ] Per-round utility `u_s` (§5.1), replacing `scoring.rs`.
-- [ ] Policy and value evaluator traits; `OnnxEvaluator` with one session per network and the layout-id check (§4, §5.5).
-- [ ] Search: all-seat backup, exact `u_s` at round end, V at leaves, per-phase budgets (§5.4). Delete the per-seat counts and the "Q = 0 when empty" fallback.
-- [ ] Encoder: V mode, `round_number` removed, layout id with its golden test (§5.5 items 7, 8, 10).
-- [ ] Replay: per-seat round scores, round id, concurrent wrapper; suit-permutation augmentation when sampling (§5.5 item 9).
-- *Exit:* unit tests pass, including these:
-  - every explored root option carries a value for the deciding seat (100%, by construction);
-  - for the last bidder in a fully known 1-card round, each bid's search value equals its exact `u_s`;
-  - a suit permutation leaves legal moves, trick winners and scores unchanged;
-  - V mode encodes every hand; P mode encodes none of the opponents' cards;
-  - `bench` and `play` run on the new search with a random-init P + V pair.
+**Phase 3 — Gen-2 engine** (done 2026-10-05, no training)
+- [x] Start-one-round helper and the round sampler (§5.2).
+- [x] Per-round utility `u_s` (§5.1), replacing `scoring.rs`.
+- [x] Policy and value evaluator traits; `OnnxEvaluator` with one session per network and the layout-id check (§4, §5.5).
+- [x] Search: all-seat backup, exact `u_s` at round end, V at leaves, per-phase budgets (§5.4). The per-seat counts and the "Q = 0 when empty" fallback are deleted.
+- [x] Encoder: V mode, `round_number` removed, layout id with its golden test (§5.5 items 7, 8, 10).
+- [x] Replay: per-seat round scores, round id, concurrent wrapper; suit-permutation augmentation when sampling (§5.5 item 9).
+- *Exit, met:* unit tests pass, including these:
+  - every explored root option carries a value for the deciding seat (100%, by construction): `every_explored_root_option_carries_the_deciders_value` (`mcts.rs`);
+  - for the last bidder in a fully known 1-card round, each bid's search value equals its exact `u_s`, at λ = 1 and λ = 0, for every seat: `last_bidder_in_known_one_card_round_values_each_bid_exactly`;
+  - a suit permutation leaves legal moves, trick winners and scores unchanged: `relabelling_keeps_legal_moves_trick_winners_and_scores` (`augment.rs`, 96 rounds played move for move on both labellings);
+  - V mode encodes every hand, `value_mode_encodes_every_hand`; P mode encodes none of the opponents' cards, `policy_mode_hides_opponents_cards` (re-dealing the hidden cards leaves P's encoding unchanged);
+  - `bench` and `play` run on the new search with a random-init P + V pair from `blobmaster-train export --output <dir>`:
+    - network-only vs the rule bot: −57.1 ± 1.4 (128 deals, 7 s; gen 1's random init: −55.9);
+    - search (bids 20×25, plays 5×100): −47.3 ± 2.4 (64 deals, 516 s; gen 1 took 262 s with one network). Search adds 10 points even to random networks, presumably through the exact values near each round's end (not measured);
+    - a full scripted 17-round `play` game against search bots, with `--show`.
+  - Totals: `blob-engine` 292 unit + 44 integration (debug), `blob-nn` 27 (release), `blob-bin` 6. `cargo build --release` has no warnings. ONNX↔tch parity passes on P, exported from `save_random_checkpoint`.
+
+*As built:*
+- **Single rounds** (`dealing.rs`, `round.rs`):
+  - `new_round(RoundParams)` deals one round from player count, cards dealt, trump and dealer.
+  - `RoundMix` draws the table size uniformly from a list and cards dealt from the rounds of a game at `start_cards`, so the game's mix (1-card rounds once per player, the others twice). Each round is weighted by `cards ^ large_round_exponent` to oversample large rounds. Trump is uniform over the five, the dealer uniform. Unknown keys are rejected.
+- **Utility** (`scoring.rs`): `round_points`, `normalized_scores`, `utilities(ŝ, n, λ)` and `terminal_utilities`. At λ = 1 the utilities sum to zero. `score_round` reads `round_points`. The z-score helpers are gone.
+- **Evaluators** (`evaluator.rs`): `PolicyEvaluator` (priors, own view) and `ValueEvaluator` (ŝ per absolute seat, full deal), each with a batch method. `DummyEvaluator` implements both: uniform priors, ŝ = 0.
+- **ONNX** (`onnx.rs`):
+  - `OnnxPolicy` reads `policy.onnx` (outputs `bid_policy`, `play_scores`, masked to legal moves as before).
+  - `OnnxValue` reads `value.onnx` (output `seat_values [B, S]`, read at the player tokens and mapped back from relative to absolute seats).
+  - `OnnxEvaluator` holds both, for search. Each file must carry `blob_layout_id` = `LAYOUT_ID` and the right `blob_network` in its metadata, or loading fails with the reason. The feature-width check is gone.
+  - Gated tests run with `BLOB_MODEL_DIR=<dir>` (was `BLOB_ONNX_MODEL`).
+- **Search** (`mcts.rs`):
+  - Nodes keep `visit_count` and per-seat `value_sums`; `backup` adds `u_s` for every seat. `q(seat)` is `None` before the first visit. An unvisited child still scores +∞ in UCB, so every option is tried once before priors and values rank them.
+  - Each lockstep step makes one `policy_batch` and one `values_batch` call over its leaves. Terminal leaves use `terminal_utilities`.
+  - `MctsConfig` has `lambda` (default 1) and `bid_budget` / `play_budget` (`SearchBudget`, default 20×25 and 5×100). `num_determinizations`, `sims_per_determinization`, `min_sims_floor` and `adaptive_budget` are gone; a config naming them fails to load.
+  - `MctsResult.action_values`: the deciding seat's mean utility per action. `play --show` prints it after each move's visit share.
+  - `bench` and `play` take `--bid-dets/--bid-sims` next to `--dets/--sims` (plays).
+- **Encoder** (`encoder.rs`, `LAYOUT_ID = "layout-3"`; layouts 1 and 2 never carried an id):
+  - Context token 16 wide, without the round number.
+  - V mode (`encode_value`) inserts every opponent's hand cards between my hand and the played cards: token type 5, width 41 (rank, suit, owner's relative seat, trump flag). Apart from those tokens it equals P mode.
+  - `golden_layout_hash` hashes both modes over every decision state of three random games; it is the same in debug and release.
+- **Augmentation** (`augment.rs`): the 24 suit relabellings, `permute_suits` for a state, and `hand_position_map` for play policies.
+- **Replay** (`replay.rs`):
+  - Stores raw states, sparse policies, each seat's round points (absolute seats) and a round id; `phases` is derived from the state.
+  - `push_round(decisions, end)` writes a finished round's decisions. Round ids are saved with the buffer, so they continue after a resume.
+  - Batches carry `seat_scores`: ŝ relative to the seat to move, V's output order.
+  - `sample_batch(n, rng, augment)` gives each example its own relabelling. `SharedReplay` wraps the buffer in an `RwLock`.
+  - Delta persistence is Phase 5's.
+- **Export** (`scripts/export_onnx.py`; `blobmaster-train export --output <dir> [--checkpoint …]`):
+  - Writes the model directory (§5.3). `meta.json` holds the layout id, the learner step (none yet) and each net's depth and weights.
+  - P loads a tch checkpoint strictly: a missing or unexpected parameter is an error, except the tch value head, which is skipped. V is random-init (seed 1) until Phase 4 has a tch V. Without `--checkpoint`, P is random-init too.
+  - `--check` compares both nets on random inputs that use every token type.
+- **blob-nn**: the learner building blocks read `seat_scores`; the tch net's scalar value head trains on the seat to move's ŝ until Phase 4. The parity test compares the tch and ONNX legal policies on bidding and playing states (gate 1e-5), instead of the value.
+- **Cost** (random-init P + V; `onnx_mcts` bench, one thread, idle machine):
+  - P call 0.55 ms and V call 0.77 ms (batch 1, 5p7c at the first trick);
+  - a 5×100 play decision 0.66 s, a 20×25 bid 0.59 s;
+  - `bench --mode search`: 4 deals in 38 s on 20 threads, against 20 s with the single gen-1-shaped network at 5×100 in Phase 2: ≈1.9×, as §5.8 estimated for a 4-layer V.
+- **Not moved:** the `tokens` measurement (cost by sequence length under 32-thread load) still runs at `gen-1-compat`. It needs a multi-threaded harness rather than criterion, so it waits for the actors (Phase 5).
+
+*Open points carried forward:*
+- `export --check` on a random tch init: P 3.0e-5, over the 1e-5 gate (its inputs now use every token type; with the old all-CLS inputs it was 1.9e-5). V gives 1.2e-7 and a torch-initialized P 5e-7. The Rust policy parity on game states passes. Set the gate in Phase 4.
+- A random V predicts ŝ ≈ 0.5 for every seat, so search values stay near 0 except close to a round's end. The random-init bench numbers say nothing about the design; Phase 4 is its first measurement.
 
 **Phase 4 — Two networks + supervised warm start**
-- [ ] P and V models (§5.3); `export_onnx.py` for both, writing the layout id; ONNX↔tch parity for both; the model directory.
+- [ ] P and V models in tch (§5.3): P drops the gen-1 value head; V matches `export_onnx.py`'s `ValueNet`. The export loads V's weights too (it writes both nets, the layout id and the model directory since Phase 3); ONNX↔tch parity for V (P's runs since Phase 3).
 - [ ] Learner: alternating P / V steps from a buffer, LR keyed to learner steps, validation split by round, a metrics row every N steps, checkpoints. CLI: `blobmaster-train pretrain`.
 - [ ] Teacher data: rounds played by rule bot 2, with some rule-bot seats mixed in for variety, stored in the replay format. P imitates rule bot 2's `bid_chances` / `play_chances`; V learns the actual per-seat round scores.
 - [ ] G1 on held-out teacher rounds.

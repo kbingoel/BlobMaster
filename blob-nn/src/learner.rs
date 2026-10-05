@@ -3,12 +3,15 @@
 //! validation split, and losses on held-out data.
 //!
 //! The learner itself (alternating P / V steps, LR keyed to learner steps,
-//! metrics rows, checkpoints) is built on these in Phase 4.
+//! metrics rows, checkpoints) is built on these in Phase 4. Until then the
+//! tch network keeps gen 1's scalar value head, and it trains on the seat
+//! to move's ŝ (`SeatScores` index 0); V's per-seat targets are the whole
+//! `seat_scores` rows.
 
 use blob_engine::bidding::legal_bids;
 use blob_engine::encoder::{encode, TOKEN_TYPE_HAND};
 use blob_engine::playing::legal_plays;
-use blob_engine::replay::{BidBatch, PlayBatch, ReplayBuffer};
+use blob_engine::replay::{BidBatch, PlayBatch, ReplayBuffer, SeatScores};
 use tch::{Device, Tensor};
 
 use crate::heads::NUM_BIDS;
@@ -54,6 +57,12 @@ impl Default for HeldOutLosses {
     }
 }
 
+/// The seat to move's ŝ of each example: the scalar value target until
+/// Phase 4.
+fn mover_scores(seat_scores: &[SeatScores]) -> Vec<f32> {
+    seat_scores.iter().map(|s| s[0]).collect()
+}
+
 /// Convert a `BidBatch` from the replay buffer into a `TrainBatch` ready
 /// for `train_step`.
 pub fn bid_train_batch(batch: &BidBatch, device: Device) -> Option<TrainBatch> {
@@ -78,7 +87,7 @@ pub fn bid_train_batch(batch: &BidBatch, device: Device) -> Option<TrainBatch> {
     let policy_target = Tensor::from_slice(&batch.policies)
         .view([n as i64, NUM_BIDS])
         .to_device(device);
-    let value_target = Tensor::from_slice(&batch.values)
+    let value_target = Tensor::from_slice(&mover_scores(&batch.seat_scores))
         .view([n as i64])
         .to_device(device);
 
@@ -136,7 +145,7 @@ pub fn play_train_batch(batch: &PlayBatch, device: Device) -> Option<TrainBatch>
     let policy_target = Tensor::from_slice(&target)
         .view([n as i64, seq_len as i64])
         .to_device(device);
-    let value_target = Tensor::from_slice(&batch.values)
+    let value_target = Tensor::from_slice(&mover_scores(&batch.seat_scores))
         .view([n as i64])
         .to_device(device);
 
@@ -184,10 +193,10 @@ pub fn held_out_losses(
     for chunk in indices.chunks(batch_size.max(1)) {
         let (bid, play) = buf.batch_from_indices(chunk);
         if let Some(tb) = bid_train_batch(&bid, device) {
-            add(&tb, &bid.values, true);
+            add(&tb, &mover_scores(&bid.seat_scores), true);
         }
         if let Some(tb) = play_train_batch(&play, device) {
-            add(&tb, &play.values, false);
+            add(&tb, &mover_scores(&play.seat_scores), false);
         }
     }
     let n = n_bid + n_play;
@@ -207,7 +216,7 @@ mod tests {
     use blob_engine::bidding::apply_bid;
     use blob_engine::dealing::deal;
     use blob_engine::game::new_game;
-    use blob_engine::replay::SparsePolicy;
+    use blob_engine::replay::{Decision, SparsePolicy};
     use blob_engine::state::{BlobState, GamePhase};
     use rand_xoshiro::rand_core::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;
@@ -235,6 +244,15 @@ mod tests {
         smallvec![(0u8, 0.5f32), (1, 0.5)]
     }
 
+    /// Push `s` as a one-decision round in which every seat made its bid
+    /// (4 players, 5 cards: every seat's ŝ is (10 + bid) / 15).
+    fn push(buf: &mut ReplayBuffer, s: BlobState, policy: SparsePolicy) {
+        let mut end = s;
+        end.game_phase = GamePhase::Scoring as u8;
+        end.tricks_won = end.bids;
+        buf.push_round(&[Decision { state: s, policy }], &end);
+    }
+
     #[test]
     fn validation_split_is_deterministic_and_near_fraction() {
         let held: usize = (0..100_000u64).filter(|&r| is_validation_round(r, 0.03)).count();
@@ -253,7 +271,7 @@ mod tests {
         let mut buf = ReplayBuffer::new(8);
         let states: Vec<BlobState> = (0..3).map(bidding_state).collect();
         for s in &states {
-            buf.push(*s, half_half(), 0.25, GamePhase::Bidding);
+            push(&mut buf, *s, half_half());
         }
         let (bid, play) = buf.batch_from_indices(&[0, 1, 2]);
         assert!(play_train_batch(&play, Device::Cpu).is_none());
@@ -269,8 +287,9 @@ mod tests {
         }
         let target: Vec<f32> = tb.policy_target.flatten(0, -1).try_into().unwrap();
         assert_eq!(&target[..3], &[0.5, 0.5, 0.0]);
+        // Nobody has bid yet, so every seat's bid is 0: ŝ = 10 / 15.
         let values: Vec<f32> = tb.value_target.try_into().unwrap();
-        assert_eq!(values, vec![0.25; 3]);
+        assert_eq!(values, vec![10.0 / 15.0; 3]);
     }
 
     /// Hand-position policies land on the matching hand-card tokens, in
@@ -281,7 +300,7 @@ mod tests {
         let states: Vec<BlobState> = (10..13).map(playing_state).collect();
         let policy: SparsePolicy = smallvec![(1u8, 0.25f32), (3, 0.75)];
         for s in &states {
-            buf.push(*s, policy.clone(), -0.5, GamePhase::Playing);
+            push(&mut buf, *s, policy.clone());
         }
         let (_, play) = buf.batch_from_indices(&[0, 1, 2]);
         let tb = play_train_batch(&play, Device::Cpu).unwrap();
@@ -317,17 +336,17 @@ mod tests {
         let model = BlobNet::new(&vs.root());
         let mut buf = ReplayBuffer::new(16);
         for i in 0..5u64 {
-            buf.push(playing_state(i), half_half(), 0.5, GamePhase::Playing);
+            push(&mut buf, playing_state(i), half_half());
         }
         for i in 0..4u64 {
-            buf.push(bidding_state(100 + i), half_half(), -0.5, GamePhase::Bidding);
+            push(&mut buf, bidding_state(100 + i), half_half());
         }
         let idx: Vec<usize> = (0..buf.len()).collect();
         let l = held_out_losses(&model, &buf, &idx, 3, Device::Cpu);
         assert_eq!(l.examples, 9);
         assert!(l.bid_policy_loss.is_finite() && l.play_policy_loss.is_finite());
         assert!(l.value_loss.is_finite());
-        assert!((l.value_loss_predict0 - 0.25).abs() < 1e-9);
+        assert!((l.value_loss_predict0 - (10.0f64 / 15.0).powi(2)).abs() < 1e-6);
 
         // Chunking doesn't change the result.
         let whole = held_out_losses(&model, &buf, &idx, 64, Device::Cpu);

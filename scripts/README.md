@@ -1,13 +1,15 @@
 # Scripts
 
 ## `export_onnx.py`
-Exports a `blob-nn` checkpoint (`model.ot`) to ONNX for `OnnxEvaluator`; see the file header. Run it through
+Writes a model directory (`policy.onnx`, `value.onnx`, `meta.json`; gen-2.md §5.3) for `OnnxPolicy` / `OnnxValue`; see the file header. Run it through
 
 ```bash
-./target/release/blobmaster-train export --checkpoint <dir or model.ot> --output <model.onnx> [--check]
+./target/release/blobmaster-train export --output <dir> [--checkpoint <dir or model.ot>] [--check]
 ```
 
-which uses the repo's `.venv` and strips `LD_PRELOAD`. The script's token widths mirror `blob-engine/src/encoder.rs`; the Rust test `export_script_mirrors_feature_widths` checks them.
+which uses the repo's `.venv` and strips `LD_PRELOAD`. `--checkpoint` loads the policy net from a `blob-nn` checkpoint; without it, the policy net is random-init. The value net is random-init until the Phase-4 learner trains it in tch.
+
+Both ONNX files carry the encoder's layout id in their metadata, and the Rust evaluators refuse a model with another. The script's token widths and `LAYOUT_ID` mirror `blob-engine/src/encoder.rs`; the Rust test `export_script_mirrors_feature_widths` checks them.
 
 ## `visualize_strength.py`, `visualize_weight_evolution.py`
 Plot a run's metrics and the evolution of its weights. They still read gen-1 outputs (`strength.csv`, per-iteration `metrics.jsonl`, `iter_*` directories) and get re-pointed at gen-2 outputs together with the learner (gen-2.md §4).

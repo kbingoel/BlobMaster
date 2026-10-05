@@ -15,6 +15,7 @@
 
 use crate::card::NUM_RANKS;
 use crate::round::NO_TRUMP;
+use crate::scoring::round_points;
 use crate::state::{BlobState, GamePhase, TrickRecord, MAX_PLAYERS};
 
 /// Bitmask of legal cards the current player may play.
@@ -169,19 +170,11 @@ pub fn current_trick_winner(state: &BlobState) -> Option<u8> {
 /// stay zero). Phase must be `Scoring`.
 pub fn score_round(state: &mut BlobState) -> [u8; MAX_PLAYERS] {
     debug_assert_eq!(state.phase(), GamePhase::Scoring);
-    let mut out = [0u8; MAX_PLAYERS];
-    for (i, slot) in out
-        .iter_mut()
-        .enumerate()
-        .take(state.num_players as usize)
-    {
-        if state.tricks_won[i] == state.bids[i] {
-            let s = 10 + state.bids[i];
-            *slot = s;
-            state.cumulative_scores[i] += s as u16;
-        }
+    let points = round_points(state);
+    for (total, &p) in state.cumulative_scores.iter_mut().zip(&points) {
+        *total += p as u16;
     }
-    out
+    points
 }
 
 #[cfg(test)]

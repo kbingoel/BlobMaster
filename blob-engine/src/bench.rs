@@ -8,8 +8,11 @@
 //!   it, so all games on one seed see the same cards whatever is played.
 //! - **Confidence intervals** treat each seed's games as one sample, because
 //!   games on the same cards are correlated.
-//! - **Bots never search.** Opponents are a rule bot or a network playing
-//!   its greedy raw policy; only the focal player may search.
+//! - **Bots never search.** Opponents are a rule bot or a model's policy
+//!   net playing greedily; only the focal player may search.
+//! - **Models are directories** (`policy.onnx`, `value.onnx`, `meta.json`;
+//!   gen-2.md §5.3). Network-only play loads only the policy net; search
+//!   loads both.
 //!
 //! Every deal and every game is seeded from [`BenchConfig::seed`], so two
 //! models benched with the same config play the same cards.
@@ -29,11 +32,13 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::bidding::{apply_bid, legal_bids};
 use crate::dealing::start_round;
-use crate::evaluator::Evaluator;
+use crate::evaluator::PolicyEvaluator;
 use crate::game::{advance_round, new_game};
 use crate::hand::Hand;
-use crate::mcts::{mcts_search, MctsConfig, MctsResult};
-use crate::onnx::OnnxEvaluator;
+use crate::mcts::{
+    mcts_search, MctsConfig, MctsResult, SearchBudget, DEFAULT_BID_BUDGET, DEFAULT_PLAY_BUDGET,
+};
+use crate::onnx::{OnnxPolicy, OnnxValue};
 use crate::playing::{apply_play, legal_plays};
 use crate::rule_bot::rule_bot_action;
 use crate::rule_bot_2::{rule_bot_2_action, rule_bot_2r_action, Rollouts};
@@ -48,18 +53,43 @@ pub enum Agent {
     RuleBot2,
     /// Rule bot 2 with rollouts ("v2r").
     RuleBot2R(Rollouts),
-    /// A network's greedy raw policy, no search.
+    /// A model directory's policy net, greedy, no search.
     Network(PathBuf),
-    /// A network driving greedy MCTS with [`BenchConfig::mcts`].
+    /// A model directory's policy and value nets driving greedy search with
+    /// [`BenchConfig::mcts`].
     Search(PathBuf),
 }
 
 impl Agent {
+    /// The agent's model directory, if it plays a model.
     pub fn model(&self) -> Option<&Path> {
         match self {
             Agent::RuleBot | Agent::RuleBot2 | Agent::RuleBot2R(_) => None,
             Agent::Network(p) | Agent::Search(p) => Some(p),
         }
+    }
+}
+
+/// The networks an agent plays with: none for a bot, the policy net for
+/// network-only play, both for search. One per worker thread.
+#[derive(Debug, Default)]
+pub struct Nets {
+    pub policy: Option<OnnxPolicy>,
+    pub value: Option<OnnxValue>,
+}
+
+impl Nets {
+    /// Load what `agent` needs from its model directory. Fails on a missing
+    /// file or a model trained on another encoder layout.
+    pub fn load(agent: &Agent) -> ort::Result<Self> {
+        Ok(match agent {
+            Agent::RuleBot | Agent::RuleBot2 | Agent::RuleBot2R(_) => Self::default(),
+            Agent::Network(dir) => Self { policy: Some(OnnxPolicy::from_dir(dir)?), value: None },
+            Agent::Search(dir) => Self {
+                policy: Some(OnnxPolicy::from_dir(dir)?),
+                value: Some(OnnxValue::from_dir(dir)?),
+            },
+        })
     }
 }
 
@@ -87,25 +117,20 @@ impl Default for BenchConfig {
             deals: 64,
             seed: DEFAULT_SEED,
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
-            mcts: eval_mcts_config(5, 100),
+            mcts: eval_mcts_config(DEFAULT_BID_BUDGET, DEFAULT_PLAY_BUDGET),
         }
     }
 }
 
-/// The gen-1 search recipe without root noise or a temperature schedule;
-/// the caller plays the most-visited move.
-pub fn eval_mcts_config(num_determinizations: u32, sims_per_determinization: u32) -> MctsConfig {
+/// Search for evaluation: the default recipe with the given budgets, no
+/// root noise and no temperature schedule; the caller plays the
+/// most-visited move.
+pub fn eval_mcts_config(bid_budget: SearchBudget, play_budget: SearchBudget) -> MctsConfig {
     MctsConfig {
-        c_puct: 1.5,
-        num_determinizations,
-        sims_per_determinization,
-        min_sims_floor: 60,
-        temperature: 1.0,
-        temperature_schedule: None,
+        bid_budget,
+        play_budget,
         arena_capacity: 4096,
-        target_batch: 5,
-        root_dirichlet_alpha: 0.0,
-        root_dirichlet_epsilon: 0.0,
+        ..MctsConfig::default()
     }
 }
 
@@ -185,8 +210,8 @@ pub struct BenchReport {
     pub opponent: Agent,
     pub num_players: u8,
     pub start_cards: u8,
-    /// `(dets, sims)` used when either side searches.
-    pub search_budget: (u32, u32),
+    /// `(bids, plays)` search budgets, used when either side searches.
+    pub search_budgets: (SearchBudget, SearchBudget),
     pub deals: usize,
     pub games: usize,
     pub focal_points: f64,
@@ -259,34 +284,32 @@ pub fn search_action(state: &BlobState, result: &MctsResult) -> u8 {
     greedy_action_by(state, &result.policy_target, &result.root_prior)
 }
 
-/// The action `agent` takes in `state`. `eval` must be loaded from the
-/// agent's model when it has one.
+/// The action `agent` takes in `state`, with `nets` loaded by
+/// [`Nets::load`] for it.
 pub fn agent_action(
     agent: &Agent,
-    eval: Option<&OnnxEvaluator>,
+    nets: &Nets,
     state: &BlobState,
     mcts: &MctsConfig,
     rng: &mut Xoshiro256PlusPlus,
 ) -> u8 {
+    let policy = || nets.policy.as_ref().expect("a model agent needs its policy net");
     match agent {
         Agent::RuleBot => rule_bot_action(state),
         Agent::RuleBot2 => rule_bot_2_action(state),
         Agent::RuleBot2R(cfg) => rule_bot_2r_action(state, cfg, rng),
-        Agent::Network(_) => {
-            let ev = eval.expect("network agent needs an evaluator");
-            greedy_action(state, &ev.evaluate(state).0)
-        }
+        Agent::Network(_) => greedy_action(state, &policy().policy(state)),
         Agent::Search(_) => {
-            let ev = eval.expect("search agent needs an evaluator");
-            search_action(state, &mcts_search(state, ev, mcts, rng, 0))
+            let value = nets.value.as_ref().expect("a search agent needs its value net");
+            search_action(state, &mcts_search(state, policy(), value, mcts, rng, 0))
         }
     }
 }
 
 fn play_game(
     cfg: &BenchConfig,
-    focal: (&Agent, Option<&OnnxEvaluator>),
-    opponent: (&Agent, Option<&OnnxEvaluator>),
+    focal: (&Agent, &Nets),
+    opponent: (&Agent, &Nets),
     deal: usize,
     focal_seat: u8,
 ) -> GameRecord {
@@ -335,10 +358,8 @@ fn play_game(
     }
 }
 
-fn load(agent: &Agent) -> Option<OnnxEvaluator> {
-    agent.model().map(|p| {
-        OnnxEvaluator::from_file(p).unwrap_or_else(|e| panic!("load ONNX model {}: {e}", p.display()))
-    })
+fn load(agent: &Agent) -> Nets {
+    Nets::load(agent).unwrap_or_else(|e| panic!("load model: {e}"))
 }
 
 /// Play every game of the benchmark on `cfg.threads` threads and return
@@ -367,8 +388,8 @@ pub fn play_games(
                     }
                     let rec = play_game(
                         cfg,
-                        (focal, focal_ev.as_ref()),
-                        (opponent, opponent_ev.as_ref()),
+                        (focal, &focal_ev),
+                        (opponent, &opponent_ev),
                         g / n,
                         (g % n) as u8,
                     );
@@ -417,7 +438,7 @@ pub fn summarize(focal: &Agent, opponent: &Agent, cfg: &BenchConfig, games: &[Ga
         opponent: opponent.clone(),
         num_players: cfg.num_players,
         start_cards: cfg.start_cards,
-        search_budget: (cfg.mcts.num_determinizations, cfg.mcts.sims_per_determinization),
+        search_budgets: (cfg.mcts.bid_budget, cfg.mcts.play_budget),
         deals: cfg.deals,
         games: games.len(),
         focal_points: games.iter().map(|g| g.focal_score).sum::<f64>() / n,
@@ -444,13 +465,13 @@ pub fn run_bench(
     summarize(focal, opponent, cfg, &games, started.elapsed().as_secs_f64())
 }
 
-fn agent_label(a: &Agent, budget: (u32, u32)) -> String {
+fn agent_label(a: &Agent, budgets: (SearchBudget, SearchBudget)) -> String {
     match a {
         Agent::RuleBot => "rule bot".to_string(),
         Agent::RuleBot2 => "rule bot 2".to_string(),
         Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("network {}", p.display()),
-        Agent::Search(p) => format!("search {}x{} {}", budget.0, budget.1, p.display()),
+        Agent::Search(p) => format!("search bids {}, plays {} {}", budgets.0, budgets.1, p.display()),
     }
 }
 
@@ -465,8 +486,8 @@ fn share(num: u64, den: u64) -> String {
 impl fmt::Display for BenchReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let opp = self.num_players - 1;
-        writeln!(f, "focal     {}", agent_label(&self.focal, self.search_budget))?;
-        writeln!(f, "opponents {opp}x {}", agent_label(&self.opponent, self.search_budget))?;
+        writeln!(f, "focal     {}", agent_label(&self.focal, self.search_budgets))?;
+        writeln!(f, "opponents {opp}x {}", agent_label(&self.opponent, self.search_budgets))?;
         writeln!(
             f,
             "table     {} players, {} start cards; {} deals x {} seats = {} games in {:.0} s",

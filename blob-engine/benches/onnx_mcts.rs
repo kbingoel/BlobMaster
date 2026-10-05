@@ -1,33 +1,43 @@
-//! Benches that require an ONNX model.
+//! Benches that require a model directory.
 //!
-//! Gated on the `BLOB_ONNX_MODEL` environment variable (path to an exported
-//! `model.onnx`). When unset the benches become no-ops so `cargo bench` still
-//! runs green on machines without a trained model.
+//! Gated on the `BLOB_MODEL_DIR` environment variable (a directory with
+//! `policy.onnx` and `value.onnx`, e.g. from `blobmaster-train export`).
+//! When unset the benches become no-ops so `cargo bench` still runs green
+//! on machines without a model.
 //!
-//! Benches: ONNX inference (batch 1), MCTS with 1 × 100 sims, and a full
-//! 5 × 100 move. Gen-1 numbers on this machine are in gen-2.md §3.1.
+//! Benches: one policy and one value call (batch 1), search with 1 × 100
+//! simulations, and a full play (5 × 100) and bid (20 × 25) decision with
+//! P + V. Gen-1 numbers on this machine (one network) are in gen-2.md §3.1.
 
 use std::hint::black_box;
 use std::path::PathBuf;
 
-use blob_engine::mcts::{mcts_search, MctsConfig};
+use blob_engine::mcts::{mcts_search, MctsConfig, SearchBudget};
 use blob_engine::{
-    apply_bid, legal_bids, new_game, start_round, Evaluator, GamePhase, OnnxEvaluator,
+    apply_bid, legal_bids, new_game, start_round, BlobState, GamePhase, OnnxEvaluator,
+    PolicyEvaluator, ValueEvaluator,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-fn model_path() -> Option<PathBuf> {
-    let p = std::env::var("BLOB_ONNX_MODEL").ok()?;
-    let pb = PathBuf::from(p);
-    pb.exists().then_some(pb)
+fn model() -> Option<OnnxEvaluator> {
+    let dir = PathBuf::from(std::env::var("BLOB_MODEL_DIR").ok()?);
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(OnnxEvaluator::from_dir(&dir).expect("load model directory"))
 }
 
-fn playing_state() -> blob_engine::BlobState {
+fn bidding_state() -> BlobState {
     let mut state = new_game(5, 7).expect("valid params");
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xC0FFEE);
     start_round(&mut state, &mut rng);
+    state
+}
+
+fn playing_state() -> BlobState {
+    let mut state = bidding_state();
     while state.phase() == GamePhase::Bidding {
         let mask = legal_bids(&state);
         let bid = (0..=13u8).find(|b| (mask >> b) & 1 == 1).expect("legal bid");
@@ -37,45 +47,38 @@ fn playing_state() -> blob_engine::BlobState {
 }
 
 fn bench_onnx_inference(c: &mut Criterion) {
-    let Some(path) = model_path() else {
-        eprintln!("BLOB_ONNX_MODEL unset; skipping onnx inference bench");
+    let Some(m) = model() else {
+        eprintln!("BLOB_MODEL_DIR unset; skipping onnx inference benches");
         return;
     };
-    let eval = OnnxEvaluator::from_file(&path).expect("load ONNX model");
     let state = playing_state();
-    c.bench_function("onnx_inference_batch1", |b| {
-        b.iter(|| black_box(eval.evaluate(black_box(&state))))
+    c.bench_function("onnx_policy_batch1", |b| {
+        b.iter(|| black_box(m.policy.policy(black_box(&state))))
+    });
+    c.bench_function("onnx_value_batch1", |b| {
+        b.iter(|| black_box(m.value.values(black_box(&state))))
     });
 }
 
-fn bench_mcts_100_sims(c: &mut Criterion) {
-    let Some(path) = model_path() else {
-        eprintln!("BLOB_ONNX_MODEL unset; skipping mcts benches");
+fn bench_search(c: &mut Criterion) {
+    let Some(m) = model() else {
+        eprintln!("BLOB_MODEL_DIR unset; skipping search benches");
         return;
     };
-    let eval = OnnxEvaluator::from_file(&path).expect("load ONNX model");
-    let state = playing_state();
-    let cfg = MctsConfig {
-        num_determinizations: 1,
-        sims_per_determinization: 100,
-        min_sims_floor: 0,
-        ..MctsConfig::default()
-    };
+    let (playing, bidding) = (playing_state(), bidding_state());
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
-    c.bench_function("mcts_1det_100sims", |b| {
-        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg, &mut rng, 0)))
+    let one_tree = MctsConfig { play_budget: SearchBudget::new(1, 100), ..MctsConfig::default() };
+    c.bench_function("search_play_1x100", |b| {
+        b.iter(|| black_box(mcts_search(black_box(&playing), &m.policy, &m.value, &one_tree, &mut rng, 0)))
     });
-
-    let cfg_full = MctsConfig {
-        num_determinizations: 5,
-        sims_per_determinization: 100,
-        min_sims_floor: 0,
-        ..MctsConfig::default()
-    };
-    c.bench_function("mcts_full_move_5x100", |b| {
-        b.iter(|| black_box(mcts_search(black_box(&state), &eval, &cfg_full, &mut rng, 0)))
+    let full = MctsConfig::default();
+    c.bench_function("search_play_5x100", |b| {
+        b.iter(|| black_box(mcts_search(black_box(&playing), &m.policy, &m.value, &full, &mut rng, 0)))
+    });
+    c.bench_function("search_bid_20x25", |b| {
+        b.iter(|| black_box(mcts_search(black_box(&bidding), &m.policy, &m.value, &full, &mut rng, 0)))
     });
 }
 
-criterion_group!(benches, bench_onnx_inference, bench_mcts_100_sims);
+criterion_group!(benches, bench_onnx_inference, bench_search);
 criterion_main!(benches);
