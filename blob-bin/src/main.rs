@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, Nets, DEFAULT_SEED};
-use blob_engine::mcts::{MctsConfig, SearchBudget, DEFAULT_C_PUCT};
+use blob_engine::mcts::{MctsConfig, SearchBudget, DEFAULT_C_PUCT, DEFAULT_SEARCH_ONE_CARD_BIDS};
 use blob_engine::rule_bot_2::Rollouts;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -143,14 +143,29 @@ struct SearchArgs {
     bid_sims: u32,
     /// Search: PUCT exploration constant. Lower lets values outweigh the
     /// policy net's priors sooner.
-    #[arg(long, default_value_t = DEFAULT_C_PUCT)]
+    #[arg(long, default_value_t = DEFAULT_C_PUCT, value_parser = parse_c_puct)]
     c_puct: f32,
+    /// Search: search the bid of a 1-card round (`false`: the policy net's
+    /// bid, no tree).
+    #[arg(long, default_value_t = DEFAULT_SEARCH_ONE_CARD_BIDS, action = clap::ArgAction::Set)]
+    search_one_card_bids: bool,
+}
+
+fn parse_c_puct(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(c) if c.is_finite() && c >= 0.0 => Ok(c),
+        _ => Err(format!("{s:?} is not a finite number >= 0")),
+    }
 }
 
 impl SearchArgs {
     fn config(self) -> MctsConfig {
         let budgets = (SearchBudget::new(self.bid_dets, self.bid_sims), SearchBudget::new(self.dets, self.sims));
-        MctsConfig { c_puct: self.c_puct, ..eval_mcts_config(budgets.0, budgets.1) }
+        MctsConfig {
+            c_puct: self.c_puct,
+            search_one_card_bids: self.search_one_card_bids,
+            ..eval_mcts_config(budgets.0, budgets.1)
+        }
     }
 }
 

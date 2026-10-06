@@ -1,0 +1,57 @@
+{
+  "g1": {
+    "correlation": 0.8299914879858993,
+    "criteria": "correlation > 0.7, last-trick RMSE < 0.05",
+    "last_trick_rmse": 0.03268290550466417,
+    "one_card_rmse": 0.03645629079066205,
+    "pass": true
+  },
+  "learner_step": 30000,
+  "secs": 2199.428349704,
+  "train_sample": {
+    "policy": {
+      "bid_agreement": 0.9923715250604567,
+      "bid_loss": 0.1865766436198283,
+      "bids": 141837,
+      "play_agreement": 0.9673164068593693,
+      "play_loss": 0.6668371443946213,
+      "plays": 262823
+    },
+    "value": {
+      "correlation": 0.8308365377296217,
+      "last_trick_max_error": 0.7275496125221252,
+      "last_trick_mse": 0.0010845487818229604,
+      "last_trick_seats": 647659,
+      "mse": 0.0425791643412725,
+      "one_card_max_error": 0.6629639863967896,
+      "one_card_mse": 0.0014586776751244433,
+      "one_card_states": 44072,
+      "seats": 3355275,
+      "states": 671055,
+      "variance": 0.13744523287483468
+    }
+  },
+  "validation": {
+    "policy": {
+      "bid_agreement": 0.9916680120452328,
+      "bid_loss": 0.18741116728175525,
+      "bids": 142463,
+      "play_agreement": 0.9673375362799727,
+      "play_loss": 0.6657373305778371,
+      "plays": 262197
+    },
+    "value": {
+      "correlation": 0.8299914879858993,
+      "last_trick_max_error": 0.7221945524215698,
+      "last_trick_mse": 0.0010681723122268076,
+      "last_trick_seats": 650165,
+      "mse": 0.04271231823285419,
+      "one_card_max_error": 0.7221945524215698,
+      "one_card_mse": 0.001329061138213311,
+      "one_card_states": 44480,
+      "seats": 3355275,
+      "states": 671055,
+      "variance": 0.13726178581340445
+    }
+  }
+}

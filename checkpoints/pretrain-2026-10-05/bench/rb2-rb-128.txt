@@ -1,0 +1,17 @@
+focal     rule bot 2
+opponents 4x rule bot
+table     5 players, 7 start cards; 128 deals x 5 seats = 640 games in 0 s
+
+points/game  focal 127.7  opponents 112.5  diff +15.2 ± 1.5 (95% CI over deals)
+win share    0.392 ± 0.037 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          3200   0.820    0.776      0.747       0.839
+2-4 cards       3840   0.720    0.572      0.622       0.570
+5-8 cards       3840   0.648    0.423      0.554       0.255
+all            10880   0.724    0.579      0.635       0.538
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.000  0.000  0.094  0.724  0.146  0.031  0.005
+opponents     0.000  0.008  0.147  0.635  0.172  0.032  0.006
+

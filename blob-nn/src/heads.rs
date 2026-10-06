@@ -129,11 +129,6 @@ impl SeatValueHead {
         let h = self.fc1.forward(x).gelu("none").dropout(HEAD_DROPOUT, train);
         self.fc2.forward(&h).squeeze_dim(-1)
     }
-
-    /// Per-token values `[B, S]` ∈ \[0, 1\].
-    pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
-        self.logits(x, train).sigmoid()
-    }
 }
 
 #[cfg(test)]
@@ -226,7 +221,7 @@ mod tests {
         let (b, s) = (4i64, 5i64);
         // Use large magnitudes to push toward saturation.
         let x = Tensor::randn([b, s, D_MODEL], (Kind::Float, Device::Cpu)) * 100.0;
-        let v = head.forward(&x, false);
+        let v = head.logits(&x, false).sigmoid();
         assert_eq!(v.size(), vec![b, s]);
         let min = v.min().double_value(&[]);
         let max = v.max().double_value(&[]);

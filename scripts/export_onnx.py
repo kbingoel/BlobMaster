@@ -54,12 +54,12 @@ LN_EPS = 1e-5
 
 # The encoder layout (`blob-engine/src/encoder.rs`). The Rust test
 # `export_script_mirrors_feature_widths` checks these lines.
-LAYOUT_ID = "layout-3"
+LAYOUT_ID = "layout-4"
 HAND_DIM = 32
 PLAYED_DIM = 49
 PLAYER_DIM = 28
 CONTEXT_DIM = 16
-OPP_HAND_DIM = 41
+OPP_HAND_DIM = 49
 FEAT_DIM = 49  # right-padded feature width: the widest token type
 assert FEAT_DIM == max(HAND_DIM, PLAYED_DIM, PLAYER_DIM, CONTEXT_DIM, OPP_HAND_DIM)
 MAX_CHRONO = 52
@@ -358,7 +358,7 @@ def main() -> None:
     meta = {
         "layout_id": LAYOUT_ID,
         "learner_step": learner_step,
-        "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None,
+        "checkpoint": str(args.checkpoint) if args.checkpoint else None,
         "policy": {"layers": P_LAYERS},
         "value": {"layers": V_LAYERS},
     }

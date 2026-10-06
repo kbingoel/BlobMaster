@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Gen 1 concluded on 2026-05-17** (final run `run-2026-05-14`, 168 iterations). On 2026-10-02 it was measured against a fixed rule bot and found weak: **−10.2 ± 2.9** points per game with 5×100 search (gen-2.md §2).
   - Root causes: a final-game value target that the value head memorized, values credited only to the seat to move at each leaf, and clipped end-of-round values.
 - **Gen 2 is the remake, planned in [gen-2.md](gen-2.md).** Phases 0 (yardsticks), 1 (encoder layout, determinization, tie-break), 2 (clean break) and 3 (the gen-2 engine: per-round utility, all-seat backup, policy and value evaluators, layout id) are done (2026-10-05).
-- **Phase 4 (two networks, supervised warm start from rule bot 2) is built and measured (2026-10-05):** G2 passes at c_puct 0.2; G1 is half met (V's correlation 0.769 passes, its 1-card exactness doesn't). Next: decide on V's trick features (gen-2.md §8), then **Phase 5, async self-play RL**.
+- **Phase 4 (two networks, supervised warm start from rule bot 2) is done (2026-10-06):** G1 and G2 pass with layout 4, which gives V's hand cards, mine and every opponent's, "beats the current winner" and their standing in suit, computed on the deal. Search defaults changed with it: c_puct 0.2, and 1-card bids from P alone. Next: **Phase 5, async self-play RL**.
 - **Gen 1 is gone from `master`.**
   - Code: tag `gen-1-final` (as trained) and tag `gen-1-compat` (the last commit whose tooling runs gen-1 models). Retired documents: `git show gen-1-final:<file>` (gen-2.md §10).
   - Reference models, `buffer.bin`, `model.ot` and metrics: archived outside the repo in `~/blobmaster-archive/run-2026-05-14/` (this machine only). gen-2.md Appendix A reproduces the gen-1 measurements from it.
-- **The warm-start model is `checkpoints/pretrain-2026-10-05/model`** (this machine only; weights are git-ignored). Its run directory also holds the config, `metrics.jsonl`, `held_out.json` and the bench reports (`bench/`).
+- **The warm-start model is `checkpoints/pretrain-2026-10-06/model`** (layout 4: its V, with the P of `checkpoints/pretrain-2026-10-05`, layout 3's run; this machine only, weights are git-ignored). Each run directory also holds the config, `metrics.jsonl`, `held_out.json` and the bench reports (`bench/`).
 - **Never commit per-iteration weights.** `*.onnx` is git-ignored; add a deliberate reference model with `git add -f`. History was rewritten on 2026-10-05 to drop the gen-1 model blobs (`.git` 4.9 GB → 31 MB, gen-2.md §9); a clone from before then must re-clone.
 
 ## Documents
@@ -32,7 +32,7 @@ cargo build --release -p blob-bin
 ./target/release/blobmaster bench <model dir> --mode search    # 64 deals × 5 seats; bids 20×25, plays 5×100, ~9 min
 ```
 
-A model is a directory: `policy.onnx`, `value.onnx`, `meta.json` (gen-2.md §5.3). Network mode loads only the policy net. Search budgets: `--bid-dets/--bid-sims` (default 20×25) and `--dets/--sims` (plays, default 5×100).
+A model is a directory: `policy.onnx`, `value.onnx`, `meta.json` (gen-2.md §5.3). Network mode loads only the policy net. Search budgets: `--bid-dets/--bid-sims` (default 20×25) and `--dets/--sims` (plays, default 5×100). `--c-puct` (default 0.2) and `--search-one-card-bids` (default `false`: P's bid, no tree) apply to `bench` and `play`; a search report's first line names all four settings.
 
 `bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. Opponents default to the rule bot; `--opponent <model dir>` uses that model's policy net, greedy (bots never search).
 
@@ -40,7 +40,8 @@ A model is a directory: `policy.onnx`, `value.onnx`, `meta.json` (gen-2.md §5.3
 
 References (default deals, against the rule bot):
 - gen-1 final: with 5×100 search on every decision **−10.2 ± 2.9**, network only −12.1 ± 2.0 (2026-10-02). Gen-1 models no longer load on `master`, so compare against these numbers or reproduce them at `gen-1-compat` (gen-2.md Appendix A).
-- the Phase-4 warm start: network only **+15.5 ± 1.5** (rule bot 2 on the same deals: +15.2 ± 1.5); search +17.0 ± 2.4 at the default c_puct 1.5, **+19.1 ± 2.6 with `--c-puct 0.2`**. Its priors are sharp, so at 1.5 search barely departs from P; `--c-puct` sets the exploration constant for `bench` and `play` (gen-2.md §6 Phase 4).
+- the Phase-4 warm start (layout 4): network only **+15.5 ± 1.5** (rule bot 2 on the same deals: +15.2 ± 1.5); search at the defaults **+20.0 ± 2.4**. Against four rule bot 2s on 128 fresh deals (`--seed 7`): search **+4.7 ± 1.0**, network only +0.1 ± 0.5 (gen-2.md §6 Phase 4).
+- in games of 1-card rounds only (`--cards 1`), search lost to P alone (−0.8 ± 0.1): the sampled deals ignore the bids already made. Hence 1-card bids from P (gen-2.md §8, exact 1-card bids).
 
 The tool uses every core, so don't run it next to a training run.
 
@@ -71,7 +72,8 @@ search: u_s = ŝ_s − λ·mean_{j≠s} ŝ_j at every leaf, exact at the round's
 - Rank, suit and seat are raw one-hots inside per-token feature vectors, with one input projection per token type. Played-card tokens also get a learned chronological embedding.
 - Seats are relative to the perspective (gen-2.md §6 Phase 1): "me" is seat 0, and player tokens come in that order.
 - **Two modes, one code path.** `encode` (P mode) shows only the seat to move's own cards; `encode_value` (V mode) adds every opponent's hand as `TOKEN_TYPE_OPP_HAND` tokens tagged with the owner's relative seat. Nothing game-level is encoded (no cumulative scores, no round number).
-- **One layout, guarded** (padded width `FEAT_DIM` = 49). `encoder::LAYOUT_ID` is stamped into every exported ONNX file (`blob_layout_id`, plus `blob_network` = `policy`/`value`), and `OnnxPolicy` / `OnnxValue` refuse any other. The golden-hash test `golden_layout_hash` fails on any encoding change: bump `LAYOUT_ID` and record the new hash. A layout change means retraining, never a compatibility path.
+- **V mode describes the deal** (layout 4). Every hand card, mine and each opponent's, carries the same features (`card_features`), computed for its owner against the other hands: suit standing, legal, beats the current winner. Opponents' cards also carry "owner still to play". P mode counts against the cards I haven't seen.
+- **One layout, guarded** (padded width `FEAT_DIM` = 49). `encoder::LAYOUT_ID` is stamped into every exported ONNX file (`blob_layout_id`, plus `blob_network` = `policy`/`value`), and `OnnxPolicy` / `OnnxValue` refuse any other. The golden-hash test `golden_layout_hash` hashes P mode and V mode separately and fails on any encoding change: bump `LAYOUT_ID` and record the new hashes. A layout change means retraining, never a compatibility path. The exception is a layout that leaves the P hash unchanged: P's input is then the same, so `[learner] policy_from` copies P's weights and only V trains (layout 4 did this).
 - `scripts/export_onnx.py` mirrors the token widths and `LAYOUT_ID`; `export_script_mirrors_feature_widths` checks them.
 
 **MCTS:**
@@ -80,6 +82,8 @@ search: u_s = ŝ_s − λ·mean_{j≠s} ŝ_j at every leaf, exact at the round's
 - Leaves: one `PolicyEvaluator::policy_batch` (priors, own view) and one `ValueEvaluator::values_batch` (ŝ for every seat, sampled deal) per lockstep step, batch up to 5. At the round's end the exact utilities are used instead.
 - Backup adds `u_s` to every seat's sum at every node on the path; UCB reads the acting seat's mean over all visits. No per-seat counts.
 - Forced moves are skipped without a network call.
+- 1-card bids come from P without a tree (`MctsConfig::search_one_card_bids`, default off).
+- c_puct defaults to 0.2 (`DEFAULT_C_PUCT`). The warm start's priors are sharp; at gen 1's 1.5 the visit counts barely depart from them.
 - Root Dirichlet noise is on in self-play.
 - `policy_target` is always τ=1; `policy_sampling` follows the τ schedule.
 
@@ -88,10 +92,10 @@ search: u_s = ŝ_s − λ·mean_{j≠s} ŝ_j at every leaf, exact at the round's
   - `model.rs`: `PolicyNet` (P, 8 layers, bid and play heads) and `ValueNet` (V, 4 layers, a projection for opponents' cards, a per-token ŝ head read at the player tokens). Parameter names match `scripts/export_onnx.py`.
   - `train.rs`: losses, AdamW, the LR schedule keyed to learner steps, checkpoints (a directory: `policy.ot`, `value.ot`, `meta.json` with `learner_step`; written beside and renamed in).
   - `learner.rs`: replay batches → tensors, `Learner` (one P and one V update per learner step), held-out measurements, `is_validation_round`, `is_forced`.
-- **V trains with sigmoid cross-entropy against ŝ** (a soft target), not MSE: same minimizer, but under MSE a high LR pinned the saturated sigmoid at 0 for good. Held-out V is reported as MSE, the targets' variance, correlation and the 1-card-round error (G1).
+- **V trains with sigmoid cross-entropy against ŝ** (a soft target), not MSE: same minimizer, but under MSE a high LR pinned the saturated sigmoid at 0 for good. Held-out V is reported as MSE, the targets' variance, correlation, the last-trick error at the seats that trick still decides (G1: every remaining play is forced, so ≈ exact) and the 1-card-round error.
 - **P skips forced decisions** (one legal move: its loss is 0 whatever it outputs); V trains on every state.
 - **Teacher data** (`blob-engine/src/teacher.rs`): rounds played by rule bot 2, with rule-bot seats (`rule_bot_share`) and exploration (`explore`) mixed in. Every decision is labelled with rule bot 2's policy, whoever played it: `argmax_weight` on its own move, the rest a softmax over each move's expected points. `fill_buffer` is deterministic in the seed on any thread count.
-- **`pretrain`** (`blob-train/src/pretrain.rs`): teacher rounds → split by round → loader threads build batches while the GPU trains → `metrics.jsonl` (training rows; held-out rows: validation vs an equal training sample) → checkpoint → held-out on every validation example (`held_out.json`, with G1) → `<run>/model`. A `STOP` file in the run directory saves and exits; `--resume` continues with the run's own `config.toml` (the data replays from the seed; the optimizers restart, tch can't save their state).
+- **`pretrain`** (`blob-train/src/pretrain.rs`): teacher rounds → split by round → loader threads build batches while the GPU trains → `metrics.jsonl` (a data row; training rows; held-out rows: validation vs an equal training sample) → checkpoint → held-out on every validation example (`held_out.json`, with G1) → `<run>/model`. A fresh run starts a new `metrics.jsonl`. A `STOP` file in the run directory saves and exits (after that step's held-out row); `--resume` continues with the run's own `config.toml` (the data replays from the seed; the optimizers restart, tch can't save their state). `[learner] policy_from = "<checkpoint dir>"` copies P and trains V only (~37 min instead of ~80).
 - Config: `blob-train/pretrain.sample.toml` lists every key at its default (a test keeps them equal).
 - The replay buffer (`blob-engine/src/replay.rs`) stores raw states, sparse policies and each seat's round points; `push_round` writes a finished round's decisions with a round id. `SharedReplay` is the concurrent wrapper; `sample_batch(.., augment)` relabels suits at random (`augment.rs`); `sample_batch_from(slots, ..)` samples from a subset, e.g. the training rounds.
 - Single rounds start with `dealing::new_round(RoundParams)`; `round::RoundMix` draws their parameters from real games' round mix.
@@ -149,7 +153,7 @@ search: u_s = ŝ_s − λ·mean_{j≠s} ŝ_j at every leaf, exact at the round's
 
 That is the `blob-nn` and `blob-train` tests and `blobmaster-train` (every subcommand: the binary links libtorch). `scripts/blobmaster-train.sh` sets the library path and the CUDA preload for it. Skip one of the three things below and you get one of:
 - a "missing shared library" abort at startup;
-- a silent CPU fallback;
+- a CPU-only libtorch (`pretrain` then refuses `cuda`; other code that links `tch` silently runs on the CPU);
 - `scripts/export_onnx.py` failing with `ModuleNotFoundError: torch`.
 
 The three things:
@@ -162,7 +166,7 @@ The three things:
   - `tch = 0.20.0` is pinned in Cargo.lock; it ships a libtorch 2.4-class build with a CUDA 12.x runtime.
 - **Library path and CUDA preload.**
   - Without `LD_LIBRARY_PATH=$LIBTORCH_DIR`, a binary that links `tch` fails to load at all.
-  - Without `LD_PRELOAD=$LIBTORCH_DIR/libtorch_cuda.so`, libtorch loads CPU-only and a GPU run silently falls back.
+  - Without `LD_PRELOAD=$LIBTORCH_DIR/libtorch_cuda.so`, libtorch loads CPU-only: `pretrain` refuses `cuda`, anything else silently runs on the CPU.
   - The CUDA driver on the box is 580.x; the runtime is carried by libtorch. `nvcc` is **not installed system-wide**, so don't reach for it.
 - **Do NOT let `LD_PRELOAD` reach Python subshells.**
   - Tch's vendored libtorch (~2.4) has a different C++ ABI from the venv's `torch==2.5.1+cu124`. Preloading it crashes `import torch` with `undefined symbol: ...torch::jit::Graph::toString...`.
@@ -170,4 +174,4 @@ The three things:
 
 `scripts/README.md` has the same notes; keep the two in sync. Launch a run with `scripts/blobmaster-train.sh pretrain --config <toml> --output checkpoints/<run>` (the learner refuses `cuda` when libtorch has no CUDA, instead of silently using the CPU). The GPU is a single RTX 4060 (`cuda:0`). Run `nvidia-smi --query-gpu=memory.used,memory.total --format=csv` before launching if another run might be resident.
 
-`scripts/visualize_strength.py` and `scripts/visualize_weight_evolution.py` still read gen-1 outputs (`strength.csv`, per-iteration `metrics.jsonl`, `iter_*` directories). They are re-pointed at gen-2 outputs together with the learner (gen-2.md §4).
+`scripts/visualize_strength.py` and `scripts/visualize_weight_evolution.py` still read gen-1 outputs (`strength.csv`, per-iteration `metrics.jsonl`, `iter_*` directories). They are re-pointed at gen-2 outputs with the Phase-5 driver, whose evaluator produces the strength series they plot (gen-2.md §4).

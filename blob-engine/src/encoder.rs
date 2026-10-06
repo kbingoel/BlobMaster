@@ -19,9 +19,14 @@
 //!   my place in bidding order.
 //! - **Trick features:** "winning so far" on current-trick cards; "legal"
 //!   and "beats the current winner" on hand cards.
-//! - Counts are scaled to [0, 1]; "highest/lowest in suit" ignore my own
-//!   cards. Nothing describes the game beyond the round: no cumulative
-//!   scores, no round number.
+//! - **V mode describes the deal** (layout 4, gen-2.md §6 Phase 4): every
+//!   hand card, mine and each opponent's, carries the same features
+//!   ([`card_features`]), with standings in suit counted against the other
+//!   hands; opponents' cards also say whether their owner is still to play
+//!   to the trick. P mode counts against the cards I haven't seen.
+//! - Counts are scaled to [0, 1]; "highest/lowest in suit" ignore the
+//!   owner's own cards. Nothing describes the game beyond the round: no
+//!   cumulative scores, no round number.
 //!
 //! **One layout, guarded** (§5.5 item 10): [`LAYOUT_ID`] names this layout.
 //! Every exported model carries it and the ONNX evaluator refuses any
@@ -38,8 +43,9 @@ use smallvec::SmallVec;
 
 /// Name of this encoder layout. Bump it with any change to the encoding:
 /// models trained on another layout must not load. Layouts 1 (gen 1) and 2
-/// (gen-2 Phase 1) predate the id and are never accepted.
-pub const LAYOUT_ID: &str = "layout-3";
+/// (gen-2 Phase 1) predate the id and are never accepted. Layout 4 changed
+/// V mode only (P mode is layout 3's, see `golden_layout_hash`).
+pub const LAYOUT_ID: &str = "layout-4";
 
 /// Dimensionality of a hand-card token.
 pub const HAND_CARD_DIM: usize = 32;
@@ -54,7 +60,7 @@ pub const PLAYER_STATE_DIM: usize = 28;
 pub const CONTEXT_DIM: usize = 16;
 
 /// Dimensionality of an opponent's hand-card token (V mode only).
-pub const OPP_HAND_CARD_DIM: usize = 41;
+pub const OPP_HAND_CARD_DIM: usize = 49;
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b {
@@ -104,21 +110,90 @@ fn flag(b: bool) -> f32 {
     }
 }
 
-/// Encode the perspective player's hand cards into feature vectors.
+/// Width of [`card_features`]: a hand card's features after its rank and
+/// suit (and, for an opponent's card, its owner).
+const CARD_FEATURE_DIM: usize = 8;
+
+/// The trick in progress while playing: its led suit and the card winning
+/// it so far. `None` while bidding and before a trick's first card.
+fn trick_in_progress(state: &BlobState) -> Option<(u8, u8)> {
+    if state.phase() != GamePhase::Playing {
+        return None;
+    }
+    current_trick_winner(state).map(|slot| {
+        let led = state.trick_play_order[0] / NUM_RANKS;
+        (led, state.trick_play_order[slot as usize])
+    })
+}
+
+/// The cards of `hand` its owner may play into the trick in progress:
+/// the led suit if they hold it, else anything; every card before the
+/// trick's first card; none while bidding.
+fn legal_cards(state: &BlobState, hand: u64, trick: Option<(u8, u8)>) -> u64 {
+    if state.phase() != GamePhase::Playing {
+        return 0;
+    }
+    match trick {
+        None => hand,
+        Some((led, _)) => {
+            let of_led = hand & (0x1FFFu64 << (led * NUM_RANKS));
+            if of_led != 0 {
+                of_led
+            } else {
+                hand
+            }
+        }
+    }
+}
+
+/// A hand card's features after rank and suit, the same for my cards and
+/// (V mode) opponents' cards:
+/// - `[0]`: is_trump
+/// - `[1]`: cards of its suit in its owner's hand / 13
+/// - `[2]`: is_highest_in_suit: no card of `others` in its suit outranks it
+/// - `[3]`: is_lowest_in_suit: no card of `others` in its suit ranks below it
+/// - `[4]`: cards of `others` above it in its suit / 13
+/// - `[5]`: cards of `others` below it in its suit / 13
+/// - `[6]`: is_legal: its owner may play it into the trick in progress
+///   (follow suit if able); 0 during bidding
+/// - `[7]`: beats_current_winner: would take the trick in progress from the
+///   card winning it so far; 0 when no card has been played
+///
+/// `others` are the cards it competes with: the unseen cards in P mode, the
+/// other hands in V mode.
+fn card_features(
+    card: Card,
+    hand: Hand,
+    others: u64,
+    legal: u64,
+    trick: Option<(u8, u8)>,
+    trump: u8,
+) -> [f32; CARD_FEATURE_DIM] {
+    let suit = card.suit();
+    let idx = card.index();
+    let counts = NUM_RANKS as f32;
+    let above = (others & suit.mask() & !((1u64 << (idx + 1)) - 1)).count_ones();
+    let below = (others & suit.mask() & ((1u64 << idx) - 1)).count_ones();
+    [
+        flag(trump < NUM_SUITS && suit.index() == trump),
+        hand.cards_of_suit(suit).count_ones() as f32 / counts,
+        flag(above == 0),
+        flag(below == 0),
+        above as f32 / counts,
+        below as f32 / counts,
+        flag((legal >> idx) & 1 == 1),
+        flag(trick.is_some_and(|(led, best)| beats(idx, best, led, trump))),
+    ]
+}
+
+/// Encode the perspective player's hand cards into feature vectors (P mode).
 ///
 /// Each card in the hand produces a 32-dimensional feature vector:
 /// - `[0..16)`: rank one-hot (13 values + 3 padding)
 /// - `[16..24)`: suit one-hot (4 values + 4 padding)
-/// - `[24]`: is_trump
-/// - `[25]`: suit_count_in_hand / 13
-/// - `[26]`: is_highest_in_suit: no unseen card of the suit outranks it
-/// - `[27]`: is_lowest_in_suit: no unseen card of the suit ranks below it
-/// - `[28]`: cards_above_unseen / 13 (same suit, higher, not mine, not played)
-/// - `[29]`: cards_below_unseen / 13 (same suit, lower, not mine, not played)
-/// - `[30]`: is_legal: playable into the current trick (follow suit if able);
-///   0 during bidding
-/// - `[31]`: beats_current_winner: would take the trick in progress from the
-///   card winning it so far; 0 when no card has been played
+/// - `[24..32)`: [`card_features`] against the unseen cards: is_trump, suit
+///   count, highest / lowest in suit, cards above / below, is_legal,
+///   beats_current_winner
 ///
 /// "Unseen" cards are neither in my hand nor played this round, so they may
 /// be in an opponent's hand (or undealt). My own cards don't count against
@@ -128,58 +203,37 @@ fn flag(b: bool) -> f32 {
 /// Tokens are emitted in `Hand::iter()` order (ascending card index).
 /// This is the canonical action order used by the playing head and MCTS.
 pub fn encode_hand_cards(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_CARD_DIM]> {
-    let hand = Hand::new(state.hands[perspective as usize]);
-    let trump = state.trump_suit;
     let deck_mask: u64 = (1u64 << 52) - 1;
-    let unseen = !hand.bits() & !state.played_this_round & deck_mask;
-    let counts = NUM_RANKS as f32;
+    let unseen = !state.hands[perspective as usize] & !state.played_this_round & deck_mask;
+    hand_card_tokens(state, perspective, unseen)
+}
 
-    // Follow-suit rule and current winner for the trick in progress.
-    let playing = state.phase() == GamePhase::Playing;
-    let trick = current_trick_winner(state).filter(|_| playing).map(|slot| {
-        let led = state.trick_play_order[0] / NUM_RANKS;
-        (led, state.trick_play_order[slot as usize])
-    });
-    let legal = match trick {
-        _ if !playing => 0,
-        None => hand.bits(),
-        Some((led, _)) => {
-            let of_led = hand.bits() & (0x1FFFu64 << (led * NUM_RANKS));
-            if of_led != 0 {
-                of_led
-            } else {
-                hand.bits()
-            }
-        }
-    };
+/// The perspective player's hand cards in V mode: [`encode_hand_cards`]'s
+/// tokens, with the standings in suit (`[26..30)`) counted against the
+/// other hands instead of the unseen cards. V sees the deal, so an undealt
+/// card doesn't count against my card.
+pub fn encode_hand_cards_dealt(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_CARD_DIM]> {
+    hand_card_tokens(state, perspective, other_hands(state, perspective))
+}
 
-    let mut tokens = Vec::with_capacity(hand.count() as usize);
-    for card in hand.iter() {
-        let mut feat = [0.0f32; HAND_CARD_DIM];
-        let suit = card.suit();
-        let idx = card.index();
+/// Every card held by a seat other than `owner`.
+fn other_hands(state: &BlobState, owner: u8) -> u64 {
+    (0..state.num_players).filter(|&p| p != owner).fold(0, |m, p| m | state.hands[p as usize])
+}
 
-        feat[card.rank() as usize] = 1.0;
-        feat[16 + suit.index() as usize] = 1.0;
-        feat[24] = flag(trump < NUM_SUITS && suit.index() == trump);
-        feat[25] = hand.cards_of_suit(suit).count_ones() as f32 / counts;
-
-        let suit_mask = suit.mask();
-        let above_in_suit = suit_mask & !((1u64 << (idx + 1)) - 1);
-        let below_in_suit = suit_mask & ((1u64 << idx) - 1);
-        let above = (unseen & above_in_suit).count_ones();
-        let below = (unseen & below_in_suit).count_ones();
-        feat[26] = flag(above == 0);
-        feat[27] = flag(below == 0);
-        feat[28] = above as f32 / counts;
-        feat[29] = below as f32 / counts;
-
-        feat[30] = flag((legal >> idx) & 1 == 1);
-        feat[31] = flag(trick.is_some_and(|(led, best)| beats(idx, best, led, trump)));
-
-        tokens.push(feat);
-    }
-    tokens
+fn hand_card_tokens(state: &BlobState, perspective: u8, others: u64) -> Vec<[f32; HAND_CARD_DIM]> {
+    let hand = Hand::new(state.hands[perspective as usize]);
+    let trick = trick_in_progress(state);
+    let legal = legal_cards(state, hand.bits(), trick);
+    hand.iter()
+        .map(|card| {
+            let mut feat = [0.0f32; HAND_CARD_DIM];
+            feat[card.rank() as usize] = 1.0;
+            feat[16 + card.suit().index() as usize] = 1.0;
+            feat[24..32].copy_from_slice(&card_features(card, hand, others, legal, trick, state.trump_suit));
+            feat
+        })
+        .collect()
 }
 
 /// Encode every opponent's hand cards (V mode), seat by seat in
@@ -190,19 +244,28 @@ pub fn encode_hand_cards(state: &BlobState, perspective: u8) -> Vec<[f32; HAND_C
 /// - `[16..24)`: suit one-hot (4 values + 4 padding)
 /// - `[24..40)`: the owner's relative seat one-hot (1..num_players; up to 8
 ///   values + 8 padding)
-/// - `[40]`: is_trump
+/// - `[40..48)`: [`card_features`] for its owner against the other hands,
+///   exactly as the owner's own V-mode hand-card token has them
+/// - `[48]`: owner_to_play: its owner has yet to play to the trick in
+///   progress (every seat before its first card); 0 during bidding
 pub fn encode_opponent_cards(state: &BlobState, perspective: u8) -> Vec<[f32; OPP_HAND_CARD_DIM]> {
     let np = state.num_players;
-    let trump = state.trump_suit;
+    let trick = trick_in_progress(state);
+    let playing = state.phase() == GamePhase::Playing;
     let mut tokens = Vec::new();
     for rel in 1..np {
         let owner = (perspective + rel) % np;
-        for card in Hand::new(state.hands[owner as usize]).iter() {
+        let hand = Hand::new(state.hands[owner as usize]);
+        let others = other_hands(state, owner);
+        let legal = legal_cards(state, hand.bits(), trick);
+        let to_play = playing && (owner + np - state.trick_leader) % np >= state.trick_cards_played;
+        for card in hand.iter() {
             let mut feat = [0.0f32; OPP_HAND_CARD_DIM];
             feat[card.rank() as usize] = 1.0;
             feat[16 + card.suit().index() as usize] = 1.0;
             feat[24 + rel as usize] = 1.0;
-            feat[40] = flag(trump < NUM_SUITS && card.suit().index() == trump);
+            feat[40..48].copy_from_slice(&card_features(card, hand, others, legal, trick, state.trump_suit));
+            feat[48] = flag(to_play);
             tokens.push(feat);
         }
     }
@@ -482,7 +545,11 @@ fn assemble(state: &BlobState, perspective: u8, every_hand: bool) -> EncodedStat
             state.phase()
         );
 
-        let hand_cards = encode_hand_cards(state, perspective);
+        let hand_cards = if every_hand {
+            encode_hand_cards_dealt(state, perspective)
+        } else {
+            encode_hand_cards(state, perspective)
+        };
         let opponent_cards =
             if every_hand { encode_opponent_cards(state, perspective) } else { Vec::new() };
         let played_cards = encode_played_cards(state, perspective);
@@ -2535,10 +2602,21 @@ mod tests {
             }
             assert_eq!(held, s.hands, "every card of every hand, with its owner");
 
-            let others: Vec<usize> =
-                (0..v.num_tokens).filter(|&i| v.token_types[i] != TOKEN_TYPE_OPP_HAND).collect();
-            let strip = |x: &Vec<Vec<f32>>| others.iter().map(|&i| x[i].clone()).collect::<Vec<_>>();
-            assert_eq!(strip(&v.features), p.features, "V mode is P mode plus opponents' cards");
+            // My hand cards' standings in suit ([26..30)) count the other
+            // hands in V mode and the unseen cards in P mode; the rest is
+            // identical.
+            let mut stripped: Vec<Vec<f32>> = (0..v.num_tokens)
+                .filter(|&i| v.token_types[i] != TOKEN_TYPE_OPP_HAND)
+                .map(|i| v.features[i].clone())
+                .collect();
+            let mut expected = p.features.clone();
+            for (i, &tt) in p.token_types.iter().enumerate() {
+                if tt == TOKEN_TYPE_HAND {
+                    stripped[i][26..30].fill(0.0);
+                    expected[i][26..30].fill(0.0);
+                }
+            }
+            assert_eq!(stripped, expected, "V mode is P mode plus opponents' cards");
             assert_eq!(v.hand_card_indices, p.hand_card_indices);
             // The player to move always holds a card, so opponents' cards
             // follow a hand card.
@@ -2582,10 +2660,117 @@ mod tests {
         assert!(redealt_any > 300, "only {redealt_any} states re-dealt");
     }
 
-    /// FNV-1a over both modes' encodings of every state of
+    /// The other hands' cards of `card`'s suit above and below it.
+    fn held_above_below(s: &BlobState, owner: u8, card: u8) -> (u32, u32) {
+        let others = (0..s.num_players).filter(|&p| p != owner).fold(0u64, |m, p| m | s.hands[p as usize]);
+        let suit = (0x1FFFu64 << (card / NUM_RANKS * NUM_RANKS)) & others;
+        ((suit >> card >> 1).count_ones(), (suit & ((1u64 << card) - 1)).count_ones())
+    }
+
+    /// V mode (layout 4): every hand card's standing in its suit counts the
+    /// other hands, so an undealt card doesn't count against it, and an
+    /// opponent's card is described exactly as its owner's own V-mode
+    /// hand-card token describes it.
+    #[test]
+    fn value_mode_card_features_describe_the_deal() {
+        for s in random_game_states() {
+            let me = s.current_player;
+            let n = s.num_players;
+            let v = encode_value(&s, me);
+            let mut opp = (0..v.num_tokens).filter(|&i| v.token_types[i] == TOKEN_TYPE_OPP_HAND);
+            for rel in 1..n {
+                let owner = (me + rel) % n;
+                let own_view = encode_hand_cards_dealt(&s, owner);
+                for (k, card) in Hand::new(s.hands[owner as usize]).iter().enumerate() {
+                    let feat = &v.features[opp.next().expect("a token per card")];
+                    assert_eq!(token_card(feat), card.index());
+                    assert_eq!(feat[40..48], own_view[k][24..32], "card {} of seat {owner}", card.index());
+                }
+            }
+            for (feat, card) in encode_hand_cards_dealt(&s, me).iter().zip(Hand::new(s.hands[me as usize]).iter()) {
+                let (above, below) = held_above_below(&s, me, card.index());
+                let counts = NUM_RANKS as f32;
+                assert_eq!(feat[26..30], [flag(above == 0), flag(below == 0), above as f32 / counts, below as f32 / counts]);
+            }
+        }
+    }
+
+    /// An opponent's legal and beats flags agree with playing the card as
+    /// its owner, and owner_to_play marks the seats still to play to the
+    /// trick in progress.
+    #[test]
+    fn opponent_trick_flags_match_playing_the_card() {
+        use crate::playing::{apply_play, legal_plays};
+        let mut checked = 0;
+        for s in random_game_states() {
+            let me = s.current_player;
+            let n = s.num_players;
+            let playing = s.phase() == GamePhase::Playing;
+            let played: Vec<u8> = (0..s.trick_cards_played).map(|i| (s.trick_leader + i) % n).collect();
+            let v = encode_value(&s, me);
+            let mut opp = (0..v.num_tokens).filter(|&i| v.token_types[i] == TOKEN_TYPE_OPP_HAND);
+            for rel in 1..n {
+                let owner = (me + rel) % n;
+                let mut as_owner = s;
+                as_owner.current_player = owner;
+                let legal = legal_plays(&as_owner);
+                let to_play = playing && !played.contains(&owner);
+                for card in Hand::new(s.hands[owner as usize]).iter().map(|c| c.index()) {
+                    let feat = &v.features[opp.next().unwrap()];
+                    assert_eq!(feat[46], flag((legal >> card) & 1 == 1), "legal, card {card}");
+                    assert_eq!(feat[48], flag(to_play), "to play, seat {owner}");
+                    // Its owner and the seat to move are both still to play,
+                    // so playing the card leaves the trick open.
+                    if to_play && s.trick_cards_played > 0 && (legal >> card) & 1 == 1 {
+                        let mut after = as_owner;
+                        apply_play(&mut after, card);
+                        let wins = current_trick_winner(&after) == Some(s.trick_cards_played);
+                        assert_eq!(feat[47], flag(wins), "beats, card {card}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "only {checked} cards checked");
+    }
+
+    /// The Phase-4 miss (gen-2.md §6): no trump, I lead 8♥ and the next
+    /// seat holds 10♥. In V mode that card shows it beats my lead.
+    #[test]
+    fn value_mode_shows_an_opponent_card_beating_the_lead() {
+        use crate::bidding::apply_bid;
+        use crate::dealing::{new_round, RoundParams};
+        use crate::playing::apply_play;
+        use rand_xoshiro::rand_core::SeedableRng;
+        let params = RoundParams { num_players: 3, cards_dealt: 1, trump: NO_TRUMP, dealer: 2 };
+        let mut s = new_round(params, &mut rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3)).unwrap();
+        for _ in 0..3 {
+            apply_bid(&mut s, 0);
+        }
+        let me = s.current_player;
+        let (h8, h10, c2) = (c(Suit::Hearts, 6), c(Suit::Hearts, 8), c(Suit::Clubs, 0));
+        s.hands = [0; MAX_PLAYERS];
+        s.hands[me as usize] = 1 << h8.index();
+        s.hands[((me + 1) % 3) as usize] = 1 << h10.index();
+        s.hands[((me + 2) % 3) as usize] = 1 << c2.index();
+
+        // Before the lead: P counts the six unseen hearts above 8♥; V the
+        // one dealt to another seat.
+        assert_eq!(encode_hand_cards(&s, me)[0][26..30], [0.0, 0.0, 6.0 / 13.0, 6.0 / 13.0]);
+        assert_eq!(encode_hand_cards_dealt(&s, me)[0][26..30], [0.0, 1.0, 1.0 / 13.0, 0.0]);
+
+        apply_play(&mut s, h8.index());
+        let opp = encode_opponent_cards(&s, me);
+        // 10♥: legal, beats the 8♥, still to play.
+        assert_eq!((opp[0][46], opp[0][47], opp[0][48]), (1.0, 1.0, 1.0));
+        // 2♣: legal (void in hearts), doesn't beat it, still to play.
+        assert_eq!((opp[1][46], opp[1][47], opp[1][48]), (1.0, 0.0, 1.0));
+    }
+
+    /// FNV-1a over one mode's encodings of every state of
     /// [`random_game_states`]: token types, chronological indices and
     /// feature bits.
-    fn layout_hash() -> u64 {
+    fn layout_hash(mode: fn(&BlobState, u8) -> EncodedState) -> u64 {
         let mut h: u64 = 0xCBF2_9CE4_8422_2325;
         let mut eat = |bytes: &[u8]| {
             for &b in bytes {
@@ -2593,14 +2778,13 @@ mod tests {
             }
         };
         for s in random_game_states() {
-            for enc in [encode(&s, s.current_player), encode_value(&s, s.current_player)] {
-                eat(&enc.token_types);
-                eat(&enc.chronological_indices);
-                for feat in &enc.features {
-                    eat(&(feat.len() as u32).to_le_bytes());
-                    for v in feat {
-                        eat(&v.to_bits().to_le_bytes());
-                    }
+            let enc = mode(&s, s.current_player);
+            eat(&enc.token_types);
+            eat(&enc.chronological_indices);
+            for feat in &enc.features {
+                eat(&(feat.len() as u32).to_le_bytes());
+                for v in feat {
+                    eat(&v.to_bits().to_le_bytes());
                 }
             }
         }
@@ -2609,13 +2793,18 @@ mod tests {
 
     /// The layout guard (gen-2.md §5.5 item 10). If this fails, the encoding
     /// changed: bump [`LAYOUT_ID`] (models trained on the old layout must
-    /// stop loading) and record the new id and hash here. A `rand` upgrade
-    /// changes the test states and fails it too; then only the hash moves.
+    /// stop loading) and record the new id and hashes here. A `rand`
+    /// upgrade changes the test states and fails it too; then only the
+    /// hashes move.
+    ///
+    /// One hash per mode. A layout whose P hash is unchanged leaves P's
+    /// input as it was, so P's weights may carry over (`learner.policy_from`).
     #[test]
     fn golden_layout_hash() {
-        const GOLDEN: (&str, u64) = ("layout-3", 0x3FD8_2F36_9277_ADB5);
+        // Layout 4 changed V mode only; P's hash is layout 3's.
+        const GOLDEN: (&str, u64, u64) = ("layout-4", 0xD7F0_8ADA_FC97_5958, 0xBF5D_345E_F6AC_8D5F);
         assert_eq!(
-            (LAYOUT_ID, layout_hash()),
+            (LAYOUT_ID, layout_hash(encode), layout_hash(encode_value)),
             GOLDEN,
             "encoder output changed: bump LAYOUT_ID and update GOLDEN (and scripts/export_onnx.py)"
         );

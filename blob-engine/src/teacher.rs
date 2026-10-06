@@ -44,7 +44,8 @@ pub struct TeacherConfig {
     /// Softmax temperature over each move's expected points, in points.
     pub temperature: f32,
     /// Weight of rule bot 2's own move in the target; the softmax gets the
-    /// rest. Above 0 the target's top move is always rule bot 2's.
+    /// rest. At 0.5 or more the target's top move is always rule bot 2's;
+    /// below, a near-tie it breaks toward the weaker move can flip it.
     pub argmax_weight: f32,
 }
 

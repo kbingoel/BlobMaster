@@ -9,7 +9,7 @@
 //! `cargo test -p blob-nn --release -- --ignored numerical_stability`
 
 use blob_engine::{fill_buffer, ReplayBuffer, RoundMix, TeacherConfig};
-use blob_nn::learner::{bid_policy_batch, is_forced, value_batch, Learner, LearnerConfig};
+use blob_nn::learner::{bid_policy_batch, is_forced, play_policy_batch, value_batch, Learner, LearnerConfig};
 use blob_nn::train::policy_probs;
 use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
 use tch::Device;
@@ -34,10 +34,12 @@ fn numerical_stability() {
         let (pl, vl) = (pl.unwrap().double_value(&[]), vl.unwrap().double_value(&[]));
         assert!(pl.is_finite() && vl.is_finite(), "non-finite loss at step {i}: {pl} {vl}");
 
-        if let Some(pb) = bid_policy_batch(&p.0, Device::Cpu) {
+        let heads = [("bid", bid_policy_batch(&p.0, Device::Cpu)), ("play", play_policy_batch(&p.1, Device::Cpu))];
+        for (head, pb) in heads {
+            let Some(pb) = pb else { continue };
             let probs = tch::no_grad(|| policy_probs(&learner.policy, &pb, false));
             let (lo, hi) = (probs.min().double_value(&[]), probs.max().double_value(&[]));
-            assert!(lo >= -1e-6 && hi <= 1.0 + 1e-6, "bid probs out of [0,1] at step {i}: [{lo}, {hi}]");
+            assert!(lo >= -1e-6 && hi <= 1.0 + 1e-6, "{head} probs out of [0,1] at step {i}: [{lo}, {hi}]");
         }
         let vb = value_batch(&v.0, &v.1, Device::Cpu).unwrap();
         let values = tch::no_grad(|| learner.value.forward(&vb.input, false));

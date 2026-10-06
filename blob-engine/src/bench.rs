@@ -36,7 +36,7 @@ use crate::evaluator::PolicyEvaluator;
 use crate::game::{advance_round, new_game};
 use crate::hand::Hand;
 use crate::mcts::{
-    mcts_search, MctsConfig, MctsResult, SearchBudget, DEFAULT_BID_BUDGET, DEFAULT_C_PUCT,
+    mcts_search, MctsConfig, MctsResult, SearchBudget, DEFAULT_BID_BUDGET,
     DEFAULT_PLAY_BUDGET,
 };
 use crate::onnx::{OnnxPolicy, OnnxValue};
@@ -211,10 +211,8 @@ pub struct BenchReport {
     pub opponent: Agent,
     pub num_players: u8,
     pub start_cards: u8,
-    /// `(bids, plays)` search budgets, used when either side searches.
-    pub search_budgets: (SearchBudget, SearchBudget),
-    /// The search's exploration constant.
-    pub c_puct: f32,
+    /// The search settings, used when either side searches.
+    pub mcts: MctsConfig,
     pub deals: usize,
     pub games: usize,
     pub focal_points: f64,
@@ -441,8 +439,7 @@ pub fn summarize(focal: &Agent, opponent: &Agent, cfg: &BenchConfig, games: &[Ga
         opponent: opponent.clone(),
         num_players: cfg.num_players,
         start_cards: cfg.start_cards,
-        search_budgets: (cfg.mcts.bid_budget, cfg.mcts.play_budget),
-        c_puct: cfg.mcts.c_puct,
+        mcts: cfg.mcts,
         deals: cfg.deals,
         games: games.len(),
         focal_points: games.iter().map(|g| g.focal_score).sum::<f64>() / n,
@@ -469,15 +466,21 @@ pub fn run_bench(
     summarize(focal, opponent, cfg, &games, started.elapsed().as_secs_f64())
 }
 
-fn agent_label(a: &Agent, budgets: (SearchBudget, SearchBudget), c_puct: f32) -> String {
+fn agent_label(a: &Agent, mcts: &MctsConfig) -> String {
     match a {
         Agent::RuleBot => "rule bot".to_string(),
         Agent::RuleBot2 => "rule bot 2".to_string(),
         Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("network {}", p.display()),
         Agent::Search(p) => {
-            let c = if c_puct == DEFAULT_C_PUCT { String::new() } else { format!(", c_puct {c_puct}") };
-            format!("search bids {}, plays {}{c} {}", budgets.0, budgets.1, p.display())
+            let one_card = if mcts.search_one_card_bids { "searched" } else { "from P" };
+            format!(
+                "search bids {}, plays {}, c_puct {}, 1-card bids {one_card} {}",
+                mcts.bid_budget,
+                mcts.play_budget,
+                mcts.c_puct,
+                p.display()
+            )
         }
     }
 }
@@ -493,8 +496,8 @@ fn share(num: u64, den: u64) -> String {
 impl fmt::Display for BenchReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let opp = self.num_players - 1;
-        writeln!(f, "focal     {}", agent_label(&self.focal, self.search_budgets, self.c_puct))?;
-        writeln!(f, "opponents {opp}x {}", agent_label(&self.opponent, self.search_budgets, self.c_puct))?;
+        writeln!(f, "focal     {}", agent_label(&self.focal, &self.mcts))?;
+        writeln!(f, "opponents {opp}x {}", agent_label(&self.opponent, &self.mcts))?;
         writeln!(
             f,
             "table     {} players, {} start cards; {} deals x {} seats = {} games in {:.0} s",

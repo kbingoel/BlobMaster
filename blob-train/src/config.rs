@@ -1,6 +1,8 @@
 //! `pretrain`'s config file (gen-2.md §6 Phase 4). Every section and key
-//! is optional and falls back to its default; unknown keys are an error,
-//! so a stale config fails loudly. `pretrain.sample.toml` lists them all.
+//! is optional and falls back to its default, except that a
+//! `[teacher.mix]` section needs `players` and `start_cards`. Unknown keys
+//! are an error, so a stale config fails loudly. `pretrain.sample.toml`
+//! lists them all.
 
 use blob_engine::TeacherConfig;
 use blob_nn::learner::LearnerConfig;
@@ -112,6 +114,7 @@ mod tests {
         assert!(PretrainConfig::parse("[gen1]\n").is_err());
         assert!(PretrainConfig::parse("[data]\nvalidation_fraction = 0.0\n").is_err());
         assert!(PretrainConfig::parse("[teacher]\nexplore = 2.0\n").is_err());
+        assert!(PretrainConfig::parse("[teacher.mix]\nstart_cards = 8\n").is_err(), "a mix names its players");
         let small = PretrainConfig::parse("[data]\nrounds = 10\n[learner]\ndevice = \"cpu\"\n").unwrap();
         assert_eq!((small.data.rounds, small.learner.device.as_str()), (10, "cpu"));
     }

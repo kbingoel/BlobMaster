@@ -6,18 +6,21 @@
 //! 2. Train P and V on the training rounds, P on decisions with a choice
 //!    and V on every state. Loader threads build batches while the GPU
 //!    trains.
-//! 3. Log to `metrics.jsonl`: a training row every `log.every` steps, and a
-//!    held-out row every `log.eval_every` steps (validation against an
-//!    equally large training sample, dropout off).
+//! 3. Log to `metrics.jsonl`: a data row (the teacher data and the split),
+//!    a training row every `log.every` steps, and a held-out row every
+//!    `log.eval_every` steps (validation against an equally large training
+//!    sample, dropout off). With `learner.policy_from`, P is copied from
+//!    that checkpoint and only V trains.
 //! 4. At the end, save the checkpoint, run the held-out measurement on
 //!    every validation example (`held_out.json`, with G1) and export the
 //!    model directory.
 //!
 //! Run directory: `config.toml` (every default filled in), `metrics.jsonl`,
-//! `checkpoint/`, `held_out.json`, `model/`. A `STOP` file makes the run
-//! save and exit at its next training row. `--resume` continues from the
-//! checkpoint with the run's own config: the teacher data replays from the
-//! seed, the optimizers start afresh.
+//! `checkpoint/`, `held_out.json`, `model/`. A fresh run starts a new
+//! `metrics.jsonl`. A `STOP` file makes the run save and exit at its next
+//! training row (after that step's held-out row, if it has one).
+//! `--resume` continues from the checkpoint with the run's own config: the
+//! teacher data replays from the seed, the optimizers start afresh.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -26,7 +29,8 @@ use std::sync::mpsc::{sync_channel, Receiver};
 use std::time::Instant;
 
 use blob_engine::{fill_buffer, ReplayBuffer};
-use blob_nn::learner::{is_forced, is_validation_round, Learner, StepBatches};
+use blob_nn::learner::{is_forced, is_validation_round, value_batch, Learner, StepBatches};
+use blob_nn::train::recover_checkpoint;
 use rand::seq::index;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -37,9 +41,10 @@ use crate::config::PretrainConfig;
 use crate::export::export;
 
 /// G1 (gen-2.md §7): V's correlation with the actual outcome on held-out
-/// rounds, and its RMSE where the deal decides the outcome.
+/// rounds, and its RMSE where the deal decides the outcome: the last trick,
+/// at the seats it still decides.
 pub const G1_MIN_CORRELATION: f64 = 0.7;
-pub const G1_MAX_ONE_CARD_RMSE: f64 = 0.05;
+pub const G1_MAX_LAST_TRICK_RMSE: f64 = 0.05;
 
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -134,22 +139,24 @@ fn short(report: &Value) -> String {
     let (vp, vv) = (&report["validation"]["policy"], &report["validation"]["value"]);
     let (tp, tv) = (&report["train_sample"]["policy"], &report["train_sample"]["value"]);
     format!(
-        "held out (valid / train): P bid {} / {}, play {} / {}, agree {} / {}; V mse {} / {} (var {}), corr {} / {}, 1-card mse {}",
+        "held out (valid / train): P bid {} / {}, play {} / {}, agree {} / {}; V mse {} / {} (var {}), corr {} / {}, last-trick mse {}, 1-card mse {}",
         f(&vp["bid_loss"]), f(&tp["bid_loss"]), f(&vp["play_loss"]), f(&tp["play_loss"]),
         f(&vp["play_agreement"]), f(&tp["play_agreement"]), f(&vv["mse"]), f(&tv["mse"]),
-        f(&vv["variance"]), f(&vv["correlation"]), f(&tv["correlation"]), f(&vv["one_card_mse"]),
+        f(&vv["variance"]), f(&vv["correlation"]), f(&tv["correlation"]), f(&vv["last_trick_mse"]),
+        f(&vv["one_card_mse"]),
     )
 }
 
 /// G1 on V's validation measurement (a serialized `ValueHeldOut`).
 fn g1(v: &Value) -> Value {
     let corr = v["correlation"].as_f64().unwrap_or(f64::NAN);
-    let rmse = v["one_card_mse"].as_f64().unwrap_or(f64::NAN).sqrt();
+    let rmse = v["last_trick_mse"].as_f64().unwrap_or(f64::NAN).sqrt();
     json!({
         "correlation": corr,
-        "one_card_rmse": rmse,
-        "pass": corr > G1_MIN_CORRELATION && rmse < G1_MAX_ONE_CARD_RMSE,
-        "criteria": format!("correlation > {G1_MIN_CORRELATION}, 1-card RMSE < {G1_MAX_ONE_CARD_RMSE}"),
+        "last_trick_rmse": rmse,
+        "one_card_rmse": v["one_card_mse"].as_f64().unwrap_or(f64::NAN).sqrt(),
+        "pass": corr > G1_MIN_CORRELATION && rmse < G1_MAX_LAST_TRICK_RMSE,
+        "criteria": format!("correlation > {G1_MIN_CORRELATION}, last-trick RMSE < {G1_MAX_LAST_TRICK_RMSE}"),
     })
 }
 
@@ -161,6 +168,7 @@ fn write_row(file: &mut File, row: &Value) -> Result<(), String> {
 pub fn pretrain(cfg: PretrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
     let started = Instant::now();
     let run = Run { dir: dir.to_path_buf() };
+    recover_checkpoint(run.checkpoint()).map_err(|e| format!("{}: {e}", run.checkpoint().display()))?;
     if resume {
         if !run.checkpoint().is_dir() {
             return Err(format!("{}: no checkpoint to resume", run.checkpoint().display()));
@@ -189,25 +197,28 @@ pub fn pretrain(cfg: PretrainConfig, dir: &Path, resume: bool) -> Result<(), Str
     let mut buf = ReplayBuffer::new(cfg.data.rounds as usize * max_decisions_per_round(&cfg));
     fill_buffer(&mut buf, &cfg.teacher, cfg.data.rounds, cfg.data.seed, threads);
     let split = Split::new(&buf, cfg.data.validation_fraction);
-    eprintln!(
-        "[pretrain] teacher: {} rounds, {} decisions in {:.1} s; training {} (P {}), validation {} (P {})",
-        buf.rounds_pushed(),
-        buf.len(),
-        t.elapsed().as_secs_f64(),
-        split.train_v.len(),
-        split.train_p.len(),
-        split.valid_v.len(),
-        split.valid_p.len(),
-    );
+    let data = json!({
+        "kind": "data",
+        "step": learner.step,
+        "rounds": buf.rounds_pushed(),
+        "decisions": buf.len(),
+        "secs": t.elapsed().as_secs_f64(),
+        "train": { "value": split.train_v.len(), "policy": split.train_p.len() },
+        "validation": { "value": split.valid_v.len(), "policy": split.valid_p.len() },
+    });
+    eprintln!("[pretrain] teacher data: {data}");
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(cfg.data.seed ^ 0xE7A1_5E75);
     let periodic = split.eval_sets(Some(cfg.log.eval_examples), &mut rng);
     let chunk = 2 * cfg.learner.batch_size;
 
     let mut metrics = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(resume)
+        .truncate(!resume)
         .open(run.path("metrics.jsonl"))
         .map_err(|e| format!("metrics.jsonl: {e}"))?;
+    write_row(&mut metrics, &data)?;
 
     let (tx, rx) = sync_channel::<StepBatches>(2 * cfg.data.loader_threads);
     let stopped = std::thread::scope(|sc| {
@@ -217,9 +228,15 @@ pub fn pretrain(cfg: PretrainConfig, dir: &Path, resume: bool) -> Result<(), Str
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(cfg.data.seed.wrapping_add(1 + t as u64));
                 let (n, augment) = (cfg.learner.batch_size, cfg.learner.augment);
                 loop {
-                    let p = buf.sample_batch_from(&split.train_p, n, &mut rng, augment);
-                    let v = buf.sample_batch_from(&split.train_v, n, &mut rng, augment);
-                    if tx.send(StepBatches::build(&p, &v, Device::Cpu)).is_err() {
+                    let batches = if cfg.learner.trains_policy() {
+                        let p = buf.sample_batch_from(&split.train_p, n, &mut rng, augment);
+                        let v = buf.sample_batch_from(&split.train_v, n, &mut rng, augment);
+                        StepBatches::build(&p, &v, Device::Cpu)
+                    } else {
+                        let v = buf.sample_batch_from(&split.train_v, n, &mut rng, augment);
+                        StepBatches { policy: Vec::new(), value: value_batch(&v.0, &v.1, Device::Cpu) }
+                    };
+                    if tx.send(batches).is_err() {
                         return;
                     }
                 }
@@ -277,6 +294,7 @@ fn train(
     // Seconds of the interval spent waiting for batches, and measuring or
     // saving (left out of steps/s).
     let (mut waited, mut paused) = (0.0f64, 0.0f64);
+    let mut stop = false;
     while learner.step < total {
         let lr = learner.lr();
         let w = Instant::now();
@@ -295,24 +313,24 @@ fn train(
                 "step": step,
                 "secs": started.elapsed().as_secs_f64(),
                 "lr": lr,
-                "policy_loss": p_sum.double_value(&[]) / n as f64,
+                "policy_loss": if learner.trains_policy { json!(p_sum.double_value(&[]) / n as f64) } else { Value::Null },
                 "value_loss": v_sum.double_value(&[]) / n as f64,
                 "steps_per_sec": n as f64 / secs,
                 "loader_wait": waited / secs,
             });
             write_row(metrics, &row)?;
             eprintln!(
-                "[pretrain] step {step}/{total} lr {lr:.2e}: P {:.4}, V {:.4}; {:.1} steps/s, waiting on batches {:.0}%",
-                row["policy_loss"].as_f64().unwrap_or(f64::NAN),
+                "[pretrain] step {step}/{total} lr {lr:.2e}: P {}, V {:.4}; {:.1} steps/s, waiting on batches {:.0}%",
+                row["policy_loss"].as_f64().map_or("frozen".to_string(), |x| format!("{x:.4}")),
                 row["value_loss"].as_f64().unwrap_or(f64::NAN),
                 n as f64 / secs,
                 100.0 * waited / secs,
             );
             (p_sum, v_sum, n, waited, paused, interval) = (zero(), zero(), 0, 0.0, 0.0, Instant::now());
-            let stop = run.path("STOP");
-            if stop.exists() {
-                let _ = std::fs::remove_file(&stop);
-                return Ok(true);
+            let file = run.path("STOP");
+            if file.exists() {
+                let _ = std::fs::remove_file(&file);
+                stop = true;
             }
         }
         let pause = Instant::now();
@@ -327,6 +345,9 @@ fn train(
                 "train_sample": report["train_sample"],
             });
             write_row(metrics, &row)?;
+        }
+        if stop {
+            return Ok(true);
         }
         if step < total && cfg.log.checkpoint_every > 0 && step.is_multiple_of(cfg.log.checkpoint_every) {
             learner.save(&run.checkpoint())?;

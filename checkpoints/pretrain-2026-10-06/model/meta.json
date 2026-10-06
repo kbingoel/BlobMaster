@@ -1,7 +1,7 @@
 {
-  "layout_id": "layout-3",
+  "layout_id": "layout-4",
   "learner_step": 30000,
-  "checkpoint": "checkpoints/pretrain-2026-10-05/checkpoint",
+  "checkpoint": "checkpoints/pretrain-2026-10-06/checkpoint",
   "policy": {
     "layers": 8
   },

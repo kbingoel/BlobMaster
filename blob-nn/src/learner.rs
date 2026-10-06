@@ -3,7 +3,8 @@
 //! and checkpoints.
 //!
 //! - **One learner step** is one P update and one V update, each on its own
-//!   batch. The LR of both follows the step ([`LrSchedule`]).
+//!   batch. The LR of both follows the step ([`LrSchedule`]). With
+//!   `policy_from`, P is a checkpoint's and only V updates.
 //! - **P** trains on the target policies of decisions with more than one
 //!   legal move ([`is_forced`]); **V** on every state, against the actual
 //!   ŝ of every seat ([`SeatScores`], relative to the seat to move: V's
@@ -14,7 +15,7 @@
 //!   Compare a validation set with the same measurement on an equally large
 //!   training sample, never with the losses logged during training.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use blob_engine::bidding::legal_bids;
 use blob_engine::encoder::{encode, encode_value, TOKEN_TYPE_HAND};
@@ -30,7 +31,7 @@ use crate::input::pad_batch;
 use crate::model::{PolicyNet, ValueNet};
 use crate::train::{
     build_optimizer, load_checkpoint, optimize, policy_cross_entropy_rows, policy_loss, policy_probs,
-    save_checkpoint, value_loss, CheckpointMeta, LrSchedule, Phase, PolicyBatch, ValueBatch,
+    save_checkpoint, value_loss, CheckpointMeta, LrSchedule, Phase, PolicyBatch, ValueBatch, POLICY_WEIGHTS,
 };
 
 /// Whether round `round_id` is held out for validation.
@@ -186,6 +187,10 @@ pub struct LearnerConfig {
     pub weight_decay: f64,
     /// Relabel the suits of every sampled example at random.
     pub augment: bool,
+    /// Copy P from this checkpoint directory and don't train it; empty:
+    /// train P. Only for a layout that left P mode unchanged (the P hash
+    /// in `encoder::golden_layout_hash`), e.g. a change to V's input.
+    pub policy_from: String,
 }
 
 impl Default for LearnerConfig {
@@ -199,6 +204,7 @@ impl Default for LearnerConfig {
             min_lr: 1e-5,
             weight_decay: 1e-4,
             augment: true,
+            policy_from: String::new(),
         }
     }
 }
@@ -216,6 +222,11 @@ impl LearnerConfig {
             return Err("learner.weight_decay must be >= 0".into());
         }
         Ok(())
+    }
+
+    /// Whether P trains (no `policy_from`).
+    pub fn trains_policy(&self) -> bool {
+        self.policy_from.is_empty()
     }
 
     pub fn schedule(&self) -> LrSchedule {
@@ -275,11 +286,28 @@ pub struct ValueHeldOut {
     pub variance: f64,
     /// Pearson correlation of predicted and actual ŝ (G1: > 0.7).
     pub correlation: f64,
-    /// States of 1-card rounds after bidding: every play is forced, so the
-    /// deal and the bids decide each seat's ŝ (G1: ≈ exact).
+    /// Last-trick positions, at the seats the trick still decides (they
+    /// need 0 or 1 more trick). Every remaining play is forced, so the deal
+    /// decides each such seat's ŝ (G1: ≈ exact). Every round size counts.
+    pub last_trick_seats: usize,
+    pub last_trick_mse: f64,
+    pub last_trick_max_error: f64,
+    /// States of 1-card rounds after bidding, every seat: the G1 measure
+    /// before layout 4, kept to compare runs.
     pub one_card_states: usize,
     pub one_card_mse: f64,
     pub one_card_max_error: f64,
+}
+
+/// Whether `seat` (relative to the seat to move) is one the last trick of
+/// `s` still decides: `s` is on its last trick and the seat needs 0 or 1
+/// more trick.
+pub fn last_trick_decides(s: &BlobState, seat: usize) -> bool {
+    if s.phase() != GamePhase::Playing || s.tricks_completed + 1 != s.cards_dealt {
+        return false;
+    }
+    let p = (s.current_player as usize + seat) % s.num_players as usize;
+    matches!(s.bids[p] as i32 - s.tricks_won[p] as i32, 0 | 1)
 }
 
 /// P and V with their optimizers.
@@ -293,19 +321,25 @@ pub struct Learner {
     policy_vars: Vec<Tensor>,
     value_vars: Vec<Tensor>,
     schedule: LrSchedule,
+    /// Whether P is updated; `false` with `policy_from`.
+    pub trains_policy: bool,
     /// Learner steps taken.
     pub step: u64,
     pub device: Device,
 }
 
 impl Learner {
-    /// Fresh networks; seed with `tch::manual_seed` first for a
-    /// reproducible init.
+    /// Fresh networks, or P copied from `cfg.policy_from`; seed with
+    /// `tch::manual_seed` first for a reproducible init.
     pub fn new(cfg: &LearnerConfig) -> Result<Self, String> {
         cfg.validate()?;
         let device = parse_device(&cfg.device)?;
-        let policy_vs = VarStore::new(device);
+        let mut policy_vs = VarStore::new(device);
         let policy = PolicyNet::new(&policy_vs.root());
+        if !cfg.trains_policy() {
+            let path = PathBuf::from(&cfg.policy_from).join(POLICY_WEIGHTS);
+            policy_vs.load(&path).map_err(|e| format!("learner.policy_from: {}: {e}", path.display()))?;
+        }
         let value_vs = VarStore::new(device);
         let value = ValueNet::new(&value_vs.root());
         let err = |e: tch::TchError| format!("optimizer: {e}");
@@ -321,6 +355,7 @@ impl Learner {
             policy_opt,
             value_opt,
             schedule: cfg.schedule(),
+            trains_policy: cfg.trains_policy(),
             step: 0,
             device,
         })
@@ -347,7 +382,8 @@ impl Learner {
     /// One learner step: a P update on `p` and a V update on `v` (each a
     /// sampled `(bids, plays)` pair; leave forced decisions out of `p`).
     /// Returns the two training losses, detached and still on the device:
-    /// reading one waits for the GPU. `None` for an empty batch.
+    /// reading one waits for the GPU. `None` for an empty batch, and for P
+    /// when it doesn't train.
     pub fn train_step(&mut self, p: &(BidBatch, PlayBatch), v: &(BidBatch, PlayBatch)) -> (Option<Tensor>, Option<Tensor>) {
         let batches = StepBatches::build(p, v, self.device);
         self.train_on(&batches)
@@ -357,7 +393,7 @@ impl Learner {
     /// device.
     pub fn train_on(&mut self, batches: &StepBatches) -> (Option<Tensor>, Option<Tensor>) {
         let lr = self.lr();
-        let p_loss = (!batches.policy.is_empty()).then(|| {
+        let p_loss = (self.trains_policy && !batches.policy.is_empty()).then(|| {
             let loss = policy_loss(&self.policy, &batches.policy.iter().collect::<Vec<_>>(), true);
             optimize(&mut self.policy_opt, &self.policy_vars, lr, loss)
         });
@@ -404,6 +440,7 @@ impl Learner {
     pub fn value_held_out(&self, buf: &ReplayBuffer, indices: &[usize], chunk: usize) -> ValueHeldOut {
         let (mut states, mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0usize, 0usize, 0.0, 0.0, 0.0, 0.0, 0.0f64);
         let (mut one_states, mut one_n, mut one_se, mut one_max) = (0usize, 0usize, 0.0f64, 0.0f64);
+        let (mut last_n, mut last_se, mut last_max) = (0usize, 0.0f64, 0.0f64);
         for idx in indices.chunks(chunk.max(1)) {
             let (bid, play) = buf.batch_from_indices(idx);
             let Some(vb) = value_batch(&bid, &play, self.device) else { continue };
@@ -427,6 +464,11 @@ impl Learner {
                         one_se += (x - y).powi(2);
                         one_max = one_max.max((x - y).abs());
                     }
+                    if last_trick_decides(s, seat) {
+                        last_n += 1;
+                        last_se += (x - y).powi(2);
+                        last_max = last_max.max((x - y).abs());
+                    }
                 }
             }
         }
@@ -439,6 +481,9 @@ impl Learner {
             mse: mean(sxx - 2.0 * sxy + syy, n),
             variance: if n > 0 { vy } else { f64::NAN },
             correlation: if n > 0 { (sxy / nf - sx / nf * sy / nf) / (vx * vy).sqrt() } else { f64::NAN },
+            last_trick_seats: last_n,
+            last_trick_mse: mean(last_se, last_n),
+            last_trick_max_error: if last_n > 0 { last_max } else { f64::NAN },
             one_card_states: one_states,
             one_card_mse: mean(one_se, one_n),
             one_card_max_error: if one_n > 0 { one_max } else { f64::NAN },
@@ -606,6 +651,19 @@ mod tests {
     }
 
     #[test]
+    fn last_trick_decides_seats_needing_zero_or_one_trick() {
+        let mut s = playing_state(4);
+        assert!(!(0..4).any(|seat| last_trick_decides(&s, seat)), "first of five tricks");
+        s.tricks_completed = 4;
+        s.current_player = 1;
+        s.bids[..4].copy_from_slice(&[2, 1, 3, 0]);
+        s.tricks_won[..4].copy_from_slice(&[2, 0, 1, 1]);
+        // Relative seat k is absolute seat (1 + k) % 4: needs 1, 2, -1, 0.
+        let decided: Vec<bool> = (0..4).map(|seat| last_trick_decides(&s, seat)).collect();
+        assert_eq!(decided, [true, false, false, true]);
+    }
+
+    #[test]
     fn forced_means_one_legal_move() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(9);
         let mut s = new_round(RoundParams { num_players: 4, cards_dealt: 1, trump: 0, dealer: 0 }, &mut rng).unwrap();
@@ -634,7 +692,7 @@ mod tests {
         let v0 = learner.value_held_out(&buf, &all, 64);
         assert_eq!(p0.bids + p0.plays, unforced.len());
         assert_eq!(v0.states, all.len());
-        assert!(v0.one_card_states > 0 && v0.correlation.is_finite());
+        assert!(v0.one_card_states > 0 && v0.last_trick_seats > 0 && v0.correlation.is_finite());
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(2);
         for _ in 0..cfg.steps {
@@ -660,6 +718,24 @@ mod tests {
         assert_eq!((again.step, again.lr()), (cfg.steps, learner.lr()));
         let v2 = again.value_held_out(&buf, &all, 64);
         assert_eq!(v2.mse, v1.mse);
+
+        // `policy_from` copies P and leaves it untrained; V still trains.
+        let frozen_cfg = LearnerConfig { policy_from: dir.display().to_string(), ..cfg.clone() };
+        let mut frozen = Learner::new(&frozen_cfg).unwrap();
+        assert!(!frozen.trains_policy);
+        let fp0 = frozen.policy_held_out(&buf, &unforced, 64);
+        assert_eq!((fp0.bid_loss, fp0.play_loss), (p1.bid_loss, p1.play_loss), "P is the checkpoint's");
+        let fv0 = frozen.value_held_out(&buf, &all, 64);
+        for _ in 0..5 {
+            let p = buf.sample_batch_from(&unforced, cfg.batch_size, &mut rng, cfg.augment);
+            let v = buf.sample_batch_from(&all, cfg.batch_size, &mut rng, cfg.augment);
+            let (pl, vl) = frozen.train_step(&p, &v);
+            assert!(pl.is_none() && vl.is_some());
+        }
+        let fp1 = frozen.policy_held_out(&buf, &unforced, 64);
+        assert_eq!((fp1.bid_loss, fp1.play_loss), (fp0.bid_loss, fp0.play_loss), "P unchanged");
+        assert_ne!(frozen.value_held_out(&buf, &all, 64).mse, fv0.mse, "V trained");
+        assert!(Learner::new(&LearnerConfig { policy_from: "/nonexistent".into(), ..cfg.clone() }).is_err());
         let _ = std::fs::remove_dir_all(&dir);
 
         // An empty set reports NaN, not 0.

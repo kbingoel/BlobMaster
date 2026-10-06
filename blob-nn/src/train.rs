@@ -101,11 +101,6 @@ pub fn policy_cross_entropy_rows(pred_probs: &Tensor, target: &Tensor) -> Tensor
     -(target * (pred_probs + LOG_EPS).log()).sum_dim_intlist(&[-1i64][..], false, Kind::Float)
 }
 
-/// Mean of [`policy_cross_entropy_rows`].
-pub fn policy_cross_entropy(pred_probs: &Tensor, target: &Tensor) -> Tensor {
-    policy_cross_entropy_rows(pred_probs, target).mean(Kind::Float)
-}
-
 /// Sigmoid cross-entropy `−t·log σ(z) − (1−t)·log(1−σ(z)) = softplus(z) − t·z`
 /// over the entries where `mask` is true.
 pub fn seat_bce_with_logits(logits: &Tensor, target: &Tensor, mask: &Tensor) -> Tensor {
@@ -202,8 +197,16 @@ fn io(e: std::io::Error) -> tch::TchError {
     tch::TchError::Io(e)
 }
 
+/// `dir` with `suffix` appended to its name.
+fn sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    dir.with_file_name(name)
+}
+
 /// Write a checkpoint directory. It is written next to `dir` and renamed
-/// into place, so an interrupted save leaves the previous one intact.
+/// into place, so an interrupted save leaves the previous one intact
+/// (between the two renames, as `dir.old`: see [`recover_checkpoint`]).
 ///
 /// Optimizer state is not saved (tch 0.20 doesn't expose the AdamW
 /// moments): a resumed run rebuilds the optimizers.
@@ -214,12 +217,7 @@ pub fn save_checkpoint(
     meta: CheckpointMeta,
 ) -> Result<(), tch::TchError> {
     let dir = dir.as_ref();
-    let sibling = |suffix: &str| -> PathBuf {
-        let mut name = dir.file_name().unwrap_or_default().to_os_string();
-        name.push(suffix);
-        dir.with_file_name(name)
-    };
-    let (tmp, old) = (sibling(".tmp"), sibling(".old"));
+    let (tmp, old) = (sibling(dir, ".tmp"), sibling(dir, ".old"));
     if tmp.exists() {
         std::fs::remove_dir_all(&tmp).map_err(io)?;
     }
@@ -239,6 +237,25 @@ pub fn save_checkpoint(
         std::fs::remove_dir_all(&old).map_err(io)?;
     }
     Ok(())
+}
+
+/// Finish a [`save_checkpoint`] that stopped between its two renames,
+/// when `dir` is missing: move the new checkpoint (`dir.tmp`, complete once
+/// its `meta.json` is written) or else the previous one (`dir.old`) into
+/// place. Does nothing when `dir` exists or neither is there.
+pub fn recover_checkpoint(dir: impl AsRef<Path>) -> std::io::Result<()> {
+    let dir = dir.as_ref();
+    if dir.exists() {
+        return Ok(());
+    }
+    let (tmp, old) = (sibling(dir, ".tmp"), sibling(dir, ".old"));
+    if tmp.join(CHECKPOINT_META).is_file() {
+        std::fs::rename(&tmp, dir)
+    } else if old.is_dir() {
+        std::fs::rename(&old, dir)
+    } else {
+        Ok(())
+    }
 }
 
 /// Load a checkpoint written by [`save_checkpoint`] into `policy` and
@@ -307,14 +324,14 @@ mod tests {
     #[test]
     fn policy_xent_zero_on_perfect_prediction() {
         let pred = Tensor::from_slice(&[0.0f32, 1.0, 0.0]).view([1, 3]);
-        let loss = policy_cross_entropy(&pred, &pred).double_value(&[]);
+        let loss = policy_cross_entropy_rows(&pred, &pred).double_value(&[0]);
         assert!(loss < 1e-6, "expected near-zero, got {loss}");
     }
 
     #[test]
     fn policy_xent_ignores_illegal_with_zero_target() {
         let pred = Tensor::from_slice(&[0.0f32, 0.5, 0.5]).view([1, 3]);
-        let loss = policy_cross_entropy(&pred, &pred).double_value(&[]);
+        let loss = policy_cross_entropy_rows(&pred, &pred).double_value(&[0]);
         assert!(loss.is_finite(), "loss not finite: {loss}");
     }
 
@@ -432,6 +449,24 @@ mod tests {
         let mut wrong = VarStore::new(Device::Cpu);
         let _ = ValueNet::new(&wrong.root());
         assert!(wrong.load(tmp.join(POLICY_WEIGHTS)).is_err());
-        let _ = std::fs::remove_dir_all(&tmp);
+
+        // A save cut between its renames: the checkpoint is `.old`, the new
+        // one `.tmp`. Recovery picks the complete new one, else the old.
+        let mut step = |dir: &Path| load_checkpoint(dir, &mut pv2, &mut vv2).unwrap().learner_step;
+        let (tmp_dir, old_dir) = (sibling(&tmp, ".tmp"), sibling(&tmp, ".old"));
+        std::fs::rename(&tmp, &old_dir).unwrap();
+        save_checkpoint(&tmp, &pv, &vv, CheckpointMeta { learner_step: 43 }).unwrap();
+        std::fs::rename(&tmp, &tmp_dir).unwrap();
+        recover_checkpoint(&tmp).unwrap();
+        assert_eq!(step(&tmp), 43);
+        std::fs::remove_file(tmp.join(CHECKPOINT_META)).unwrap();
+        std::fs::rename(&tmp, &tmp_dir).unwrap();
+        save_checkpoint(&old_dir, &pv, &vv, CheckpointMeta { learner_step: 42 }).unwrap();
+        recover_checkpoint(&tmp).unwrap();
+        assert_eq!(step(&tmp), 42, "an incomplete .tmp loses to .old");
+        recover_checkpoint(&tmp).unwrap();
+        for d in [&tmp, &tmp_dir, &old_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

@@ -25,10 +25,12 @@ use tch::{nn::VarStore, Device, Tensor};
 
 const TOLERANCE: f32 = 1e-5;
 
+/// The path in `key`; `None` when unset (the test skips). A path that
+/// doesn't exist fails, so a typo can't pass as a skip.
 fn env_path(key: &str) -> Option<PathBuf> {
-    let p = std::env::var(key).ok()?;
-    let pb = PathBuf::from(p);
-    pb.exists().then_some(pb)
+    let p = PathBuf::from(std::env::var(key).ok()?);
+    assert!(p.exists(), "{key}={} doesn't exist", p.display());
+    Some(p)
 }
 
 /// The tch network's legal policy for `s`, in `PolicyEvaluator` layout.

@@ -3,7 +3,7 @@
 # library path and its CUDA backend preloaded (AGENTS.md, Runtime
 # environment). Arguments pass through, e.g.
 #
-#   scripts/blobmaster-train.sh pretrain --config blob-train/pretrain.sample.toml --output runs/pretrain-1
+#   scripts/blobmaster-train.sh pretrain --config blob-train/pretrain.sample.toml --output checkpoints/pretrain-1
 #   scripts/blobmaster-train.sh export --output /tmp/random-model
 #
 # `export` strips LD_PRELOAD again before it starts Python.

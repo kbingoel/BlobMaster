@@ -40,8 +40,15 @@ use crate::playing::{apply_play, legal_plays};
 use crate::scoring::{terminal_utilities, utilities, DEFAULT_LAMBDA};
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 
-/// Default `c_puct` exploration constant.
-pub const DEFAULT_C_PUCT: f32 = 1.5;
+/// Default `c_puct` exploration constant. 0.2 since Phase 4 (gen 1 used
+/// 1.5): the warm start's priors are sharp, and at 1.5 the visit counts
+/// barely depart from them; 0.1 and 0.2 scored the same (gen-2.md §6).
+pub const DEFAULT_C_PUCT: f32 = 0.2;
+
+/// Whether 1-card bids are searched (`MctsConfig::search_one_card_bids`).
+/// Off: search lost to P alone there on both warm starts, because the
+/// sampled deals ignore the bids already made (gen-2.md §6 Phase 4).
+pub const DEFAULT_SEARCH_ONE_CARD_BIDS: bool = false;
 
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
@@ -644,6 +651,10 @@ fn default_root_dirichlet_epsilon() -> f32 {
     0.0
 }
 
+fn default_search_one_card_bids() -> bool {
+    DEFAULT_SEARCH_ONE_CARD_BIDS
+}
+
 /// Sample a single `Gamma(alpha, 1)` variate via Marsaglia–Tsang for
 /// `alpha >= 1`, with the standard boost trick
 /// (`G(alpha) ≡ G(alpha+1) · U^(1/alpha)`) for `alpha < 1`. Used by
@@ -838,6 +849,12 @@ pub struct MctsConfig {
     /// files.
     #[serde(default = "default_root_dirichlet_epsilon")]
     pub root_dirichlet_epsilon: f32,
+    /// Search the bid of a 1-card round. Off (the default), the bid is P's
+    /// policy, with no tree: the bid is the round's only decision (every
+    /// play is forced), and on the Phase-4 warm starts search made it worse
+    /// than P alone (gen-2.md §6 Phase 4). Optional in config files.
+    #[serde(default = "default_search_one_card_bids")]
+    pub search_one_card_bids: bool,
 }
 
 impl MctsConfig {
@@ -872,6 +889,7 @@ impl Default for MctsConfig {
             target_batch: DEFAULT_TARGET_BATCH,
             root_dirichlet_alpha: default_root_dirichlet_alpha(),
             root_dirichlet_epsilon: default_root_dirichlet_epsilon(),
+            search_one_card_bids: DEFAULT_SEARCH_ONE_CARD_BIDS,
         }
     }
 }
@@ -969,7 +987,8 @@ fn action_to_policy_index(
 /// and their root visit counts are summed into one dense policy.
 /// Temperature, entropy and top-1 share come from the sum, not per tree.
 ///
-/// A forced move returns at once, with no tree and no network call.
+/// A forced move returns at once, with no tree and no network call; so does
+/// a 1-card bid with `search_one_card_bids` off, from one P call.
 pub fn mcts_search<P, V, R>(
     state: &BlobState,
     policy: &P,
@@ -1027,6 +1046,23 @@ where
                 action_values: vec![0.0; policy_len],
                 visit_entropy: 0.0,
                 top1_visit_share: 1.0,
+                total_visits: 0,
+                value_estimate: 0.0,
+            };
+        }
+
+        // A 1-card bid from P alone: the prior is both policies (sampling at
+        // the configured τ), and there are no visits or values.
+        if !cfg.search_one_card_bids && phase == GamePhase::Bidding && state.cards_dealt == 1 {
+            let prior = policy.policy(state);
+            let tau = cfg.temperature_at(decision_index);
+            return MctsResult {
+                policy_sampling: prior_at_temperature(&prior, tau),
+                visit_entropy: entropy(&prior),
+                top1_visit_share: prior.iter().cloned().fold(0.0f32, f32::max),
+                policy_target: prior.clone(),
+                root_prior: prior,
+                action_values: vec![0.0; policy_len],
                 total_visits: 0,
                 value_estimate: 0.0,
             };
@@ -1123,6 +1159,28 @@ where
             value_estimate: value_sum / num_dets as f32,
         }
     })
+}
+
+/// `prior` at temperature `tau`: `p^(1/τ)` normalized; `tau < 1e-3` is
+/// one-hot on the most likely action.
+fn prior_at_temperature(prior: &[f32], tau: f32) -> Vec<f32> {
+    if (tau - 1.0).abs() < 1e-6 {
+        return prior.to_vec();
+    }
+    let mut out = vec![0.0f32; prior.len()];
+    if tau < 1e-3 {
+        let best = (0..prior.len()).fold(0, |b, i| if prior[i] > prior[b] { i } else { b });
+        out[best] = 1.0;
+        return out;
+    }
+    let weights: Vec<f32> = prior.iter().map(|&p| p.powf(1.0 / tau)).collect();
+    let z: f32 = weights.iter().sum();
+    if z > 0.0 {
+        for (o, w) in out.iter_mut().zip(&weights) {
+            *o = w / z;
+        }
+    }
+    out
 }
 
 /// Map aggregated root visit counts to a dense probability vector at
@@ -1668,6 +1726,30 @@ mod tests {
         }
     }
 
+    /// With `search_one_card_bids` off, a 1-card bid is P's policy from
+    /// one P call and no tree; larger rounds' bids are still searched.
+    #[test]
+    fn one_card_bids_can_come_from_p_alone() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let off = MctsConfig { search_one_card_bids: false, ..cfg_with((4, 20), (1, 1)) };
+        let one = new_round(RoundParams { num_players: 4, cards_dealt: 1, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        let c = Counting::default();
+        let r = mcts_search(&one, &c, &c, &off, &mut rng, 0);
+        assert_eq!((c.policy_states.load(Ordering::Relaxed), c.value_states.load(Ordering::Relaxed)), (1, 0));
+        assert_eq!(r.policy_target, D.policy(&one));
+        assert_eq!((r.total_visits, r.policy_target.clone()), (0, r.root_prior.clone()));
+        let greedy = MctsConfig { temperature: 0.0, ..off };
+        let sharp = mcts_search(&one, &D, &D, &greedy, &mut rng, 0).policy_sampling;
+        assert_eq!(sharp.iter().filter(|&&p| p == 1.0).count(), 1, "τ = 0 is one-hot: {sharp:?}");
+
+        let two = new_round(RoundParams { num_players: 4, cards_dealt: 2, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        let c = Counting::default();
+        let r = mcts_search(&two, &c, &c, &off, &mut rng, 0);
+        assert!(r.total_visits > 0 && c.value_states.load(Ordering::Relaxed) > 0, "a 2-card bid is searched");
+        let on = MctsConfig { search_one_card_bids: true, ..off };
+        assert!(mcts_search(&one, &D, &D, &on, &mut rng, 0).total_visits > 0);
+    }
+
     /// Each leaf costs one P call and one V call; terminal and forced
     /// nodes cost none.
     #[test]
@@ -1836,8 +1918,13 @@ mod tests {
     fn lockstep_search_matches_serial_per_det() {
         let states = [playing_state(101), playing_state(202), playing_state(303)];
         let sims = 80u32;
-        for target_batch in [states.len(), 1] {
-            let cfg = MctsConfig { target_batch, ..MctsConfig::default() };
+        // A batch of one leaf per tree matches serial search while no
+        // descent ends at the round's end: such a leaf is backed up at once,
+        // and its tree may then add a second leaf to the same batch. At
+        // c_puct 1.5 none does within 80 simulations here. A batch of 1
+        // matches at any c_puct.
+        for (target_batch, c_puct) in [(states.len(), 1.5), (1, DEFAULT_C_PUCT)] {
+            let cfg = MctsConfig { target_batch, c_puct, ..MctsConfig::default() };
             let mut serial: Vec<MctsArena> =
                 states.iter().map(|s| MctsArena::new(s.current_player)).collect();
             for (arena, state) in serial.iter_mut().zip(states.iter()) {

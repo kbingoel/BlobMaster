@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-05: gen 1 is concluded; Phases 0–3 are done. Phase 4, the supervised warm start, is built and measured: P alone matches rule bot 2 (+15.5 vs the rule bot), search adds 2.5–3 points at c_puct 0.2 (G2 passes), and V's correlation passes G1 but its 1-card exactness doesn't (§6). Next: decide on V's trick features (§8), then Phase 5, async self-play RL.
+Status, 2026-10-06: gen 1 is concluded; Phases 0–4 are done. The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Next: Phase 5, async self-play RL.
 
 ---
 
@@ -253,7 +253,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 | `mcts.rs` backup and leaves | All-seat backup, exact `u_s` at round end, V at leaves, per-phase budgets (§5.4). Per-seat counts, `backprop_terminal`'s z-scores and the "Q = 0 when empty" fallback go |
 | `replay.rs` | Same raw-state layout. Per-seat round scores instead of one value, a round id for the validation split, a concurrent wrapper, delta persistence (§5.6) |
 | `blob-nn` `model.rs` | P: today's net with the policy heads only. V: a new 4-layer net with an input projection for opponents' hand cards and a per-seat ŝ head |
-| `blob-nn` `train.rs` | LR schedule keyed to learner steps; per-seat value MSE on ŝ. `z_score_clip` and the value-head LR group go |
+| `blob-nn` `train.rs` | LR schedule keyed to learner steps; per-seat sigmoid cross-entropy against ŝ (Phase 4: MSE could pin a saturated V at 0). `z_score_clip` and the value-head LR group go |
 | `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs` | A learner module (seeded in Phase 2 as `blob_nn::learner` with the batch construction and held-out-loss code from `training_loop.rs`) and an actor module that plays single rounds (§5.2). Whole-game self-play, `backfill_values` and the synchronous iteration loop were deleted in Phase 2 |
 | `blob-train`: `main.rs`, `config.rs`, `pretrain.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export` (working since Phase 2), on a new config schema. `evaluate`, `self-play`, `profile`, gen-1 `train` and the gen-1 config were deleted in Phase 2 |
 | `scripts/export_onnx.py` | Exports P and V and writes the layout id into the ONNX metadata; `export_script_mirrors_feature_widths` covers both |
@@ -318,9 +318,9 @@ Per-round targets leave nothing linking rounds, so self-play plays **single roun
 
 **Why V doesn't over-promise.** V is trained on rounds played by players who did *not* see each other's hands. So it predicts realistic outcomes, not "everyone plays perfectly with open cards" ones.
 
-**Why V is easier to learn.** With all hands known, a round's outcome is nearly decided. In 1-card rounds, every play is forced, so after bidding the outcome is fully determined. That gives a free exactness test (§7).
+**Why V is easier to learn.** With all hands known, a round's outcome is nearly decided. On the last trick of any round every play is forced, so the deal fully determines the outcome. That gives a free exactness test (§7). It needs V to compare cards across hands, which V learned only once its input said which card beats which (layout 4, Phase 4).
 
-**Packaging.** A model is a directory: `policy.onnx`, `value.onnx` and `meta.json` (layout id, learner step, config). `bench`, `play` and the actors take the directory; network-only mode reads only `policy.onnx`.
+**Packaging.** A model is a directory: `policy.onnx`, `value.onnx` and `meta.json` (layout id, learner step, the checkpoint it was exported from, layer counts). `bench`, `play` and the actors take the directory; network-only mode reads only `policy.onnx`.
 
 ### 5.4 Search
 
@@ -356,7 +356,8 @@ P and V share the encoder code. Items 1–6 were done in Phase 1 and items 7–1
 7. **Remove `round_number`** from the context token. With single rounds (§5.2) it describes nothing, and no trained model depends on it.
 8. **V mode:** opponents' hand cards become a new token type, tagged with the owner's relative seat.
 9. **Suit-permutation augmentation** when sampling training batches: relabel suits consistently, including trump; 24 permutations. Cheap, and it multiplies data variety against memorization.
-10. **One layout, guarded.** `encoder.rs` holds the only layout. Its `LAYOUT_ID` goes into every exported ONNX file, and `OnnxEvaluator` refuses a model whose id differs. A golden-hash test over fixed states fails on any encoding change, so a change can't land without bumping the id. No old layout is kept: a bump means retraining.
+10. **One layout, guarded.** `encoder.rs` holds the only layout. Its `LAYOUT_ID` goes into every exported ONNX file, and `OnnxEvaluator` refuses a model whose id differs. A golden-hash test over fixed states fails on any encoding change, so a change can't land without bumping the id. No old layout is kept: a bump means retraining. The test hashes P mode and V mode separately: a layout that leaves P's hash unchanged leaves P's input as it was, so P's weights may carry over (`learner.policy_from`) while V retrains.
+11. **V mode describes the deal** (layout 4, Phase 4). Every hand card, mine and each opponent's, carries the same features, computed for its owner against the other hands: trump, suit length, highest / lowest in suit and the cards above / below it, legal into the trick in progress, beats the current winner. Opponents' cards also say whether their owner is still to play to the trick. P mode keeps counting against the cards I haven't seen.
 
 ### 5.6 Training: async actor–learner
 
@@ -575,12 +576,13 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 - `export --check` on a random tch init: P 3.0e-5, over the 1e-5 gate (its inputs now use every token type; with the old all-CLS inputs it was 1.9e-5). V gives 1.2e-7 and a torch-initialized P 5e-7. The Rust policy parity on game states passes. Set the gate in Phase 4.
 - A random V predicts ŝ ≈ 0.5 for every seat, so search values stay near 0 except close to a round's end. The random-init bench numbers say nothing about the design; Phase 4 is its first measurement.
 
-**Phase 4 — Two networks + supervised warm start** (built and measured 2026-10-05; G2 passes, G1 half)
+**Phase 4 — Two networks + supervised warm start** (done 2026-10-06: G1 and G2 pass)
 - [x] P and V models in tch (§5.3): P drops the gen-1 value head; V matches `export_onnx.py`'s `ValueNet`. The export loads V's weights too (it writes both nets, the layout id and the model directory since Phase 3); ONNX↔tch parity for V (P's runs since Phase 3).
 - [x] Learner: alternating P / V steps from a buffer, LR keyed to learner steps, validation split by round, a metrics row every N steps, checkpoints. CLI: `blobmaster-train pretrain`.
 - [x] Teacher data: rounds played by rule bot 2, with some rule-bot seats mixed in for variety, stored in the replay format. P imitates rule bot 2's `bid_chances` / `play_chances`; V learns the actual per-seat round scores.
 - [x] G1 on held-out teacher rounds.
 - [x] Bench P network-only and P + V with search, against the rule bot and against rule bot 2.
+- [x] Conclusion (2026-10-06): layout 4 (V-mode trick features) with V retrained, G1's exactness check on the last trick of every round, 1-card bids from P, c_puct 0.2.
 - *Exit:* G1 and G2 pass.
 - *Record:*
   - how much search adds over network-only (gen 1: about 4 points, §2.1);
@@ -588,7 +590,7 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
   - bids made by hand size, against both bots.
 - No RL yet. This phase measures the new value design and search on their own, which is what the dropped "per-round values in the gen-1 driver" step was meant to isolate.
 
-*Exit: G1 half met, G2 met with a lower c_puct (2026-10-05).*
+*First run, layout 3 (2026-10-05): G1 half met, G2 met with a lower c_puct.* The conclusion (layout 4) follows the as-built notes.
 - **G1 — correlation passes, exactness fails.** V's correlation with the actual ŝ on every validation position is 0.769 (> 0.7). On 1-card rounds after bidding, where the deal decides the outcome, its RMSE is 0.129, not ≈ 0 (`pretrain` checks < 0.05). Diagnosis below.
 - **G2 — passes at c_puct 0.2, fails at the default 1.5.** On 128 fresh deals (`--seed 7`) against four rule bot 2s, search scores **+2.6 ± 1.0** and P alone **+0.1 ± 0.5**. At c_puct 1.5 search adds only +0.7 (+0.9 ± 0.8 vs +0.2 ± 0.7): P's priors outvote V. c_puct was picked on the default deals, so the fresh-deal run is the out-of-sample check.
 - **G3 already passes** at the warm start: search scores +17.0 ± 2.4 against the rule bot at c_puct 1.5, +19.1 ± 2.6 at 0.2.
@@ -603,8 +605,8 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 | V correlation | 0.769 | 0.771 |
 | V RMSE, 1-card rounds after bidding | 0.129 | 0.131 |
 
-- **No memorization:** validation and training sample stayed within 0.001 of each other on every measurement, at every held-out row. P saw each of its 13.1M training positions about 1.2 times, V each of its 21.7M about 0.7 times (15.4M samples per net).
-- **The curves had flattened:** from step 20000 to 30000, V's MSE went 0.0571 → 0.0566 and its correlation 0.764 → 0.767.
+- **No memorization:** validation and training sample stayed within 0.005 of each other on every measurement, at every held-out row, and the gap didn't grow (V's correlation: training 0.003–0.005 higher throughout). P saw each of its 13.1M training positions about 1.2 times, V each of its 21.7M about 0.7 times (15.4M samples per net).
+- **The curves had flattened:** from step 20000 to 28000 (the last periodic row), V's MSE went 0.0571 → 0.0566 and its correlation 0.764 → 0.767. V's 1-card MSE had stopped falling by step 6000 (0.0168, then 0.015–0.016).
 
 `bench`, 5 players / 7 cards, default seed; search at bids 20×25, plays 5×100:
 
@@ -628,7 +630,7 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the rule bot (§2.1).
 
 *Findings:*
-- **P is a faithful copy of rule bot 2.** Against the rule bot it scores what its teacher does on the same deals (+15.5 vs +15.2), with the same bid statistics to the third decimal. Against rule bot 2 it is even. At step 10000 it was already +14.9 ± 1.5.
+- **P is a faithful copy of rule bot 2.** Against the rule bot it scores what its teacher does on the same deals (+15.5 vs +15.2), with the same bid statistics to within 0.001. Against rule bot 2 it is even. At step 10000 it was already +14.9 ± 1.5.
 - **What search adds over network-only:** +3.0 against the rule bot and +2.5 against rule bot 2 at c_puct 0.2, from bidding and playing larger hands better (5–8-card bids made: 0.616 vs 0.578 against rule bot 2). Gen 1's search added about 4 points, over a much weaker network. At c_puct 1.5 search adds under a point.
 - **Why c_puct matters this much:** the teacher target gives rule bot 2's move 0.5 plus its softmax share, and P learned it, so P's priors are sharp. With a top prior of 0.8 against 0.1, 100 simulations and c_puct 1.5, the other move only wins the visit count if V rates it ~0.2 higher in u: about 20 points more likely to make its bid. Spreading the same budget over more deals doesn't help (32×16 / 64×8: +0.3), because the visit counts still follow the priors. Lowering c_puct lets V's values decide.
 - **The 0-bid share is not a problem:** in 5–8-card rounds P bids 0 42% of the time against the rule bot, exactly as rule bot 2 does; search lowers it to 41%. Gen 1 bid 0 in 84% of those rounds.
@@ -664,10 +666,66 @@ For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the
 - **Replay:** `sample_batch_from(slots, …)` samples from a subset (the training rounds). `sample_batch` draws with `rand::seq::index::sample` instead of scanning every slot, which cost O(buffer) per batch.
 - **Step cost** (profiled 2026-10-05, batch 512, RTX 4060): P forward + backward 84 ms, V 67 ms; AdamW and the clip ≈ 0; building a batch 4 ms on a loader thread; host → device 1.6 ms. So 6.4 learner steps/s with the GPU at 100%. Both passes are bound by memory traffic on activations (the 4060 has 272 GB/s), not by arithmetic or launches. fp16 autocast halves both (P 40 ms, V 36 ms) but tch has no gradient scaler, so it isn't used: the warm start fits in ~80 min, and Phase 5 is bound by CPU self-play (§5.8).
 
+*Conclusion, layout 4 (2026-10-06): G1 and G2 pass.* Run `checkpoints/pretrain-2026-10-06`: V retrained on layout 4, P copied from the first run (`learner.policy_from`), every other setting the first run's; 37 min (V alone trains at 15 steps/s against 6.4 for both nets).
+
+**Why V missed: the last trick of every round, not 1-card rounds.** V's RMSE at the seats the last trick still decides (every remaining play is forced, so the deal decides the outcome), on the same 16k fresh teacher rounds for both layouts:
+
+| Cards already in the last trick | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| layout 3, 1-card rounds | 0.178 | 0.158 | 0.134 | 0.098 | 0.003 |
+| layout 3, 2–7-card rounds | 0.134 | 0.120 | 0.101 | 0.075 | 0.010 |
+| layout 4, 1-card rounds | 0.083 | 0.003 | 0.003 | 0.002 | 0.002 |
+| layout 4, 2–7-card rounds | 0.068 | 0.009 | 0.009 | 0.008 | 0.008 |
+
+- The error was the same in every round size, so it wasn't a 1-card quirk, and dropping 1-card rounds from training or from the gate wouldn't have fixed it.
+- With only the mover's card left to play, V was exact: that card carried "beats the current winner". With one opponent's card still to come, the error jumped to 0.07–0.10. Opponents' cards carried no such feature.
+- Layout 4 is exact once a card is on the table. What's left is the lead (0 cards), where no card is winning yet to compare with.
+- The gain reaches earlier positions too: in 7-card rounds V's RMSE with 2 cards left went 0.136 → 0.076, with 3 left 0.196 → 0.156 (there the outcome still depends on play, so it isn't 0).
+- So G1's exactness check now covers the last trick of every round, at the seats it still decides (§7). Search never asks V about these positions (it plays forced moves out to the exact result); they are a probe of V's card comparisons, which it does need at earlier leaves.
+
+**The change: V mode describes the deal** (§5.5 item 11, `LAYOUT_ID = "layout-4"`). Every hand card in V mode, mine and each opponent's, carries the same features, computed for its owner against the other hands (suit standing, legal, beats the current winner), plus "owner still to play" on opponents' cards. My cards' standings no longer count undealt cards (in a 1-card round, 47 of the 52). P mode is unchanged: the golden test's P hash is layout 3's, so P's weights carry over.
+
+| Held out (every validation position) | layout 3 | layout 4 |
+|---|---|---|
+| V MSE (the targets' variance: 0.137) | 0.0560 | **0.0427** |
+| V correlation | 0.769 | **0.830** |
+| V RMSE, last trick (G1: < 0.05) | 0.110 (the fresh rounds above) | **0.033** (also on the fresh rounds) |
+| V RMSE, 1-card rounds after bidding | 0.129 | **0.036** |
+| P bid / play cross-entropy | 0.187 / 0.666 | the same (P is the first run's) |
+
+- G1 passed by step 4000 (last-trick RMSE 0.042), where V's MSE was already below the first run's final value. Validation and training sample stayed within 0.005 throughout.
+
+**1-card bids: search loses to P alone, whatever V knows.** In games of 1-card rounds only (`bench --cards 1`, 1000 deals, against rule bot 2), every focal decision is a 1-card bid:
+
+| Focal player | points per game (5 rounds) | bids made |
+|---|---|---|
+| P alone (identical to rule bot 2: 4000 deals, ± 0.0) | 0.0 | 0.786 |
+| layout 3, search, c_puct 1.5 / 0.2 | −0.1 ± 0.1 / **−0.8 ± 0.1** | 0.782 / 0.771 |
+| layout 4, search, c_puct 0.5 / 0.2 | −0.8 ± 0.1 / **−0.9 ± 0.1** | 0.772 / 0.770 |
+
+- A near-exact V didn't help, so V's error wasn't the cause. The sampled deals ignore the bids already made, and in a 1-card round those bids are almost the only clue to the opponents' cards. P read them from rule bot 2; search throws them away. The lower the c_puct, the more V's bid-blind values decide, and the more search loses. Rule bot 2r's rollouts lose there the same way (bids made 0.773 vs 0.783, `rule_bot_2.rs` header).
+- 1-card rounds are 5 of a game's 17 and about a third of its points, so this cost ~0.8 points per full game.
+- **Decision:** 1-card bids come from P (`MctsConfig::search_one_card_bids`, default off; `--search-one-card-bids true` searches them). Self-play inherits it, so RL doesn't train P toward the worse bids. The real fix is bid-weighted sampling, cheapest to build exactly for 1-card bids first (§8).
+
+**c_puct 0.2 is the new default** (`DEFAULT_C_PUCT`, gen 1's 1.5 before): against rule bot 2 on the default deals, 0.2 and 0.1 scored the same (+5.4 ± 1.8, +5.3 ± 1.7). 0.2 is the less extreme of the two, and RL will soften P's priors.
+
+`bench`, 5 players / 7 cards, layout 4, search at bids 20×25, plays 5×100, c_puct 0.2, 1-card bids from P (P alone is the first run's P, so its rows above stand):
+
+| Focal player | Opponents | Deals | Points/game | Bids made: 1 / 2–4 / 5–8 cards | 0-bids, 5–8 cards |
+|---|---|---|---|---|---|
+| P + V search, c_puct 0.2 | rule bot 2 | 64 | **+5.4 ± 1.8** | 0.782 / 0.695 / 0.644 | 0.373 |
+| P + V search, c_puct 0.1 | rule bot 2 | 64 | +5.3 ± 1.7 | 0.782 / 0.692 / 0.645 | 0.356 |
+| P + V search, `--seed 7` | rule bot 2 | 128 | **+4.7 ± 1.0** | 0.784 / 0.701 / 0.633 | 0.371 |
+| P + V search | rule bot | 64 | **+20.0 ± 2.4** | 0.810 / 0.736 / 0.693 | 0.410 |
+
+- **G2 passes clearly:** on 128 fresh deals (`--seed 7`) against rule bot 2, search scores **+4.7 ± 1.0** and P alone +0.1 ± 0.5 (first run: +2.6 ± 1.0). The network-only reports of the new model directory are identical to the first run's.
+- **G3:** +20.0 ± 2.4 against the rule bot (first run +19.1 ± 2.6, P alone +16.1 ± 2.4 on the same deals). That touches G5's numeric bars (≥ +20 against the rule bot, > 0 against rule bot 2), with the CI reaching below +20; G5 also needs the long run and human playtests.
+- **What search adds over network-only:** +4.6 against rule bot 2 (fresh deals) and +3.9 against the rule bot (first run: +2.5 and +3.0; gen 1: about 4, over a much weaker network). Against rule bot 2 the gain over the first run's search is +2.1, about 0.8 of it from leaving 1-card bids to P. It comes from the larger rounds: 5–8-card bids made 0.633, against 0.615 for the first run's search and 0.578 for P alone.
+
 **Phase 5 — Async self-play RL**
 - [ ] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train`.
 - [ ] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run.
-- [ ] Self-play search settings: the warm start's priors are sharp, and at c_puct 1.5 visit counts ≈ P's priors (Phase 4). Measure c_puct 0.2–0.5 in self-play before the short run.
+- [ ] Self-play search settings: the warm start's priors are sharp; at c_puct 1.5 visit counts ≈ P's priors (Phase 4), hence the default of 0.2. Check it in self-play (the visit targets must depart from P's priors) before the short run. 1-card bids come from P (`search_one_card_bids` off), so their targets are P's own until bid-weighted sampling exists (§8).
 - [ ] Short run (a few hours, 5p7c) from the Phase-4 checkpoint.
 - [ ] First human playtest (`blobmaster play`).
 - *Exit:*
@@ -694,9 +752,9 @@ For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the
 | Gate | Measure | Pass |
 |---|---|---|
 | G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced — **passed 2026-10-02: −10.2 ± 2.9**. Historic: gen-1 models are deleted in Phase 2 |
-| G1 value learnable | V on held-out teacher rounds (Phase 4) | correlation with the actual round outcome > 0.7; 1-card rounds after bidding ≈ exact (`pretrain` checks RMSE < 0.05) — **half met 2026-10-05:** correlation 0.769, 1-card RMSE 0.129 (§6 Phase 4) |
-| G2 search helps | Phase-4 warm start: P + V with search vs P network-only, same deals | search clearly ahead (95% CIs separate) — **passed 2026-10-05 at c_puct 0.2:** +2.6 ± 1.0 vs +0.1 ± 0.5 against rule bot 2, fresh deals; not at c_puct 1.5 |
-| G3 beats the rule bot | search bench | ≥ +10 points/game — met by the warm start: +17.0 ± 2.4 (c_puct 1.5), +19.1 ± 2.6 (0.2) |
+| G1 value learnable | V on held-out teacher rounds (Phase 4) | correlation with the actual round outcome > 0.7; the last trick ≈ exact at the seats it still decides, every round size (`pretrain` checks RMSE < 0.05; until 2026-10-06 the check was 1-card rounds only) — **passed 2026-10-06 with layout 4:** correlation 0.830, last-trick RMSE 0.033 (layout 3: 0.769, 1-card RMSE 0.129; §6 Phase 4) |
+| G2 search helps | Phase-4 warm start: P + V with search vs P network-only, same deals | search clearly ahead (95% CIs separate) — **passed 2026-10-05 at c_puct 0.2:** +2.6 ± 1.0 vs +0.1 ± 0.5 against rule bot 2, fresh deals; not at c_puct 1.5. Layout 4 (2026-10-06): **+4.7 ± 1.0** |
+| G3 beats the rule bot | search bench | ≥ +10 points/game — met by the warm start: +17.0 ± 2.4 (c_puct 1.5), +19.1 ± 2.6 (0.2); layout 4: +20.0 ± 2.4 |
 | G4 RL adds strength | Phase-5 run, search bench | clearly above the Phase-4 warm start (CIs separate) and still rising; replay ratio on target |
 | G5 strong | long run, search bench | ≥ +20 points/game vs the rule bot; > 0 vs four rule-bot-2 opponents; human playtests |
 
@@ -715,7 +773,7 @@ G3 may already pass at the warm start: rule bot 2 itself scores +14.5. That is f
 - **Strategy fusion.** Inside a sampled deal, opponents act as if they see it. Mitigate with more deals and shallower search; information-set MCTS variants later.
 - **Game-aware objective.** Use the standings in the final rounds, e.g. through a standings-conditioned fine-tune.
 - **Opponent diversity.** Mix rule bots and past checkpoints into self-play, so the bot doesn't only learn to beat itself. Humans play differently.
-- **V's trick features** (Phase 4, G1). V doesn't learn to compare opponents' hand cards with mine or with the led card, even on 1-card positions alone. Giving V-mode hand cards the full-information trick features (follows the led suit, beats the current winner, rank among the cards of its suit still held) is a layout change and a retrain; cheapest before RL data exists.
+- **Exact 1-card bids.** A 1-card round has one real decision per seat (every play is forced), worth as much as any other bid, and 5 of a 17-round game's rounds. It can be computed instead of searched: sample the hidden cards weighted by how likely each earlier bid was under P, take the later bids from P's policy, play out the forced cards, and pick the bid with the best expected `u`. No V at all. It is bid inference in sampling (above) in its smallest form, so it is also the place to test that idea first. Rule bot 2's 1-card formula already weights cards by their holder's bid (`BID_NOISE`), a starting point for the weights. Until then `MctsConfig::search_one_card_bids` chooses between search and P alone (Phase 4).
 - **Training-step efficiency.** Profiled in Phase 4: P's forward + backward is 84 ms per 512 examples and V's 67 ms, bound by activation memory traffic. fp16 autocast halves both, but tch has no gradient scaler; worth adding (a manual loss scale, or bf16) only if the learner ever limits a run.
 - **Model size.** The GPU is mostly idle and CPU inference sets the limit (§5.8).
 - **Plan B.** DouZero-style "Deep Monte-Carlo": no search; learn Q(state, action) directly from round scores. Worth running as a comparison if search-based training stalls.

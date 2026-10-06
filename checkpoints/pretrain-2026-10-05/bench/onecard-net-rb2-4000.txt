@@ -1,0 +1,15 @@
+focal     network checkpoints/pretrain-2026-10-05/model
+opponents 4x rule bot 2
+table     5 players, 1 start cards; 4000 deals x 5 seats = 20000 games in 24 s
+
+points/game  focal 39.8  opponents 39.8  diff -0.0 ± 0.0 (95% CI over deals)
+win share    0.200 ± 0.000 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card        100000   0.783    0.738      0.783       0.738
+all           100000   0.783    0.738      0.783       0.738
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.000  0.000  0.139  0.783  0.078  0.000  0.000
+opponents     0.000  0.000  0.139  0.783  0.078  0.000  0.000
+
