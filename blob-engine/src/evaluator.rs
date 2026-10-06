@@ -42,6 +42,21 @@ pub trait PolicyEvaluator: Send + Sync {
     }
 }
 
+/// Largest batch [`policy_in_chunks`] sends at once.
+const POLICY_CHUNK: usize = 256;
+
+/// [`PolicyEvaluator::policy_batch`] over any number of states, in batches
+/// of at most 256. For the bid likelihoods of sampled deals, which can run
+/// to a thousand states per decision.
+pub fn policy_in_chunks<P: PolicyEvaluator + ?Sized>(policy: &P, states: &[BlobState]) -> Vec<Vec<f32>> {
+    let mut out = Vec::with_capacity(states.len());
+    for chunk in states.chunks(POLICY_CHUNK) {
+        let refs: Vec<&BlobState> = chunk.iter().collect();
+        out.extend(policy.policy_batch(&refs));
+    }
+    out
+}
+
 /// Expected ŝ (round points / (10 + cards dealt), in [0, 1]) of every seat,
 /// indexed by absolute seat; slots `>= num_players` are 0.
 ///

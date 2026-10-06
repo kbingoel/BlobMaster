@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Gen 1 concluded on 2026-05-17** (final run `run-2026-05-14`, 168 iterations). On 2026-10-02 it was measured against a fixed rule bot and found weak: **−10.2 ± 2.9** points per game with 5×100 search (gen-2.md §2).
   - Root causes: a final-game value target that the value head memorized, values credited only to the seat to move at each leaf, and clipped end-of-round values.
 - **Gen 2 is the remake, planned in [gen-2.md](gen-2.md).** Phases 0 (yardsticks), 1 (encoder layout, determinization, tie-break), 2 (clean break) and 3 (the gen-2 engine: per-round utility, all-seat backup, policy and value evaluators, layout id) are done (2026-10-05).
-- **Phase 4 (two networks, supervised warm start from rule bot 2) is done (2026-10-06):** G1 and G2 pass with layout 4, which gives V's hand cards, mine and every opponent's, "beats the current winner" and their standing in suit, computed on the deal. Search defaults changed with it: c_puct 0.2, and 1-card bids from P alone. Next: **Phase 5, async self-play RL**.
+- **Phase 4 (two networks, supervised warm start from rule bot 2) is done (2026-10-06):** G1 and G2 pass with layout 4, which gives V's hand cards, mine and every opponent's, "beats the current winner" and their standing in suit, computed on the deal. Search defaults changed with it: c_puct 0.2.
+- **Phase 4b (bid-aware sampling) is done (2026-10-06):** 1-card bids are computed exactly, and every search's sampled deals are weighted by the bids already made, under P. Search vs rule bot 2: +6.4, paired +1.7 over Phase 4, at +43% time (gen-2.md §6 Phase 4b). Next: **Phase 5, async self-play RL**.
 - **Gen 1 is gone from `master`.**
   - Code: tag `gen-1-final` (as trained) and tag `gen-1-compat` (the last commit whose tooling runs gen-1 models). Retired documents: `git show gen-1-final:<file>` (gen-2.md §10).
   - Reference models, `buffer.bin`, `model.ot` and metrics: archived outside the repo in `~/blobmaster-archive/run-2026-05-14/` (this machine only). gen-2.md Appendix A reproduces the gen-1 measurements from it.
@@ -32,16 +33,16 @@ cargo build --release -p blob-bin
 ./target/release/blobmaster bench <model dir> --mode search    # 64 deals × 5 seats; bids 20×25, plays 5×100, ~9 min
 ```
 
-A model is a directory: `policy.onnx`, `value.onnx`, `meta.json` (gen-2.md §5.3). Network mode loads only the policy net. Search budgets: `--bid-dets/--bid-sims` (default 20×25) and `--dets/--sims` (plays, default 5×100). `--c-puct` (default 0.2) and `--search-one-card-bids` (default `false`: P's bid, no tree) apply to `bench` and `play`; a search report's first line names all four settings.
+A model is a directory: `policy.onnx`, `value.onnx`, `meta.json` (gen-2.md §5.3). Network mode loads only the policy net. Search budgets: `--bid-dets/--bid-sims` (default 20×25) and `--dets/--sims` (plays, default 5×100). `--c-puct` (default 0.2), `--one-card-bids` (`exact` by default; `policy` is P's bid, `search` a searched one) and the bid weighting of sampled deals (`--bid-candidates`, default 8 per deal, 0 = off; `--bid-noise`, default 0.1) apply to `bench` and `play`; a search report's first line names every setting.
 
-`bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. Opponents default to the rule bot; `--opponent <model dir>` uses that model's policy net, greedy (bots never search).
+`bench` plays duplicate deals: every deal seed once from each seat. Its CI is over deals. The default seed is fixed, so models are compared on the same cards. `--per-deal-out <file>` saves each deal's result and `--compare <file>` prints this run minus that one with a paired CI (same seed, deals and table); use it to compare settings or models, since separate CIs overlap long after a difference is real. Opponents default to the rule bot; `--opponent <model dir>` uses that model's policy net, greedy (bots never search).
 
 `rulebot2` (`blob-engine/src/rule_bot_2.rs`: card counting, bid-aware, +14.5 ± 0.3 vs the rule bot with `--deals 4000`) works as the focal player or as `--opponent`. It is a harder second yardstick; the rule bot stays the reference, so never retune `rule_bot.rs`. `rulebot2r` is rule bot 2 with rollouts (`--samples`, default 128; `--depth`, default full; `--play-only`); its bench label carries the settings. Its gains vs `rulebot2` are in the `rule_bot_2.rs` header.
 
 References (default deals, against the rule bot):
 - gen-1 final: with 5×100 search on every decision **−10.2 ± 2.9**, network only −12.1 ± 2.0 (2026-10-02). Gen-1 models no longer load on `master`, so compare against these numbers or reproduce them at `gen-1-compat` (gen-2.md Appendix A).
-- the Phase-4 warm start (layout 4): network only **+15.5 ± 1.5** (rule bot 2 on the same deals: +15.2 ± 1.5); search at the defaults **+20.0 ± 2.4**. Against four rule bot 2s on 128 fresh deals (`--seed 7`): search **+4.7 ± 1.0**, network only +0.1 ± 0.5 (gen-2.md §6 Phase 4).
-- in games of 1-card rounds only (`--cards 1`), search lost to P alone (−0.8 ± 0.1): the sampled deals ignore the bids already made. Hence 1-card bids from P (gen-2.md §8, exact 1-card bids).
+- the Phase-4 warm start (layout 4): network only **+15.5 ± 1.5** (rule bot 2 on the same deals: +15.2 ± 1.5); search at the Phase-4b defaults **+20.1 ± 2.4** (Phase 4's settings: +20.0). Against four rule bot 2s on 128 fresh deals (`--seed 7`): search **+6.4 ± 1.1** (Phase 4's settings: +4.7 ± 1.0), network only +0.1 ± 0.5 (gen-2.md §6 Phase 4, 4b).
+- in games of 1-card rounds only (`--cards 1`, against rule bot 2), search lost to P alone (−0.9 ± 0.1): the sampled deals ignored the bids already made. Exact 1-card bids (Phase 4b) score +0.2 ± 0.1 there.
 
 The tool uses every core, so don't run it next to a training run.
 
@@ -78,11 +79,12 @@ search: u_s = ŝ_s − λ·mean_{j≠s} ŝ_j at every leaf, exact at the round's
 
 **MCTS:**
 - Determinization: N sampled deals per decision, one arena-allocated tree each, root visits summed across trees.
+- Bid-weighted deals (`belief::sample_deals`, `MctsConfig::bid_weighting`, gen-2.md §6 Phase 4b): draw N × `candidates` deals consistent with the voids, weight each by the likelihood of every earlier bid under P, read from that bidder's bid-time view of the candidate (`belief::rewind_to_bid`), with a noise floor (`noise`: a share of uniform bids); keep N by systematic resampling. Costs one P call per candidate per bidder.
 - Budgets per phase (`MctsConfig::bid_budget`, `play_budget`): bids 20 deals × 25 sims, plays 5 × 100 by default.
 - Leaves: one `PolicyEvaluator::policy_batch` (priors, own view) and one `ValueEvaluator::values_batch` (ŝ for every seat, sampled deal) per lockstep step, batch up to 5. At the round's end the exact utilities are used instead.
 - Backup adds `u_s` to every seat's sum at every node on the path; UCB reads the acting seat's mean over all visits. No per-seat counts.
 - Forced moves are skipped without a network call.
-- 1-card bids come from P without a tree (`MctsConfig::search_one_card_bids`, default off).
+- 1-card bids are computed, not searched (`one_card.rs`, `MctsConfig::one_card_bids` = `Exact`): earlier bidders' cards drawn by their bids' likelihood under P, later bids from P's policy (every line weighted), the forced cards played out, the best expected `u` chosen. No tree, no V. `Policy` (P's bid) and `Search` remain as settings.
 - c_puct defaults to 0.2 (`DEFAULT_C_PUCT`). The warm start's priors are sharp; at gen 1's 1.5 the visit counts barely depart from them.
 - Root Dirichlet noise is on in self-play.
 - `policy_target` is always τ=1; `policy_sampling` follows the τ schedule.

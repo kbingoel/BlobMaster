@@ -226,6 +226,12 @@ pub struct BenchReport {
     pub focal_bids: BidStats,
     pub opponent_bids: BidStats,
     pub secs: f64,
+    /// Base seed of the deal list.
+    pub seed: u64,
+    /// Mean of focal score − opponents' mean score on each deal (over its
+    /// seats), indexed by deal; NaN for a deal with no game. Two runs on the
+    /// same deals compare deal by deal ([`paired_diff`]).
+    pub per_deal: Vec<f64>,
 }
 
 /// SplitMix64 finalizer over two words, for well-spread derived seeds.
@@ -405,14 +411,26 @@ pub fn play_games(
     games
 }
 
-/// Mean and 95% half-width of the per-deal means of `f`.
-fn per_deal_mean_ci(games: &[GameRecord], deals: usize, f: impl Fn(&GameRecord) -> f64) -> (f64, f64) {
+/// Mean of `f` over each deal's games, indexed by deal; NaN for a deal
+/// with no game.
+fn per_deal_means(games: &[GameRecord], deals: usize, f: impl Fn(&GameRecord) -> f64) -> Vec<f64> {
     let mut sums = vec![(0.0f64, 0usize); deals];
     for g in games {
         sums[g.deal].0 += f(g);
         sums[g.deal].1 += 1;
     }
-    let means: Vec<f64> = sums.iter().filter(|s| s.1 > 0).map(|s| s.0 / s.1 as f64).collect();
+    sums.iter().map(|s| if s.1 > 0 { s.0 / s.1 as f64 } else { f64::NAN }).collect()
+}
+
+/// Mean and 95% half-width of the per-deal means of `f`.
+fn per_deal_mean_ci(games: &[GameRecord], deals: usize, f: impl Fn(&GameRecord) -> f64) -> (f64, f64) {
+    mean_ci(&per_deal_means(games, deals, f))
+}
+
+/// Mean and 95% half-width of the finite values in `xs` (NaN half-width
+/// with fewer than two).
+fn mean_ci(xs: &[f64]) -> (f64, f64) {
+    let means: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
     let k = means.len() as f64;
     let mean = means.iter().sum::<f64>() / k;
     if means.len() < 2 {
@@ -451,7 +469,49 @@ pub fn summarize(focal: &Agent, opponent: &Agent, cfg: &BenchConfig, games: &[Ga
         focal_bids,
         opponent_bids,
         secs,
+        seed: cfg.seed,
+        per_deal: per_deal_means(games, cfg.deals, |g| g.focal_score - g.opponent_mean_score),
     }
+}
+
+/// First line of a per-deal file: the deal list it was played on.
+fn per_deal_header(r: &BenchReport) -> String {
+    format!("# seed {} players {} cards {} deals {}", r.seed, r.num_players, r.start_cards, r.deals)
+}
+
+/// Write `report`'s per-deal diffs as `deal,diff` lines under a header
+/// naming the deal list, for a later [`paired_diff`] (`bench --compare`).
+pub fn write_per_deal(report: &BenchReport, path: &Path) -> std::io::Result<()> {
+    let mut out = per_deal_header(report);
+    out.push_str("\ndeal,diff\n");
+    for (d, x) in report.per_deal.iter().enumerate() {
+        out.push_str(&format!("{d},{x}\n"));
+    }
+    std::fs::write(path, out)
+}
+
+/// Paired comparison of `report` with the per-deal file at `path`: mean and
+/// 95% half-width over deals of (this run's diff − that run's), and the
+/// number of deals compared. Refuses a file from another deal list.
+pub fn paired_diff(report: &BenchReport, path: &Path) -> Result<(f64, f64, usize), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
+    if header != per_deal_header(report) {
+        return Err(format!("{}: played on another deal list ({header:?}, this run {:?})", path.display(), per_deal_header(report)));
+    }
+    let mut other = vec![f64::NAN; report.deals];
+    for line in lines.skip(1) {
+        let (d, x) = line.split_once(',').ok_or_else(|| format!("{}: bad line {line:?}", path.display()))?;
+        let d: usize = d.parse().map_err(|_| format!("{}: bad deal {d:?}", path.display()))?;
+        let x: f64 = x.parse().map_err(|_| format!("{}: bad diff {x:?}", path.display()))?;
+        if d < other.len() {
+            other[d] = x;
+        }
+    }
+    let deltas: Vec<f64> = report.per_deal.iter().zip(&other).map(|(a, b)| a - b).collect();
+    let (mean, ci) = mean_ci(&deltas);
+    Ok((mean, ci, deltas.iter().filter(|x| x.is_finite()).count()))
 }
 
 /// Run the benchmark: [`play_games`] then [`summarize`].
@@ -473,12 +533,13 @@ fn agent_label(a: &Agent, mcts: &MctsConfig) -> String {
         Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("network {}", p.display()),
         Agent::Search(p) => {
-            let one_card = if mcts.search_one_card_bids { "searched" } else { "from P" };
             format!(
-                "search bids {}, plays {}, c_puct {}, 1-card bids {one_card} {}",
+                "search bids {}, plays {}, c_puct {}, 1-card bids {}, bid weighting {} {}",
                 mcts.bid_budget,
                 mcts.play_budget,
                 mcts.c_puct,
+                mcts.one_card_bids,
+                mcts.bid_weighting,
                 p.display()
             )
         }
@@ -581,6 +642,29 @@ mod tests {
         let mut sc = new_game(5, 7).unwrap();
         start_round(&mut sc, &mut c);
         assert_ne!(sa.hands, sc.hands);
+    }
+
+    /// A per-deal file reads back for a paired comparison, and one from
+    /// another deal list is refused.
+    #[test]
+    fn per_deal_file_round_trips_into_a_paired_diff() {
+        let c = cfg(3);
+        let a = run_bench(&Agent::RuleBot2, &Agent::RuleBot, &c, &|_, _| {});
+        let b = run_bench(&Agent::RuleBot, &Agent::RuleBot, &c, &|_, _| {});
+        assert_eq!(a.per_deal.len(), 3);
+        assert!((a.per_deal.iter().sum::<f64>() / 3.0 - a.diff).abs() < 1e-9, "every deal has all its seats");
+        let dir = std::env::temp_dir().join(format!("blob-per-deal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.csv");
+        write_per_deal(&b, &path).unwrap();
+        let (mean, _, n) = paired_diff(&a, &path).unwrap();
+        assert_eq!(n, 3);
+        assert!((mean - (a.diff - b.diff)).abs() < 1e-9, "{mean} vs {}", a.diff - b.diff);
+        let (zero, _, _) = paired_diff(&b, &path).unwrap();
+        assert_eq!(zero, 0.0);
+        let other = run_bench(&Agent::RuleBot, &Agent::RuleBot, &cfg(2), &|_, _| {});
+        assert!(paired_diff(&other, &path).unwrap_err().contains("another deal list"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

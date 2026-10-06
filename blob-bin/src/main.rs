@@ -19,8 +19,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use blob_engine::bench::{eval_mcts_config, run_bench, Agent, BenchConfig, Nets, DEFAULT_SEED};
-use blob_engine::mcts::{MctsConfig, SearchBudget, DEFAULT_C_PUCT, DEFAULT_SEARCH_ONE_CARD_BIDS};
+use blob_engine::bench::{
+    eval_mcts_config, paired_diff, run_bench, write_per_deal, Agent, BenchConfig, Nets, DEFAULT_SEED,
+};
+use blob_engine::belief::{BidWeighting, DEFAULT_BID_CANDIDATES, DEFAULT_BID_NOISE};
+use blob_engine::mcts::{MctsConfig, OneCardBids, SearchBudget, DEFAULT_C_PUCT};
 use blob_engine::rule_bot_2::Rollouts;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -91,6 +94,15 @@ enum Command {
         /// the same cards.
         #[arg(long, default_value_t = DEFAULT_SEED)]
         seed: u64,
+        /// Write each deal's points/game difference to this file, for a
+        /// later `--compare`.
+        #[arg(long)]
+        per_deal_out: Option<PathBuf>,
+        /// Compare deal by deal with an earlier run's `--per-deal-out` file
+        /// on the same deals (same seed, deals and table): prints this run's
+        /// difference minus that one's, with a paired 95% CI.
+        #[arg(long)]
+        compare: Option<PathBuf>,
     },
     /// Play a game in the terminal against bots.
     Play {
@@ -145,10 +157,33 @@ struct SearchArgs {
     /// policy net's priors sooner.
     #[arg(long, default_value_t = DEFAULT_C_PUCT, value_parser = parse_c_puct)]
     c_puct: f32,
-    /// Search: search the bid of a 1-card round (`false`: the policy net's
-    /// bid, no tree).
-    #[arg(long, default_value_t = DEFAULT_SEARCH_ONE_CARD_BIDS, action = clap::ArgAction::Set)]
-    search_one_card_bids: bool,
+    /// Search: how a 1-card bid is made. `exact` computes it from the bids
+    /// made and the policy net's model of the later ones; `policy` is the
+    /// policy net's bid; `search` searches it like any bid.
+    #[arg(long, value_enum, default_value_t = OneCardArg::Exact)]
+    one_card_bids: OneCardArg,
+    /// Search: candidate deals drawn per sampled deal, weighted by the bids
+    /// already made (0 or 1: no weighting, uniform deals).
+    #[arg(long, default_value_t = DEFAULT_BID_CANDIDATES)]
+    bid_candidates: u32,
+    /// Search: noise floor of the bid model behind the weighting and the
+    /// exact 1-card bids (share of a uniform bid, 0..1).
+    #[arg(long, default_value_t = DEFAULT_BID_NOISE, value_parser = parse_bid_noise)]
+    bid_noise: f32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OneCardArg {
+    Exact,
+    Policy,
+    Search,
+}
+
+fn parse_bid_noise(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(e) if (0.0..=1.0).contains(&e) => Ok(e),
+        _ => Err(format!("{s:?} is not a number in [0, 1]")),
+    }
 }
 
 fn parse_c_puct(s: &str) -> Result<f32, String> {
@@ -161,9 +196,15 @@ fn parse_c_puct(s: &str) -> Result<f32, String> {
 impl SearchArgs {
     fn config(self) -> MctsConfig {
         let budgets = (SearchBudget::new(self.bid_dets, self.bid_sims), SearchBudget::new(self.dets, self.sims));
+        let one_card_bids = match self.one_card_bids {
+            OneCardArg::Exact => OneCardBids::Exact,
+            OneCardArg::Policy => OneCardBids::Policy,
+            OneCardArg::Search => OneCardBids::Search,
+        };
         MctsConfig {
             c_puct: self.c_puct,
-            search_one_card_bids: self.search_one_card_bids,
+            one_card_bids,
+            bid_weighting: BidWeighting { candidates: self.bid_candidates, noise: self.bid_noise },
             ..eval_mcts_config(budgets.0, budgets.1)
         }
     }
@@ -227,6 +268,8 @@ fn cmd_bench(
     rollouts: Rollouts,
     threads: Option<usize>,
     seed: u64,
+    per_deal_out: Option<PathBuf>,
+    compare: Option<PathBuf>,
 ) {
     let focal = match (focal.as_str(), mode) {
         ("rulebot", _) => Agent::RuleBot,
@@ -274,6 +317,24 @@ fn cmd_bench(
     };
     let report = run_bench(&focal, &opponent, &cfg, &progress);
     println!("{report}");
+    if let Some(path) = per_deal_out {
+        if let Err(e) = write_per_deal(&report, &path) {
+            eprintln!("error: write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+    if let Some(path) = compare {
+        match paired_diff(&report, &path) {
+            Ok((mean, ci, n)) => println!(
+                "paired vs {}: diff {mean:+.1} ± {ci:.1} (95% CI over {n} deals)",
+                path.display()
+            ),
+            Err(e) => {
+                eprintln!("error: compare: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 fn main() {
@@ -287,8 +348,21 @@ fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench { focal, mode, opponent, deals, players, cards, search, rollouts, threads, seed } => {
-            cmd_bench(focal, mode, opponent, deals, players, cards, search.config(), rollouts.config(), threads, seed)
+        Command::Bench { focal, mode, opponent, deals, players, cards, search, rollouts, threads, seed, per_deal_out, compare } => {
+            cmd_bench(
+                focal,
+                mode,
+                opponent,
+                deals,
+                players,
+                cards,
+                search.config(),
+                rollouts.config(),
+                threads,
+                seed,
+                per_deal_out,
+                compare,
+            )
         }
         Command::Play { model, bot, players, cards, seat, seed, show, search, rollouts, no_color } => {
             let bot = match (bot, model) {

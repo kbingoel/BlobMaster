@@ -6,8 +6,9 @@
 //! - Objective: `scoring` (the per-round utility `u_s`, gen-2.md §5.1).
 //! - Network input: `encoder` (variable-length typed token sequences, P and
 //!   V modes, one guarded layout).
-//! - Search: `mcts` over sampled deals from `belief`, guided by a policy and
-//!   a value evaluator (`evaluator`; `onnx::OnnxEvaluator` in production).
+//! - Search: `mcts` over sampled deals from `belief` (weighted by the bids
+//!   made), guided by a policy and a value evaluator (`evaluator`;
+//!   `onnx::OnnxEvaluator` in production). `one_card` computes 1-card bids.
 //! - Training data: `replay`, with suit-permutation augmentation from
 //!   `augment`; `teacher` plays the warm start's rule-bot-2 rounds.
 //! - Yardsticks: `rule_bot`, `rule_bot_2` and `bench` (gen-2.md §5.7).
@@ -25,6 +26,7 @@ pub mod evaluator;
 pub mod game;
 pub mod hand;
 pub mod mcts;
+pub mod one_card;
 pub mod onnx;
 pub mod playing;
 pub mod profiling;
@@ -43,11 +45,14 @@ pub use card::{Card, Suit, MAX_CARDS_DEALT, NUM_CARDS, NUM_RANKS, NUM_SUITS};
 pub use dealing::{deal, new_round, start_round, RoundParams};
 pub use game::{advance_round, is_game_over, new_game};
 pub use hand::Hand;
-pub use belief::{determinize, void_suits, VoidTable, DEFAULT_DETERMINIZE_ATTEMPTS};
+pub use belief::{
+    determinize, rewind_to_bid, sample_deals, void_suits, BidWeighting, VoidTable,
+    DEFAULT_DETERMINIZE_ATTEMPTS,
+};
 pub use mcts::{
     apply_action, backup, expand, is_terminal, mcts_search, root_action_probs, run_search,
     select_best_child, select_leaf, signal_ratio, ucb1_score, MctsArena, MctsConfig, MctsNode,
-    MctsResult, SearchBudget, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
+    MctsResult, OneCardBids, SearchBudget, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
 };
 pub use rule_bot::{rule_bot_action, rule_bot_bid, rule_bot_play};
 pub use rule_bot_2::{rule_bot_2_action, rule_bot_2_bid, rule_bot_2_play};

@@ -5,19 +5,25 @@
 //! opponent hands ("determinizations") and run an independent tree on
 //! each, aggregating the root visit counts at the end.
 //!
-//! Belief information is conservative: the only public inference rule
-//! used is the suit-void signal (an opponent who didn't follow the led
-//! suit is provably void in that suit). Rejection sampling then
-//! enforces void constraints when dealing opponent hands; when it keeps
-//! failing, a constrained deal relaxes only the seats whose voids can't
-//! all be met (none, for a real game state).
+//! Two kinds of evidence shape the sampled deals:
+//! - **Voids, as hard constraints.** An opponent who didn't follow the led
+//!   suit is provably void in it. Rejection sampling enforces the voids;
+//!   when it keeps failing, a constrained deal relaxes only the seats whose
+//!   voids can't all be met (none, for a real game state).
+//! - **Bids, as weights** ([`sample_deals`], gen-2.md §6 Phase 4b). A deal
+//!   that explains the bids already made is likelier than one that
+//!   doesn't. Candidate deals are weighted by how likely each earlier bid
+//!   was under the policy net, from that bidder's view of the candidate
+//!   when it bid, and the kept deals are resampled from them.
 
 use rand::seq::SliceRandom;
 use rand::Rng;
 use smallvec::SmallVec;
 
+use crate::bidding::{bid_order_position, has_bid, legal_bids};
 use crate::card::{NUM_RANKS, NUM_SUITS};
-use crate::state::{BlobState, MAX_PLAYERS};
+use crate::evaluator::{policy_in_chunks, PolicyEvaluator};
+use crate::state::{BlobState, GamePhase, TrickRecord, MAX_PLAYERS};
 
 /// Cap on rejection-sampling retries before falling back to a constrained
 /// sequential deal. Rejection sampling is exactly uniform over consistent
@@ -289,6 +295,176 @@ fn new_hands_merged(
         } else {
             opponents[i]
         };
+    }
+    out
+}
+
+/// The round as `seat` saw it when it bid: every seat holds its starting
+/// hand (its cards now plus those it has played this round), the seats
+/// before `seat` in bidding order have their bids, and no card is played.
+///
+/// On a real state this is the state `seat` bid from; on a sampled deal,
+/// the one it would have bid from with those cards. `seat` must have bid
+/// already (or be about to).
+pub fn rewind_to_bid(state: &BlobState, seat: u8) -> BlobState {
+    let n = state.num_players;
+    let mut s = *state;
+    for rec in &state.trick_history[..state.tricks_completed as usize] {
+        for &(p, c) in &rec.cards[..rec.num_played as usize] {
+            s.hands[p as usize] |= 1u64 << c;
+        }
+    }
+    for i in 0..state.trick_cards_played {
+        let p = (state.trick_leader + i) % n;
+        s.hands[p as usize] |= 1u64 << state.trick_play_order[i as usize];
+    }
+    s.tricks_won = [0; MAX_PLAYERS];
+    s.played_this_round = 0;
+    s.trick_history = [TrickRecord::default(); crate::card::MAX_CARDS_DEALT];
+    s.trick_play_order = [0; MAX_PLAYERS];
+    s.trick_cards_played = 0;
+    s.tricks_completed = 0;
+    s.trick_leader = (s.dealer + 1) % n;
+    s.game_phase = GamePhase::Bidding as u8;
+    s.current_player = seat;
+    let pos = bid_order_position(&s, seat);
+    for p in 0..n {
+        if bid_order_position(&s, p) >= pos {
+            s.bids[p as usize] = 0;
+        }
+    }
+    s
+}
+
+/// How the bids already made weight the sampled deals (gen-2.md §6
+/// Phase 4b). Unknown keys are an error.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BidWeighting {
+    /// Candidate deals drawn per deal kept. 0 or 1 turns weighting off:
+    /// every kept deal is a uniform consistent one.
+    pub candidates: u32,
+    /// The bid model's noise floor: a seat bids from P's policy with
+    /// probability `1 − noise` and uniformly over its legal bids otherwise.
+    /// It keeps a bid P finds unlikely from ruling a deal out, and stands
+    /// for players who bid unlike P. Also used by exact 1-card bids.
+    pub noise: f32,
+}
+
+/// Default candidates per kept deal.
+pub const DEFAULT_BID_CANDIDATES: u32 = 8;
+/// Default noise floor of the bid model.
+pub const DEFAULT_BID_NOISE: f32 = 0.1;
+
+impl Default for BidWeighting {
+    fn default() -> Self {
+        Self { candidates: DEFAULT_BID_CANDIDATES, noise: DEFAULT_BID_NOISE }
+    }
+}
+
+impl BidWeighting {
+    /// No weighting: uniform consistent deals, as before Phase 4b.
+    pub const OFF: Self = Self { candidates: 0, noise: DEFAULT_BID_NOISE };
+
+    /// Whether candidate deals are weighted at all.
+    pub fn is_on(&self) -> bool {
+        self.candidates > 1
+    }
+
+    /// The bid model's probability of a bid that P gives `p`, for a seat
+    /// with `legal` legal bids.
+    #[inline]
+    pub fn likelihood(&self, p: f32, legal: u32) -> f32 {
+        (1.0 - self.noise) * p + self.noise / legal.max(1) as f32
+    }
+}
+
+impl std::fmt::Display for BidWeighting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_on() {
+            write!(f, "{}x candidates, noise {}", self.candidates, self.noise)
+        } else {
+            write!(f, "off")
+        }
+    }
+}
+
+/// `n` deals of the hidden cards for `perspective`, consistent with the
+/// known voids and weighted by the bids already made.
+///
+/// With weighting on and at least one opponent's bid made, this draws
+/// `n × weighting.candidates` uniform consistent deals ([`determinize`]),
+/// scores each by the product over those bidders of
+/// [`BidWeighting::likelihood`] of the actual bid, P's policy read from the
+/// bidder's view of the candidate when it bid ([`rewind_to_bid`]), and
+/// keeps `n` by systematic resampling. A deal may be kept more than once.
+/// Otherwise it is `n` uniform consistent deals.
+pub fn sample_deals<P, R>(
+    state: &BlobState,
+    perspective: u8,
+    policy: &P,
+    n: usize,
+    weighting: BidWeighting,
+    rng: &mut R,
+) -> Vec<BlobState>
+where
+    P: PolicyEvaluator + ?Sized,
+    R: Rng + ?Sized,
+{
+    let voids = void_suits(state);
+    let bidders: SmallVec<[u8; MAX_PLAYERS]> =
+        (0..state.num_players).filter(|&p| p != perspective && has_bid(state, p)).collect();
+    let draw = |rng: &mut R| determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS);
+    if !weighting.is_on() || bidders.is_empty() || n == 0 {
+        return (0..n).map(|_| draw(rng)).collect();
+    }
+
+    let candidates: Vec<BlobState> = (0..n * weighting.candidates as usize).map(|_| draw(rng)).collect();
+    let log_w = bid_log_weights(state, &bidders, &candidates, policy, weighting);
+    systematic_resample(&log_w, n, rng).into_iter().map(|i| candidates[i]).collect()
+}
+
+/// Log weight of each candidate deal: the sum over `bidders` of the log
+/// [`BidWeighting::likelihood`] of the bid each made in `state`, P's policy
+/// read from its view of the candidate when it bid.
+pub fn bid_log_weights<P: PolicyEvaluator + ?Sized>(
+    state: &BlobState,
+    bidders: &[u8],
+    candidates: &[BlobState],
+    policy: &P,
+    weighting: BidWeighting,
+) -> Vec<f64> {
+    crate::profiling::time(&crate::profiling::BID_WEIGHTS, || {
+        let views: Vec<BlobState> =
+            candidates.iter().flat_map(|c| bidders.iter().map(|&j| rewind_to_bid(c, j))).collect();
+        let mut log_w = vec![0.0f64; candidates.len()];
+        for (i, (view, pol)) in views.iter().zip(policy_in_chunks(policy, &views)).enumerate() {
+            let j = view.current_player as usize;
+            let l = weighting.likelihood(pol[state.bids[j] as usize], legal_bids(view).count_ones());
+            log_w[i / bidders.len()] += (l.max(f32::MIN_POSITIVE) as f64).ln();
+        }
+        log_w
+    })
+}
+
+/// `n` indices drawn in proportion to `exp(log_w)` by systematic
+/// resampling: one uniform offset, then evenly spaced points along the
+/// cumulative weights. Index `i` appears `⌊n·w_i⌋` or `⌈n·w_i⌉` times
+/// (normalized weights), the lowest-variance unbiased scheme.
+fn systematic_resample<R: Rng + ?Sized>(log_w: &[f64], n: usize, rng: &mut R) -> Vec<usize> {
+    let max = log_w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let w: Vec<f64> = log_w.iter().map(|&l| (l - max).exp()).collect();
+    let step = w.iter().sum::<f64>() / n as f64;
+    let mut point = rng.gen::<f64>() * step;
+    let (mut i, mut cum) = (0usize, w[0]);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        while cum < point && i + 1 < w.len() {
+            i += 1;
+            cum += w[i];
+        }
+        out.push(i);
+        point += step;
     }
     out
 }
@@ -566,5 +742,124 @@ mod tests {
             }
         }
         assert!(checked > 100, "only {checked} void checks ran");
+    }
+
+    /// Rewinding any later state of a round to a seat's bid gives exactly
+    /// the state that seat bid from.
+    #[test]
+    fn rewind_to_bid_recovers_each_bidders_state() {
+        use crate::dealing::{new_round, RoundParams};
+        use crate::rule_bot::rule_bot_action;
+        for seed in 0..20u64 {
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+            let params = RoundParams { num_players: 3 + (seed % 4) as u8, cards_dealt: 1 + (seed % 7) as u8, trump: (seed % 5) as u8, dealer: (seed % 3) as u8 };
+            let mut s = new_round(params, &mut rng).unwrap();
+            let mut at_bid = Vec::new();
+            while s.phase() != GamePhase::Scoring {
+                if s.phase() == GamePhase::Bidding {
+                    at_bid.push(s);
+                }
+                let a = rule_bot_action(&s);
+                crate::mcts::apply_action(&mut s, a);
+                if s.phase() == GamePhase::Playing {
+                    for b in &at_bid {
+                        assert_eq!(rewind_to_bid(&s, b.current_player), *b, "seed {seed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn systematic_resample_keeps_each_index_in_proportion() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
+        let log_w: Vec<f64> = [0.5f64, 0.25, 0.25, 0.0].iter().map(|w| w.ln()).collect();
+        for _ in 0..50 {
+            let picks = systematic_resample(&log_w, 8, &mut rng);
+            let count = |i| picks.iter().filter(|&&p| p == i).count();
+            assert_eq!((count(0), count(1), count(2), count(3)), (4, 2, 2, 0), "{picks:?}");
+        }
+        let flat = systematic_resample(&[0.0; 40], 5, &mut rng);
+        assert_eq!(flat.len(), 5);
+        assert!(flat.windows(2).all(|w| w[1] - w[0] == 8), "one per block of 8: {flat:?}");
+    }
+
+    /// A policy that bids 1 exactly with the ♠A: after such a bid every
+    /// kept deal gives that seat the ♠A (no noise); without weighting most
+    /// don't.
+    #[test]
+    fn sample_deals_follow_the_bids() {
+        use crate::dealing::{new_round, RoundParams};
+        use crate::evaluator::uniform_policy;
+        struct AceBidder;
+        impl PolicyEvaluator for AceBidder {
+            fn policy(&self, s: &BlobState) -> Vec<f32> {
+                let mut p = uniform_policy(s);
+                let one = s.hands[s.current_player as usize] >> 12 & 1 == 1;
+                let target = if one { 1 } else { 0 };
+                if legal_bids(s) >> target & 1 == 1 {
+                    p.iter_mut().enumerate().for_each(|(b, x)| *x = if b == target { 1.0 } else { 0.0 });
+                }
+                p
+            }
+        }
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(12);
+        let params = RoundParams { num_players: 4, cards_dealt: 3, trump: 1, dealer: 3 };
+        let mut s = new_round(params, &mut rng).unwrap();
+        let ace = 1u64 << 12;
+        let hand = |cards: [u8; 3]| cards.iter().fold(0u64, |h, &c| h | 1u64 << c);
+        s.hands[..4].copy_from_slice(&[hand([12, 13, 26]), hand([14, 27, 40]), hand([15, 28, 41]), hand([16, 29, 42])]);
+        crate::bidding::apply_bid(&mut s, 1); // seat 0
+        let sharp = BidWeighting { candidates: 16, noise: 0.0 };
+        let deals = sample_deals(&s, 1, &AceBidder, 40, sharp, &mut rng);
+        assert_eq!(deals.len(), 40);
+        assert!(deals.iter().all(|d| d.hands[0] & ace != 0), "every deal explains the bid");
+        assert!(deals.iter().all(|d| d.hands[1] == s.hands[1]), "my hand is kept");
+        let uniform = sample_deals(&s, 1, &AceBidder, 40, BidWeighting::OFF, &mut rng);
+        assert!(uniform.iter().filter(|d| d.hands[0] & ace != 0).count() < 20);
+    }
+
+    /// Effective sample size of the bid weights with a real P, at every
+    /// decision of a few rounds played by rule bot 2. Needs `BLOB_MODEL_DIR`;
+    /// run with `--ignored --nocapture` in release.
+    #[test]
+    #[ignore]
+    fn bid_weight_ess_with_a_model() {
+        use crate::dealing::{new_round, RoundParams};
+        use crate::rule_bot_2::rule_bot_2_action;
+        let Ok(dir) = std::env::var("BLOB_MODEL_DIR") else { return };
+        let p = crate::onnx::OnnxPolicy::from_dir(&dir).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(21);
+        let k = 80usize;
+        for noise in [0.05f32, 0.1, 0.2] {
+            let w = BidWeighting { candidates: 8, noise };
+            let (mut bid_ess, mut play_ess) = (Vec::new(), Vec::new());
+            for r in 0..6u8 {
+                let params = RoundParams { num_players: 5, cards_dealt: 7, trump: r % 5, dealer: r % 5 };
+                let mut s = new_round(params, &mut rng).unwrap();
+                while s.phase() != GamePhase::Scoring {
+                    let me = s.current_player;
+                    let bidders: Vec<u8> = (0..5).filter(|&j| j != me && has_bid(&s, j)).collect();
+                    if !bidders.is_empty() {
+                        let voids = void_suits(&s);
+                        let cands: Vec<BlobState> =
+                            (0..k).map(|_| determinize(&s, me, &voids, &mut rng, DEFAULT_DETERMINIZE_ATTEMPTS)).collect();
+                        let lw = bid_log_weights(&s, &bidders, &cands, &p, w);
+                        let max = lw.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let ws: Vec<f64> = lw.iter().map(|l| (l - max).exp()).collect();
+                        let ess = ws.iter().sum::<f64>().powi(2) / ws.iter().map(|x| x * x).sum::<f64>();
+                        if s.phase() == GamePhase::Bidding { bid_ess.push(ess) } else { play_ess.push(ess) }
+                    }
+                    let a = rule_bot_2_action(&s);
+                    crate::mcts::apply_action(&mut s, a);
+                }
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            let low = |v: &[f64]| { let mut v = v.to_vec(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 10] };
+            println!(
+                "noise {noise}: ESS of {k} candidates — bids mean {:.1} (10th pct {:.1}), plays mean {:.1} (10th pct {:.1})",
+                mean(&bid_ess), low(&bid_ess), mean(&play_ess), low(&play_ess)
+            );
+        }
     }
 }

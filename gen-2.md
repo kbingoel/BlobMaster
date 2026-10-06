@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-06: gen 1 is concluded; Phases 0–4 are done. The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Next: Phase 5, async self-play RL.
+Status, 2026-10-06: gen 1 is concluded; Phases 0–4b are done. The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Phase 4b (bid-aware sampling: exact 1-card bids and bid-weighted deals) lifts search to +6.4 against rule bot 2, paired +1.7 over Phase 4 (§6 Phase 4b). Next: Phase 5, async self-play RL.
 
 ---
 
@@ -341,7 +341,8 @@ Per-round targets leave nothing linking rounds, so self-play plays **single roun
   - Plays keep 5 × 100 until measurements say otherwise.
   - Both are config values per phase.
 - **Greedy play** = most visits; ties go to the higher prior (done, Phase 1).
-- **Determinization:** voids from the current trick; on fallback, relax only the seat that can't be satisfied (done, Phase 1).
+- **Determinization:** voids from the current trick; on fallback, relax only the seat that can't be satisfied (done, Phase 1). Deals are weighted by the bids already made, under P (done, Phase 4b).
+- **1-card bids** are computed, not searched (done, Phase 4b).
 
 ### 5.5 Encoder
 
@@ -705,7 +706,7 @@ For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the
 
 - A near-exact V didn't help, so V's error wasn't the cause. The sampled deals ignore the bids already made, and in a 1-card round those bids are almost the only clue to the opponents' cards. P read them from rule bot 2; search throws them away. The lower the c_puct, the more V's bid-blind values decide, and the more search loses. Rule bot 2r's rollouts lose there the same way (bids made 0.773 vs 0.783, `rule_bot_2.rs` header).
 - 1-card rounds are 5 of a game's 17 and about a third of its points, so this cost ~0.8 points per full game.
-- **Decision:** 1-card bids come from P (`MctsConfig::search_one_card_bids`, default off; `--search-one-card-bids true` searches them). Self-play inherits it, so RL doesn't train P toward the worse bids. The real fix is bid-weighted sampling, cheapest to build exactly for 1-card bids first (§8).
+- **Decision:** 1-card bids come from P (then `MctsConfig::search_one_card_bids`, default off; replaced in Phase 4b by exact 1-card bids, `MctsConfig::one_card_bids`). Self-play inherits it, so RL doesn't train P toward the worse bids. The real fix is bid-weighted sampling, cheapest to build exactly for 1-card bids first (§8).
 
 **c_puct 0.2 is the new default** (`DEFAULT_C_PUCT`, gen 1's 1.5 before): against rule bot 2 on the default deals, 0.2 and 0.1 scored the same (+5.4 ± 1.8, +5.3 ± 1.7). 0.2 is the less extreme of the two, and RL will soften P's priors.
 
@@ -722,10 +723,58 @@ For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the
 - **G3:** +20.0 ± 2.4 against the rule bot (first run +19.1 ± 2.6, P alone +16.1 ± 2.4 on the same deals). That touches G5's numeric bars (≥ +20 against the rule bot, > 0 against rule bot 2), with the CI reaching below +20; G5 also needs the long run and human playtests.
 - **What search adds over network-only:** +4.6 against rule bot 2 (fresh deals) and +3.9 against the rule bot (first run: +2.5 and +3.0; gen 1: about 4, over a much weaker network). Against rule bot 2 the gain over the first run's search is +2.1, about 0.8 of it from leaving 1-card bids to P. It comes from the larger rounds: 5–8-card bids made 0.633, against 0.615 for the first run's search and 0.578 for P alone.
 
+**Phase 4b — Bid-aware sampling** (added and done 2026-10-06: both gates pass)
+
+The sampled deals ignored the bids already made (§6 Phase 4, 1-card bids), and the Phase-5 run trains P on search's choices, so the fix comes before that run. The Phase-5 driver doesn't depend on it: it calls search as a black box.
+- [x] **Exact 1-card bids** (§8; `one_card.rs`, `MctsConfig::one_card_bids = Exact`, the new default): no tree and no V. The earlier bidders' cards are drawn weighted by how likely each one's bid was under P, the later bidders' bids follow P's policy, the cards play out, and the bid with the best expected `u` is chosen. Replaces "1-card bids from P" (still available as `Policy`).
+- [x] **Bid-weighted sampling for every decision** (`belief::sample_deals`, `MctsConfig::bid_weighting`, default on): draw more candidate deals than trees, weight each by the likelihood of every earlier bid under P (from that bidder's bid-time view of the candidate, `belief::rewind_to_bid`), and keep the trees' deals by systematic resampling. A noise floor in the bid model keeps an unlikely bid from ruling a deal out.
+- [x] `bench --per-deal-out <file>` and `--compare <file>`: a paired comparison of two runs on the same deals (same seed, deals and table).
+- *Gates:*
+  - exact 1-card bids beat P alone in 1-card-only games against rule bot 2 (`--cards 1`; Phase 4: P 0.0, search −0.9) — **passed: +0.2 ± 0.1**;
+  - search with both beats Phase 4's +4.7 ± 1.0 against rule bot 2 (128 fresh deals, `--seed 7`), with the cost per decision measured — **passed: +6.4 ± 1.1, paired +1.7 ± 1.1 over Phase 4, at +43% wall time**.
+
+*As built:*
+- **Exact 1-card bids** (`one_card::one_card_bid`):
+  - Each earlier bidder's likelihood is tabled over the 51 cards it might hold (one P call each, from a view that holds that card and placeholders elsewhere: P reads only its own hand and the hand sizes).
+  - 2048 deals per bid. The earlier bidders draw their cards in turn, in proportion to their likelihood over the cards left; each deal's weight is the product of the normalizers, so the deals are exact draws from "uniform, weighted by the bids". The later bidders' cards are uniform over the rest.
+  - The later bidders' bids are enumerated as lines, each weighted by P's probability given the card and the bids before it, mine included (one P call per distinct line and card, cached). Lines below 1e-4 within a deal are dropped; raising that to 1e-2 changed neither the values nor the cost.
+  - The dealer rule enters through P's legal mask. At λ = 1 my bid moves the later seats' expected scores (for example, forcing the dealer), and the values include that.
+  - Both policies of the result are one-hot on the chosen bid, as visits would be after unlimited search; `action_values` are each bid's expected `u`.
+  - Cost with the warm start's P, one thread: 50 ms (the dealer, 4 earlier bidders, 204 P states) to 340 ms (first to bid, ~1400 states), against ~590 ms for a 20×25 searched bid. P costs ~0.25 ms per state even batched.
+- **Bid-weighted deals** (`belief::sample_deals`):
+  - Defaults `candidates = 8` per kept deal and `noise = 0.1`: each bidder bids from P's policy with probability 0.9 and uniformly over its legal bids otherwise (`BidWeighting::likelihood`). The noise floor also serves the exact 1-card bids.
+  - Cost: one P call per candidate per earlier bidder: 320 per bid on average at 20 deals, 160 per play at 5 deals (4 bidders).
+  - Effective sample size (the warm start's P, rule-bot-2 rounds, 80 candidates): about a quarter of the candidates on average, 6% in the worst tenth of decisions (noise 0.1; 0.05 is lower, 0.2 similar). At 5 × 8 candidates a play's 5 trees see 2–3 distinct deals in the hardest cases.
+- **Tests:** the rewind recovers every bidder's real bid-time state; systematic resampling keeps each index in proportion; a bid that reveals a card puts that card in every kept deal; the exact 1-card values match hand-computed cases (a sure winner; P(win) at λ = 0; the later bidders' lines and the dealer rule at λ = 1, exact to 1e-5); weighting costs `deals × candidates × bidders` P calls.
+
+*Results* (`checkpoints/pretrain-2026-10-06/bench4b/`; c_puct 0.2, bids 20×25, plays 5×100):
+
+| Focal player | Opponents | Deals | Points/game | Paired vs Phase 4 | Bids made: 1 / 2–4 / 5–8 cards | Wall time |
+|---|---|---|---|---|---|---|
+| 1-card games: P alone (Phase 4) | rule bot 2 | 1000 | 0.0 | | 0.786 | |
+| 1-card games: search (Phase 4) | rule bot 2 | 1000 | −0.9 ± 0.1 | | 0.770 | 86 s |
+| 1-card games: **exact** | rule bot 2 | 1000 | **+0.2 ± 0.1** | | 0.784 | 660 s |
+| Phase 4 search: 1-card bids from P, uniform deals | rule bot 2, `--seed 7` | 128 | +4.7 ± 1.0 | | 0.784 / 0.701 / 0.633 | 940 s |
+| exact 1-card bids, uniform deals | rule bot 2, `--seed 7` | 128 | +5.1 ± 1.0 | +0.5 ± 0.8 | 0.787 / 0.700 / 0.636 | 989 s |
+| **exact 1-card bids, bid-weighted deals** | rule bot 2, `--seed 7` | 128 | **+6.4 ± 1.1** | **+1.7 ± 1.1** | 0.787 / 0.715 / 0.636 | 1340 s |
+| Phase 4 search (Phase 4 report) | rule bot | 64 | +20.0 ± 2.4 | | 0.810 / 0.736 / 0.693 | 481 s |
+| exact 1-card bids, bid-weighted deals | rule bot | 64 | +20.1 ± 2.4 | | 0.812 / 0.743 / 0.688 | 670 s |
+
+- **Exact 1-card bids gain a little:** +0.2 per 5-round 1-card game, so ~+0.2 per full game (5 of its 17 rounds are 1-card rounds). They make about as many bids as P (0.784 vs 0.786) and score more: at λ = 1 they also weigh what the bid does to the later seats. P is rule bot 2's 1-card formula almost exactly, which is already bid-aware, so little was left to gain over P; the fix is that search no longer loses 0.9 there.
+- **Bid-weighted deals carry most of the gain:** +1.3 ± 1.1 over exact 1-card bids alone (paired), almost all of it in 2–4-card rounds, where bids made rose from 0.700 to 0.715. In 5–8-card rounds my own 7 cards say more than the bids, and the trees see play as it happens.
+- **Against the rule bot nothing changes** (+20.1 against +20.0 on the same deals). The weighting reads bids through P, which bids like rule bot 2; the rule bot bids by a cruder rule, so its bids are misread as often as read. The gain depends on the bid model matching the opponents: in self-play it does by construction, against humans it won't, which is what the noise floor and per-player models (§8.1) are for.
+- **The cost is +36% wall time** for the weighting (989 s → 1340 s), more than the P-call count suggests at one thread: under a full 32-thread load each P state costs more. Exact 1-card bids cost +5%.
+- **The bench's default deals are reproducible:** rerunning Phase 4's settings with the new code gave the same +4.7 ± 1.0 and the same points, so the old reports stand.
+
+*Open points carried forward:*
+- The noise floor and the candidate count were set once, not tuned. Larger counts raise the effective sample size at more P calls; noise 0.1 against 0.05 and 0.2 was compared only by effective sample size.
+- Plays carry information too (a seat at its bid ducks): the same weighting could score candidates by the plays made so far. Not built.
+- Self-play: the exact 1-card bids' targets are one-hot, so 1-card bids get no exploration from τ; and in self-play the opponents are P, the model the weighting assumes, the best case for it. Against humans the noise floor, then per-player models (§8.1), stand in.
+
 **Phase 5 — Async self-play RL**
 - [ ] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train`.
 - [ ] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run.
-- [ ] Self-play search settings: the warm start's priors are sharp; at c_puct 1.5 visit counts ≈ P's priors (Phase 4), hence the default of 0.2. Check it in self-play (the visit targets must depart from P's priors) before the short run. 1-card bids come from P (`search_one_card_bids` off), so their targets are P's own until bid-weighted sampling exists (§8).
+- [ ] Self-play search settings: the warm start's priors are sharp; at c_puct 1.5 visit counts ≈ P's priors (Phase 4), hence the default of 0.2. Check it in self-play (the visit targets must depart from P's priors) before the short run. 1-card bids are exact (Phase 4b): their targets are one-hot on the computed bid.
 - [ ] Short run (a few hours, 5p7c) from the Phase-4 checkpoint.
 - [ ] First human playtest (`blobmaster play`).
 - *Exit:*
@@ -769,11 +818,11 @@ G3 may already pass at the warm start: rule bot 2 itself scores +14.5. That is f
 
 ## 8. Open questions and later work
 
-- **Bid inference in sampling.** Weight sampled deals by how likely the observed bids are under P ("they bid 3, so they hold strength"). Probably the biggest remaining gain for both bidding and play.
+- **Bid inference in sampling** (done, Phase 4b). Weight sampled deals by how likely the observed bids are under P ("they bid 3, so they hold strength"). Next: weight by the plays made too, and per player (§8.1).
 - **Strategy fusion.** Inside a sampled deal, opponents act as if they see it. Mitigate with more deals and shallower search; information-set MCTS variants later.
 - **Game-aware objective.** Use the standings in the final rounds, e.g. through a standings-conditioned fine-tune.
 - **Opponent diversity.** Mix rule bots and past checkpoints into self-play, so the bot doesn't only learn to beat itself. Humans play differently.
-- **Exact 1-card bids.** A 1-card round has one real decision per seat (every play is forced), worth as much as any other bid, and 5 of a 17-round game's rounds. It can be computed instead of searched: sample the hidden cards weighted by how likely each earlier bid was under P, take the later bids from P's policy, play out the forced cards, and pick the bid with the best expected `u`. No V at all. It is bid inference in sampling (above) in its smallest form, so it is also the place to test that idea first. Rule bot 2's 1-card formula already weights cards by their holder's bid (`BID_NOISE`), a starting point for the weights. Until then `MctsConfig::search_one_card_bids` chooses between search and P alone (Phase 4).
+- **Exact 1-card bids** (done, Phase 4b). A 1-card round has one real decision per seat (every play is forced), worth as much as any other bid, and 5 of a 17-round game's rounds. It can be computed instead of searched: sample the hidden cards weighted by how likely each earlier bid was under P, take the later bids from P's policy, play out the forced cards, and pick the bid with the best expected `u`. No V at all. It is bid inference in sampling (above) in its smallest form, so it is also the place to test that idea first. Rule bot 2's 1-card formula already weights cards by their holder's bid (`BID_NOISE`), a starting point for the weights. Done in Phase 4b (`one_card.rs`).
 - **Training-step efficiency.** Profiled in Phase 4: P's forward + backward is 84 ms per 512 examples and V's 67 ms, bound by activation memory traffic. fp16 autocast halves both, but tch has no gradient scaler; worth adding (a manual loss scale, or bf16) only if the learner ever limits a run.
 - **Model size.** The GPU is mostly idle and CPU inference sets the limit (§5.8).
 - **Plan B.** DouZero-style "Deep Monte-Carlo": no search; learn Q(state, action) directly from round scores. Worth running as a comparison if search-based training stalls.

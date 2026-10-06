@@ -79,6 +79,8 @@ where
 pub static GAME_TOTAL: Bucket = Bucket::new("game_total");
 pub static MCTS_SEARCH: Bucket = Bucket::new("mcts_search");
 pub static DETERMINIZE: Bucket = Bucket::new("determinize");
+pub static BID_WEIGHTS: Bucket = Bucket::new("bid_weights");
+pub static ONE_CARD_BID: Bucket = Bucket::new("one_card_bid");
 pub static ENCODE: Bucket = Bucket::new("encode");
 pub static ONNX_TENSOR_BUILD: Bucket = Bucket::new("onnx_tensor_build");
 pub static ONNX_INFERENCE: Bucket = Bucket::new("onnx_inference");
@@ -91,6 +93,8 @@ pub const ALL_BUCKETS: &[&Bucket] = &[
     &GAME_TOTAL,
     &MCTS_SEARCH,
     &DETERMINIZE,
+    &BID_WEIGHTS,
+    &ONE_CARD_BID,
     &ENCODE,
     &ONNX_TENSOR_BUILD,
     &ONNX_INFERENCE,

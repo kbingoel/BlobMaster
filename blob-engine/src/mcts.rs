@@ -32,10 +32,11 @@
 use rand::Rng;
 use smallvec::SmallVec;
 
-use crate::belief::{determinize, void_suits, DEFAULT_DETERMINIZE_ATTEMPTS};
+use crate::belief::{sample_deals, BidWeighting};
 use crate::bidding::{apply_bid, legal_bids};
 use crate::encoder::hand_card_indices;
 use crate::evaluator::{PolicyEvaluator, ValueEvaluator, NUM_BIDS};
+use crate::one_card::{one_card_bid, DEFAULT_ONE_CARD_SAMPLES};
 use crate::playing::{apply_play, legal_plays};
 use crate::scoring::{terminal_utilities, utilities, DEFAULT_LAMBDA};
 use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
@@ -45,10 +46,36 @@ use crate::state::{BlobState, GamePhase, MAX_PLAYERS};
 /// barely depart from them; 0.1 and 0.2 scored the same (gen-2.md §6).
 pub const DEFAULT_C_PUCT: f32 = 0.2;
 
-/// Whether 1-card bids are searched (`MctsConfig::search_one_card_bids`).
-/// Off: search lost to P alone there on both warm starts, because the
-/// sampled deals ignore the bids already made (gen-2.md §6 Phase 4).
-pub const DEFAULT_SEARCH_ONE_CARD_BIDS: bool = false;
+/// How a 1-card bid is made (`MctsConfig::one_card_bids`).
+///
+/// The bid is the round's only decision (every play is forced). Search lost
+/// to P alone there on both Phase-4 warm starts: its deals ignored the bids
+/// already made, and inside a deal the later bidders bid as if they saw
+/// every card (gen-2.md §6 Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OneCardBids {
+    /// Computed from the bids made and P's model of the later ones
+    /// (`one_card.rs`, gen-2.md §6 Phase 4b).
+    Exact,
+    /// P's policy, no tree (Phase 4).
+    Policy,
+    /// Searched like any other bid.
+    Search,
+}
+
+impl std::fmt::Display for OneCardBids {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OneCardBids::Exact => "exact",
+            OneCardBids::Policy => "from P",
+            OneCardBids::Search => "searched",
+        })
+    }
+}
+
+/// Default 1-card bids.
+pub const DEFAULT_ONE_CARD_BIDS: OneCardBids = OneCardBids::Exact;
 
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
@@ -651,8 +678,8 @@ fn default_root_dirichlet_epsilon() -> f32 {
     0.0
 }
 
-fn default_search_one_card_bids() -> bool {
-    DEFAULT_SEARCH_ONE_CARD_BIDS
+fn default_one_card_bids() -> OneCardBids {
+    DEFAULT_ONE_CARD_BIDS
 }
 
 /// Sample a single `Gamma(alpha, 1)` variate via Marsaglia–Tsang for
@@ -849,12 +876,15 @@ pub struct MctsConfig {
     /// files.
     #[serde(default = "default_root_dirichlet_epsilon")]
     pub root_dirichlet_epsilon: f32,
-    /// Search the bid of a 1-card round. Off (the default), the bid is P's
-    /// policy, with no tree: the bid is the round's only decision (every
-    /// play is forced), and on the Phase-4 warm starts search made it worse
-    /// than P alone (gen-2.md §6 Phase 4). Optional in config files.
-    #[serde(default = "default_search_one_card_bids")]
-    pub search_one_card_bids: bool,
+    /// How the bid of a 1-card round is made ([`OneCardBids`]). Optional in
+    /// config files.
+    #[serde(default = "default_one_card_bids")]
+    pub one_card_bids: OneCardBids,
+    /// How the bids already made weight the sampled deals
+    /// ([`BidWeighting`]; its noise floor also serves exact 1-card bids).
+    /// Optional in config files.
+    #[serde(default)]
+    pub bid_weighting: BidWeighting,
 }
 
 impl MctsConfig {
@@ -889,7 +919,8 @@ impl Default for MctsConfig {
             target_batch: DEFAULT_TARGET_BATCH,
             root_dirichlet_alpha: default_root_dirichlet_alpha(),
             root_dirichlet_epsilon: default_root_dirichlet_epsilon(),
-            search_one_card_bids: DEFAULT_SEARCH_ONE_CARD_BIDS,
+            one_card_bids: DEFAULT_ONE_CARD_BIDS,
+            bid_weighting: BidWeighting::default(),
         }
     }
 }
@@ -982,13 +1013,15 @@ fn action_to_policy_index(
 /// Full search over sampled deals, with diagnostics.
 ///
 /// The phase's budget (`cfg.budget`) sets how many deals are sampled for
-/// the hidden hands, consistent with known voids, and how many simulations
-/// each deal's tree gets. The trees run in lockstep ([`run_lockstep_search`])
+/// the hidden hands, consistent with known voids and weighted by the bids
+/// made (`belief::sample_deals`, `cfg.bid_weighting`), and how many
+/// simulations each deal's tree gets. The trees run in lockstep ([`run_lockstep_search`])
 /// and their root visit counts are summed into one dense policy.
 /// Temperature, entropy and top-1 share come from the sum, not per tree.
 ///
-/// A forced move returns at once, with no tree and no network call; so does
-/// a 1-card bid with `search_one_card_bids` off, from one P call.
+/// A forced move returns at once, with no tree and no network call. A
+/// 1-card bid has no tree unless `cfg.one_card_bids` is `Search`: `Exact`
+/// computes it (`one_card.rs`), `Policy` takes P's policy.
 pub fn mcts_search<P, V, R>(
     state: &BlobState,
     policy: &P,
@@ -1051,35 +1084,69 @@ where
             };
         }
 
-        // A 1-card bid from P alone: the prior is both policies (sampling at
-        // the configured τ), and there are no visits or values.
-        if !cfg.search_one_card_bids && phase == GamePhase::Bidding && state.cards_dealt == 1 {
-            let prior = policy.policy(state);
-            let tau = cfg.temperature_at(decision_index);
-            return MctsResult {
-                policy_sampling: prior_at_temperature(&prior, tau),
-                visit_entropy: entropy(&prior),
-                top1_visit_share: prior.iter().cloned().fold(0.0f32, f32::max),
-                policy_target: prior.clone(),
-                root_prior: prior,
-                action_values: vec![0.0; policy_len],
-                total_visits: 0,
-                value_estimate: 0.0,
-            };
+        if phase == GamePhase::Bidding && state.cards_dealt == 1 {
+            match cfg.one_card_bids {
+                // P alone: the prior is both policies (sampling at the
+                // configured τ), and there are no visits or values.
+                OneCardBids::Policy => {
+                    let prior = policy.policy(state);
+                    let tau = cfg.temperature_at(decision_index);
+                    return MctsResult {
+                        policy_sampling: prior_at_temperature(&prior, tau),
+                        visit_entropy: entropy(&prior),
+                        top1_visit_share: prior.iter().cloned().fold(0.0f32, f32::max),
+                        policy_target: prior.clone(),
+                        root_prior: prior,
+                        action_values: vec![0.0; policy_len],
+                        total_visits: 0,
+                        value_estimate: 0.0,
+                    };
+                }
+                // Computed: both policies are one-hot on the best bid, as
+                // visits would be after an unlimited search; the values are
+                // each bid's expected u.
+                OneCardBids::Exact => {
+                    let prior = policy.policy(state);
+                    let r = one_card_bid(
+                        state,
+                        policy,
+                        &prior,
+                        cfg.lambda,
+                        cfg.bid_weighting,
+                        DEFAULT_ONE_CARD_SAMPLES,
+                        rng,
+                    );
+                    let mut target = vec![0.0f32; policy_len];
+                    target[r.bid as usize] = 1.0;
+                    let mut action_values = vec![0.0f32; policy_len];
+                    for (b, &v) in r.values.iter().enumerate() {
+                        if v.is_finite() {
+                            action_values[b] = v;
+                        }
+                    }
+                    return MctsResult {
+                        policy_sampling: target.clone(),
+                        policy_target: target,
+                        root_prior: prior,
+                        action_values,
+                        visit_entropy: 0.0,
+                        top1_visit_share: 1.0,
+                        total_visits: 0,
+                        value_estimate: r.values[r.bid as usize],
+                    };
+                }
+                OneCardBids::Search => {}
+            }
         }
 
         let budget = cfg.budget(phase);
         let num_dets = budget.determinizations.max(1) as usize;
         let sims_per = budget.sims_per_determinization.max(1);
-        let voids = void_suits(state);
 
         // One sampled deal and one arena per tree, driven in lockstep.
-        let mut det_states: Vec<BlobState> = Vec::with_capacity(num_dets);
-        let mut arenas: Vec<MctsArena> = Vec::with_capacity(num_dets);
-        for _ in 0..num_dets {
-            det_states.push(determinize(state, perspective, &voids, rng, DEFAULT_DETERMINIZE_ATTEMPTS));
-            arenas.push(MctsArena::with_capacity(perspective, cfg.arena_capacity));
-        }
+        let det_states = sample_deals(state, perspective, policy, num_dets, cfg.bid_weighting, rng);
+        let mut arenas: Vec<MctsArena> =
+            (0..num_dets).map(|_| MctsArena::with_capacity(perspective, cfg.arena_capacity)).collect();
 
         // Root Dirichlet noise: expand every root with one batched call
         // first, so the priors can be decorated with `(1−ε)·P + ε·Dir(α)`
@@ -1225,10 +1292,14 @@ mod tests {
 
     const D: DummyEvaluator = DummyEvaluator;
 
+    /// Default settings with these budgets and uniform deals (no bid
+    /// weighting), so P calls are one per leaf; the weighting has its own
+    /// tests.
     fn cfg_with(bid: (u32, u32), play: (u32, u32)) -> MctsConfig {
         MctsConfig {
             bid_budget: SearchBudget::new(bid.0, bid.1),
             play_budget: SearchBudget::new(play.0, play.1),
+            bid_weighting: BidWeighting::OFF,
             ..MctsConfig::default()
         }
     }
@@ -1726,28 +1797,66 @@ mod tests {
         }
     }
 
-    /// With `search_one_card_bids` off, a 1-card bid is P's policy from
-    /// one P call and no tree; larger rounds' bids are still searched.
+    /// A 1-card bid has no tree unless `one_card_bids` is `Search`: `Policy`
+    /// is P's policy from one P call, `Exact` a computed one-hot bid from P
+    /// calls alone. Larger rounds' bids are searched either way.
     #[test]
-    fn one_card_bids_can_come_from_p_alone() {
+    fn one_card_bids_follow_their_setting() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
-        let off = MctsConfig { search_one_card_bids: false, ..cfg_with((4, 20), (1, 1)) };
+        let base = cfg_with((4, 20), (1, 1));
+        let from_p = MctsConfig { one_card_bids: OneCardBids::Policy, ..base };
         let one = new_round(RoundParams { num_players: 4, cards_dealt: 1, trump: 0, dealer: 0 }, &mut rng).unwrap();
         let c = Counting::default();
-        let r = mcts_search(&one, &c, &c, &off, &mut rng, 0);
+        let r = mcts_search(&one, &c, &c, &from_p, &mut rng, 0);
         assert_eq!((c.policy_states.load(Ordering::Relaxed), c.value_states.load(Ordering::Relaxed)), (1, 0));
         assert_eq!(r.policy_target, D.policy(&one));
         assert_eq!((r.total_visits, r.policy_target.clone()), (0, r.root_prior.clone()));
-        let greedy = MctsConfig { temperature: 0.0, ..off };
+        let greedy = MctsConfig { temperature: 0.0, ..from_p };
         let sharp = mcts_search(&one, &D, &D, &greedy, &mut rng, 0).policy_sampling;
         assert_eq!(sharp.iter().filter(|&&p| p == 1.0).count(), 1, "τ = 0 is one-hot: {sharp:?}");
 
-        let two = new_round(RoundParams { num_players: 4, cards_dealt: 2, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        let exact = MctsConfig { one_card_bids: OneCardBids::Exact, ..base };
         let c = Counting::default();
-        let r = mcts_search(&two, &c, &c, &off, &mut rng, 0);
-        assert!(r.total_visits > 0 && c.value_states.load(Ordering::Relaxed) > 0, "a 2-card bid is searched");
-        let on = MctsConfig { search_one_card_bids: true, ..off };
-        assert!(mcts_search(&one, &D, &D, &on, &mut rng, 0).total_visits > 0);
+        let r = mcts_search(&one, &c, &c, &exact, &mut rng, 0);
+        assert!(c.policy_states.load(Ordering::Relaxed) > 1, "the later bidders' bids come from P");
+        assert_eq!(c.value_states.load(Ordering::Relaxed), 0, "no V");
+        assert_eq!(r.total_visits, 0);
+        assert_eq!(r.policy_target.iter().filter(|&&p| p == 1.0).count(), 1, "{:?}", r.policy_target);
+        assert_eq!(r.policy_target, r.policy_sampling);
+        assert_eq!(r.root_prior, D.policy(&one));
+
+        let two = new_round(RoundParams { num_players: 4, cards_dealt: 2, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        for cfg in [from_p, exact] {
+            let c = Counting::default();
+            let r = mcts_search(&two, &c, &c, &cfg, &mut rng, 0);
+            assert!(r.total_visits > 0 && c.value_states.load(Ordering::Relaxed) > 0, "a 2-card bid is searched");
+        }
+        let searched = MctsConfig { one_card_bids: OneCardBids::Search, ..base };
+        assert!(mcts_search(&one, &D, &D, &searched, &mut rng, 0).total_visits > 0);
+    }
+
+    /// With bid weighting on, a decision after an opponent's bid costs
+    /// `deals × candidates × bidders` extra P calls for the likelihoods;
+    /// before any bid it costs none.
+    #[test]
+    fn bid_weighting_adds_one_p_call_per_candidate_and_bidder() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(9);
+        let weighted = MctsConfig {
+            bid_weighting: BidWeighting { candidates: 3, ..BidWeighting::default() },
+            ..cfg_with((2, 10), (2, 10))
+        };
+        let mut s = new_round(RoundParams { num_players: 4, cards_dealt: 3, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        let count = |s: &BlobState, cfg: &MctsConfig, rng: &mut Xoshiro256PlusPlus| {
+            let c = Counting::default();
+            mcts_search(s, &c, &c, cfg, rng, 0);
+            (c.policy_states.load(Ordering::Relaxed), c.value_states.load(Ordering::Relaxed))
+        };
+        let (p, v) = count(&s, &weighted, &mut rng);
+        assert_eq!(p, v, "nobody has bid: no likelihoods");
+        bid_apply(&mut s, 1);
+        bid_apply(&mut s, 0);
+        let (p, v) = count(&s, &weighted, &mut rng);
+        assert_eq!(p, v + 2 * 3 * 2, "2 deals × 3 candidates × 2 bidders");
     }
 
     /// Each leaf costs one P call and one V call; terminal and forced
