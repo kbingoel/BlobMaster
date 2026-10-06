@@ -1,14 +1,25 @@
 //! blob-train — training CLI.
 //!
-//! Until the gen-2 learner lands (gen-2.md §6 Phase 4: `pretrain`; Phase 5:
-//! `train`), the only subcommand is `export`: a model directory
-//! (`policy.onnx`, `value.onnx`, `meta.json`) through
-//! `scripts/export_onnx.py`.
+//! - `pretrain`: the supervised warm start from rule bot 2 (gen-2.md §6
+//!   Phase 4), ending in a model directory.
+//! - `export`: a model directory (`policy.onnx`, `value.onnx`,
+//!   `meta.json`) from a learner checkpoint, or random-init.
+//!
+//! Links libtorch: run it with `LD_LIBRARY_PATH` (and, for CUDA,
+//! `LD_PRELOAD`) set as AGENTS.md describes, e.g. through
+//! `scripts/blobmaster-train.sh`. `train` (async self-play RL) comes in
+//! Phase 5.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command as ProcCommand, ExitCode};
+mod config;
+mod export;
+mod pretrain;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use crate::config::PretrainConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "blobmaster-train", about = "Blob training CLI.", version)]
@@ -19,11 +30,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Write a model directory with `scripts/export_onnx.py`: the policy net
-    /// from a tch checkpoint (random-init without one) and the value net
-    /// (random-init until the Phase-4 learner trains it).
+    /// Supervised warm start: play rule-bot-2 rounds, train P and V on them,
+    /// measure on held-out rounds, export `<output>/model`.
+    Pretrain {
+        /// Run directory: config, metrics, checkpoint, held-out report, model.
+        #[arg(long)]
+        output: PathBuf,
+        /// Config TOML (`blob-train/pretrain.sample.toml`); defaults without one.
+        #[arg(long, conflicts_with = "resume")]
+        config: Option<PathBuf>,
+        /// Continue the run in `<output>` from its checkpoint, with its own config.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Write a model directory with `scripts/export_onnx.py`: both networks
+    /// from a learner checkpoint, or random-init without one.
     Export {
-        /// The policy net's `model.ot`, or a checkpoint directory containing it.
+        /// A learner checkpoint directory (`policy.ot`, `value.ot`, `meta.json`).
         #[arg(long)]
         checkpoint: Option<PathBuf>,
         /// Model directory to write (created if missing).
@@ -35,56 +58,23 @@ enum Command {
     },
 }
 
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("blob-train sits in the workspace")
-}
-
-/// The repo's pinned venv if present (AGENTS.md), else `python3` on `PATH`.
-fn python() -> PathBuf {
-    let venv = workspace_root().join(".venv/bin/python");
-    if venv.exists() {
-        venv
-    } else {
-        PathBuf::from("python3")
-    }
-}
-
-/// Run `scripts/export_onnx.py`. `LD_PRELOAD` is removed: a preloaded tch
-/// libtorch crashes the venv's `import torch` (different C++ ABI).
-fn export(checkpoint: Option<&Path>, output: &Path, check: bool) -> Result<(), String> {
-    let mut cmd = ProcCommand::new(python());
-    cmd.env_remove("LD_PRELOAD")
-        .arg(workspace_root().join("scripts/export_onnx.py"))
-        .arg("--out-dir")
-        .arg(output);
-    if let Some(checkpoint) = checkpoint {
-        let weights =
-            if checkpoint.is_dir() { checkpoint.join("model.ot") } else { checkpoint.to_path_buf() };
-        if !weights.is_file() {
-            return Err(format!("no checkpoint at {}", weights.display()));
-        }
-        cmd.arg("--weights").arg(weights);
-    }
-    if check {
-        cmd.arg("--check");
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to run {}: {e}", cmd.get_program().to_string_lossy()))?;
-    if !status.success() {
-        return Err(format!("export_onnx.py failed: {status}"));
-    }
-    Ok(())
+fn read_config(path: &std::path::Path) -> Result<PretrainConfig, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    PretrainConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Export {
-            checkpoint,
-            output,
-            check,
-        } => export(checkpoint.as_deref(), &output, check),
+        Command::Pretrain { output, config, resume } => {
+            let cfg = if resume {
+                read_config(&output.join(pretrain::CONFIG_FILE))
+            } else {
+                config.as_deref().map_or_else(|| Ok(PretrainConfig::default()), read_config)
+            };
+            cfg.and_then(|cfg| pretrain::pretrain(cfg, &output, resume))
+        }
+        Command::Export { checkpoint, output, check } => export::export(checkpoint.as_deref(), &output, check),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

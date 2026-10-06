@@ -1,23 +1,37 @@
-//! Learner building blocks salvaged from the gen-1 training driver
-//! (gen-2.md §6 Phase 2): replay batches → training tensors, the
-//! validation split, and losses on held-out data.
+//! The learner (gen-2.md §5.6): P and V with an optimizer each, trained in
+//! alternating updates on replay batches, plus the held-out measurements
+//! and checkpoints.
 //!
-//! The learner itself (alternating P / V steps, LR keyed to learner steps,
-//! metrics rows, checkpoints) is built on these in Phase 4. Until then the
-//! tch network keeps gen 1's scalar value head, and it trains on the seat
-//! to move's ŝ (`SeatScores` index 0); V's per-seat targets are the whole
-//! `seat_scores` rows.
+//! - **One learner step** is one P update and one V update, each on its own
+//!   batch. The LR of both follows the step ([`LrSchedule`]).
+//! - **P** trains on the target policies of decisions with more than one
+//!   legal move ([`is_forced`]); **V** on every state, against the actual
+//!   ŝ of every seat ([`SeatScores`], relative to the seat to move: V's
+//!   output order).
+//! - **Validation by round** ([`is_validation_round`]): positions of one
+//!   round share their outcome, so a position-level split would leak.
+//! - **Held-out measurements** run with dropout off and no gradients.
+//!   Compare a validation set with the same measurement on an equally large
+//!   training sample, never with the losses logged during training.
+
+use std::path::Path;
 
 use blob_engine::bidding::legal_bids;
-use blob_engine::encoder::{encode, TOKEN_TYPE_HAND};
+use blob_engine::encoder::{encode, encode_value, TOKEN_TYPE_HAND};
 use blob_engine::playing::legal_plays;
 use blob_engine::replay::{BidBatch, PlayBatch, ReplayBuffer, SeatScores};
-use tch::{Device, Tensor};
+use blob_engine::state::{BlobState, GamePhase};
+use serde::{Deserialize, Serialize};
+use tch::nn::{self, VarStore};
+use tch::{Device, Kind, Tensor};
 
 use crate::heads::NUM_BIDS;
 use crate::input::pad_batch;
-use crate::model::BlobNet;
-use crate::train::{policy_cross_entropy, value_mse, Phase, TrainBatch};
+use crate::model::{PolicyNet, ValueNet};
+use crate::train::{
+    build_optimizer, load_checkpoint, optimize, policy_cross_entropy_rows, policy_loss, policy_probs,
+    save_checkpoint, value_loss, CheckpointMeta, LrSchedule, Phase, PolicyBatch, ValueBatch,
+};
 
 /// Whether round `round_id` is held out for validation.
 ///
@@ -33,39 +47,18 @@ pub fn is_validation_round(round_id: u64, fraction: f64) -> bool {
     ((x >> 11) as f64 / (1u64 << 53) as f64) < fraction
 }
 
-/// Losses of the current weights (eval mode, no dropout) over a set of
-/// examples. `NaN` where the set has no examples of that phase.
-#[derive(Debug, Clone, Copy)]
-pub struct HeldOutLosses {
-    pub examples: usize,
-    pub bid_policy_loss: f64,
-    pub play_policy_loss: f64,
-    pub value_loss: f64,
-    /// Value MSE of always predicting 0, for scale (gen-2.md §2.2).
-    pub value_loss_predict0: f64,
-}
-
-impl Default for HeldOutLosses {
-    fn default() -> Self {
-        Self {
-            examples: 0,
-            bid_policy_loss: f64::NAN,
-            play_policy_loss: f64::NAN,
-            value_loss: f64::NAN,
-            value_loss_predict0: f64::NAN,
-        }
+/// Whether the seat to move has a single legal move. Such a decision
+/// teaches P nothing (its loss is 0 whatever P outputs); V still learns
+/// from the state.
+pub fn is_forced(state: &BlobState) -> bool {
+    match state.phase() {
+        GamePhase::Bidding => legal_bids(state).count_ones() == 1,
+        _ => legal_plays(state).count_ones() == 1,
     }
 }
 
-/// The seat to move's ŝ of each example: the scalar value target until
-/// Phase 4.
-fn mover_scores(seat_scores: &[SeatScores]) -> Vec<f32> {
-    seat_scores.iter().map(|s| s[0]).collect()
-}
-
-/// Convert a `BidBatch` from the replay buffer into a `TrainBatch` ready
-/// for `train_step`.
-pub fn bid_train_batch(batch: &BidBatch, device: Device) -> Option<TrainBatch> {
+/// P's examples from a `BidBatch`.
+pub fn bid_policy_batch(batch: &BidBatch, device: Device) -> Option<PolicyBatch> {
     let n = batch.states.len();
     if n == 0 {
         return None;
@@ -77,37 +70,22 @@ pub fn bid_train_batch(batch: &BidBatch, device: Device) -> Option<TrainBatch> {
     for (row, state) in batch.states.iter().enumerate() {
         let legal = legal_bids(state);
         for b in 0..NUM_BIDS as usize {
-            if (legal >> b) & 1 == 1 {
-                mask[row * NUM_BIDS as usize + b] = true;
-            }
+            mask[row * NUM_BIDS as usize + b] = (legal >> b) & 1 == 1;
         }
     }
-    let legal_mask =
-        Tensor::from_slice(&mask).view([n as i64, NUM_BIDS]).to_device(device);
-    let policy_target = Tensor::from_slice(&batch.policies)
-        .view([n as i64, NUM_BIDS])
-        .to_device(device);
-    let value_target = Tensor::from_slice(&mover_scores(&batch.seat_scores))
-        .view([n as i64])
-        .to_device(device);
-
-    Some(TrainBatch {
-        input,
-        phase: Phase::Bidding,
-        legal_mask,
-        policy_target,
-        value_target,
-    })
+    let legal_mask = Tensor::from_slice(&mask).view([n as i64, NUM_BIDS]).to_device(device);
+    let target = Tensor::from_slice(&batch.policies).view([n as i64, NUM_BIDS]).to_device(device);
+    Some(PolicyBatch { input, phase: Phase::Bidding, legal_mask, target })
 }
 
-/// Convert a `PlayBatch` into a `TrainBatch`.
+/// P's examples from a `PlayBatch`.
 ///
-/// Play-head policies in the replay buffer are indexed by **hand position**
+/// Play policies in the replay buffer are indexed by **hand position**
 /// (0..hand_size). The play head outputs one score per **sequence
-/// position**. This helper scatters each row's hand-indexed policy onto
-/// the sequence positions whose `token_types[i] == TOKEN_TYPE_HAND`, in
-/// encoder emission order (matches `EncodedState::hand_card_indices`).
-pub fn play_train_batch(batch: &PlayBatch, device: Device) -> Option<TrainBatch> {
+/// position**, so each row's policy is scattered onto the sequence
+/// positions whose `token_types[i] == TOKEN_TYPE_HAND`, in encoder
+/// emission order (`EncodedState::hand_card_indices`).
+pub fn play_policy_batch(batch: &PlayBatch, device: Device) -> Option<PolicyBatch> {
     let n = batch.states.len();
     if n == 0 {
         return None;
@@ -126,87 +104,345 @@ pub fn play_train_batch(batch: &PlayBatch, device: Device) -> Option<TrainBatch>
                 continue;
             }
             let card_idx = enc.hand_card_indices[hand_slot];
-            let pol_base = row * batch.max_hand_size;
-            // `max_hand_size` in a PlayBatch is the largest *nonzero* hand
-            // position observed — may be smaller than the encoder's actual
-            // hand-token count. Treat out-of-range positions as zero prob.
+            // `max_hand_size` is the largest hand position with a policy
+            // entry in the batch, plus one: positions past it have none.
             if hand_slot < batch.max_hand_size {
-                target[row * seq_len + seq_i] = batch.policies[pol_base + hand_slot];
+                target[row * seq_len + seq_i] = batch.policies[row * batch.max_hand_size + hand_slot];
             }
-            if (legal >> card_idx) & 1 == 1 {
-                mask[row * seq_len + seq_i] = true;
-            }
+            mask[row * seq_len + seq_i] = (legal >> card_idx) & 1 == 1;
             hand_slot += 1;
         }
     }
+    let legal_mask = Tensor::from_slice(&mask).view([n as i64, seq_len as i64]).to_device(device);
+    let target = Tensor::from_slice(&target).view([n as i64, seq_len as i64]).to_device(device);
+    Some(PolicyBatch { input, phase: Phase::Playing, legal_mask, target })
+}
 
-    let legal_mask =
-        Tensor::from_slice(&mask).view([n as i64, seq_len as i64]).to_device(device);
-    let policy_target = Tensor::from_slice(&target)
-        .view([n as i64, seq_len as i64])
-        .to_device(device);
-    let value_target = Tensor::from_slice(&mover_scores(&batch.seat_scores))
-        .view([n as i64])
-        .to_device(device);
-
-    Some(TrainBatch {
+/// V's examples from both halves of a sampled batch, bids first: V-mode
+/// inputs and each seat's actual ŝ.
+pub fn value_batch(bid: &BidBatch, play: &PlayBatch, device: Device) -> Option<ValueBatch> {
+    let states: Vec<&BlobState> = bid.states.iter().chain(&play.states).collect();
+    let scores: Vec<&SeatScores> = bid.seat_scores.iter().chain(&play.seat_scores).collect();
+    let n = states.len();
+    if n == 0 {
+        return None;
+    }
+    let encs: Vec<_> = states.iter().map(|s| encode_value(s, s.current_player)).collect();
+    let input = pad_batch(&encs, device);
+    let k = states.iter().map(|s| s.num_players as usize).max().unwrap_or(0);
+    let mut target = vec![0.0f32; n * k];
+    let mut mask = vec![false; n * k];
+    for (row, (s, sc)) in states.iter().zip(&scores).enumerate() {
+        for seat in 0..s.num_players as usize {
+            target[row * k + seat] = sc[seat];
+            mask[row * k + seat] = true;
+        }
+    }
+    let shape = [n as i64, k as i64];
+    Some(ValueBatch {
         input,
-        phase: Phase::Playing,
-        legal_mask,
-        policy_target,
-        value_target,
+        target: Tensor::from_slice(&target).view(shape).to_device(device),
+        seat_mask: Tensor::from_slice(&mask).view(shape).to_device(device),
     })
 }
 
-/// Losses of `model` on `buf[indices]`, in eval mode (no dropout) and
-/// without gradients, in `batch_size` chunks.
-///
-/// Compare a validation set with the same measurement on an equally large
-/// training sample, never with losses logged during training: those are
-/// averaged over many steps with dropout on (gen-2.md §5.6).
-pub fn held_out_losses(
-    model: &BlobNet,
-    buf: &ReplayBuffer,
-    indices: &[usize],
-    batch_size: usize,
-    device: Device,
-) -> HeldOutLosses {
-    let (mut bid_ce, mut play_ce, mut v_se, mut v_zero) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    let (mut n_bid, mut n_play) = (0usize, 0usize);
-    let mut add = |tb: &TrainBatch, values: &[f32], is_bid: bool| {
-        let n = values.len();
-        let (probs, value_pred) = tch::no_grad(|| match tb.phase {
-            Phase::Bidding => model.forward_bid(&tb.input, &tb.legal_mask, false),
-            Phase::Playing => model.forward_play(&tb.input, &tb.legal_mask, false),
-        });
-        let ce = policy_cross_entropy(&probs, &tb.policy_target).double_value(&[]) * n as f64;
-        v_se += value_mse(&value_pred, &tb.value_target).double_value(&[]) * n as f64;
-        v_zero += values.iter().map(|&t| (t as f64).powi(2)).sum::<f64>();
-        if is_bid {
-            bid_ce += ce;
-            n_bid += n;
-        } else {
-            play_ce += ce;
-            n_play += n;
-        }
-    };
-    for chunk in indices.chunks(batch_size.max(1)) {
-        let (bid, play) = buf.batch_from_indices(chunk);
-        if let Some(tb) = bid_train_batch(&bid, device) {
-            add(&tb, &mover_scores(&bid.seat_scores), true);
-        }
-        if let Some(tb) = play_train_batch(&play, device) {
-            add(&tb, &mover_scores(&play.seat_scores), false);
+/// The tensors of one learner step: P's bid and play batches (either may
+/// be missing) and V's batch. Built off the training thread on the CPU,
+/// then moved with [`StepBatches::to_device`].
+pub struct StepBatches {
+    pub policy: Vec<PolicyBatch>,
+    pub value: Option<ValueBatch>,
+}
+
+impl StepBatches {
+    pub fn build(p: &(BidBatch, PlayBatch), v: &(BidBatch, PlayBatch), device: Device) -> Self {
+        Self {
+            policy: [bid_policy_batch(&p.0, device), play_policy_batch(&p.1, device)].into_iter().flatten().collect(),
+            value: value_batch(&v.0, &v.1, device),
         }
     }
-    let n = n_bid + n_play;
-    let mean = |sum: f64, k: usize| if k > 0 { sum / k as f64 } else { f64::NAN };
-    HeldOutLosses {
-        examples: n,
-        bid_policy_loss: mean(bid_ce, n_bid),
-        play_policy_loss: mean(play_ce, n_play),
-        value_loss: mean(v_se, n),
-        value_loss_predict0: mean(v_zero, n),
+
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            policy: self.policy.iter().map(|b| b.to_device(device)).collect(),
+            value: self.value.as_ref().map(|b| b.to_device(device)),
+        }
+    }
+}
+
+/// The learner's settings. Unknown keys are an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LearnerConfig {
+    /// `cuda`, `cuda:N` or `cpu`.
+    pub device: String,
+    /// Examples per P update, and per V update.
+    pub batch_size: usize,
+    /// Learner steps; each is one P and one V update.
+    pub steps: u64,
+    pub warmup_steps: u64,
+    pub peak_lr: f64,
+    pub min_lr: f64,
+    pub weight_decay: f64,
+    /// Relabel the suits of every sampled example at random.
+    pub augment: bool,
+}
+
+impl Default for LearnerConfig {
+    fn default() -> Self {
+        Self {
+            device: "cuda".into(),
+            batch_size: 512,
+            steps: 30_000,
+            warmup_steps: 1_000,
+            peak_lr: 3e-4,
+            min_lr: 1e-5,
+            weight_decay: 1e-4,
+            augment: true,
+        }
+    }
+}
+
+impl LearnerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        parse_device_tag(&self.device)?;
+        if self.batch_size == 0 || self.steps == 0 {
+            return Err("learner.batch_size and learner.steps must be > 0".into());
+        }
+        if !(self.peak_lr > 0.0 && (0.0..=self.peak_lr).contains(&self.min_lr)) {
+            return Err(format!("learner: need 0 <= min_lr <= peak_lr, peak_lr > 0 (got {} / {})", self.min_lr, self.peak_lr));
+        }
+        if self.weight_decay < 0.0 {
+            return Err("learner.weight_decay must be >= 0".into());
+        }
+        Ok(())
+    }
+
+    pub fn schedule(&self) -> LrSchedule {
+        LrSchedule { warmup_steps: self.warmup_steps, total_steps: self.steps, peak_lr: self.peak_lr, min_lr: self.min_lr }
+    }
+}
+
+fn parse_device_tag(tag: &str) -> Result<Device, String> {
+    match tag.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Ok(Device::Cpu),
+        "cuda" => Ok(Device::Cuda(0)),
+        t => t
+            .strip_prefix("cuda:")
+            .and_then(|i| i.parse().ok())
+            .map(Device::Cuda)
+            .ok_or_else(|| format!("unknown device {tag:?}: use cuda, cuda:N or cpu")),
+    }
+}
+
+/// The device named by `tag`. CUDA must actually be there: libtorch falls
+/// back to the CPU silently when `libtorch_cuda.so` isn't preloaded.
+pub fn parse_device(tag: &str) -> Result<Device, String> {
+    let device = parse_device_tag(tag)?;
+    if let Device::Cuda(i) = device {
+        if !tch::Cuda::is_available() || i as i64 >= tch::Cuda::device_count() {
+            return Err(format!(
+                "{tag}: CUDA is not available to libtorch. Preload it: \
+                 LD_PRELOAD=$LIBTORCH_DIR/libtorch_cuda.so (AGENTS.md, Runtime environment)"
+            ));
+        }
+    }
+    Ok(device)
+}
+
+/// P's held-out measurement. `NaN` where a phase has no examples.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PolicyHeldOut {
+    pub bids: usize,
+    pub plays: usize,
+    /// Mean cross-entropy against the target policies.
+    pub bid_loss: f64,
+    pub play_loss: f64,
+    /// Share of examples whose most likely move is the target's top move.
+    pub bid_agreement: f64,
+    pub play_agreement: f64,
+}
+
+/// V's held-out measurement over every (state, seat) pair. `NaN` where a
+/// set is empty.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ValueHeldOut {
+    pub states: usize,
+    pub seats: usize,
+    /// MSE of the predicted ŝ.
+    pub mse: f64,
+    /// MSE of predicting the set's mean ŝ: the scale for `mse`.
+    pub variance: f64,
+    /// Pearson correlation of predicted and actual ŝ (G1: > 0.7).
+    pub correlation: f64,
+    /// States of 1-card rounds after bidding: every play is forced, so the
+    /// deal and the bids decide each seat's ŝ (G1: ≈ exact).
+    pub one_card_states: usize,
+    pub one_card_mse: f64,
+    pub one_card_max_error: f64,
+}
+
+/// P and V with their optimizers.
+pub struct Learner {
+    pub policy: PolicyNet,
+    pub value: ValueNet,
+    policy_vs: VarStore,
+    value_vs: VarStore,
+    policy_opt: nn::Optimizer,
+    value_opt: nn::Optimizer,
+    policy_vars: Vec<Tensor>,
+    value_vars: Vec<Tensor>,
+    schedule: LrSchedule,
+    /// Learner steps taken.
+    pub step: u64,
+    pub device: Device,
+}
+
+impl Learner {
+    /// Fresh networks; seed with `tch::manual_seed` first for a
+    /// reproducible init.
+    pub fn new(cfg: &LearnerConfig) -> Result<Self, String> {
+        cfg.validate()?;
+        let device = parse_device(&cfg.device)?;
+        let policy_vs = VarStore::new(device);
+        let policy = PolicyNet::new(&policy_vs.root());
+        let value_vs = VarStore::new(device);
+        let value = ValueNet::new(&value_vs.root());
+        let err = |e: tch::TchError| format!("optimizer: {e}");
+        let policy_opt = build_optimizer(&policy_vs, cfg.weight_decay).map_err(err)?;
+        let value_opt = build_optimizer(&value_vs, cfg.weight_decay).map_err(err)?;
+        Ok(Self {
+            policy_vars: policy_vs.trainable_variables(),
+            value_vars: value_vs.trainable_variables(),
+            policy,
+            value,
+            policy_vs,
+            value_vs,
+            policy_opt,
+            value_opt,
+            schedule: cfg.schedule(),
+            step: 0,
+            device,
+        })
+    }
+
+    /// Load a checkpoint's weights and step. The optimizers start afresh.
+    pub fn resume(&mut self, dir: &Path) -> Result<(), String> {
+        let meta = load_checkpoint(dir, &mut self.policy_vs, &mut self.value_vs)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        self.step = meta.learner_step;
+        Ok(())
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        save_checkpoint(dir, &self.policy_vs, &self.value_vs, CheckpointMeta { learner_step: self.step })
+            .map_err(|e| format!("{}: {e}", dir.display()))
+    }
+
+    /// The LR of the next step.
+    pub fn lr(&self) -> f64 {
+        self.schedule.lr(self.step)
+    }
+
+    /// One learner step: a P update on `p` and a V update on `v` (each a
+    /// sampled `(bids, plays)` pair; leave forced decisions out of `p`).
+    /// Returns the two training losses, detached and still on the device:
+    /// reading one waits for the GPU. `None` for an empty batch.
+    pub fn train_step(&mut self, p: &(BidBatch, PlayBatch), v: &(BidBatch, PlayBatch)) -> (Option<Tensor>, Option<Tensor>) {
+        let batches = StepBatches::build(p, v, self.device);
+        self.train_on(&batches)
+    }
+
+    /// [`Learner::train_step`] on batches built already, on this learner's
+    /// device.
+    pub fn train_on(&mut self, batches: &StepBatches) -> (Option<Tensor>, Option<Tensor>) {
+        let lr = self.lr();
+        let p_loss = (!batches.policy.is_empty()).then(|| {
+            let loss = policy_loss(&self.policy, &batches.policy.iter().collect::<Vec<_>>(), true);
+            optimize(&mut self.policy_opt, &self.policy_vars, lr, loss)
+        });
+        let v_loss = batches.value.as_ref().map(|vb| {
+            let loss = value_loss(&self.value, vb, true);
+            optimize(&mut self.value_opt, &self.value_vars, lr, loss)
+        });
+        self.step += 1;
+        (p_loss, v_loss)
+    }
+
+    /// P on `buf[indices]`, in chunks of `chunk` examples.
+    pub fn policy_held_out(&self, buf: &ReplayBuffer, indices: &[usize], chunk: usize) -> PolicyHeldOut {
+        // [examples, loss sum, agreements] per phase.
+        let mut acc = [[0.0f64; 3]; 2];
+        for idx in indices.chunks(chunk.max(1)) {
+            let (bid, play) = buf.batch_from_indices(idx);
+            let parts = [bid_policy_batch(&bid, self.device), play_policy_batch(&play, self.device)];
+            for (slot, pb) in parts.iter().enumerate() {
+                let Some(pb) = pb else { continue };
+                let (ce, agree) = tch::no_grad(|| {
+                    let probs = policy_probs(&self.policy, pb, false);
+                    let ce = policy_cross_entropy_rows(&probs, &pb.target).sum(Kind::Double);
+                    let agree = probs.argmax(-1, false).eq_tensor(&pb.target.argmax(-1, false)).sum(Kind::Double);
+                    (ce.double_value(&[]), agree.double_value(&[]))
+                });
+                acc[slot][0] += pb.rows() as f64;
+                acc[slot][1] += ce;
+                acc[slot][2] += agree;
+            }
+        }
+        let mean = |a: &[f64; 3], i: usize| if a[0] > 0.0 { a[i] / a[0] } else { f64::NAN };
+        PolicyHeldOut {
+            bids: acc[0][0] as usize,
+            plays: acc[1][0] as usize,
+            bid_loss: mean(&acc[0], 1),
+            play_loss: mean(&acc[1], 1),
+            bid_agreement: mean(&acc[0], 2),
+            play_agreement: mean(&acc[1], 2),
+        }
+    }
+
+    /// V on `buf[indices]`, in chunks of `chunk` examples.
+    pub fn value_held_out(&self, buf: &ReplayBuffer, indices: &[usize], chunk: usize) -> ValueHeldOut {
+        let (mut states, mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0usize, 0usize, 0.0, 0.0, 0.0, 0.0, 0.0f64);
+        let (mut one_states, mut one_n, mut one_se, mut one_max) = (0usize, 0usize, 0.0f64, 0.0f64);
+        for idx in indices.chunks(chunk.max(1)) {
+            let (bid, play) = buf.batch_from_indices(idx);
+            let Some(vb) = value_batch(&bid, &play, self.device) else { continue };
+            let k = vb.target.size()[1] as usize;
+            let pred: Vec<f32> = tch::no_grad(|| self.value.seat_values(&vb.input, k as i64, false))
+                .to_device(Device::Cpu)
+                .flatten(0, -1)
+                .try_into()
+                .expect("f32 values");
+            let rows = bid.states.iter().chain(&play.states).zip(bid.seat_scores.iter().chain(&play.seat_scores));
+            for (row, (s, target)) in rows.enumerate() {
+                states += 1;
+                let one_card = s.cards_dealt == 1 && s.phase() == GamePhase::Playing;
+                one_states += one_card as usize;
+                for seat in 0..s.num_players as usize {
+                    let (x, y) = (pred[row * k + seat] as f64, target[seat] as f64);
+                    n += 1;
+                    (sx, sy, sxx, syy, sxy) = (sx + x, sy + y, sxx + x * x, syy + y * y, sxy + x * y);
+                    if one_card {
+                        one_n += 1;
+                        one_se += (x - y).powi(2);
+                        one_max = one_max.max((x - y).abs());
+                    }
+                }
+            }
+        }
+        let nf = n as f64;
+        let mean = |sum: f64, k: usize| if k > 0 { sum / k as f64 } else { f64::NAN };
+        let (vx, vy) = (sxx / nf - (sx / nf).powi(2), syy / nf - (sy / nf).powi(2));
+        ValueHeldOut {
+            states,
+            seats: n,
+            mse: mean(sxx - 2.0 * sxy + syy, n),
+            variance: if n > 0 { vy } else { f64::NAN },
+            correlation: if n > 0 { (sxy / nf - sx / nf * sy / nf) / (vx * vy).sqrt() } else { f64::NAN },
+            one_card_states: one_states,
+            one_card_mse: mean(one_se, one_n),
+            one_card_max_error: if one_n > 0 { one_max } else { f64::NAN },
+        }
     }
 }
 
@@ -214,20 +450,16 @@ pub fn held_out_losses(
 mod tests {
     use super::*;
     use blob_engine::bidding::apply_bid;
-    use blob_engine::dealing::deal;
-    use blob_engine::game::new_game;
     use blob_engine::replay::{Decision, SparsePolicy};
-    use blob_engine::state::{BlobState, GamePhase};
+    use blob_engine::scoring::round_points;
+    use blob_engine::{fill_buffer, new_round, RoundParams, TeacherConfig};
     use rand_xoshiro::rand_core::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;
     use smallvec::smallvec;
-    use tch::nn;
 
     fn bidding_state(seed: u64) -> BlobState {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let mut s = new_game(4, 5).unwrap();
-        deal(&mut s, &mut rng);
-        s
+        new_round(RoundParams { num_players: 4, cards_dealt: 5, trump: 0, dealer: 3 }, &mut rng).unwrap()
     }
 
     /// First trick, first card: every card in the leader's hand is legal.
@@ -240,10 +472,6 @@ mod tests {
         s
     }
 
-    fn half_half() -> SparsePolicy {
-        smallvec![(0u8, 0.5f32), (1, 0.5)]
-    }
-
     /// Push `s` as a one-decision round in which every seat made its bid
     /// (4 players, 5 cards: every seat's ŝ is (10 + bid) / 15).
     fn push(buf: &mut ReplayBuffer, s: BlobState, policy: SparsePolicy) {
@@ -251,6 +479,10 @@ mod tests {
         end.game_phase = GamePhase::Scoring as u8;
         end.tricks_won = end.bids;
         buf.push_round(&[Decision { state: s, policy }], &end);
+    }
+
+    fn cpu_config() -> LearnerConfig {
+        LearnerConfig { device: "cpu".into(), batch_size: 16, steps: 40, warmup_steps: 5, peak_lr: 1e-3, ..Default::default() }
     }
 
     #[test]
@@ -267,29 +499,36 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_keys_and_bad_values() {
+        let cfg: LearnerConfig = toml::from_str("device = \"cpu\"\nsteps = 7\n").unwrap();
+        assert_eq!((cfg.steps, cfg.batch_size), (7, LearnerConfig::default().batch_size));
+        assert!(toml::from_str::<LearnerConfig>("step = 7\n").is_err());
+        assert!(LearnerConfig { device: "gpu".into(), ..cpu_config() }.validate().is_err());
+        assert!(LearnerConfig { min_lr: 1.0, ..cpu_config() }.validate().is_err());
+        assert_eq!(parse_device_tag("cuda:1"), Ok(Device::Cuda(1)));
+    }
+
+    #[test]
     fn bid_batch_masks_exactly_the_legal_bids() {
         let mut buf = ReplayBuffer::new(8);
         let states: Vec<BlobState> = (0..3).map(bidding_state).collect();
         for s in &states {
-            push(&mut buf, *s, half_half());
+            push(&mut buf, *s, smallvec![(0u8, 0.5f32), (1, 0.5)]);
         }
         let (bid, play) = buf.batch_from_indices(&[0, 1, 2]);
-        assert!(play_train_batch(&play, Device::Cpu).is_none());
-        let tb = bid_train_batch(&bid, Device::Cpu).unwrap();
-        assert_eq!(tb.phase, Phase::Bidding);
-        assert_eq!(tb.legal_mask.size(), vec![3, NUM_BIDS]);
-        let mask: Vec<bool> = tb.legal_mask.flatten(0, -1).try_into().unwrap();
+        assert!(play_policy_batch(&play, Device::Cpu).is_none());
+        let pb = bid_policy_batch(&bid, Device::Cpu).unwrap();
+        assert_eq!(pb.phase, Phase::Bidding);
+        assert_eq!(pb.legal_mask.size(), vec![3, NUM_BIDS]);
+        let mask: Vec<bool> = pb.legal_mask.flatten(0, -1).try_into().unwrap();
         for (row, s) in states.iter().enumerate() {
             let legal = legal_bids(s);
             for b in 0..NUM_BIDS as usize {
                 assert_eq!(mask[row * NUM_BIDS as usize + b], (legal >> b) & 1 == 1);
             }
         }
-        let target: Vec<f32> = tb.policy_target.flatten(0, -1).try_into().unwrap();
+        let target: Vec<f32> = pb.target.flatten(0, -1).try_into().unwrap();
         assert_eq!(&target[..3], &[0.5, 0.5, 0.0]);
-        // Nobody has bid yet, so every seat's bid is 0: ŝ = 10 / 15.
-        let values: Vec<f32> = tb.value_target.try_into().unwrap();
-        assert_eq!(values, vec![10.0 / 15.0; 3]);
     }
 
     /// Hand-position policies land on the matching hand-card tokens, in
@@ -298,22 +537,20 @@ mod tests {
     fn play_batch_scatters_policy_onto_hand_tokens() {
         let mut buf = ReplayBuffer::new(8);
         let states: Vec<BlobState> = (10..13).map(playing_state).collect();
-        let policy: SparsePolicy = smallvec![(1u8, 0.25f32), (3, 0.75)];
         for s in &states {
-            push(&mut buf, *s, policy.clone());
+            push(&mut buf, *s, smallvec![(1u8, 0.25f32), (3, 0.75)]);
         }
         let (_, play) = buf.batch_from_indices(&[0, 1, 2]);
-        let tb = play_train_batch(&play, Device::Cpu).unwrap();
-        assert_eq!(tb.phase, Phase::Playing);
-        let seq_len = tb.legal_mask.size()[1] as usize;
-        let mask: Vec<bool> = tb.legal_mask.flatten(0, -1).try_into().unwrap();
-        let target: Vec<f32> = tb.policy_target.flatten(0, -1).try_into().unwrap();
+        let pb = play_policy_batch(&play, Device::Cpu).unwrap();
+        assert_eq!(pb.phase, Phase::Playing);
+        let seq_len = pb.legal_mask.size()[1] as usize;
+        let mask: Vec<bool> = pb.legal_mask.flatten(0, -1).try_into().unwrap();
+        let target: Vec<f32> = pb.target.flatten(0, -1).try_into().unwrap();
         for (row, s) in states.iter().enumerate() {
             let enc = encode(s, s.current_player);
             let legal = legal_plays(s);
-            let hand_positions: Vec<usize> = (0..enc.num_tokens)
-                .filter(|&i| enc.token_types[i] == TOKEN_TYPE_HAND)
-                .collect();
+            let hand_positions: Vec<usize> =
+                (0..enc.num_tokens).filter(|&i| enc.token_types[i] == TOKEN_TYPE_HAND).collect();
             assert_eq!(hand_positions.len(), enc.hand_card_indices.len());
             for i in 0..seq_len {
                 let slot = hand_positions.iter().position(|&p| p == i);
@@ -323,39 +560,111 @@ mod tests {
                     _ => 0.0,
                 };
                 assert_eq!(target[row * seq_len + i], want_target, "row {row} pos {i}");
-                let want_mask =
-                    slot.is_some_and(|h| (legal >> enc.hand_card_indices[h]) & 1 == 1);
+                let want_mask = slot.is_some_and(|h| (legal >> enc.hand_card_indices[h]) & 1 == 1);
                 assert_eq!(mask[row * seq_len + i], want_mask, "row {row} pos {i}");
             }
         }
     }
 
+    /// V's targets are each seat's ŝ from the mover's seat on, masked to the
+    /// table; the inputs show every hand.
     #[test]
-    fn held_out_losses_cover_every_example() {
-        let vs = nn::VarStore::new(Device::Cpu);
-        let model = BlobNet::new(&vs.root());
-        let mut buf = ReplayBuffer::new(16);
-        for i in 0..5u64 {
-            push(&mut buf, playing_state(i), half_half());
+    fn value_batch_targets_every_real_seat() {
+        let mut buf = ReplayBuffer::new(64);
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let mut ends = Vec::new();
+        for (n, cards) in [(3u8, 4u8), (5, 2)] {
+            let mut s = new_round(RoundParams { num_players: n, cards_dealt: cards, trump: 1, dealer: 0 }, &mut rng).unwrap();
+            let mut decisions = Vec::new();
+            while matches!(s.phase(), GamePhase::Bidding | GamePhase::Playing) {
+                decisions.push(Decision { state: s, policy: smallvec![(0u8, 1.0f32)] });
+                let action = blob_engine::rule_bot_action(&s);
+                blob_engine::mcts::apply_action(&mut s, action);
+            }
+            buf.push_round(&decisions, &s);
+            ends.push(s);
         }
-        for i in 0..4u64 {
-            push(&mut buf, bidding_state(100 + i), half_half());
+        let all: Vec<usize> = (0..buf.len()).collect();
+        let (bid, play) = buf.batch_from_indices(&all);
+        let vb = value_batch(&bid, &play, Device::Cpu).unwrap();
+        assert_eq!(vb.target.size(), vec![buf.len() as i64, 5]);
+        let target: Vec<f32> = vb.target.flatten(0, -1).try_into().unwrap();
+        let mask: Vec<bool> = vb.seat_mask.flatten(0, -1).try_into().unwrap();
+        for (row, s) in bid.states.iter().chain(&play.states).enumerate() {
+            let end = ends.iter().find(|e| e.num_players == s.num_players).unwrap();
+            let points = round_points(end);
+            for seat in 0..5 {
+                let real = seat < s.num_players as usize;
+                assert_eq!(mask[row * 5 + seat], real);
+                let abs = (s.current_player as usize + seat) % s.num_players as usize;
+                let want = if real { points[abs] as f32 / (10.0 + s.cards_dealt as f32) } else { 0.0 };
+                assert_eq!(target[row * 5 + seat], want);
+            }
         }
-        let idx: Vec<usize> = (0..buf.len()).collect();
-        let l = held_out_losses(&model, &buf, &idx, 3, Device::Cpu);
-        assert_eq!(l.examples, 9);
-        assert!(l.bid_policy_loss.is_finite() && l.play_policy_loss.is_finite());
-        assert!(l.value_loss.is_finite());
-        assert!((l.value_loss_predict0 - (10.0f64 / 15.0).powi(2)).abs() < 1e-6);
+        let types: Vec<i64> = vb.input.token_types.flatten(0, -1).try_into().unwrap();
+        assert!(types.contains(&(blob_engine::encoder::TOKEN_TYPE_OPP_HAND as i64)));
+    }
+
+    #[test]
+    fn forced_means_one_legal_move() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(9);
+        let mut s = new_round(RoundParams { num_players: 4, cards_dealt: 1, trump: 0, dealer: 0 }, &mut rng).unwrap();
+        assert!(!is_forced(&s));
+        while s.phase() == GamePhase::Bidding {
+            apply_bid(&mut s, 0);
+        }
+        assert!(is_forced(&s), "a 1-card hand has one play");
+    }
+
+    /// Teacher data through the whole learner: both losses fall on a small
+    /// buffer, held-out sets cover every example, and a checkpoint resumes
+    /// at its step.
+    #[test]
+    fn learner_trains_measures_and_resumes() {
+        tch::manual_seed(11);
+        let mut buf = ReplayBuffer::new(4_000);
+        let teacher = TeacherConfig { mix: blob_engine::RoundMix { players: vec![4], start_cards: 3, large_round_exponent: 0.0 }, ..Default::default() };
+        fill_buffer(&mut buf, &teacher, 60, 1, 4);
+        let all: Vec<usize> = (0..buf.len()).collect();
+        let unforced: Vec<usize> = all.iter().copied().filter(|&i| !is_forced(buf.state(i))).collect();
+
+        let cfg = cpu_config();
+        let mut learner = Learner::new(&cfg).unwrap();
+        let p0 = learner.policy_held_out(&buf, &unforced, 64);
+        let v0 = learner.value_held_out(&buf, &all, 64);
+        assert_eq!(p0.bids + p0.plays, unforced.len());
+        assert_eq!(v0.states, all.len());
+        assert!(v0.one_card_states > 0 && v0.correlation.is_finite());
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(2);
+        for _ in 0..cfg.steps {
+            let p = buf.sample_batch_from(&unforced, cfg.batch_size, &mut rng, cfg.augment);
+            let v = buf.sample_batch_from(&all, cfg.batch_size, &mut rng, cfg.augment);
+            let (pl, vl) = learner.train_step(&p, &v);
+            assert!(pl.unwrap().double_value(&[]).is_finite() && vl.unwrap().double_value(&[]).is_finite());
+        }
+        let p1 = learner.policy_held_out(&buf, &unforced, 64);
+        let v1 = learner.value_held_out(&buf, &all, 64);
+        assert!(p1.bid_loss + p1.play_loss < p0.bid_loss + p0.play_loss, "{p0:?} -> {p1:?}");
+        assert!(v1.mse < v0.mse, "{v0:?} -> {v1:?}");
+        assert!((v1.variance - v0.variance).abs() < 1e-9, "variance is the targets'");
 
         // Chunking doesn't change the result.
-        let whole = held_out_losses(&model, &buf, &idx, 64, Device::Cpu);
-        assert!((whole.value_loss - l.value_loss).abs() < 1e-5);
-        assert!((whole.play_policy_loss - l.play_policy_loss).abs() < 1e-5);
+        let whole = learner.value_held_out(&buf, &all, 10_000);
+        assert!((whole.mse - v1.mse).abs() < 1e-6 && (whole.correlation - v1.correlation).abs() < 1e-6);
+
+        let dir = std::env::temp_dir().join(format!("blob-learner-{}", std::process::id()));
+        learner.save(&dir).unwrap();
+        let mut again = Learner::new(&cfg).unwrap();
+        again.resume(&dir).unwrap();
+        assert_eq!((again.step, again.lr()), (cfg.steps, learner.lr()));
+        let v2 = again.value_held_out(&buf, &all, 64);
+        assert_eq!(v2.mse, v1.mse);
+        let _ = std::fs::remove_dir_all(&dir);
 
         // An empty set reports NaN, not 0.
-        let empty = held_out_losses(&model, &buf, &[], 3, Device::Cpu);
-        assert_eq!(empty.examples, 0);
-        assert!(empty.value_loss.is_nan());
+        let empty = learner.value_held_out(&buf, &[], 64);
+        assert_eq!(empty.states, 0);
+        assert!(empty.mse.is_nan() && learner.policy_held_out(&buf, &[], 64).bid_loss.is_nan());
     }
 }

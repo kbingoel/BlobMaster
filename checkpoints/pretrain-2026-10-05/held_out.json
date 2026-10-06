@@ -1,0 +1,50 @@
+{
+  "g1": {
+    "correlation": 0.7694723005668159,
+    "criteria": "correlation > 0.7, 1-card RMSE < 0.05",
+    "one_card_rmse": 0.1289834271516262,
+    "pass": false
+  },
+  "learner_step": 30000,
+  "secs": 4794.65338444,
+  "train_sample": {
+    "policy": {
+      "bid_agreement": 0.9923715250604567,
+      "bid_loss": 0.1865766436198283,
+      "bids": 141837,
+      "play_agreement": 0.9673164068593693,
+      "play_loss": 0.6668371443946213,
+      "plays": 262823
+    },
+    "value": {
+      "correlation": 0.7714742650067978,
+      "mse": 0.055650010174254416,
+      "one_card_max_error": 0.9570955038070679,
+      "one_card_mse": 0.017130494529285,
+      "one_card_states": 44072,
+      "seats": 3355275,
+      "states": 671055,
+      "variance": 0.13744523287483468
+    }
+  },
+  "validation": {
+    "policy": {
+      "bid_agreement": 0.9916680120452328,
+      "bid_loss": 0.18741116728175525,
+      "bids": 142463,
+      "play_agreement": 0.9673375362799727,
+      "play_loss": 0.6657373305778371,
+      "plays": 262197
+    },
+    "value": {
+      "correlation": 0.7694723005668159,
+      "mse": 0.055996362364057764,
+      "one_card_max_error": 0.9539252258837223,
+      "one_card_mse": 0.01663672447977886,
+      "one_card_states": 44480,
+      "seats": 3355275,
+      "states": 671055,
+      "variance": 0.13726178581340445
+    }
+  }
+}

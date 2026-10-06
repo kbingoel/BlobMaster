@@ -7,7 +7,8 @@
 //! Input tensors (constructed by callers; see [`pad_batch`]):
 //! - `features: [B, S, FEAT_DIM]` f32 — per-token features, right-padded to
 //!   `FEAT_DIM` (the encoder's widest token type)
-//! - `token_types: [B, S]` i64 — values 0..=4 (see encoder constants)
+//! - `token_types: [B, S]` i64 — values 0..=5 (see encoder constants; 5,
+//!   opponents' hand cards, only in V mode)
 //! - `chrono_indices: [B, S]` i64 — 0..52 for played tokens, 0 elsewhere
 //! - `attention_mask: [B, S]` bool — true for real tokens, false for padding
 //!
@@ -15,8 +16,8 @@
 
 use blob_engine::encoder::{
     EncodedState, CONTEXT_DIM as ENC_CONTEXT_DIM, FEAT_DIM as ENC_FEAT_DIM, HAND_CARD_DIM,
-    PLAYED_CARD_DIM, PLAYER_STATE_DIM, TOKEN_TYPE_CLS, TOKEN_TYPE_CONTEXT, TOKEN_TYPE_HAND,
-    TOKEN_TYPE_PLAYED, TOKEN_TYPE_PLAYER,
+    OPP_HAND_CARD_DIM, PLAYED_CARD_DIM, PLAYER_STATE_DIM, TOKEN_TYPE_CLS, TOKEN_TYPE_CONTEXT,
+    TOKEN_TYPE_HAND, TOKEN_TYPE_OPP_HAND, TOKEN_TYPE_PLAYED, TOKEN_TYPE_PLAYER,
 };
 use tch::{nn, nn::Module, Tensor};
 
@@ -31,6 +32,7 @@ const HAND_DIM: i64 = HAND_CARD_DIM as i64;
 const PLAYED_DIM: i64 = PLAYED_CARD_DIM as i64;
 const PLAYER_DIM: i64 = PLAYER_STATE_DIM as i64;
 const CTX_DIM: i64 = ENC_CONTEXT_DIM as i64;
+const OPP_HAND_DIM: i64 = OPP_HAND_CARD_DIM as i64;
 
 /// Per-token-type input projections + CLS parameter + chronological embedding.
 #[derive(Debug)]
@@ -39,12 +41,16 @@ pub struct InputProjection {
     played: nn::Linear,
     player: nn::Linear,
     context: nn::Linear,
+    /// Opponents' hand cards: V only.
+    opp_hand: Option<nn::Linear>,
     cls: Tensor,
     chrono: nn::Embedding,
 }
 
 impl InputProjection {
-    pub fn new(vs: &nn::Path) -> Self {
+    /// `opponent_cards` adds the projection for opponents' hand cards
+    /// (`opp_hand_proj`), which only V reads.
+    pub fn new(vs: &nn::Path, opponent_cards: bool) -> Self {
         let lc = nn::LinearConfig::default();
         let ec = nn::EmbeddingConfig::default();
         Self {
@@ -52,6 +58,8 @@ impl InputProjection {
             played: nn::linear(vs / "played_proj", PLAYED_DIM, D_MODEL, lc),
             player: nn::linear(vs / "player_proj", PLAYER_DIM, D_MODEL, lc),
             context: nn::linear(vs / "context_proj", CTX_DIM, D_MODEL, lc),
+            opp_hand: opponent_cards
+                .then(|| nn::linear(vs / "opp_hand_proj", OPP_HAND_DIM, D_MODEL, lc)),
             cls: vs.randn("cls", &[D_MODEL], 0.0, 0.02),
             chrono: nn::embedding(vs / "chrono_embed", MAX_CHRONO, D_MODEL, ec),
         }
@@ -89,6 +97,10 @@ impl InputProjection {
             + player_out * mask_of(TOKEN_TYPE_PLAYER as i64)
             + hand_out * mask_of(TOKEN_TYPE_HAND as i64)
             + played_out * mask_of(TOKEN_TYPE_PLAYED as i64);
+        if let Some(opp_hand) = &self.opp_hand {
+            let opp_out = opp_hand.forward(&features.narrow(-1, 0, OPP_HAND_DIM));
+            out = out + opp_out * mask_of(TOKEN_TYPE_OPP_HAND as i64);
+        }
 
         // Chronological embedding added for played card tokens only.
         let chrono_emb = self.chrono.forward(chrono_indices);
@@ -105,6 +117,17 @@ pub struct InputBatch {
     pub token_types: Tensor,    // [B, S] i64
     pub chrono_indices: Tensor, // [B, S] i64
     pub attention_mask: Tensor, // [B, S] bool
+}
+
+impl InputBatch {
+    pub fn to_device(&self, device: tch::Device) -> Self {
+        Self {
+            features: self.features.to_device(device),
+            token_types: self.token_types.to_device(device),
+            chrono_indices: self.chrono_indices.to_device(device),
+            attention_mask: self.attention_mask.to_device(device),
+        }
+    }
 }
 
 /// Pad and stack a batch of encoded states into a single set of tensors.
@@ -160,7 +183,7 @@ mod tests {
 
     fn make_proj() -> (VarStore, InputProjection) {
         let vs = VarStore::new(Device::Cpu);
-        let p = InputProjection::new(&vs.root());
+        let p = InputProjection::new(&vs.root(), false);
         (vs, p)
     }
 
@@ -231,6 +254,24 @@ mod tests {
             .double_value(&[]);
         assert_eq!(diff_hand, 0.0);
         assert!(diff_played > 0.0);
+    }
+
+    /// Opponents' cards reach V's projection and leave P's at zero.
+    #[test]
+    fn opponent_cards_only_count_with_their_projection() {
+        let (b, s) = (1i64, 2i64);
+        let features = Tensor::ones([b, s, FEAT_DIM], (Kind::Float, Device::Cpu));
+        let token_types = Tensor::from_slice(&[TOKEN_TYPE_CLS as i64, TOKEN_TYPE_OPP_HAND as i64]).view([b, s]);
+        let chrono = Tensor::zeros([b, s], (Kind::Int64, Device::Cpu));
+        let mask = Tensor::ones([b, s], (Kind::Bool, Device::Cpu));
+        let row_abs = |opponent_cards: bool| -> f64 {
+            let vs = VarStore::new(Device::Cpu);
+            let proj = InputProjection::new(&vs.root(), opponent_cards);
+            let out = proj.forward(&features, &token_types, &chrono, &mask);
+            out.get(0).get(1).abs().sum(Kind::Float).double_value(&[])
+        };
+        assert_eq!(row_abs(false), 0.0);
+        assert!(row_abs(true) > 0.0);
     }
 
     #[test]

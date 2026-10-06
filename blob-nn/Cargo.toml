@@ -6,8 +6,11 @@ license.workspace = true
 
 [dependencies]
 blob-engine = { path = "../blob-engine" }
+serde = { workspace = true }
+serde_json = "1"
 tch = { version = "0.20", features = ["download-libtorch"] }
 
 [dev-dependencies]
 rand_xoshiro = { workspace = true }
 smallvec = { workspace = true }
+toml = "0.8"

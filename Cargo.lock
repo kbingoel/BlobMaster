@@ -173,15 +173,26 @@ version = "0.1.0"
 dependencies = [
  "blob-engine",
  "rand_xoshiro",
+ "serde",
+ "serde_json",
  "smallvec",
  "tch",
+ "toml",
 ]
 
 [[package]]
 name = "blob-train"
 version = "0.1.0"
 dependencies = [
+ "blob-engine",
+ "blob-nn",
  "clap",
+ "rand 0.8.5",
+ "rand_xoshiro",
+ "serde",
+ "serde_json",
+ "tch",
+ "toml",
 ]
 
 [[package]]

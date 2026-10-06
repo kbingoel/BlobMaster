@@ -1,532 +1,437 @@
-//! Losses, optimizer, LR schedule, training step, checkpoints.
+//! Losses, optimizer, LR schedule, training steps and checkpoints for the
+//! two networks (gen-2.md §5.3, §5.6).
 //!
-//! - Policy loss: cross-entropy against an MCTS-visit-count distribution,
-//!   `-Σ t · log(p + ε)`. Illegal actions have `t = 0`, contributing nothing.
-//! - Value loss: MSE against the value target: until Phase 4 splits P and
-//!   V, the seat to move's ŝ from the replay buffer (`learner.rs`).
-//! - Combined: `policy_loss + 2.0 · value_loss`.
-//! - Optimizer: AdamW (β₁=0.9, β₂=0.999, wd=1e-4).
-//! - LR schedule: linear warmup to 3e-4 over `warmup_steps` in iteration 0,
-//!   then cosine annealing to 1e-5 over iterations ([`LrSchedule`]).
-//! - Grad clip: global norm 1.0.
-//! - Checkpoints: `VarStore::save` + sidecar JSON with iteration.
+//! - **P loss:** cross-entropy against the target policy, `-Σ t · log(p + ε)`.
+//!   Illegal moves have `t = 0` and contribute nothing. A step's bid and
+//!   play sub-batches are weighted by their example counts.
+//! - **V loss:** sigmoid cross-entropy between V's logits and the actual ŝ
+//!   (a soft target in \[0, 1\]) over the real seats of each table. Like MSE
+//!   it is minimized by the expected ŝ, but its gradient doesn't vanish
+//!   when the sigmoid saturates: under MSE a high learning rate pinned V at
+//!   0 for good. Held-out V is still reported as MSE.
+//! - **Optimizer:** AdamW (β₁ = 0.9, β₂ = 0.999), one per network; global
+//!   grad-norm clip 1.0.
+//! - **LR schedule** keyed to learner steps ([`LrSchedule`]): linear warm-up,
+//!   then cosine to `min_lr` at `total_steps`. The LR is a function of the
+//!   step alone, so a resume continues it exactly (gen-2.md §3.3).
+//! - **Checkpoints:** one directory with `policy.ot` and `value.ot` (tch
+//!   `VarStore`s) and `meta.json` (`{"learner_step": …}`).
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tch::{
     nn::{self, OptimizerConfig, VarStore},
-    Kind, Tensor,
+    Device, Kind, Tensor,
 };
 
 use crate::input::InputBatch;
-use crate::model::BlobNet;
+use crate::model::{PolicyNet, ValueNet};
 
 pub const LOG_EPS: f64 = 1e-8;
-pub const VALUE_LOSS_COEF: f64 = 2.0;
-pub const PEAK_LR: f64 = 3e-4;
-pub const MIN_LR: f64 = 1e-5;
-pub const DEFAULT_WARMUP_STEPS: i64 = 1000;
 pub const GRAD_CLIP_MAX_NORM: f64 = 1.0;
 pub const ADAM_BETA1: f64 = 0.9;
 pub const ADAM_BETA2: f64 = 0.999;
-pub const WEIGHT_DECAY: f64 = 1e-4;
 
-/// Parameter-group id for the value head. Anything not registered under
-/// this group stays in the default group 0.
-pub const VALUE_HEAD_GROUP: usize = 1;
-/// Multiplier applied to the value-head param group's LR, relative to
-/// `peak_lr`. Reverted to 1.0: the run-7.2 baseline ran at 1.0 with
-/// `grad_norms.value_head ≈ 5` and reached 0.77 eval win rate. The
-/// run-7.3b attempt at 0.5 decoupled value from policy.
-pub const VALUE_HEAD_LR_SCALE: f64 = 1.0;
-
-/// Apply `lr` to the default param group and `lr * VALUE_HEAD_LR_SCALE`
-/// to `VALUE_HEAD_GROUP`. Use this in the training loop instead of bare
-/// `optimizer.set_lr(lr)` so the multiplier stays in one place.
-pub fn set_schedule_lr(optimizer: &mut nn::Optimizer, lr: f64) {
-    optimizer.set_lr(lr);
-    optimizer.set_lr_group(VALUE_HEAD_GROUP, lr * VALUE_HEAD_LR_SCALE);
-}
-
-/// Which head the batch targets. The value head always contributes.
+/// Which of P's heads a batch targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Bidding,
     Playing,
 }
 
-/// One training batch. Policy target and legal mask shapes depend on phase:
+/// One phase's examples for P.
 ///
-/// - `Phase::Bidding`: `policy_target` and `legal_mask` are `[B, 14]`.
-/// - `Phase::Playing`: `policy_target` and `legal_mask` are `[B, S]` where
-///   `S` matches `input.attention_mask.size()[1]`. Non-hand and illegal
-///   positions must be 0 in the target and `false` in the mask.
-///
-/// `value_target: [B]` f32, the seat to move's ŝ in `[0, 1]` until Phase 4.
-pub struct TrainBatch {
+/// - `Phase::Bidding`: `legal_mask` and `target` are `[B, 14]`.
+/// - `Phase::Playing`: `legal_mask` and `target` are `[B, S]`, `S` the
+///   padded sequence length. Only hand-card tokens of legal plays are true
+///   in the mask; the target is 0 everywhere else.
+pub struct PolicyBatch {
     pub input: InputBatch,
     pub phase: Phase,
     pub legal_mask: Tensor,
-    pub policy_target: Tensor,
-    pub value_target: Tensor,
+    pub target: Tensor,
 }
 
-/// Cross-entropy against a probability target. Target entries on illegal
-/// actions must be zero (they contribute zero term regardless of `p`).
-///
-/// `pred_probs` should already be masked+softmaxed by the head, so
-/// illegal actions have `p = 0`; we add `LOG_EPS` before `log` to keep
-/// the gradient finite there, and the target's zero zeros out the term.
-pub fn policy_cross_entropy(pred_probs: &Tensor, target: &Tensor) -> Tensor {
-    let log_p = (pred_probs + LOG_EPS).log();
-    let per_sample = -(target * log_p).sum_dim_intlist(
-        &[-1i64][..],
-        false,
-        Kind::Float,
-    );
-    per_sample.mean(Kind::Float)
-}
-
-/// MSE `(pred - target)²`.
-pub fn value_mse(pred: &Tensor, target: &Tensor) -> Tensor {
-    (pred - target).square().mean(Kind::Float)
-}
-
-/// Z-score a slice of cumulative scores into `[-1, 1]`.
-///
-/// `clip((x - mean) / max(std, eps), -1, 1)`. Exposed for test fixtures.
-pub fn z_score_clip(scores: &[f32], eps: f32) -> Vec<f32> {
-    let n = scores.len() as f32;
-    if n == 0.0 {
-        return vec![];
+impl PolicyBatch {
+    pub fn rows(&self) -> i64 {
+        self.target.size()[0]
     }
-    let mean = scores.iter().sum::<f32>() / n;
-    let var = scores.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n;
-    let std = var.sqrt().max(eps);
-    scores
-        .iter()
-        .map(|s| ((s - mean) / std).clamp(-1.0, 1.0))
-        .collect()
+
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            input: self.input.to_device(device),
+            phase: self.phase,
+            legal_mask: self.legal_mask.to_device(device),
+            target: self.target.to_device(device),
+        }
+    }
 }
 
-/// Learning-rate schedule: linear warmup → iteration-relative cosine.
-///
-/// This replaces the old step-based schedule because it silently coupled
-/// LR decay to `epoch_early_stop_rel` — run 7.3b ran ~4× more steps per
-/// iter than run 7.2, which dragged the cosine to `min_lr` by iter 14
-/// even though the iteration count was the same. The new schedule
-/// decays per-iteration, so changing the epoch cap can no longer warp the
-/// LR trajectory (gen-2.md §3.3).
-///
-/// Within iteration 0 we still linearly warm up over the first
-/// `warmup_steps` batches (protects the freshly-initialised bootstrap
-/// model from an immediate full-LR hit).
-#[derive(Debug, Clone, Copy)]
+/// Examples for V: V-mode inputs, and each row's actual ŝ per relative seat
+/// with the mask of real seats, both `[B, K]` (`K` = the largest table in
+/// the batch).
+pub struct ValueBatch {
+    pub input: InputBatch,
+    pub target: Tensor,
+    pub seat_mask: Tensor,
+}
+
+impl ValueBatch {
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            input: self.input.to_device(device),
+            target: self.target.to_device(device),
+            seat_mask: self.seat_mask.to_device(device),
+        }
+    }
+}
+
+/// P's policy for a batch: `[B, 14]` or `[B, S]`.
+pub fn policy_probs(net: &PolicyNet, batch: &PolicyBatch, train: bool) -> Tensor {
+    match batch.phase {
+        Phase::Bidding => net.forward_bid(&batch.input, &batch.legal_mask, train),
+        Phase::Playing => net.forward_play(&batch.input, &batch.legal_mask, train),
+    }
+}
+
+/// Per-row cross-entropy `-Σ t · log(p + ε)`, `[B]`. Target entries on
+/// illegal actions must be zero; `p` is already 0 there.
+pub fn policy_cross_entropy_rows(pred_probs: &Tensor, target: &Tensor) -> Tensor {
+    -(target * (pred_probs + LOG_EPS).log()).sum_dim_intlist(&[-1i64][..], false, Kind::Float)
+}
+
+/// Mean of [`policy_cross_entropy_rows`].
+pub fn policy_cross_entropy(pred_probs: &Tensor, target: &Tensor) -> Tensor {
+    policy_cross_entropy_rows(pred_probs, target).mean(Kind::Float)
+}
+
+/// Sigmoid cross-entropy `−t·log σ(z) − (1−t)·log(1−σ(z)) = softplus(z) − t·z`
+/// over the entries where `mask` is true.
+pub fn seat_bce_with_logits(logits: &Tensor, target: &Tensor, mask: &Tensor) -> Tensor {
+    let m = mask.to_kind(Kind::Float);
+    ((logits.softplus() - target * logits) * &m).sum(Kind::Float) / m.sum(Kind::Float).clamp_min(1.0)
+}
+
+/// P's loss over a step's sub-batches, weighted by their example counts.
+pub fn policy_loss(net: &PolicyNet, batches: &[&PolicyBatch], train: bool) -> Tensor {
+    let rows: i64 = batches.iter().map(|b| b.rows()).sum();
+    assert!(rows > 0, "policy step without examples");
+    batches
+        .iter()
+        .map(|b| policy_cross_entropy_rows(&policy_probs(net, b, train), &b.target).sum(Kind::Float))
+        .reduce(|a, b| a + b)
+        .expect("at least one batch")
+        / rows as f64
+}
+
+/// V's training loss on a batch ([`seat_bce_with_logits`]).
+pub fn value_loss(net: &ValueNet, batch: &ValueBatch, train: bool) -> Tensor {
+    let seats = batch.target.size()[1];
+    seat_bce_with_logits(&net.seat_logits(&batch.input, seats, train), &batch.target, &batch.seat_mask)
+}
+
+/// Learning rate by learner step: linear warm-up to `peak_lr` over
+/// `warmup_steps`, then a cosine down to `min_lr` at `total_steps`, and
+/// `min_lr` after that.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LrSchedule {
-    pub warmup_steps: i64,
-    pub total_iterations: u64,
+    pub warmup_steps: u64,
+    pub total_steps: u64,
     pub peak_lr: f64,
     pub min_lr: f64,
 }
 
 impl LrSchedule {
-    pub fn new(total_iterations: u64) -> Self {
-        Self {
-            warmup_steps: DEFAULT_WARMUP_STEPS,
-            total_iterations,
-            peak_lr: PEAK_LR,
-            min_lr: MIN_LR,
+    pub fn lr(&self, step: u64) -> f64 {
+        if step < self.warmup_steps {
+            return self.peak_lr * (step + 1) as f64 / self.warmup_steps as f64;
         }
+        let span = self.total_steps.saturating_sub(self.warmup_steps).max(1);
+        let t = ((step - self.warmup_steps) as f64 / span as f64).min(1.0);
+        self.min_lr + (self.peak_lr - self.min_lr) * 0.5 * (1.0 + (std::f64::consts::PI * t).cos())
     }
+}
 
-    /// LR at `iteration` (0-indexed), with `step_in_run` batches consumed
-    /// in total since training started. `step_in_run` is only consulted
-    /// during iteration 0 to drive the initial warmup; afterwards the LR
-    /// depends purely on the iteration index.
-    pub fn lr(&self, iteration: u64, step_in_run: i64) -> f64 {
-        if iteration == 0 && step_in_run < self.warmup_steps {
-            let frac = (step_in_run + 1) as f64 / self.warmup_steps.max(1) as f64;
-            return self.peak_lr * frac;
+/// AdamW over every variable of `vs`. The LR is set before each step.
+pub fn build_optimizer(vs: &VarStore, weight_decay: f64) -> Result<nn::Optimizer, tch::TchError> {
+    nn::AdamW { beta1: ADAM_BETA1, beta2: ADAM_BETA2, wd: weight_decay, ..Default::default() }.build(vs, 0.0)
+}
+
+/// Scale the gradients of `vars` down to a global norm of at most `max`.
+/// Unlike `Optimizer::clip_grad_norm`, the norm never leaves the device, so
+/// the step doesn't wait for the GPU.
+pub fn clip_grad_norm(vars: &[Tensor], max: f64) {
+    tch::no_grad(|| {
+        let grads: Vec<Tensor> = vars.iter().map(|v| v.grad()).filter(|g| g.defined()).collect();
+        if grads.is_empty() {
+            return;
         }
-        let decay_span = self.total_iterations.saturating_sub(1).max(1) as f64;
-        let t = (iteration as f64 / decay_span).min(1.0);
-        let cos = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
-        self.min_lr + (self.peak_lr - self.min_lr) * cos
-    }
+        let norms: Vec<Tensor> = grads.iter().map(|g| g.norm()).collect();
+        let total = Tensor::stack(&norms, 0).norm();
+        let coef = ((total + 1e-6).reciprocal() * max).clamp_max(1.0);
+        for mut g in grads {
+            let _ = g.g_mul_(&coef);
+        }
+    })
 }
 
-/// Individual loss terms produced by [`train_step`].
-#[derive(Debug, Clone, Copy)]
-pub struct StepLosses {
-    pub policy: f64,
-    pub value: f64,
-    pub total: f64,
+/// One optimizer step on `loss`. Returns the loss, detached.
+pub fn optimize(opt: &mut nn::Optimizer, vars: &[Tensor], lr: f64, loss: Tensor) -> Tensor {
+    opt.set_lr(lr);
+    opt.zero_grad();
+    loss.backward();
+    clip_grad_norm(vars, GRAD_CLIP_MAX_NORM);
+    opt.step();
+    loss.detach()
 }
 
-/// Build the AdamW optimizer with the project defaults, bound to `vs`.
+pub const POLICY_WEIGHTS: &str = "policy.ot";
+pub const VALUE_WEIGHTS: &str = "value.ot";
+pub const CHECKPOINT_META: &str = "meta.json";
+
+/// A checkpoint's `meta.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointMeta {
+    /// Learner steps taken: the step the next update gets.
+    pub learner_step: u64,
+}
+
+fn io(e: std::io::Error) -> tch::TchError {
+    tch::TchError::Io(e)
+}
+
+/// Write a checkpoint directory. It is written next to `dir` and renamed
+/// into place, so an interrupted save leaves the previous one intact.
 ///
-/// The `VALUE_HEAD_GROUP` param group is started at `PEAK_LR *
-/// VALUE_HEAD_LR_SCALE`; the LR schedule in the training loop must use
-/// [`set_schedule_lr`] (not bare `set_lr`) to keep the ratio after warmup.
-pub fn build_optimizer(vs: &VarStore) -> Result<nn::Optimizer, tch::TchError> {
-    let mut opt = nn::AdamW {
-        beta1: ADAM_BETA1,
-        beta2: ADAM_BETA2,
-        wd: WEIGHT_DECAY,
-        ..Default::default()
-    }
-    .build(vs, PEAK_LR)?;
-    opt.set_lr_group(VALUE_HEAD_GROUP, PEAK_LR * VALUE_HEAD_LR_SCALE);
-    Ok(opt)
-}
-
-/// One training step: forward, loss, backward, clip, step. Returns the
-/// three scalar loss values (after the step).
-pub fn train_step(
-    model: &BlobNet,
-    optimizer: &mut nn::Optimizer,
-    batch: &TrainBatch,
-) -> StepLosses {
-    let (policy_probs, value_pred) = match batch.phase {
-        Phase::Bidding => model.forward_bid(&batch.input, &batch.legal_mask, true),
-        Phase::Playing => model.forward_play(&batch.input, &batch.legal_mask, true),
-    };
-
-    let policy_loss = policy_cross_entropy(&policy_probs, &batch.policy_target);
-    let value_loss = value_mse(&value_pred, &batch.value_target);
-    let total = &policy_loss + VALUE_LOSS_COEF * &value_loss;
-
-    optimizer.zero_grad();
-    total.backward();
-    optimizer.clip_grad_norm(GRAD_CLIP_MAX_NORM);
-    optimizer.step();
-
-    StepLosses {
-        policy: policy_loss.double_value(&[]),
-        value: value_loss.double_value(&[]),
-        total: total.double_value(&[]),
-    }
-}
-
-/// On-disk checkpoint layout:
-/// - `{dir}/model.ot`: weights via `VarStore::save`
-/// - `{dir}/meta.json`: `{"iteration": <u64>}`
-///
-/// Note on optimizer state: `tch-rs` 0.20 does not expose the Adam moment
-/// buffers for serialization. On resume we rebuild the optimizer and
-/// re-enter the LR schedule at `iteration`. The first few post-resume
-/// steps will see warmup-like transient moments; this is an acceptable
-/// trade-off given this project's short training horizons.
+/// Optimizer state is not saved (tch 0.20 doesn't expose the AdamW
+/// moments): a resumed run rebuilds the optimizers.
 pub fn save_checkpoint(
-    vs: &VarStore,
-    iteration: u64,
     dir: impl AsRef<Path>,
+    policy: &VarStore,
+    value: &VarStore,
+    meta: CheckpointMeta,
 ) -> Result<(), tch::TchError> {
     let dir = dir.as_ref();
-    std::fs::create_dir_all(dir).map_err(|e| tch::TchError::Io(e))?;
-    vs.save(dir.join("model.ot"))?;
-    let meta = format!("{{\"iteration\":{iteration}}}\n");
-    std::fs::write(dir.join("meta.json"), meta).map_err(|e| tch::TchError::Io(e))?;
+    let sibling = |suffix: &str| -> PathBuf {
+        let mut name = dir.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        dir.with_file_name(name)
+    };
+    let (tmp, old) = (sibling(".tmp"), sibling(".old"));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).map_err(io)?;
+    }
+    std::fs::create_dir_all(&tmp).map_err(io)?;
+    policy.save(tmp.join(POLICY_WEIGHTS))?;
+    value.save(tmp.join(VALUE_WEIGHTS))?;
+    let json = serde_json::to_string(&meta).expect("meta serializes") + "\n";
+    std::fs::write(tmp.join(CHECKPOINT_META), json).map_err(io)?;
+    if dir.exists() {
+        if old.exists() {
+            std::fs::remove_dir_all(&old).map_err(io)?;
+        }
+        std::fs::rename(dir, &old).map_err(io)?;
+    }
+    std::fs::rename(&tmp, dir).map_err(io)?;
+    if old.exists() {
+        std::fs::remove_dir_all(&old).map_err(io)?;
+    }
     Ok(())
 }
 
-/// Load weights into `vs` and return the iteration counter.
+/// Load a checkpoint written by [`save_checkpoint`] into `policy` and
+/// `value`, which must hold a [`PolicyNet`] and a [`ValueNet`].
 pub fn load_checkpoint(
-    vs: &mut VarStore,
     dir: impl AsRef<Path>,
-) -> Result<u64, tch::TchError> {
-    let dir: PathBuf = dir.as_ref().to_path_buf();
-    vs.load(dir.join("model.ot"))?;
-    let raw = std::fs::read_to_string(dir.join("meta.json"))
-        .map_err(|e| tch::TchError::Io(e))?;
-    // Minimal parse: extract the integer after `"iteration":`.
-    let iteration = raw
-        .split("\"iteration\":")
-        .nth(1)
-        .and_then(|s| s.trim().trim_end_matches('}').trim().trim_end_matches('\n').parse::<u64>().ok())
-        .unwrap_or(0);
-    Ok(iteration)
+    policy: &mut VarStore,
+    value: &mut VarStore,
+) -> Result<CheckpointMeta, tch::TchError> {
+    let dir = dir.as_ref();
+    policy.load(dir.join(POLICY_WEIGHTS))?;
+    value.load(dir.join(VALUE_WEIGHTS))?;
+    let raw = std::fs::read_to_string(dir.join(CHECKPOINT_META)).map_err(io)?;
+    serde_json::from_str(&raw)
+        .map_err(|e| tch::TchError::FileFormat(format!("{}: {e}", dir.join(CHECKPOINT_META).display())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heads::NUM_BIDS;
-    use crate::input::{pad_batch, FEAT_DIM};
-    use blob_engine::encoder::{encode, TOKEN_TYPE_HAND};
-    use blob_engine::{dealing::deal, game::new_game};
+    use crate::input::pad_batch;
+    use blob_engine::encoder::{encode, encode_value, TOKEN_TYPE_HAND};
+    use blob_engine::{new_round, RoundParams};
     use rand_xoshiro::{rand_core::SeedableRng, Xoshiro256PlusPlus};
-    use tch::{Device, Kind};
 
-    fn make_play_batch(seed: u64, batch_size: usize) -> TrainBatch {
+    fn states(seed: u64, n: usize) -> Vec<blob_engine::BlobState> {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let mut encs = Vec::with_capacity(batch_size);
-        for _ in 0..batch_size {
-            let mut s = new_game(4, 5).unwrap();
-            deal(&mut s, &mut rng);
-            let e = encode(&s, s.current_player);
-            encs.push(e);
-        }
+        (0..n)
+            .map(|i| {
+                let p = RoundParams { num_players: 4 + (i % 2) as u8, cards_dealt: 5, trump: 0, dealer: 0 };
+                new_round(p, &mut rng).unwrap()
+            })
+            .collect()
+    }
+
+    /// Every hand card treated as legal, uniform target over them.
+    fn play_batch(seed: u64, n: usize) -> PolicyBatch {
+        let encs: Vec<_> = states(seed, n).iter().map(|s| encode(s, s.current_player)).collect();
         let input = pad_batch(&encs, Device::Cpu);
-        assert_eq!(input.features.size()[2], FEAT_DIM);
-        let s = input.attention_mask.size()[1];
-        let b = batch_size as i64;
+        let hand = input.token_types.eq(TOKEN_TYPE_HAND as i64);
+        let counts = hand.to_kind(Kind::Float).sum_dim_intlist(&[-1i64][..], true, Kind::Float);
+        let target = hand.to_kind(Kind::Float) / counts.clamp_min(1.0);
+        PolicyBatch { input, phase: Phase::Playing, legal_mask: hand, target }
+    }
 
-        // legal_mask = hand tokens (every hand card is treated legal here).
-        let hand_mask = input.token_types.eq(TOKEN_TYPE_HAND as i64);
-
-        // Policy target: uniform over legal hand positions per row.
-        let counts = hand_mask.to_kind(Kind::Float).sum_dim_intlist(
-            &[-1i64][..],
-            true,
-            Kind::Float,
-        );
-        let target = hand_mask.to_kind(Kind::Float) / counts.clamp_min(1.0);
-
-        // Value target: random in [-1, 1].
-        let vt_vec: Vec<f32> = (0..b).map(|i| ((i as f32) * 0.37 - 0.5).clamp(-1.0, 1.0)).collect();
-        let value_target = Tensor::from_slice(&vt_vec).view([b]);
-
-        let _ = s;
-        TrainBatch {
+    fn value_batch(seed: u64, n: usize) -> ValueBatch {
+        let ss = states(seed, n);
+        let encs: Vec<_> = ss.iter().map(|s| encode_value(s, s.current_player)).collect();
+        let input = pad_batch(&encs, Device::Cpu);
+        let k = 5usize;
+        let mut target = vec![0.0f32; n * k];
+        let mut mask = vec![false; n * k];
+        for (row, s) in ss.iter().enumerate() {
+            for seat in 0..s.num_players as usize {
+                target[row * k + seat] = if seat % 2 == 0 { 0.8 } else { 0.0 };
+                mask[row * k + seat] = true;
+            }
+        }
+        ValueBatch {
             input,
-            phase: Phase::Playing,
-            legal_mask: hand_mask,
-            policy_target: target,
-            value_target,
+            target: Tensor::from_slice(&target).view([n as i64, k as i64]),
+            seat_mask: Tensor::from_slice(&mask).view([n as i64, k as i64]),
         }
     }
 
     #[test]
     fn policy_xent_zero_on_perfect_prediction() {
-        // Target = pred (one-hot), loss ≈ 0 (up to LOG_EPS).
         let pred = Tensor::from_slice(&[0.0f32, 1.0, 0.0]).view([1, 3]);
-        let target = pred.shallow_clone();
-        let loss = policy_cross_entropy(&pred, &target).double_value(&[]);
+        let loss = policy_cross_entropy(&pred, &pred).double_value(&[]);
         assert!(loss < 1e-6, "expected near-zero, got {loss}");
     }
 
     #[test]
     fn policy_xent_ignores_illegal_with_zero_target() {
-        // Illegal action has p=0, t=0 → 0·log(ε) = 0, not NaN.
         let pred = Tensor::from_slice(&[0.0f32, 0.5, 0.5]).view([1, 3]);
-        let target = Tensor::from_slice(&[0.0f32, 0.5, 0.5]).view([1, 3]);
-        let loss = policy_cross_entropy(&pred, &target).double_value(&[]);
+        let loss = policy_cross_entropy(&pred, &pred).double_value(&[]);
         assert!(loss.is_finite(), "loss not finite: {loss}");
     }
 
+    /// The cross-entropy matches its definition, ignores masked seats, and is
+    /// smallest where σ(z) equals the target.
     #[test]
-    fn z_score_clip_produces_unit_variance_then_clips() {
-        let xs = [10.0f32, 20.0, 30.0, 40.0, 50.0];
-        let z = z_score_clip(&xs, 1e-6);
-        assert_eq!(z.len(), 5);
-        // Symmetric around 0.
-        let sum: f32 = z.iter().sum();
-        assert!(sum.abs() < 1e-5, "sum not zero: {sum}");
-        for v in &z {
-            assert!((-1.0..=1.0).contains(v));
-        }
-        // Degenerate: all equal → all zeros.
-        let z2 = z_score_clip(&[5.0, 5.0, 5.0], 1e-6);
-        assert!(z2.iter().all(|v| *v == 0.0));
+    fn seat_bce_matches_definition_and_targets_the_mean() {
+        let z = Tensor::from_slice(&[0.3f32, -2.0, 50.0]).view([1, 3]);
+        let t = Tensor::from_slice(&[0.7f32, 0.0, 0.0]).view([1, 3]);
+        let mask = Tensor::from_slice(&[true, true, false]).view([1, 3]);
+        let p = z.sigmoid();
+        let (one_t, one_p): (Tensor, Tensor) = (1.0 - &t, 1.0 - &p);
+        let want = -(&t * p.log() + one_t * one_p.log()).narrow(1, 0, 2).mean(Kind::Float);
+        let got = seat_bce_with_logits(&z, &t, &mask);
+        assert!((got - want).abs().double_value(&[]) < 1e-6);
+        let at = |x: f64| {
+            let z = Tensor::from_slice(&[x as f32]).view([1, 1]);
+            let t = Tensor::from_slice(&[0.6f32]).view([1, 1]);
+            seat_bce_with_logits(&z, &t, &Tensor::from_slice(&[true]).view([1, 1])).double_value(&[])
+        };
+        let best = (0.6f64 / 0.4).ln();
+        assert!(at(best) < at(best + 0.1) && at(best) < at(best - 0.1));
     }
 
     #[test]
-    fn lr_schedule_warmup_peak_cosine() {
-        let s = LrSchedule {
-            warmup_steps: 100,
-            total_iterations: 15,
-            peak_lr: 3e-4,
-            min_lr: 1e-5,
-        };
-        // Iteration 0 warms up over its first `warmup_steps` batches.
-        assert!(s.lr(0, 0) > 0.0 && s.lr(0, 0) < s.peak_lr);
-        assert!((s.lr(0, 99) - s.peak_lr).abs() < 1e-9);
-        // After warmup (still iter 0, step >= warmup_steps) LR hits peak
-        // exactly — `t = 0` on the cosine.
-        assert!((s.lr(0, 100) - s.peak_lr).abs() < 1e-9);
-        // Last iteration sits at min_lr.
-        assert!((s.lr(14, 0) - s.min_lr).abs() < 1e-9);
-        // Mid-run is strictly between peak and min.
-        let mid = s.lr(7, 0);
-        assert!(mid > s.min_lr && mid < s.peak_lr);
-        // Past-the-end stays pinned at min_lr.
-        assert!((s.lr(99, 0) - s.min_lr).abs() < 1e-9);
-        // Warmup only triggers in iteration 0 — later iterations ignore
-        // the step counter.
-        assert_eq!(s.lr(1, 0), s.lr(1, 10_000));
-    }
-
-    /// Regression: bug observed on the sweep-2026-04-28 anchor resume.
-    /// The resume TOML had `total_iterations = 14` (count of iters to
-    /// run this session), but `LrSchedule::new(14)` sets a cosine span
-    /// of [0, 13]. The absolute iteration counter started at 16 (= K+1
-    /// after resuming from iter_15), so `t = 16/13 > 1.0` → clamped
-    /// to t=1 → cos=0 → LR pinned at MIN_LR for all 14 iters. Model
-    /// effectively frozen; iter_29 vs iter_15 head-to-head was 0.484
-    /// win rate (no learning).
-    ///
-    /// The fix was at the call-site (the gen-1 driver switched to
-    /// absolute-target semantics: `total_iterations` is the cosine span,
-    /// the loop ran `while iteration < total`). This test documents what
-    /// the LR schedule produces under correct usage so we never re-enable
-    /// the failure mode by accident.
-    #[test]
-    fn lr_schedule_continuous_across_resume_with_absolute_target() {
-        // 100-iter run (absolute target). Resume from iter 15 → loop
-        // processes iters 16..99. The schedule must give a sensible
-        // mid-cosine LR at iter 16, not MIN_LR.
-        let s = LrSchedule {
-            warmup_steps: 1000,
-            total_iterations: 100,
-            peak_lr: 3e-4,
-            min_lr: 1e-5,
-        };
-
-        let lr_16 = s.lr(16, 0);
-        // Hand-computed: t = 16 / 99 = 0.1616, cos(π·t) ≈ 0.872,
-        //   schedule = 0.5 * (1 + 0.872) = 0.936,
-        //   lr ≈ 1e-5 + 2.9e-4 * 0.936 ≈ 2.72e-4.
-        assert!(
-            lr_16 > 2.5e-4,
-            "iter 16 LR should be near peak under 100-target cosine; got {lr_16:.3e}"
-        );
-        assert!(
-            lr_16 < s.peak_lr,
-            "iter 16 LR should be strictly below peak; got {lr_16:.3e}"
-        );
-
-        // Mid-run (iter 50) is the cosine midpoint.
-        let lr_50 = s.lr(50, 0);
-        assert!(lr_50 > s.min_lr * 5.0 && lr_50 < lr_16);
-
-        // Final iter (99 — the last processed under `while iter < 100`)
-        // sits at MIN_LR — that's the cosine cooldown by design.
-        assert!((s.lr(99, 0) - s.min_lr).abs() < 1e-9);
-
-        // Sanity: the buggy configuration from sweep-2026-04-28 (span=14
-        // but resume starts at iter 16) does in fact clamp to MIN_LR.
-        // Documented here as the failure mode we're guarding against.
-        let buggy = LrSchedule {
-            warmup_steps: 1000,
-            total_iterations: 14,
-            peak_lr: 3e-4,
-            min_lr: 1e-5,
-        };
-        for iter in 16u64..30 {
-            let lr = buggy.lr(iter, 0);
-            assert!(
-                (lr - buggy.min_lr).abs() < 1e-12,
-                "buggy span=14 schedule should clamp at iter {iter}; got {lr:.3e}"
-            );
-        }
+    fn lr_schedule_warms_up_then_decays_to_min() {
+        let s = LrSchedule { warmup_steps: 100, total_steps: 1100, peak_lr: 3e-4, min_lr: 1e-5 };
+        assert!(s.lr(0) > 0.0 && s.lr(0) < s.peak_lr);
+        assert!((s.lr(99) - s.peak_lr).abs() < 1e-12);
+        assert!((s.lr(100) - s.peak_lr).abs() < 1e-12);
+        let mid = s.lr(600);
+        assert!((mid - (s.min_lr + s.peak_lr) / 2.0).abs() < 1e-9, "{mid}");
+        assert!((s.lr(1100) - s.min_lr).abs() < 1e-12);
+        assert!((s.lr(50_000) - s.min_lr).abs() < 1e-12);
+        // Strictly decreasing after warm-up.
+        assert!((100..1100).all(|t| s.lr(t + 1) < s.lr(t)));
     }
 
     #[test]
-    fn train_step_reduces_loss_on_fixed_batch() {
+    fn policy_and_value_steps_reduce_their_losses() {
         tch::manual_seed(42);
         let vs = VarStore::new(Device::Cpu);
-        let model = BlobNet::new(&vs.root());
-        let mut opt = build_optimizer(&vs).unwrap();
-        opt.set_lr(3e-4); // project-default peak LR.
-
-        // Build a batch whose value target matches the model's *initial*
-        // value prediction (detached). This removes value-loss variance
-        // from the smoke test, so loss changes reflect the policy signal.
-        let mut batch = make_play_batch(123, 2);
-        let (_p0, v0) = model.forward_play(&batch.input, &batch.legal_mask, false);
-        batch.value_target = v0.detach().copy();
-
-        let (p0, v0b) = model.forward_play(&batch.input, &batch.legal_mask, false);
-        let initial_policy =
-            policy_cross_entropy(&p0, &batch.policy_target).double_value(&[]);
-        let initial_value = value_mse(&v0b, &batch.value_target).double_value(&[]);
-        assert!(initial_value < 1e-6, "value loss must start at zero");
-
-        let mut last_policy = f64::INFINITY;
-        for _ in 0..200 {
-            let l = train_step(&model, &mut opt, &batch);
-            last_policy = l.policy;
-            assert!(l.total.is_finite(), "loss diverged: {l:?}");
+        let p = PolicyNet::new(&vs.root());
+        let mut opt = build_optimizer(&vs, 1e-4).unwrap();
+        let vars = vs.trainable_variables();
+        let batch = play_batch(123, 4);
+        let first = policy_loss(&p, &[&batch], false).double_value(&[]);
+        for _ in 0..100 {
+            let l = optimize(&mut opt, &vars, 3e-4, policy_loss(&p, &[&batch], true));
+            assert!(l.double_value(&[]).is_finite());
         }
-        assert!(
-            last_policy < initial_policy - 0.05,
-            "policy loss did not decrease: initial={initial_policy} last={last_policy}"
-        );
-    }
+        let last = policy_loss(&p, &[&batch], false).double_value(&[]);
+        assert!(last < first - 0.05, "P: {first} -> {last}");
 
-    #[test]
-    fn bidding_train_step_runs_and_decreases() {
         let vs = VarStore::new(Device::Cpu);
-        let model = BlobNet::new(&vs.root());
-        let mut opt = build_optimizer(&vs).unwrap();
-        opt.set_lr(1e-3);
-
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(9);
-        let mut encs = Vec::new();
-        for _ in 0..2 {
-            let mut s = new_game(4, 5).unwrap();
-            deal(&mut s, &mut rng);
-            encs.push(encode(&s, s.current_player));
-        }
-        let input = pad_batch(&encs, Device::Cpu);
-        let b = 2i64;
-        let legal = Tensor::ones([b, NUM_BIDS], (Kind::Bool, Device::Cpu));
-        // Target: one-hot on bid 3 for both rows.
-        let mut tgt = vec![0.0f32; (b * NUM_BIDS) as usize];
-        tgt[3] = 1.0;
-        tgt[(NUM_BIDS + 3) as usize] = 1.0;
-        let policy_target = Tensor::from_slice(&tgt).view([b, NUM_BIDS]);
-        let value_target = Tensor::from_slice(&[0.2f32, -0.3]).view([b]);
-
-        let batch = TrainBatch {
-            input,
-            phase: Phase::Bidding,
-            legal_mask: legal,
-            policy_target,
-            value_target,
+        let v = ValueNet::new(&vs.root());
+        let mut opt = build_optimizer(&vs, 1e-4).unwrap();
+        let vars = vs.trainable_variables();
+        let batch = value_batch(7, 6);
+        let mse = || {
+            let pred = v.seat_values(&batch.input, 5, false);
+            let m = batch.seat_mask.to_kind(Kind::Float);
+            ((pred - &batch.target).square() * &m).sum(Kind::Float).double_value(&[]) / m.sum(Kind::Float).double_value(&[])
         };
-
-        let first = train_step(&model, &mut opt, &batch).total;
-        let mut last = first;
-        for _ in 0..50 {
-            last = train_step(&model, &mut opt, &batch).total;
+        let first = mse();
+        for _ in 0..100 {
+            let _ = optimize(&mut opt, &vars, 1e-3, value_loss(&v, &batch, true));
         }
-        assert!(last < first, "bidding loss did not decrease: {first} -> {last}");
+        let last = mse();
+        assert!(last < first / 2.0, "V: {first} -> {last}");
     }
 
     #[test]
-    fn checkpoint_round_trip_restores_weights() {
-        let tmp = std::env::temp_dir().join(format!("blobnet-ckpt-{}", std::process::id()));
-
-        // Train a bit to make weights non-default.
+    fn clip_bounds_the_global_grad_norm() {
         let vs = VarStore::new(Device::Cpu);
-        let model = BlobNet::new(&vs.root());
-        let mut opt = build_optimizer(&vs).unwrap();
-        let batch = make_play_batch(7, 2);
-        for _ in 0..5 {
-            train_step(&model, &mut opt, &batch);
+        let x = vs.root().var("x", &[3], nn::Init::Const(1.0));
+        let y = vs.root().var("y", &[1], nn::Init::Const(1.0));
+        let loss = (&x * 100.0).sum(Kind::Float) + (&y * 100.0).sum(Kind::Float);
+        loss.backward();
+        let vars = vs.trainable_variables();
+        clip_grad_norm(&vars, 1.0);
+        let norm: f64 = vars.iter().map(|v| v.grad().square().sum(Kind::Float).double_value(&[])).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "{norm}");
+        // A small gradient is left alone.
+        let vs = VarStore::new(Device::Cpu);
+        let z = vs.root().var("z", &[2], nn::Init::Const(1.0));
+        (&z * 0.1).sum(Kind::Float).backward();
+        clip_grad_norm(&vs.trainable_variables(), 1.0);
+        let g: Vec<f32> = z.grad().try_into().unwrap();
+        assert!(g.iter().all(|&x| (x - 0.1).abs() < 1e-7), "{g:?}");
+    }
+
+    #[test]
+    fn checkpoint_round_trip_restores_weights_and_step() {
+        let tmp = std::env::temp_dir().join(format!("blob-ckpt-{}", std::process::id()));
+        let (pv, vv) = (VarStore::new(Device::Cpu), VarStore::new(Device::Cpu));
+        let (_p, _v) = (PolicyNet::new(&pv.root()), ValueNet::new(&vv.root()));
+        save_checkpoint(&tmp, &pv, &vv, CheckpointMeta { learner_step: 41 }).unwrap();
+        // A second save replaces the first in place.
+        save_checkpoint(&tmp, &pv, &vv, CheckpointMeta { learner_step: 42 }).unwrap();
+
+        let (mut pv2, mut vv2) = (VarStore::new(Device::Cpu), VarStore::new(Device::Cpu));
+        let (_p2, _v2) = (PolicyNet::new(&pv2.root()), ValueNet::new(&vv2.root()));
+        let meta = load_checkpoint(&tmp, &mut pv2, &mut vv2).unwrap();
+        assert_eq!(meta.learner_step, 42);
+        for (a, b) in [(&pv, &pv2), (&vv, &vv2)] {
+            let (va, vb) = (a.variables(), b.variables());
+            assert_eq!(va.len(), vb.len());
+            for (name, t) in &va {
+                let diff = (t - &vb[name]).abs().sum(Kind::Float).double_value(&[]);
+                assert_eq!(diff, 0.0, "{name}");
+            }
         }
-
-        // Snapshot one parameter tensor for comparison.
-        let snap_name = vs.variables().keys().next().unwrap().clone();
-        let snap_before = vs.variables()[&snap_name].shallow_clone().copy();
-
-        save_checkpoint(&vs, 42, &tmp).unwrap();
-
-        // Fresh model + fresh varstore, then load.
-        let mut vs2 = VarStore::new(Device::Cpu);
-        let _model2 = BlobNet::new(&vs2.root());
-        let iter = load_checkpoint(&mut vs2, &tmp).unwrap();
-        assert_eq!(iter, 42);
-
-        let snap_after = vs2.variables()[&snap_name].shallow_clone();
-        let diff: f64 = (&snap_before - &snap_after)
-            .abs()
-            .sum(Kind::Float)
-            .double_value(&[]);
-        assert!(diff < 1e-6, "weights did not round-trip (diff={diff})");
-
+        // P's weights don't load into V.
+        let mut wrong = VarStore::new(Device::Cpu);
+        let _ = ValueNet::new(&wrong.root());
+        assert!(wrong.load(tmp.join(POLICY_WEIGHTS)).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

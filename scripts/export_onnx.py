@@ -3,11 +3,11 @@
 Run it through `blobmaster-train export`, which picks the repo's venv and
 strips LD_PRELOAD:
 
-    ./target/release/blobmaster-train export --output <dir> [--checkpoint <P checkpoint>] [--check]
+    blobmaster-train export --output <dir> [--checkpoint <checkpoint dir>] [--check]
 
 or directly:
 
-    python scripts/export_onnx.py --out-dir <dir> [--weights <model.ot>] [--check]
+    python scripts/export_onnx.py --out-dir <dir> [--checkpoint <checkpoint dir>] [--check]
 
 It writes `<dir>/policy.onnx`, `<dir>/value.onnx` and `<dir>/meta.json`
 (gen-2.md §5.3). Both ONNX files carry the encoder layout id and the network
@@ -15,19 +15,16 @@ name in their metadata (`blob_layout_id`, `blob_network`); the Rust
 `OnnxPolicy` / `OnnxValue` refuse a file with another layout (gen-2.md §5.5
 item 10).
 
-- P mirrors `blob-nn/src/{input,transformer,heads,model}.rs` parameter for
-  parameter, so `--weights` loads a tch VarStore checkpoint into it. The tch
-  model's value head (gen-1 shaped until Phase 4) is not part of P and is
-  skipped. Any other change to the Rust network must be made here too, or
-  the weights won't load or the outputs will disagree with tch.
-- V (4 layers, an input projection for opponents' cards, a per-seat ŝ head
-  on the player tokens) has no tch counterpart until Phase 4, so it is
-  always exported random-init (seeded).
-- Without `--weights`, P is random-init too: a model for exercising `bench`
-  and `play`.
+- `PolicyNet` and `ValueNet` mirror `blob-nn/src/{input,transformer,heads,
+  model}.rs` parameter for parameter, so a learner checkpoint (`policy.ot`,
+  `value.ot`: tch VarStores, plus `meta.json` with the learner step) loads
+  strictly. Any change to the Rust networks must be made here too, or the
+  weights won't load or the outputs will disagree with tch.
+- Without `--checkpoint`, both nets are random-init (seeded): a model for
+  exercising `bench` and `play`.
 
 `--check` runs random inputs through PyTorch and the exported graphs and
-reports the max absolute difference per network; target < 1e-5.
+reports the max absolute difference per network against `PARITY_GATE`.
 """
 
 from __future__ import annotations
@@ -73,6 +70,10 @@ HEAD_HIDDEN = 64
 
 TT_CLS, TT_CONTEXT, TT_PLAYER, TT_HAND, TT_PLAYED = 0, 1, 2, 3, 4
 TT_OPP_HAND = 5
+
+# `--check` passes when |PyTorch − ONNX Runtime| <= PARITY_GATE · max(1, |PyTorch|)
+# on every output: absolute below 1, relative above (P's raw play scores).
+PARITY_GATE = 1e-5
 
 INPUT_NAMES = ["features", "token_types", "chrono_indices", "attention_mask"]
 SEQ_AXES = {name: {0: "batch", 1: "seq"} for name in INPUT_NAMES}
@@ -255,10 +256,9 @@ def _rust_to_torch_key(rust_key: str) -> str:
     return re.sub(r"\.layer(\d+)\.", r".layers.\1.", k)
 
 
-def load_varstore_into(model: nn.Module, weights_path: Path, skip_prefixes: tuple[str, ...]) -> None:
-    """Load a tch VarStore archive into `model`, ignoring parameters under
-    `skip_prefixes`. Any other missing or unexpected parameter is an error:
-    the two definitions have drifted apart."""
+def load_varstore_into(model: nn.Module, weights_path: Path) -> None:
+    """Load a tch VarStore archive into `model`. A missing or unexpected
+    parameter is an error: the two definitions have drifted apart."""
     # `VarStore::save` writes a TorchScript archive (zip of named tensors).
     try:
         module = torch.jit.load(str(weights_path), map_location="cpu")
@@ -268,11 +268,7 @@ def load_varstore_into(model: nn.Module, weights_path: Path, skip_prefixes: tupl
     except Exception:
         raw = torch.load(weights_path, map_location="cpu", weights_only=True)
 
-    remapped = {
-        k: v
-        for k, v in ((_rust_to_torch_key(k), v) for k, v in raw.items())
-        if not k.startswith(skip_prefixes)
-    }
+    remapped = {_rust_to_torch_key(k): v for k, v in raw.items()}
     missing, unexpected = model.load_state_dict(remapped, strict=False)
     if missing or unexpected:
         sys.exit(f"[export_onnx] {weights_path}: missing={missing} unexpected={unexpected}")
@@ -282,7 +278,10 @@ def load_varstore_into(model: nn.Module, weights_path: Path, skip_prefixes: tupl
 
 
 def random_inputs(batch: int, seq: int, max_token_type: int) -> tuple[torch.Tensor, ...]:
-    features = torch.randn(batch, seq, FEAT_DIM)
+    # Uniform in [0, 1], the encoder's range: every feature is a flag, a
+    # one-hot entry or a count scaled to [0, 1], except the over/under-bid
+    # ratio, which stays within [-1, 12].
+    features = torch.rand(batch, seq, FEAT_DIM)
     token_types = torch.randint(0, max_token_type + 1, (batch, seq))
     token_types[:, 0] = TT_CLS
     chrono = torch.randint(0, MAX_CHRONO, (batch, seq))
@@ -315,12 +314,13 @@ def export(model: nn.Module, network: str, out_dir: Path) -> Path:
 
 
 def parity_check(model: nn.Module, network: str, path: Path, n_trials: int = 100) -> float:
+    """Worst |PyTorch − ONNX Runtime| / max(1, |PyTorch|) over random inputs."""
     import onnxruntime as ort  # type: ignore
 
     sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     _, _, max_tt = NETWORKS[network]
     model.eval()
-    max_diff = 0.0
+    max_abs, max_scaled = 0.0, 0.0
     for _ in range(n_trials):
         seq = int(torch.randint(5, 50, (1,)).item())
         inputs = random_inputs(2, seq, max_tt)
@@ -329,40 +329,46 @@ def parity_check(model: nn.Module, network: str, path: Path, n_trials: int = 100
         want = want if isinstance(want, tuple) else (want,)
         got = sess.run(None, {name: t.numpy() for name, t in zip(INPUT_NAMES, inputs)})
         for a, b in zip(want, got):
-            max_diff = max(max_diff, float(abs(a.numpy() - b).max()))
-    print(f"[parity] {network}: max abs diff over {n_trials} trials: {max_diff:.3e}")
-    return max_diff
+            diff = abs(a.numpy() - b)
+            max_abs = max(max_abs, float(diff.max()))
+            max_scaled = max(max_scaled, float((diff / abs(a.numpy()).clip(min=1.0)).max()))
+    print(f"[parity] {network}: over {n_trials} trials, max abs diff {max_abs:.3e}, scaled {max_scaled:.3e}")
+    return max_scaled
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", type=Path, required=True, help="model directory to write")
-    p.add_argument("--weights", type=Path, help="tch VarStore model.ot for P (default: random init)")
+    p.add_argument("--checkpoint", type=Path, help="learner checkpoint directory (default: random init)")
     p.add_argument("--check", action="store_true", help="run a parity check after export")
     args = p.parse_args()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
     policy = PolicyNet()
-    if args.weights is not None:
-        load_varstore_into(policy, args.weights, skip_prefixes=("value_head.",))
     torch.manual_seed(1)
     value = ValueNet()
+    learner_step = None
+    if args.checkpoint is not None:
+        load_varstore_into(policy, args.checkpoint / "policy.ot")
+        load_varstore_into(value, args.checkpoint / "value.ot")
+        learner_step = json.loads((args.checkpoint / "meta.json").read_text())["learner_step"]
 
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     paths = {"policy": export(policy, "policy", args.out_dir), "value": export(value, "value", args.out_dir)}
     meta = {
         "layout_id": LAYOUT_ID,
-        "learner_step": None,
-        "policy": {"layers": P_LAYERS, "weights": str(args.weights) if args.weights else None},
-        "value": {"layers": V_LAYERS, "weights": None},
+        "learner_step": learner_step,
+        "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None,
+        "policy": {"layers": P_LAYERS},
+        "value": {"layers": V_LAYERS},
     }
     (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     print(f"[export_onnx] wrote {args.out_dir}: {', '.join(str(p.name) for p in paths.values())}, meta.json")
 
     if args.check:
         worst = max(parity_check(policy, "policy", paths["policy"]), parity_check(value, "value", paths["value"]))
-        if worst > 1e-5:
-            sys.exit(f"[parity] exceeds the 1e-5 tolerance ({worst:.3e})")
+        if worst > PARITY_GATE:
+            sys.exit(f"[parity] exceeds the {PARITY_GATE:.0e} tolerance ({worst:.3e})")
 
 
 if __name__ == "__main__":

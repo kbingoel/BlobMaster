@@ -22,7 +22,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::{RwLock, RwLockReadGuard};
 
-use rand::seq::IteratorRandom;
+use rand::seq::index;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -130,6 +130,11 @@ impl ReplayBuffer {
         self.round_ids[i]
     }
 
+    /// State of the example in slot `i` (`< len`).
+    pub fn state(&self, i: usize) -> &BlobState {
+        &self.states[i]
+    }
+
     /// Store every decision of a finished round, with the points each seat
     /// scored in it, read from `end` (the round's final state, in
     /// `Scoring`). Returns the round's id.
@@ -176,11 +181,25 @@ impl ReplayBuffer {
         augment: bool,
     ) -> (BidBatch, PlayBatch) {
         assert!(self.len > 0, "cannot sample from empty replay buffer");
-        let indices: Vec<usize> = if n <= self.len {
-            (0..self.len).choose_multiple(rng, n)
-        } else {
-            (0..n).map(|_| rng.gen_range(0..self.len)).collect()
-        };
+        let indices = draw(self.len, n, rng);
+        self.batch_of(indices, rng, augment)
+    }
+
+    /// [`ReplayBuffer::sample_batch`] restricted to `slots` (each `< len`),
+    /// e.g. the examples of the training rounds only.
+    pub fn sample_batch_from<R: Rng + ?Sized>(
+        &self,
+        slots: &[usize],
+        n: usize,
+        rng: &mut R,
+        augment: bool,
+    ) -> (BidBatch, PlayBatch) {
+        assert!(!slots.is_empty(), "cannot sample from an empty slot list");
+        let indices = draw(slots.len(), n, rng).into_iter().map(|i| slots[i]).collect();
+        self.batch_of(indices, rng, augment)
+    }
+
+    fn batch_of<R: Rng + ?Sized>(&self, indices: Vec<usize>, rng: &mut R, augment: bool) -> (BidBatch, PlayBatch) {
         let examples = indices
             .iter()
             .map(|&i| {
@@ -216,6 +235,15 @@ impl ReplayBuffer {
         let file = File::open(path).map_err(|e| Box::new(bincode::ErrorKind::Io(e)))?;
         let reader = BufReader::new(file);
         bincode::deserialize_from(reader)
+    }
+}
+
+/// `n` indices below `len`: without replacement if `n <= len`, else with.
+fn draw<R: Rng + ?Sized>(len: usize, n: usize, rng: &mut R) -> Vec<usize> {
+    if n <= len {
+        index::sample(rng, len, n).into_vec()
+    } else {
+        (0..n).map(|_| rng.gen_range(0..len)).collect()
     }
 }
 
@@ -476,6 +504,28 @@ mod tests {
         let expected = 20_000.0 * 5.0 / K as f64;
         let chi2: f64 = counts.iter().map(|&c| (c as f64 - expected).powi(2) / expected).sum();
         assert!(chi2 < 43.82, "chi2 = {chi2}");
+    }
+
+    #[test]
+    fn sampling_from_slots_draws_only_those_slots() {
+        let mut buf = ReplayBuffer::new(100);
+        for seed in 0..3 {
+            let (decisions, end) = played_round(20 + seed, 2);
+            buf.push_round(&decisions, &end);
+        }
+        let (kept, left_out): (Vec<usize>, Vec<usize>) = (0..buf.len()).partition(|&i| buf.round_id(i) != 1);
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(3);
+        for _ in 0..50 {
+            let (bid, play) = buf.sample_batch_from(&kept, 5, &mut rng, false);
+            assert_eq!(bid.states.len() + play.states.len(), 5);
+            for s in bid.states.iter().chain(&play.states) {
+                assert!(kept.iter().any(|&i| buf.state(i) == s));
+                assert!(!left_out.iter().any(|&i| buf.state(i) == s));
+            }
+        }
+        // More draws than slots: with replacement.
+        let (bid, play) = buf.sample_batch_from(&kept[..3], 10, &mut rng, true);
+        assert_eq!(bid.states.len() + play.states.len(), 10);
     }
 
     #[test]

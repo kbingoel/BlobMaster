@@ -9,7 +9,7 @@
 //! - Search: `mcts` over sampled deals from `belief`, guided by a policy and
 //!   a value evaluator (`evaluator`; `onnx::OnnxEvaluator` in production).
 //! - Training data: `replay`, with suit-permutation augmentation from
-//!   `augment`.
+//!   `augment`; `teacher` plays the warm start's rule-bot-2 rounds.
 //! - Yardsticks: `rule_bot`, `rule_bot_2` and `bench` (gen-2.md §5.7).
 //!
 //! Pure Rust plus `ort`; never depends on `tch` (that lives in `blob-nn`).
@@ -34,6 +34,7 @@ pub mod rule_bot;
 pub mod rule_bot_2;
 pub mod scoring;
 pub mod state;
+pub mod teacher;
 
 pub use bidding::{apply_bid, forbidden_bid, legal_bids};
 pub use evaluator::{DummyEvaluator, PolicyEvaluator, ValueEvaluator, NUM_BIDS};
@@ -61,3 +62,4 @@ pub use round::{
     RoundMix, RoundParamsError, NO_TRUMP, TRUMP_CYCLE_LEN,
 };
 pub use state::{BlobState, GamePhase, TrickRecord, MAX_PLAYERS, MIN_PLAYERS};
+pub use teacher::{fill_buffer, teacher_policy, teacher_round, TeacherConfig};

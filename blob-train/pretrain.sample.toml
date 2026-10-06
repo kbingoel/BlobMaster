@@ -1,0 +1,39 @@
+# `blobmaster-train pretrain` — the Phase-4 supervised warm start (gen-2.md §6).
+# Every key is shown at its default; leave out any you don't change.
+# Unknown keys are an error.
+
+[data]
+seed = 1
+rounds = 1000000            # teacher rounds played before training (~22 decisions each at 5p/7c)
+threads = 0                 # threads playing them; 0 = every core
+validation_fraction = 0.03  # rounds held out, split by round
+loader_threads = 4          # threads building batches while the GPU trains
+
+# Rule bot 2 plays and labels the rounds (blob-engine/src/teacher.rs).
+[teacher]
+rule_bot_share = 0.2  # chance a seat is the rule bot instead (per seat and round)
+explore = 0.1         # chance an unforced move is drawn from the teacher policy
+temperature = 1.0     # softmax over each move's expected points, in points
+argmax_weight = 0.5   # target weight on rule bot 2's own move; the softmax gets the rest
+
+[teacher.mix]
+players = [5]
+start_cards = 7
+large_round_exponent = 0.0  # 0 = real games' round mix
+
+# One learner step = one P update and one V update.
+[learner]
+device = "cuda"
+batch_size = 512
+steps = 30000
+warmup_steps = 1000
+peak_lr = 3e-4
+min_lr = 1e-5
+weight_decay = 1e-4
+augment = true  # random suit relabelling of every sampled example
+
+[log]
+every = 100              # a training row in metrics.jsonl
+eval_every = 2000        # a held-out row (validation vs an equal training sample); 0 = only at the end
+eval_examples = 20000    # per periodic held-out set; the final one uses every validation example
+checkpoint_every = 5000  # 0 = only at the end

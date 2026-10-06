@@ -1,6 +1,6 @@
 //! Output heads.
 //!
-//! Three independent heads read from the Transformer's `[B, S, 128]` output:
+//! P's two heads and V's head read the Transformer's `[B, S, 128]` output:
 //!
 //! - **Playing head** (entity-based): a shared MLP is applied to every hand
 //!   card token position to produce a scalar score. The caller passes a
@@ -10,13 +10,14 @@
 //! - **Bidding head**: reads the CLS token (position 0 in the encoder's
 //!   emit order) and produces logits over bids 0..=13. The caller supplies
 //!   a legal-bid mask of shape `[B, 14]`.
-//! - **Value head**: reads the CLS token and produces a scalar in `[-1, 1]`.
+//! - **Seat value head** (V): a shared MLP applied to every position gives
+//!   an expected ŝ in `[0, 1]`; it is read at the player tokens, one per
+//!   seat in relative-seat order.
 //!
-//! Phase dispatch is the caller's responsibility: the NN always computes a
-//! value, plus one of (bid policy, play policy). This module intentionally
-//! does not inspect `GamePhase` — the Transformer forward pass is identical
-//! regardless of phase, and the phase-specific head is chosen by the owner
-//! of the trained model.
+//! Phase dispatch is the caller's responsibility: P computes one of (bid
+//! policy, play policy). This module intentionally does not inspect
+//! `GamePhase` — the Transformer forward pass is identical regardless of
+//! phase, and the phase-specific head is chosen by the owner of the model.
 
 use tch::{nn, nn::Module, Kind, Tensor};
 
@@ -105,14 +106,16 @@ impl BiddingHead {
     }
 }
 
-/// Value head: CLS → MLP → scalar ∈ \[-1, 1\].
+/// V's head: one shared `Linear→GeLU→Linear→sigmoid` MLP on every
+/// position, an expected ŝ ∈ \[0, 1\] per token. Only the player tokens'
+/// values mean anything; the caller reads those.
 #[derive(Debug)]
-pub struct ValueHead {
+pub struct SeatValueHead {
     fc1: nn::Linear,
     fc2: nn::Linear,
 }
 
-impl ValueHead {
+impl SeatValueHead {
     pub fn new(vs: &nn::Path) -> Self {
         let lc = nn::LinearConfig::default();
         Self {
@@ -121,15 +124,15 @@ impl ValueHead {
         }
     }
 
-    /// Scalar value `[B]` ∈ [-1, 1].
+    /// Per-token logits `[B, S]`; the values are their sigmoid.
+    pub fn logits(&self, x: &Tensor, train: bool) -> Tensor {
+        let h = self.fc1.forward(x).gelu("none").dropout(HEAD_DROPOUT, train);
+        self.fc2.forward(&h).squeeze_dim(-1)
+    }
+
+    /// Per-token values `[B, S]` ∈ \[0, 1\].
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
-        let cls = x.select(1, 0); // [B, D]
-        let h = self
-            .fc1
-            .forward(&cls)
-            .gelu("none")
-            .dropout(HEAD_DROPOUT, train);
-        self.fc2.forward(&h).tanh().squeeze_dim(-1)
+        self.logits(x, train).sigmoid()
     }
 }
 
@@ -217,36 +220,17 @@ mod tests {
     }
 
     #[test]
-    fn value_head_in_tanh_range() {
+    fn seat_value_head_is_per_token_in_unit_range() {
         let vs = new_vs();
-        let head = ValueHead::new(&vs.root());
+        let head = SeatValueHead::new(&vs.root());
         let (b, s) = (4i64, 5i64);
         // Use large magnitudes to push toward saturation.
         let x = Tensor::randn([b, s, D_MODEL], (Kind::Float, Device::Cpu)) * 100.0;
         let v = head.forward(&x, false);
-        assert_eq!(v.size(), vec![b]);
+        assert_eq!(v.size(), vec![b, s]);
         let min = v.min().double_value(&[]);
         let max = v.max().double_value(&[]);
-        assert!(min >= -1.0 && max <= 1.0, "value out of [-1,1]: min={min} max={max}");
-    }
-
-    #[test]
-    fn total_param_count_matches_spec() {
-        // Full model (input + transformer + 3 heads) ≈ 1.63M params.
-        let vs = new_vs();
-        let root = vs.root();
-        let _ip = InputProjection::new(&(&root / "input"));
-        let _tr = TransformerEncoder::new(&(&root / "transformer"));
-        let _ph = PlayingHead::new(&(&root / "play_head"));
-        let _bh = BiddingHead::new(&(&root / "bid_head"));
-        let _vh = ValueHead::new(&(&root / "value_head"));
-
-        let total: i64 = vs.variables().values().map(|t| t.numel() as i64).sum();
-        // Spec: ~1.63M. Accept ±5%.
-        assert!(
-            (1_550_000..=1_710_000).contains(&total),
-            "full model param count {total} outside spec band (~1.63M)"
-        );
+        assert!(min >= 0.0 && max <= 1.0, "value out of [0,1]: min={min} max={max}");
     }
 
     #[test]
@@ -257,11 +241,10 @@ mod tests {
 
         let vs = new_vs();
         let root = vs.root();
-        let ip = InputProjection::new(&(&root / "input"));
-        let tr = TransformerEncoder::new(&(&root / "transformer"));
+        let ip = InputProjection::new(&(&root / "input"), false);
+        let tr = TransformerEncoder::new(&(&root / "transformer"), 8);
         let ph = PlayingHead::new(&(&root / "play_head"));
         let bh = BiddingHead::new(&(&root / "bid_head"));
-        let vh = ValueHead::new(&(&root / "value_head"));
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
         let mut s1 = new_game(4, 5).unwrap();
@@ -295,11 +278,5 @@ mod tests {
         let bid_mask = Tensor::ones([2, NUM_BIDS], (Kind::Bool, Device::Cpu));
         let bid_probs = bh.forward(&encoded, &bid_mask, false);
         assert_eq!(bid_probs.size(), vec![2, NUM_BIDS]);
-
-        let v = vh.forward(&encoded, false);
-        assert_eq!(v.size(), vec![2]);
-        let vmin = v.min().double_value(&[]);
-        let vmax = v.max().double_value(&[]);
-        assert!(vmin >= -1.0 && vmax <= 1.0);
     }
 }

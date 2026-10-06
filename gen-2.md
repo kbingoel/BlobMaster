@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-05: gen 1 is concluded; Phases 0–3 are done; next is Phase 4, two networks and a supervised warm start (§6).
+Status, 2026-10-05: gen 1 is concluded; Phases 0–3 are done. Phase 4, the supervised warm start, is built and measured: P alone matches rule bot 2 (+15.5 vs the rule bot), search adds 2.5–3 points at c_puct 0.2 (G2 passes), and V's correlation passes G1 but its 1-card exactness doesn't (§6). Next: decide on V's trick features (§8), then Phase 5, async self-play RL.
 
 ---
 
@@ -194,7 +194,7 @@ These hold for a model with d_model = 128, 8 layers and 1.63M parameters, on a R
 
 Training was **two thirds** of the iteration, mostly re-reading the same examples.
 
-**Training step:** about 150 ms per 512-sample step (bid and play sub-batches). That is far slower than the arithmetic needs. `nvidia-smi` showed 95–100% "utilization", but that only says a kernel was running, not that the GPU was compute-bound. Profile before optimizing (§8).
+**Training step:** about 150 ms per 512-sample step (bid and play sub-batches). That is far slower than the arithmetic needs. `nvidia-smi` showed 95–100% "utilization", but that only says a kernel was running, not that the GPU was compute-bound. Profiled in Phase 4 (as built, "Step cost"): the forward and backward passes are bound by activation memory traffic; the optimizer, clipping and batch building cost almost nothing.
 
 ### 3.2 Ruled out — don't retry unless the stated condition changes
 
@@ -234,7 +234,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 |---|---|
 | Game rules: `card`, `hand`, `state`, `dealing`, `bidding`, `playing`, `round`, `game` + 143 ported tests | Correct and fast. Add a helper that starts one round with given parameters (§5.2). `game.rs` and `cumulative_scores` stay because `bench` and `play` play whole games; no network input reads them |
 | `belief.rs` determinization | Fixed in Phase 1. Later: weight sampled deals by the observed bids (§8) |
-| `rule_bot.rs`, `rule_bot_2.rs` | Fixed yardsticks (never retune `rule_bot.rs`) and warm-start teachers. Rule bot 2: +14.5 ± 0.3 points/game vs the rule bot (5p/7c); `bid_chances` / `play_chances` give per-action scores for soft targets |
+| `rule_bot.rs`, `rule_bot_2.rs` | Fixed yardsticks (never retune `rule_bot.rs`) and warm-start teachers. Rule bot 2: +14.5 ± 0.3 points/game vs the rule bot (5p/7c); `bid_chances` / `play_chances` give per-action scores for soft targets; `teacher.rs` plays and labels the warm start's rounds (Phase 4) |
 | `bench.rs`, `blobmaster bench` | The §5.7 yardstick. Keeps playing whole games, so results stay comparable with §2 and with rule bot 2. Loads a gen-2 model directory (§5.3) |
 | `blobmaster play` | Human vs bots in the terminal; loads a gen-2 model directory |
 | `mcts.rs` skeleton: arena, UCB, lockstep batching, forced-move fast path, Dirichlet noise, τ split, tie-break, `signal_ratio` | Backup and leaf evaluation change (next table) |
@@ -255,7 +255,7 @@ Training was **two thirds** of the iteration, mostly re-reading the same example
 | `blob-nn` `model.rs` | P: today's net with the policy heads only. V: a new 4-layer net with an input projection for opponents' hand cards and a per-seat ŝ head |
 | `blob-nn` `train.rs` | LR schedule keyed to learner steps; per-seat value MSE on ŝ. `z_score_clip` and the value-head LR group go |
 | `blob-nn` `training_loop.rs`, `engine.rs`, `self_play.rs` | A learner module (seeded in Phase 2 as `blob_nn::learner` with the batch construction and held-out-loss code from `training_loop.rs`) and an actor module that plays single rounds (§5.2). Whole-game self-play, `backfill_values` and the synchronous iteration loop were deleted in Phase 2 |
-| `blob-train`: `main.rs`, `config.rs`, `config.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export` (working since Phase 2), on a new config schema. `evaluate`, `self-play`, `profile`, gen-1 `train` and the gen-1 config were deleted in Phase 2 |
+| `blob-train`: `main.rs`, `config.rs`, `pretrain.sample.toml` | Subcommands `pretrain` (Phase 4) and `train` (Phase 5) plus `export` (working since Phase 2), on a new config schema. `evaluate`, `self-play`, `profile`, gen-1 `train` and the gen-1 config were deleted in Phase 2 |
 | `scripts/export_onnx.py` | Exports P and V and writes the layout id into the ONNX metadata; `export_script_mirrors_feature_widths` covers both |
 | `scripts/visualize_strength.py`, `visualize_weight_evolution.py` | Read gen-2 metrics (keyed by learner step) and model directories; gen-1 formats dropped |
 | `blob-engine/benches/onnx_mcts.rs` | P + V search bench. Absorbs the cost-by-sequence-length measurement (`tokens`) from `diagnostics.rs` |
@@ -575,12 +575,12 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 - `export --check` on a random tch init: P 3.0e-5, over the 1e-5 gate (its inputs now use every token type; with the old all-CLS inputs it was 1.9e-5). V gives 1.2e-7 and a torch-initialized P 5e-7. The Rust policy parity on game states passes. Set the gate in Phase 4.
 - A random V predicts ŝ ≈ 0.5 for every seat, so search values stay near 0 except close to a round's end. The random-init bench numbers say nothing about the design; Phase 4 is its first measurement.
 
-**Phase 4 — Two networks + supervised warm start**
-- [ ] P and V models in tch (§5.3): P drops the gen-1 value head; V matches `export_onnx.py`'s `ValueNet`. The export loads V's weights too (it writes both nets, the layout id and the model directory since Phase 3); ONNX↔tch parity for V (P's runs since Phase 3).
-- [ ] Learner: alternating P / V steps from a buffer, LR keyed to learner steps, validation split by round, a metrics row every N steps, checkpoints. CLI: `blobmaster-train pretrain`.
-- [ ] Teacher data: rounds played by rule bot 2, with some rule-bot seats mixed in for variety, stored in the replay format. P imitates rule bot 2's `bid_chances` / `play_chances`; V learns the actual per-seat round scores.
-- [ ] G1 on held-out teacher rounds.
-- [ ] Bench P network-only and P + V with search, against the rule bot and against rule bot 2.
+**Phase 4 — Two networks + supervised warm start** (built and measured 2026-10-05; G2 passes, G1 half)
+- [x] P and V models in tch (§5.3): P drops the gen-1 value head; V matches `export_onnx.py`'s `ValueNet`. The export loads V's weights too (it writes both nets, the layout id and the model directory since Phase 3); ONNX↔tch parity for V (P's runs since Phase 3).
+- [x] Learner: alternating P / V steps from a buffer, LR keyed to learner steps, validation split by round, a metrics row every N steps, checkpoints. CLI: `blobmaster-train pretrain`.
+- [x] Teacher data: rounds played by rule bot 2, with some rule-bot seats mixed in for variety, stored in the replay format. P imitates rule bot 2's `bid_chances` / `play_chances`; V learns the actual per-seat round scores.
+- [x] G1 on held-out teacher rounds.
+- [x] Bench P network-only and P + V with search, against the rule bot and against rule bot 2.
 - *Exit:* G1 and G2 pass.
 - *Record:*
   - how much search adds over network-only (gen 1: about 4 points, §2.1);
@@ -588,9 +588,86 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
   - bids made by hand size, against both bots.
 - No RL yet. This phase measures the new value design and search on their own, which is what the dropped "per-round values in the gen-1 driver" step was meant to isolate.
 
+*Exit: G1 half met, G2 met with a lower c_puct (2026-10-05).*
+- **G1 — correlation passes, exactness fails.** V's correlation with the actual ŝ on every validation position is 0.769 (> 0.7). On 1-card rounds after bidding, where the deal decides the outcome, its RMSE is 0.129, not ≈ 0 (`pretrain` checks < 0.05). Diagnosis below.
+- **G2 — passes at c_puct 0.2, fails at the default 1.5.** On 128 fresh deals (`--seed 7`) against four rule bot 2s, search scores **+2.6 ± 1.0** and P alone **+0.1 ± 0.5**. At c_puct 1.5 search adds only +0.7 (+0.9 ± 0.8 vs +0.2 ± 0.7): P's priors outvote V. c_puct was picked on the default deals, so the fresh-deal run is the out-of-sample check.
+- **G3 already passes** at the warm start: search scores +17.0 ± 2.4 against the rule bot at c_puct 1.5, +19.1 ± 2.6 at 0.2.
+
+*Results* (run `checkpoints/pretrain-2026-10-05`, default config: 1M teacher rounds, 30k learner steps, 80 min; weights git-ignored, on this machine only):
+
+| Held out (every validation position; training sample of equal size) | validation | training sample |
+|---|---|---|
+| P bid cross-entropy / play cross-entropy | 0.187 / 0.666 | 0.187 / 0.667 |
+| P's top move = rule bot 2's, bids / plays | 0.992 / 0.967 | 0.992 / 0.967 |
+| V MSE (the targets' variance: 0.137) | 0.0560 | 0.0557 |
+| V correlation | 0.769 | 0.771 |
+| V RMSE, 1-card rounds after bidding | 0.129 | 0.131 |
+
+- **No memorization:** validation and training sample stayed within 0.001 of each other on every measurement, at every held-out row. P saw each of its 13.1M training positions about 1.2 times, V each of its 21.7M about 0.7 times (15.4M samples per net).
+- **The curves had flattened:** from step 20000 to 30000, V's MSE went 0.0571 → 0.0566 and its correlation 0.764 → 0.767.
+
+`bench`, 5 players / 7 cards, default seed; search at bids 20×25, plays 5×100:
+
+| Focal player | Opponents | Deals | Points/game | Bids made: 1 / 2–4 / 5–8 cards | 0-bids, 5–8 cards |
+|---|---|---|---|---|---|
+| rule bot 2 (the teacher) | rule bot | 128 | +15.2 ± 1.5 | 0.820 / 0.720 / 0.648 | 0.423 |
+| P, network only | rule bot | 128 | **+15.5 ± 1.5** | 0.820 / 0.720 / 0.649 | 0.423 |
+| P, network only | rule bot | 64 | +16.1 ± 2.4 | 0.810 / 0.727 / 0.657 | 0.433 |
+| P + V search, c_puct 1.5 | rule bot | 64 | +17.0 ± 2.4 | 0.807 / 0.733 / 0.664 | 0.432 |
+| P + V search, c_puct 0.2 | rule bot | 64 | **+19.1 ± 2.6** | 0.801 / 0.737 / 0.693 | 0.412 |
+| P, network only | rule bot 2 | 128 | −0.2 ± 0.5 | 0.785 / 0.688 / 0.576 | 0.382 |
+| P, network only | rule bot 2 | 64 | +0.2 ± 0.7 | 0.782 / 0.686 / 0.578 | 0.390 |
+| P + V search, c_puct 1.5 | rule bot 2 | 64 | +0.9 ± 0.8 | 0.779 / 0.690 / 0.588 | 0.390 |
+| same, plays 32×16, bids 64×8 | rule bot 2 | 64 | +0.3 ± 0.8 | 0.781 / 0.686 / 0.582 | 0.390 |
+| P + V search, c_puct 0.5 | rule bot 2 | 64 | +1.5 ± 1.4 | 0.770 / 0.694 / 0.602 | 0.389 |
+| P + V search, c_puct 0.2 | rule bot 2 | 64 | +2.7 ± 1.7 | 0.771 / 0.694 / 0.616 | 0.375 |
+| P + V search, c_puct 0.1 | rule bot 2 | 64 | +2.8 ± 1.6 | 0.769 / 0.687 / 0.623 | 0.354 |
+| P, network only, `--seed 7` | rule bot 2 | 128 | +0.1 ± 0.5 | 0.784 / 0.696 / 0.578 | 0.379 |
+| P + V search, c_puct 0.2, `--seed 7` | rule bot 2 | 128 | **+2.6 ± 1.0** | 0.768 / 0.705 / 0.615 | 0.373 |
+
+For scale, gen 1 final scored −12.1 (network) and −10.2 (search) against the rule bot (§2.1).
+
+*Findings:*
+- **P is a faithful copy of rule bot 2.** Against the rule bot it scores what its teacher does on the same deals (+15.5 vs +15.2), with the same bid statistics to the third decimal. Against rule bot 2 it is even. At step 10000 it was already +14.9 ± 1.5.
+- **What search adds over network-only:** +3.0 against the rule bot and +2.5 against rule bot 2 at c_puct 0.2, from bidding and playing larger hands better (5–8-card bids made: 0.616 vs 0.578 against rule bot 2). Gen 1's search added about 4 points, over a much weaker network. At c_puct 1.5 search adds under a point.
+- **Why c_puct matters this much:** the teacher target gives rule bot 2's move 0.5 plus its softmax share, and P learned it, so P's priors are sharp. With a top prior of 0.8 against 0.1, 100 simulations and c_puct 1.5, the other move only wins the visit count if V rates it ~0.2 higher in u: about 20 points more likely to make its bid. Spreading the same budget over more deals doesn't help (32×16 / 64×8: +0.3), because the visit counts still follow the priors. Lowering c_puct lets V's values decide.
+- **The 0-bid share is not a problem:** in 5–8-card rounds P bids 0 42% of the time against the rule bot, exactly as rule bot 2 does; search lowers it to 41%. Gen 1 bid 0 in 84% of those rounds.
+- **For Phase 5:** self-play turns visit counts into policy targets. At c_puct 1.5 they would be P's own priors, so RL would have nothing to learn. Use a lower c_puct in self-play (start at 0.2–0.5 and measure), or softer priors.
+- **V's 1-card errors** are not a data-share problem:
+  - By cards already in the trick, its 1-card MSE is 0.031, 0.025, 0.018, 0.009 and 0.000 for 0–4; no-trump rounds 0.044, trump rounds 0.010.
+  - A V trained only on 1-card positions (712k positions, 8000 steps of 256) plateaus at MSE 0.0105.
+  - Typical miss: no trump, I lead 8♥, an opponent holds 10♥, and V predicts that my 8♥ wins. V doesn't learn to compare an opponent's hand card with mine or with the led card.
+  - Opponents' hand-card tokens carry only rank, suit, owner and trump, while played cards carry led-suit and winning flags, and my hand cards legality and "beats the winner".
+  - Candidate fix (a layout change, so a retrain): give V-mode hand cards the full-information trick features — follows the led suit, beats the current winner, and its rank among the cards of its suit still held by anyone.
+
+*As built:*
+- **Teacher** (`blob-engine/src/teacher.rs`, `TeacherConfig`):
+  - Rounds come from a `RoundMix` (default 5p/7c, real games' mix). Each seat is rule bot 2, or the rule bot with chance `rule_bot_share` = 0.2. With chance `explore` = 0.1 an unforced move is drawn from the teacher policy instead.
+  - **Every decision is labelled with rule bot 2's policy, whoever played it**, so P also gets targets off rule bot 2's own path. The target puts `argmax_weight` = 0.5 on rule bot 2's move; the rest is a softmax at `temperature` = 1 point over each legal move's expected points: `(10 + b) · P(make b)` for a bid (`bid_chances`), `(10 + bid) · P(make)` after a card (`play_chances`). Its top move is always rule bot 2's.
+  - **Forced moves are stored.** V needs them: every play of a 1-card round is forced, and G1 measures exactly those. P's learner skips them (`learner::is_forced`); their loss is 0 whatever P outputs.
+  - `fill_buffer` plays on every core; round `i` is seeded from `(seed, i)`, so the buffer is the same on any thread count. 1M rounds (22.3M decisions) take 9.6 s.
+- **Networks** (`blob-nn` `model.rs`): `PolicyNet` is the input projection, 8 layers and the bid and play heads (1.62M parameters). `ValueNet` is the input projection plus `opp_hand_proj`, 4 layers and `SeatValueHead`, a per-token MLP with a sigmoid read at the player tokens (0.83M). `BlobNet`, gen 1's scalar value head, `z_score_clip`, the value-head LR group and the iteration-keyed LR schedule are gone.
+- **V's loss is sigmoid cross-entropy against ŝ**, a soft target in [0, 1], not MSE. Both are minimized by the expected ŝ, but under MSE the stability test's high learning rate pinned V's sigmoid at 0 for good (held-out MSE 0.41: predicting 0 everywhere). Held-out V is still reported as MSE.
+- **Learner** (`blob-nn` `learner.rs`, `train.rs`):
+  - `Learner` holds both nets, an AdamW each (weight decay 1e-4). One learner step is one P update (bid and play sub-batches, weighted by their sizes) and one V update, 512 examples each.
+  - LR: warm-up over 1000 steps, then cosine from 3e-4 to 1e-5 at the last step; a function of the step alone.
+  - Grad-norm clip 1.0 that keeps the norm on the GPU (tch's `clip_grad_norm` reads it back every step).
+  - Checkpoint: a directory with `policy.ot`, `value.ot` and `meta.json` (`learner_step`), written beside the old one and renamed in. Optimizer state isn't saved (tch can't); a resume restarts AdamW.
+  - Held-out: `policy_held_out` (cross-entropy and agreement with the target's top move, per phase) and `value_held_out` (MSE, the targets' variance, Pearson correlation over (state, seat) pairs, and MSE and max error in 1-card rounds after bidding).
+- **`blobmaster-train pretrain`** (`blob-train/src/pretrain.rs`; config sections `[data]`, `[teacher]`, `[learner]`, `[log]`, unknown keys rejected; `pretrain.sample.toml` is the defaults):
+  - teacher buffer → split by round (3% validation) → 4 loader threads build CPU batches while the GPU trains;
+  - `metrics.jsonl`: a training row every 100 steps (LR, mean training losses, steps/s, share of time waiting for batches) and a held-out row every 2000 steps (20k validation examples per net vs an equally large training sample);
+  - checkpoint every 5000 steps; at the end, the held-out measurement on every validation example (`held_out.json`, with G1) and the export to `<run>/model`;
+  - a `STOP` file saves and exits; `--resume` continues with the run's own `config.toml`, replaying the teacher data from the seed.
+- **`blob-train` links tch now.** `scripts/blobmaster-train.sh` runs it with the library path and the CUDA preload; the learner refuses `cuda` when libtorch has none, instead of falling back to the CPU.
+- **Export** (`scripts/export_onnx.py`): `--checkpoint <dir>` loads both nets strictly, and `meta.json` gets the learner step. `--check` now draws its random inputs uniformly from [0, 1], the encoder's range (they were N(0, 1)), and gates at 1e-5, relative above 1. A random *tch* init still fails it (P 2.1e-5: tch initializes with ~2.5× torch's weight scale); the Rust parity on game states is the authoritative gate (random init: P 3.3e-6, V 2.1e-6).
+- **Replay:** `sample_batch_from(slots, …)` samples from a subset (the training rounds). `sample_batch` draws with `rand::seq::index::sample` instead of scanning every slot, which cost O(buffer) per batch.
+- **Step cost** (profiled 2026-10-05, batch 512, RTX 4060): P forward + backward 84 ms, V 67 ms; AdamW and the clip ≈ 0; building a batch 4 ms on a loader thread; host → device 1.6 ms. So 6.4 learner steps/s with the GPU at 100%. Both passes are bound by memory traffic on activations (the 4060 has 272 GB/s), not by arithmetic or launches. fp16 autocast halves both (P 40 ms, V 36 ms) but tch has no gradient scaler, so it isn't used: the warm start fits in ~80 min, and Phase 5 is bound by CPU self-play (§5.8).
+
 **Phase 5 — Async self-play RL**
 - [ ] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train`.
 - [ ] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run.
+- [ ] Self-play search settings: the warm start's priors are sharp, and at c_puct 1.5 visit counts ≈ P's priors (Phase 4). Measure c_puct 0.2–0.5 in self-play before the short run.
 - [ ] Short run (a few hours, 5p7c) from the Phase-4 checkpoint.
 - [ ] First human playtest (`blobmaster play`).
 - *Exit:*
@@ -617,9 +694,9 @@ Delete gen-1 support in one pass, before any gen-2 code is written on top of it.
 | Gate | Measure | Pass |
 |---|---|---|
 | G0 yardstick | `bench`, gen-1 final, search | −9 ± 3 reproduced — **passed 2026-10-02: −10.2 ± 2.9**. Historic: gen-1 models are deleted in Phase 2 |
-| G1 value learnable | V on held-out teacher rounds (Phase 4) | correlation with the actual round outcome > 0.7; 1-card rounds after bidding ≈ exact |
-| G2 search helps | Phase-4 warm start: P + V with search vs P network-only, same deals | search clearly ahead (95% CIs separate) |
-| G3 beats the rule bot | search bench | ≥ +10 points/game |
+| G1 value learnable | V on held-out teacher rounds (Phase 4) | correlation with the actual round outcome > 0.7; 1-card rounds after bidding ≈ exact (`pretrain` checks RMSE < 0.05) — **half met 2026-10-05:** correlation 0.769, 1-card RMSE 0.129 (§6 Phase 4) |
+| G2 search helps | Phase-4 warm start: P + V with search vs P network-only, same deals | search clearly ahead (95% CIs separate) — **passed 2026-10-05 at c_puct 0.2:** +2.6 ± 1.0 vs +0.1 ± 0.5 against rule bot 2, fresh deals; not at c_puct 1.5 |
+| G3 beats the rule bot | search bench | ≥ +10 points/game — met by the warm start: +17.0 ± 2.4 (c_puct 1.5), +19.1 ± 2.6 (0.2) |
 | G4 RL adds strength | Phase-5 run, search bench | clearly above the Phase-4 warm start (CIs separate) and still rising; replay ratio on target |
 | G5 strong | long run, search bench | ≥ +20 points/game vs the rule bot; > 0 vs four rule-bot-2 opponents; human playtests |
 
@@ -638,7 +715,8 @@ G3 may already pass at the warm start: rule bot 2 itself scores +14.5. That is f
 - **Strategy fusion.** Inside a sampled deal, opponents act as if they see it. Mitigate with more deals and shallower search; information-set MCTS variants later.
 - **Game-aware objective.** Use the standings in the final rounds, e.g. through a standings-conditioned fine-tune.
 - **Opponent diversity.** Mix rule bots and past checkpoints into self-play, so the bot doesn't only learn to beat itself. Humans play differently.
-- **Training-step efficiency.** ~150 ms per 512 samples for 1.6M params is far above the arithmetic cost. Profile (kernel count, mixed precision, batch size) before buying hardware time.
+- **V's trick features** (Phase 4, G1). V doesn't learn to compare opponents' hand cards with mine or with the led card, even on 1-card positions alone. Giving V-mode hand cards the full-information trick features (follows the led suit, beats the current winner, rank among the cards of its suit still held) is a layout change and a retrain; cheapest before RL data exists.
+- **Training-step efficiency.** Profiled in Phase 4: P's forward + backward is 84 ms per 512 examples and V's 67 ms, bound by activation memory traffic. fp16 autocast halves both, but tch has no gradient scaler; worth adding (a manual loss scale, or bf16) only if the learner ever limits a run.
 - **Model size.** The GPU is mostly idle and CPU inference sets the limit (§5.8).
 - **Plan B.** DouZero-style "Deep Monte-Carlo": no search; learn Q(state, action) directly from round scores. Worth running as a comparison if search-based training stalls.
 - **Opponent modelling across rounds.** Learn each player's style during a game and use it in sampling, rollouts and (later) the networks. See §8.1.

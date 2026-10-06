@@ -1,0 +1,11 @@
+{
+  "layout_id": "layout-3",
+  "learner_step": 30000,
+  "checkpoint": "/home/kbuntu/Documents/Github/BlobMaster/checkpoints/pretrain-2026-10-05/checkpoint",
+  "policy": {
+    "layers": 8
+  },
+  "value": {
+    "layers": 4
+  }
+}

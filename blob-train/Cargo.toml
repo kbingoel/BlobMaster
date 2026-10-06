@@ -9,4 +9,12 @@ name = "blobmaster-train"
 path = "src/main.rs"
 
 [dependencies]
+blob-engine = { path = "../blob-engine" }
+blob-nn = { path = "../blob-nn" }
 clap = { version = "4", features = ["derive"] }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tch = "0.20"
+toml = "0.8"

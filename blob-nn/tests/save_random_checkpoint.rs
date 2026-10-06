@@ -1,12 +1,10 @@
-//! Helper: save a random-init BlobNet to a directory specified by
+//! Helper: save a random-init P and V checkpoint to the directory in
 //! `BLOB_SAVE_CKPT_DIR`. Only runs when the env var is set.
 //!
 //! `cargo test -p blob-nn --release --test save_random_checkpoint -- --ignored save_random_init`
 
-use std::path::PathBuf;
-
-use blob_nn::model::BlobNet;
-use blob_nn::train::save_checkpoint;
+use blob_nn::model::{PolicyNet, ValueNet};
+use blob_nn::train::{save_checkpoint, CheckpointMeta};
 use tch::{nn::VarStore, Device};
 
 #[test]
@@ -17,8 +15,8 @@ fn save_random_init() {
         return;
     };
     tch::manual_seed(0);
-    let vs = VarStore::new(Device::Cpu);
-    let _ = BlobNet::new(&vs.root());
-    save_checkpoint(&vs, 0, PathBuf::from(&dir)).expect("save");
+    let (p, v) = (VarStore::new(Device::Cpu), VarStore::new(Device::Cpu));
+    let _ = (PolicyNet::new(&p.root()), ValueNet::new(&v.root()));
+    save_checkpoint(&dir, &p, &v, CheckpointMeta { learner_step: 0 }).expect("save");
     eprintln!("[save_random_init] wrote checkpoint to {dir}");
 }

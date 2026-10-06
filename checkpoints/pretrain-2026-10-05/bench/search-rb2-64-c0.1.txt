@@ -1,0 +1,17 @@
+focal     search bids 20x25, plays 5x100, c_puct 0.1 checkpoints/pretrain-2026-10-05/model
+opponents 4x rule bot 2
+table     5 players, 7 start cards; 64 deals x 5 seats = 320 games in 479 s
+
+points/game  focal 122.0  opponents 119.1  diff +2.8 ± 1.6 (95% CI over deals)
+win share    0.232 ± 0.038 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          1600   0.769    0.743      0.785       0.734
+2-4 cards       1920   0.687    0.656      0.685       0.558
+5-8 cards       1920   0.623    0.354      0.569       0.391
+all             5440   0.689    0.575      0.674       0.551
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.003  0.094  0.689  0.170  0.037  0.006
+opponents     0.000  0.000  0.106  0.674  0.169  0.042  0.009
+

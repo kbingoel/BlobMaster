@@ -1,8 +1,9 @@
 //! Pre-norm Transformer encoder.
 //!
-//! Stacks 8 identical blocks of the form
+//! Stacks identical blocks of the form
 //! `x + MHA(LN(x))` then `x + FFN(LN(x))`
-//! over the `[B, S, 128]` tensor produced by the input projection.
+//! over the `[B, S, 128]` tensor produced by the input projection: 8 for P,
+//! 4 for V (`model.rs`).
 //!
 //! Multi-head self-attention is implemented manually rather than via
 //! `tch::nn::MultiheadAttention` so that the key-padding mask can be
@@ -15,7 +16,6 @@ pub const D_MODEL: i64 = 128;
 pub const N_HEADS: i64 = 8;
 pub const HEAD_DIM: i64 = D_MODEL / N_HEADS; // 16
 pub const FFN_DIM: i64 = 512;
-pub const N_LAYERS: usize = 8;
 pub const DROPOUT: f64 = 0.1;
 pub const LN_EPS: f64 = 1e-5;
 
@@ -127,15 +127,15 @@ impl EncoderBlock {
     }
 }
 
-/// Stack of `N_LAYERS` pre-norm Transformer encoder blocks.
+/// Stack of pre-norm Transformer encoder blocks, `layer0`, `layer1`, ….
 #[derive(Debug)]
 pub struct TransformerEncoder {
     layers: Vec<EncoderBlock>,
 }
 
 impl TransformerEncoder {
-    pub fn new(vs: &nn::Path) -> Self {
-        let layers = (0..N_LAYERS)
+    pub fn new(vs: &nn::Path, n_layers: usize) -> Self {
+        let layers = (0..n_layers)
             .map(|i| EncoderBlock::new(&(vs / format!("layer{i}"))))
             .collect();
         Self { layers }
@@ -159,7 +159,7 @@ mod tests {
 
     fn make_enc() -> (VarStore, TransformerEncoder) {
         let vs = VarStore::new(Device::Cpu);
-        let enc = TransformerEncoder::new(&vs.root());
+        let enc = TransformerEncoder::new(&vs.root(), 8);
         (vs, enc)
     }
 
