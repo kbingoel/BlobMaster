@@ -6,11 +6,15 @@
 //!   starts it, restarts it if it dies, and stops it by closing its stdin):
 //!   `run.actors` threads play single rounds with P + V search and write
 //!   them to `replay/` in chunks. It plays the model named in `model.json`.
+//!   With `rollout.actors` it also plays rollout rounds (policy iteration
+//!   by rollouts, `blob_engine::rollout`) into `replay-pi/`; P then trains
+//!   on those instead of on search targets, and `run.actors` may be 0.
 //! - **This process** (libtorch):
 //!   - **ingest** tails `replay/` and splits the rounds by round id into the
 //!     training and validation buffers; with `value_stream.actors`, it also
 //!     reads (and deletes) `replay-v/`, the rounds of P alone for V, into
-//!     their own pair of buffers;
+//!     their own pair of buffers; with `rollout.actors`, `replay-pi/` into
+//!     the rollout buffers (and each valued move's next state into V's);
 //!   - **loaders** build batches from the training buffer, P's from the
 //!     decisions with a choice;
 //!   - **learner** (the main thread, GPU): one P and one V update per step,
@@ -49,19 +53,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blob_engine::bench::DEFAULT_SEED;
 use blob_engine::mcts::OneCardBids;
+use blob_engine::replay::{Decision, SparsePolicy};
+use blob_engine::rollout::{PiReplay, RolloutStats};
 use blob_engine::selfplay::{
-    chunk_files, chunk_files_in, read_chunk, read_json, write_json, ActorsConfig, ModelPointer, ACTORS_CONFIG_FILE,
-    MODEL_POINTER_FILE, REPLAY_DIR, SELFPLAY_BUCKETS, VALUE_REPLAY_DIR,
+    chunk_files, chunk_files_in, read_chunk, read_json, read_rollout_chunk, write_json, ActorsConfig, ModelPointer,
+    ACTORS_CONFIG_FILE, MODEL_POINTER_FILE, REPLAY_DIR, ROLLOUT_REPLAY_DIR, SELFPLAY_BUCKETS, VALUE_REPLAY_DIR,
 };
 use blob_engine::{fill_buffer, BlobState, GamePhase, ReplayBuffer, SelfPlayStats, SharedReplay, TeacherConfig};
 use blob_nn::learner::{
-    bid_policy_batch, is_forced, is_validation_round, play_policy_batch, value_batch, Learner, StepBatches,
+    bid_policy_batch, is_forced, is_validation_round, play_policy_batch, value_batch, FrozenPolicy, Learner, PiStep,
+    StepBatches,
 };
 use blob_nn::train::{policy_probs, recover_checkpoint, ValueBatch};
 use rand::seq::index;
@@ -146,6 +153,14 @@ struct Shared {
     vrounds: AtomicU64,
     vsamples: AtomicU64,
     vwindow: Mutex<(u64, u64)>,
+    /// Rollout samples (`rollout`): their buffers, training samples
+    /// produced, rounds read, and their statistics since the last
+    /// self-play row.
+    rtrain: RwLock<PiReplay>,
+    rvalid: RwLock<PiReplay>,
+    rproduced: AtomicU64,
+    rrounds: AtomicU64,
+    rwindow: Mutex<RolloutStats>,
     /// The fixed V check (`eval.value_rounds_from`), if any.
     fixed: Option<FixedRounds>,
     /// The learner's V update count at the last publish: V-only updates
@@ -184,6 +199,16 @@ fn unix_secs() -> f64 {
 impl Shared {
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// P trains on rollout samples, not on search targets.
+    fn pi_on(&self) -> bool {
+        self.cfg.rollout.actors > 0
+    }
+
+    /// V has its own buffers: the V stream, or the rollouts' next states.
+    fn v_on(&self) -> bool {
+        self.cfg.value_stream.actors > 0 || (self.pi_on() && self.cfg.rollout.value_children)
     }
 
     fn secs(&self) -> f64 {
@@ -404,16 +429,72 @@ fn ingest_value(sh: &Shared) -> usize {
     read
 }
 
+/// Load the chunks of `replay-pi/` into the rollout buffers and delete
+/// them; with `rollout.value_children`, the state after each valued move
+/// goes to V's buffers with its outcome. Returns the chunks read.
+fn ingest_rollout(sh: &Shared) -> usize {
+    let fraction = sh.cfg.replay.validation_fraction;
+    let children = sh.cfg.rollout.value_children;
+    let mut read = 0;
+    for (_, path) in chunk_files_in(&sh.dir, ROLLOUT_REPLAY_DIR) {
+        let chunk = read_rollout_chunk(&path);
+        let _ = std::fs::remove_file(&path);
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                sh.event(format!("skipping {e}"));
+                continue;
+            }
+        };
+        for r in chunk.rounds {
+            let valid = is_validation_round(r.id, fraction);
+            let (n, mut kids) = (r.samples.len() as u64, 0u64);
+            for smp in r.samples {
+                if children {
+                    for (state, points) in smp.children() {
+                        let d = Decision { state, policy: SparsePolicy::from_slice(&[(0u8, 1.0f32)]) };
+                        if valid {
+                            sh.vvalid.push_scored(&[d], points);
+                        } else {
+                            sh.vtrain.push_scored(&[d], points);
+                            kids += 1;
+                        }
+                    }
+                }
+                if valid {
+                    sh.rvalid.write().unwrap().push(r.id, smp);
+                } else {
+                    sh.rtrain.write().unwrap().push(r.id, smp);
+                }
+            }
+            if !valid {
+                sh.rproduced.fetch_add(n, SeqCst);
+                sh.vproduced.fetch_add(kids, SeqCst);
+            }
+            sh.rrounds.fetch_add(1, SeqCst);
+        }
+        sh.rwindow.lock().unwrap().merge(&chunk.stats);
+        read += 1;
+    }
+    read
+}
+
 fn ingest(sh: Arc<Shared>, mut next_id: u64) {
     while !sh.ingest_done.load(SeqCst) {
-        if ingest_new(&sh, &mut next_id) + ingest_value(&sh) == 0 {
+        if ingest_new(&sh, &mut next_id) + ingest_value(&sh) + ingest_rollout(&sh) == 0 {
             thread::sleep(Duration::from_secs(1));
         }
     }
     ingest_new(&sh, &mut next_id);
 }
 
-fn loader(sh: Arc<Shared>, tx: SyncSender<StepBatches>, seed: u64) {
+/// One learner step's batches: search targets, or rollout samples.
+enum Batches {
+    Search(StepBatches),
+    Pi(PiStep),
+}
+
+fn loader(sh: Arc<Shared>, tx: SyncSender<Batches>, seed: u64) {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let (n, augment) = (sh.cfg.learner.batch_size, sh.cfg.learner.augment);
     loop {
@@ -428,7 +509,30 @@ fn loader(sh: Arc<Shared>, tx: SyncSender<StepBatches>, seed: u64) {
             let buf = sh.train.read();
             (buf.sample_batch_where(n, &mut rng, augment, |s| !is_forced(s)), buf.sample_batch(n, &mut rng, augment))
         };
-        if tx.send(StepBatches::build(&p, &v, Device::Cpu)).is_err() {
+        if tx.send(Batches::Search(StepBatches::build(&p, &v, Device::Cpu))).is_err() {
+            return;
+        }
+    }
+}
+
+/// Policy-iteration batches: rollout samples for P, and V's batch from its
+/// own buffers once they hold `value_stream.min_examples` states.
+fn pi_loader(sh: Arc<Shared>, tx: SyncSender<Batches>, seed: u64) {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let (n, augment) = (sh.cfg.learner.batch_size, sh.cfg.learner.augment);
+    let lambda = sh.cfg.selfplay.search.lambda;
+    loop {
+        if sh.stop.load(SeqCst) {
+            return;
+        }
+        if sh.rtrain.read().unwrap().len() < sh.cfg.rollout.min_examples {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let p = sh.rtrain.read().unwrap().sample_batch(n, &mut rng, augment, lambda);
+        let v = (sh.v_on() && sh.vtrain.len() >= sh.cfg.value_stream.min_examples)
+            .then(|| sh.vtrain.read().sample_batch(n, &mut rng, augment));
+        if tx.send(Batches::Pi(PiStep::build(&p, v.as_ref(), Device::Cpu))).is_err() {
             return;
         }
     }
@@ -622,7 +726,7 @@ fn pick_where(buf: &ReplayBuffer, n: usize, rng: &mut Xoshiro256PlusPlus, keep: 
 
 /// Held out: self-play validation rounds against an equal sample of
 /// training rounds, and the teacher probe set.
-fn held_out(sh: &Shared, l: &Learner, probe: &Probe, rng: &mut Xoshiro256PlusPlus) -> Value {
+fn held_out(sh: &Shared, l: &Learner, probe: &Probe, start: Option<&FrozenPolicy>, rng: &mut Xoshiro256PlusPlus) -> Value {
     let chunk = probe.chunk;
     let n = sh.cfg.log.eval_examples;
     let (valid, train) = {
@@ -657,6 +761,26 @@ fn held_out(sh: &Shared, l: &Learner, probe: &Probe, rng: &mut Xoshiro256PlusPlu
             json!({ "validation": l.value_held_out(&vb, &vv, chunk), "train_sample": l.value_held_out(&tb, &tv, chunk) })
         }
     };
+    // Policy iteration: rollout validation samples against an equal training
+    // sample, and the newest validation samples (the latest models' play).
+    let rollout = {
+        let (vb, tb) = (sh.rvalid.read().unwrap(), sh.rtrain.read().unwrap());
+        if vb.is_empty() || tb.is_empty() {
+            Value::Null
+        } else {
+            let (t, eps, lambda) = (sh.cfg.rollout.temperature, sh.cfg.rollout.epsilon, sh.cfg.selfplay.search.lambda);
+            let mut vv: Vec<usize> = index::sample(rng, vb.len(), n.min(vb.len())).into_vec();
+            vv.sort_unstable();
+            let mut tv: Vec<usize> = index::sample(rng, tb.len(), vv.len().min(tb.len())).into_vec();
+            tv.sort_unstable();
+            let recent = vb.recent((n / 4).max(1));
+            json!({
+                "validation": l.pi_held_out(&vb, &vv, chunk, t, eps, lambda, None),
+                "train_sample": l.pi_held_out(&tb, &tv, chunk, t, eps, lambda, None),
+                "recent": l.pi_held_out(&vb, &recent, chunk, t, eps, lambda, start),
+            })
+        }
+    };
     json!({
         "kind": "held_out",
         "step": l.step,
@@ -666,6 +790,7 @@ fn held_out(sh: &Shared, l: &Learner, probe: &Probe, rng: &mut Xoshiro256PlusPlu
         "train_sample": train,
         "teacher_probe": teacher,
         "value_stream": stream,
+        "rollout": rollout,
         "fixed_value": sh.fixed.as_ref().map_or(Value::Null, |f| f.measure(l, chunk)),
     })
 }
@@ -677,13 +802,22 @@ fn num(v: &Value) -> String {
 fn short_held_out(r: &Value) -> String {
     let (v, t, p) = (&r["validation"], &r["train_sample"], &r["teacher_probe"]);
     let fixed = &r["fixed_value"];
+    let ro = &r["rollout"];
     let extra = format!(
-        "; fixed V mse {} (bids {}, plays {}); V stream mse {} / {}",
+        "; fixed V mse {} (bids {}, plays {}); V stream mse {} / {}; rollouts: gain bids {} plays {} (newest {} / {}), over the start {} / {}, V's pick {} / {}",
         num(&fixed["all"]["mse"]),
         num(&fixed["bids"]["mse"]),
         num(&fixed["plays"]["mse"]),
         num(&r["value_stream"]["validation"]["mse"]),
         num(&r["value_stream"]["train_sample"]["mse"]),
+        num(&ro["validation"]["bids"]["gain"]),
+        num(&ro["validation"]["plays"]["gain"]),
+        num(&ro["recent"]["bids"]["gain"]),
+        num(&ro["recent"]["plays"]["gain"]),
+        num(&ro["recent"]["bids"]["gain_vs_start"]),
+        num(&ro["recent"]["plays"]["gain_vs_start"]),
+        num(&ro["validation"]["bids"]["v_gain"]),
+        num(&ro["validation"]["plays"]["v_gain"]),
     );
     format!(
         "P bid {} / {}, play {} / {}, top = search's {} / {}; V mse {} / {} (var {}), corr {} / {}; teacher probe: P top = rule bot 2's {} / {}, V last-trick mse {}",
@@ -708,15 +842,15 @@ fn publish(sh: &Shared, l: &Learner, tx: &Sender<(u64, PathBuf)>) -> Result<(), 
 fn learn(
     sh: &Shared,
     l: &mut Learner,
-    rx: &Receiver<StepBatches>,
+    rx: &Receiver<Batches>,
     vrx: &Receiver<ValueBatch>,
     probe: &Probe,
     init: &ProbeOut,
+    start: Option<&FrozenPolicy>,
     pub_tx: &Sender<(u64, PathBuf)>,
 ) -> Result<(), String> {
     let cfg = &sh.cfg;
     let b = cfg.learner.batch_size as f64;
-    let ratio = cfg.replay.replay_ratio;
     let start_step = l.step;
     let start_value_updates = l.value_updates;
     let resumed = start_step > 0;
@@ -732,7 +866,8 @@ fn learn(
     // The starting held-out row comes before any update, P's or V's.
     let mut first_row = resumed;
     let mut prev = probe.outputs(l);
-    let v_on = cfg.value_stream.actors > 0;
+    let v_on = sh.v_on();
+    let pi_on = sh.pi_on();
     let (mut vo_sum, mut vo_n, mut vo_time) = (zero(), 0u32, 0.0f64);
     let mut lr = l.lr();
     // A training row every `log.every` learner steps, and at least every
@@ -740,10 +875,20 @@ fn learn(
     // time before P's first step).
     let row_secs = 120.0;
     while !sh.stop.load(SeqCst) {
-        let produced = sh.produced.load(SeqCst) as f64;
-        let ready = sh.train.len() >= cfg.replay.min_examples;
+        // P's data and its governor: rollout samples, or search targets.
+        let (produced, have, need, ratio) = if pi_on {
+            let r = &cfg.rollout;
+            (sh.rproduced.load(SeqCst) as f64, sh.rtrain.read().unwrap().len(), r.min_examples, r.ratio)
+        } else {
+            (sh.produced.load(SeqCst) as f64, sh.train.len(), cfg.replay.min_examples, cfg.replay.replay_ratio)
+        };
+        let ready = have >= need;
         let mut stepped = false;
-        if !ready || sh.paused.load(SeqCst) || (l.step + 1) as f64 * b > ratio * produced {
+        // Rollout buffers start empty on a resume: count P's samples from
+        // this start (search's buffer reloads, so its count spans the run).
+        let steps = l.step - if pi_on { start_step } else { 0 };
+        let per_step = if pi_on { b * cfg.rollout.micro_batches.max(1) as f64 } else { b };
+        if !ready || sh.paused.load(SeqCst) || (steps + 1) as f64 * per_step > ratio * produced {
             // P waits for search data: V learns from the rounds of P alone
             // meanwhile, within its own ratio cap, from the start.
             let v_room = (sh.vsamples.load(SeqCst) as f64 + b) <= cfg.value_stream.ratio * sh.vproduced.load(SeqCst) as f64;
@@ -751,7 +896,7 @@ fn learn(
             if let Some(vb) = vb {
                 if !first_row {
                     first_row = true;
-                    let row = held_out(sh, l, probe, &mut rng);
+                    let row = held_out(sh, l, probe, start, &mut rng);
                     eprintln!("[train] step {} (before any update): {}", l.step, short_held_out(&row));
                     sh.log(&row);
                     sh.status.lock().unwrap().held_out = row;
@@ -770,17 +915,19 @@ fn learn(
                 thread::sleep(Duration::from_millis(if v_on && first_row { 5 } else { 50 }));
                 gov_wait += w.elapsed().as_secs_f64();
                 if !ready {
-                    sh.set_phase(&format!("waiting for data ({} / {} training examples)", sh.train.len(), cfg.replay.min_examples));
+                    let what = if pi_on { "rollout samples" } else { "training examples" };
+                    sh.set_phase(&format!("waiting for data ({have} / {need} {what})"));
                 }
             }
         } else {
             if !training {
                 training = true;
                 sh.set_phase("training");
-                sh.event(format!("learner starts at step {} on {} training examples", l.step, sh.train.len()));
+                let what = if pi_on { "rollout samples" } else { "training examples" };
+                sh.event(format!("learner starts at step {} on {have} {what}", l.step));
                 if !first_row {
                     first_row = true;
-                    let row = held_out(sh, l, probe, &mut rng);
+                    let row = held_out(sh, l, probe, start, &mut rng);
                     eprintln!("[train] step {}: {}", l.step, short_held_out(&row));
                     sh.log(&row);
                     sh.status.lock().unwrap().held_out = row;
@@ -795,7 +942,20 @@ fn learn(
             let w = Instant::now();
             let batches = rx.recv().map_err(|_| "batch loaders stopped".to_string())?;
             load_wait += w.elapsed().as_secs_f64();
-            let (p, v) = l.train_on(&batches.to_device(device));
+            let (p, v) = match batches {
+                Batches::Search(b) => l.train_on(&b.to_device(device)),
+                Batches::Pi(b) => {
+                    // `rollout.micro_batches` batches per P update.
+                    let mut parts = vec![b.to_device(device)];
+                    while parts.len() < cfg.rollout.micro_batches.max(1) {
+                        match rx.recv().map_err(|_| "batch loaders stopped".to_string())? {
+                            Batches::Pi(b) => parts.push(b.to_device(device)),
+                            Batches::Search(_) => unreachable!("one kind of loader per run"),
+                        }
+                    }
+                    l.train_pi_on(&parts, cfg.rollout.temperature, cfg.rollout.epsilon)
+                }
+            };
             p_sum += p.unwrap_or_else(zero);
             v_sum += v.unwrap_or_else(zero);
             n += 1;
@@ -821,7 +981,7 @@ fn learn(
                 "governor_wait": gov_wait / secs,
                 "loader_wait": load_wait / secs,
                 "examples_produced": produced,
-                "replay_ratio": step as f64 * b / produced.max(1.0),
+                "replay_ratio": (step - if pi_on { start_step } else { 0 }) as f64 * per_step / produced.max(1.0),
                 "train_examples": sh.train.len(),
                 "valid_examples": sh.valid.len(),
                 "model_step": sh.state.lock().unwrap().model_step,
@@ -833,6 +993,8 @@ fn learn(
                 "value_stream_produced": vproduced,
                 "value_stream_ratio": sh.vsamples.load(SeqCst) as f64 / vproduced.max(1.0),
                 "value_stream_examples": sh.vtrain.len(),
+                "rollout_produced": sh.rproduced.load(SeqCst),
+                "rollout_examples": sh.rtrain.read().unwrap().len(),
             });
             eprintln!(
                 "[train] step {step} lr {lr:.2e}: P {:.4}, V {:.4}; {:.0} steps/h, replay ratio {:.2}, governor wait {:.0}%; V-only {:.0}/h, V-only loss {:.4}",
@@ -851,7 +1013,7 @@ fn learn(
         }
         let t = Instant::now();
         if stepped && step.is_multiple_of(cfg.log.eval_every) {
-            let row = held_out(sh, l, probe, &mut rng);
+            let row = held_out(sh, l, probe, start, &mut rng);
             eprintln!("[train] step {step}: {}", short_held_out(&row));
             sh.log(&row);
             sh.status.lock().unwrap().held_out = row;
@@ -873,7 +1035,7 @@ fn learn(
     }
     // The run's last held-out row, before the final publish.
     if sh.finish.load(SeqCst) && first_row {
-        let row = held_out(sh, l, probe, &mut rng);
+        let row = held_out(sh, l, probe, start, &mut rng);
         eprintln!("[train] step {} (final): {}", l.step, short_held_out(&row));
         sh.log(&row);
         sh.status.lock().unwrap().held_out = row;
@@ -1101,25 +1263,31 @@ fn net_search_deals_name(sh: &Shared) -> String {
 
 fn net_benches(sh: &Shared, step: u64, model: &Path) {
     let e = &sh.cfg.eval;
-    let on_search_deals = net_search_deals_name(sh);
-    for (name, opponent, deals, seed) in [
-        ("net-rb2", "rulebot2", e.net_deals_rule_bot_2, DEFAULT_SEED),
-        ("net-rb", "rulebot", e.net_deals_rule_bot, DEFAULT_SEED),
+    let start_model = std::fs::canonicalize(&sh.cfg.run.init_model).unwrap_or_else(|_| PathBuf::from(&sh.cfg.run.init_model));
+    let benches = [
+        ("net-rb2".to_string(), "rulebot2".to_string(), e.net_deals_rule_bot_2, DEFAULT_SEED),
+        ("net-rb".to_string(), "rulebot".to_string(), e.net_deals_rule_bot, DEFAULT_SEED),
         // The search bench's deals: search's margin over P alone, paired.
-        (on_search_deals.as_str(), "rulebot2", e.search_deals, e.search_seed),
-    ] {
+        (net_search_deals_name(sh), "rulebot2".to_string(), e.search_deals, e.search_seed),
+        // Four copies of the run's starting P: progress in self-play's
+        // own setting (the start scores 0 there).
+        ("net-vs0".to_string(), start_model.to_string_lossy().to_string(), if step > 0 { e.net_deals_vs_start } else { 0 }, DEFAULT_SEED),
+    ];
+    for (name, opponent, deals, seed) in benches {
         if deals == 0 {
             continue;
         }
         let mut baselines = vec![];
+        let start = sh.path("bench").join(format!("{name}-step-000000.csv"));
         if step > 0 {
-            let start = sh.path("bench").join(format!("{name}-step-000000.csv"));
-            if let Some(p) = previous_csv(sh, name, step).filter(|p| *p != start) {
+            if let Some(p) = previous_csv(sh, &name, step).filter(|p| *p != start) {
                 baselines.push(("previous".to_string(), p));
             }
-            baselines.insert(0, ("start".to_string(), start));
+            if start.is_file() {
+                baselines.insert(0, ("start".to_string(), start));
+            }
         }
-        bench(sh, step, name, model, "network", opponent, deals, seed, Some(e.threads), &[], &baselines);
+        bench(sh, step, &name, model, "network", &opponent, deals, seed, Some(e.threads), &[], &baselines);
     }
 }
 
@@ -1158,7 +1326,12 @@ fn search_vs_p(sh: &Shared, step: u64, model: &Path) {
 
 fn evaluator(sh: Arc<Shared>, rx: Receiver<(u64, PathBuf)>) {
     let e = &sh.cfg.eval;
-    for (step, model) in rx {
+    while let Ok(mut next) = rx.recv() {
+        // Publishes can come faster than the benches run: bench the newest.
+        while let Ok(newer) = rx.try_recv() {
+            next = newer;
+        }
+        let (step, model) = next;
         if sh.stop.load(SeqCst) && !sh.finish.load(SeqCst) {
             continue;
         }
@@ -1192,7 +1365,17 @@ fn phase_stats(p: &blob_engine::selfplay::PhaseStats) -> Value {
     })
 }
 
-fn selfplay_row(sh: &Shared, w: &SelfPlayStats, vw: (u64, u64), secs: f64) -> Value {
+fn rollout_phase(rw: &RolloutStats, k: usize) -> Value {
+    let n = rw.samples[k].max(1) as f64;
+    json!({
+        "samples": rw.samples[k],
+        "moves_per_sample": rw.moves[k] as f64 / n,
+        "top_not_best": rw.top_not_best[k] as f64 / n,
+        "hindsight": rw.hindsight_sum[k] / n,
+    })
+}
+
+fn selfplay_row(sh: &Shared, w: &SelfPlayStats, vw: (u64, u64), rw: &RolloutStats, secs: f64) -> Value {
     let share = |x: u64, n: u64| if n > 0 { x as f64 / n as f64 } else { f64::NAN };
     json!({
         "kind": "selfplay",
@@ -1218,6 +1401,15 @@ fn selfplay_row(sh: &Shared, w: &SelfPlayStats, vw: (u64, u64), secs: f64) -> Va
             "rounds_total": sh.vrounds.load(SeqCst),
             "train_states": sh.vtrain.len(),
             "valid_states": sh.vvalid.len(),
+        },
+        "rollout": {
+            "rounds_per_hour": rw.rounds as f64 / secs * 3600.0,
+            "samples_per_hour": (rw.samples[0] + rw.samples[1]) as f64 / secs * 3600.0,
+            "bid": rollout_phase(rw, 0),
+            "play": rollout_phase(rw, 1),
+            "rounds_total": sh.rrounds.load(SeqCst),
+            "train_samples": sh.rtrain.read().unwrap().len(),
+            "valid_samples": sh.rvalid.read().unwrap().len(),
         },
     })
 }
@@ -1298,15 +1490,26 @@ fn render_status(sh: &Shared) -> String {
             f(&l["policy_loss"], 4),
             f(&l["value_loss"], 4),
             f(&l["replay_ratio"], 2),
-            cfg.replay.replay_ratio,
+            if cfg.rollout.actors > 0 { cfg.rollout.ratio } else { cfg.replay.replay_ratio },
             f(&l["steps_per_hour"], 0),
             pct(&l["governor_wait"]),
             model_step,
         ));
-        if cfg.value_stream.actors > 0 {
+        if cfg.rollout.actors > 0 {
             w(String::new());
             w(format!(
-                "V stream (rounds of P alone): {} V-only updates/h (GPU {} of the time), V loss {} · ratio {} (cap {}) · buffer {} states",
+                "P trains on rollouts (T {}, ε {}): {} samples produced, buffer {} · replay ratio cap {}.",
+                cfg.rollout.temperature,
+                cfg.rollout.epsilon,
+                l["rollout_produced"],
+                l["rollout_examples"],
+                cfg.rollout.ratio,
+            ));
+        }
+        if sh.v_on() {
+            w(String::new());
+            w(format!(
+                "V's own buffer (V stream, rollout next states): {} V-only updates/h (GPU {} of the time), V loss {} · ratio {} (cap {}) · buffer {} states",
                 f(&l["value_only_steps_per_hour"], 0),
                 pct(&l["value_only_busy"]),
                 f(&l["value_only_loss"], 4),
@@ -1339,6 +1542,30 @@ fn render_status(sh: &Shared) -> String {
             w(row("V stream: targets' variance", &vs["validation"]["variance"], &vs["train_sample"]["variance"]));
         }
         w(String::new());
+        let ro = &h["rollout"];
+        if !ro.is_null() {
+            let (rv, rt, rn) = (&ro["validation"], &ro["train_sample"], &ro["recent"]);
+            w("Rollout samples (utility units on each sample's own deal; gain = P's top move minus the playing P's, the rest of the round by that P):".into());
+            w(String::new());
+            w("| | validation | training sample | newest validation |".into());
+            w("|---|---|---|---|".into());
+            let pm = |v: &Value| format!("{} ± {}", f(&v["gain"], 4), f(&v["gain_ci"], 4));
+            let vm = |v: &Value| format!("{} ± {}", f(&v["v_gain"], 4), f(&v["v_gain_ci"], 4));
+            for (name, ph) in [("bids", "bids"), ("plays", "plays")] {
+                w(format!("| PI loss, {name} | {} | {} | {} |", f(&rv[ph]["loss"], 4), f(&rt[ph]["loss"], 4), f(&rn[ph]["loss"], 4)));
+                w(format!("| P's gain, {name} | {} | {} | {} |", pm(&rv[ph]), pm(&rt[ph]), pm(&rn[ph])));
+                w(format!(
+                    "| P's gain over the start's top move, {name} | | | {} ± {} ({} changed) |",
+                    f(&rn[ph]["gain_vs_start"], 4),
+                    f(&rn[ph]["gain_vs_start_ci"], 4),
+                    pct(&rn[ph]["changed_vs_start"]),
+                ));
+                w(format!("| top move changed, {name} | {} | {} | {} |", pct(&rv[ph]["changed"]), pct(&rt[ph]["changed"]), pct(&rn[ph]["changed"])));
+                w(format!("| V's pick gain, {name} | {} | {} | {} |", vm(&rv[ph]), vm(&rt[ph]), vm(&rn[ph])));
+                w(format!("| hindsight gap, {name} | {} | {} | {} |", f(&rv[ph]["hindsight"], 4), f(&rt[ph]["hindsight"], 4), f(&rn[ph]["hindsight"], 4)));
+            }
+            w(String::new());
+        }
         let fx = &h["fixed_value"];
         if !fx.is_null() {
             w(format!(
@@ -1403,16 +1630,40 @@ fn render_status(sh: &Shared) -> String {
             sp["actor_restarts"],
         ));
         w(String::new());
-        w("| search health | bids | plays |".into());
-        w("|---|---|---|".into());
-        let (b, p) = (&sp["bid"], &sp["play"]);
-        w(format!("| decisions with a choice | {} | {} |", b["decisions"], p["decisions"]));
-        w(format!("| target's top ≠ P's top | {} | {} |", pct(&b["top_differs"]), pct(&p["top_differs"])));
-        w(format!("| KL(target ‖ P) | {} | {} |", f(&b["kl_target_prior"], 3), f(&p["kl_target_prior"], 3)));
-        w(format!("| entropy: target / P | {} / {} | {} / {} |", f(&b["target_entropy"], 3), f(&b["prior_entropy"], 3), f(&p["target_entropy"], 3), f(&p["prior_entropy"], 3)));
-        w(format!("| move played ≠ target's top | {} | {} |", pct(&b["off_top_played"]), pct(&p["off_top_played"])));
-        w(String::new());
+        if cfg.run.actors > 0 {
+            w("| search health | bids | plays |".into());
+            w("|---|---|---|".into());
+            let (b, p) = (&sp["bid"], &sp["play"]);
+            w(format!("| decisions with a choice | {} | {} |", b["decisions"], p["decisions"]));
+            w(format!("| target's top ≠ P's top | {} | {} |", pct(&b["top_differs"]), pct(&p["top_differs"])));
+            w(format!("| KL(target ‖ P) | {} | {} |", f(&b["kl_target_prior"], 3), f(&p["kl_target_prior"], 3)));
+            w(format!("| entropy: target / P | {} / {} | {} / {} |", f(&b["target_entropy"], 3), f(&b["prior_entropy"], 3), f(&p["target_entropy"], 3), f(&p["prior_entropy"], 3)));
+            w(format!("| move played ≠ target's top | {} | {} |", pct(&b["off_top_played"]), pct(&p["off_top_played"])));
+            w(String::new());
+        }
         let (m, z) = (&sp["made"], &sp["zero_bids"]);
+        let ro = &sp["rollout"];
+        if cfg.rollout.actors > 0 {
+            w(format!(
+                "Rollouts: {} rounds/h, {} valued decisions/h ({} bids, {} plays; moves per decision {} / {}); P's top move not the best on the deal {} / {}, hindsight gap {} / {}; {} rounds in all; buffers: training {} / {}, validation {}; {} actors.",
+                f(&ro["rounds_per_hour"], 0),
+                f(&ro["samples_per_hour"], 0),
+                ro["bid"]["samples"],
+                ro["play"]["samples"],
+                f(&ro["bid"]["moves_per_sample"], 2),
+                f(&ro["play"]["moves_per_sample"], 2),
+                pct(&ro["bid"]["top_not_best"]),
+                pct(&ro["play"]["top_not_best"]),
+                f(&ro["bid"]["hindsight"], 4),
+                f(&ro["play"]["hindsight"], 4),
+                ro["rounds_total"],
+                ro["train_samples"],
+                cfg.rollout.capacity,
+                ro["valid_samples"],
+                cfg.rollout.actors,
+            ));
+            w(String::new());
+        }
         let vs = &sp["value_stream"];
         if cfg.value_stream.actors > 0 {
             w(format!(
@@ -1502,8 +1753,9 @@ fn monitor(sh: Arc<Shared>, done: Arc<AtomicBool>) {
             window = Instant::now();
             let w = std::mem::take(&mut *sh.window.lock().unwrap());
             let vw = std::mem::take(&mut *sh.vwindow.lock().unwrap());
-            if w.rounds > 0 {
-                let row = selfplay_row(&sh, &w, vw, secs);
+            let rw = std::mem::take(&mut *sh.rwindow.lock().unwrap());
+            if w.rounds > 0 || rw.rounds > 0 {
+                let row = selfplay_row(&sh, &w, vw, &rw, secs);
                 sh.log(&row);
                 sh.status.lock().unwrap().selfplay = row;
             }
@@ -1568,6 +1820,9 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
         chunk_secs: cfg.replay.chunk_secs,
         value_actors: cfg.value_stream.actors,
         value_chunk_secs: cfg.value_stream.chunk_secs,
+        rollout_actors: cfg.rollout.actors,
+        rollout: cfg.rollout.round(),
+        rollout_chunk_secs: cfg.rollout.chunk_secs,
     };
     write_json(&dir.join(ACTORS_CONFIG_FILE), &actors).map_err(|e| format!("{ACTORS_CONFIG_FILE}: {e}"))?;
     write_json(&dir.join(MODEL_POINTER_FILE), &ModelPointer { model: state.model.clone(), step: state.model_step })
@@ -1614,9 +1869,17 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
     if let Some(f) = &fixed {
         eprintln!("[train] fixed V check: {} states from {} ({:.1} s)", f.all.len(), f.from, t.elapsed().as_secs_f64());
     }
+    let start_policy = if cfg.rollout.actors > 0 {
+        Some(FrozenPolicy::load(Path::new(&cfg.run.init_checkpoint), learner.device)?)
+    } else {
+        None
+    };
     let cap = cfg.replay.capacity;
     let fr = cfg.replay.validation_fraction;
-    let vcap = if cfg.value_stream.actors > 0 { cfg.value_stream.capacity } else { 1 };
+    let pi_on = cfg.rollout.actors > 0;
+    let v_on = cfg.value_stream.actors > 0 || (pi_on && cfg.rollout.value_children);
+    let vcap = if v_on { cfg.value_stream.capacity } else { 1 };
+    let rcap = if pi_on { cfg.rollout.capacity } else { 1 };
     let valid_cap = |c: usize| ((c as f64 * fr / (1.0 - fr)).ceil() as usize).max(1000);
     let sh = Arc::new(Shared {
         cfg: cfg.clone(),
@@ -1643,6 +1906,11 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
         vrounds: AtomicU64::new(0),
         vsamples: AtomicU64::new(0),
         vwindow: Mutex::new((0, 0)),
+        rtrain: RwLock::new(PiReplay::new(rcap)),
+        rvalid: RwLock::new(PiReplay::new(valid_cap(rcap))),
+        rproduced: AtomicU64::new(0),
+        rrounds: AtomicU64::new(0),
+        rwindow: Mutex::new(RolloutStats::default()),
         fixed,
         published_value_updates: AtomicU64::new(learner.value_updates),
         metrics: Mutex::new(metrics),
@@ -1722,24 +1990,28 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
         let (sh, eval_tx) = (sh.clone(), eval_tx.clone());
         thread::spawn(move || publisher(sh, pub_rx, eval_tx))
     };
-    let (batch_tx, batch_rx) = sync_channel::<StepBatches>(2 * cfg.replay.loader_threads);
+    let (batch_tx, batch_rx) = sync_channel::<Batches>(2 * cfg.replay.loader_threads);
     let loaders: Vec<JoinHandle<()>> = (0..cfg.replay.loader_threads)
         .map(|i| {
             let (sh, tx) = (sh.clone(), batch_tx.clone());
             let seed = cfg.run.seed ^ 0x10AD ^ ((learner.step << 8) + i as u64);
-            thread::spawn(move || loader(sh, tx, seed))
+            if pi_on {
+                thread::spawn(move || pi_loader(sh, tx, seed))
+            } else {
+                thread::spawn(move || loader(sh, tx, seed))
+            }
         })
         .collect();
     drop(batch_tx);
     let (vbatch_tx, vbatch_rx) = sync_channel::<ValueBatch>(4);
-    let value_loader_h = (cfg.value_stream.actors > 0).then(|| {
+    let value_loader_h = v_on.then(|| {
         let sh = sh.clone();
         let seed = cfg.run.seed ^ 0x7A1E ^ (learner.step << 8);
         thread::spawn(move || value_loader(sh, vbatch_tx, seed))
     });
     write_status(&sh);
 
-    let result = learn(&sh, &mut learner, &batch_rx, &vbatch_rx, &probe, &init, &pub_tx);
+    let result = learn(&sh, &mut learner, &batch_rx, &vbatch_rx, &probe, &init, start_policy.as_ref(), &pub_tx);
     sh.stop.store(true, SeqCst);
     drop(batch_rx);
     drop(vbatch_rx);
@@ -1774,8 +2046,10 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
             (st.model_step, st.model.clone())
         };
         let e = &cfg.eval;
-        search_bench(&sh, step, &model, "search-rb2", "rulebot2", e.search_deals, e.search_seed, &e.search_baseline);
-        search_vs_p(&sh, step, &model);
+        if e.final_search {
+            search_bench(&sh, step, &model, "search-rb2", "rulebot2", e.search_deals, e.search_seed, &e.search_baseline);
+            search_vs_p(&sh, step, &model);
+        }
         if e.final_rule_bot_deals > 0 {
             search_bench(&sh, step, &model, "search-rb", "rulebot", e.final_rule_bot_deals, DEFAULT_SEED, &e.final_rule_bot_baseline);
         }

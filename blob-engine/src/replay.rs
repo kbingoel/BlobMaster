@@ -140,18 +140,26 @@ impl ReplayBuffer {
     /// `Scoring`). Returns the round's id.
     pub fn push_round(&mut self, decisions: &[Decision], end: &BlobState) -> u64 {
         assert_eq!(end.phase(), GamePhase::Scoring, "push_round needs the finished round");
-        let points = round_points(end);
+        for d in decisions {
+            debug_assert_eq!(
+                (d.state.num_players, d.state.cards_dealt, d.state.dealer),
+                (end.num_players, end.cards_dealt, end.dealer),
+                "decision from another round"
+            );
+        }
+        self.push_scored(decisions, round_points(end))
+    }
+
+    /// [`ReplayBuffer::push_round`] with the points every seat (absolute)
+    /// scored given directly, e.g. a state after one move whose round was
+    /// played out apart from the recorded one.
+    pub fn push_scored(&mut self, decisions: &[Decision], points: [u8; MAX_PLAYERS]) -> u64 {
         let id = self.next_round_id;
         self.next_round_id += 1;
         for d in decisions {
             debug_assert!(
                 matches!(d.state.phase(), GamePhase::Bidding | GamePhase::Playing),
                 "replay buffer only accepts decision-point phases (Bidding/Playing)"
-            );
-            debug_assert_eq!(
-                (d.state.num_players, d.state.cards_dealt, d.state.dealer),
-                (end.num_players, end.cards_dealt, end.dealer),
-                "decision from another round"
             );
             if self.len < self.capacity {
                 self.states.push(d.state);
@@ -348,6 +356,11 @@ impl SharedReplay {
     /// [`ReplayBuffer::push_round`] under the write lock.
     pub fn push_round(&self, decisions: &[Decision], end: &BlobState) -> u64 {
         self.0.write().expect("replay lock poisoned").push_round(decisions, end)
+    }
+
+    /// [`ReplayBuffer::push_scored`] under the write lock.
+    pub fn push_scored(&self, decisions: &[Decision], points: [u8; MAX_PLAYERS]) -> u64 {
+        self.0.write().expect("replay lock poisoned").push_scored(decisions, points)
     }
 
     /// [`ReplayBuffer::sample_batch`] under a read lock.

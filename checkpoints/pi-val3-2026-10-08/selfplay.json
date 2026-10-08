@@ -1,0 +1,52 @@
+{
+  "actors": 0,
+  "seed": 1,
+  "mix": {
+    "players": [
+      5
+    ],
+    "start_cards": 7,
+    "large_round_exponent": 0.0
+  },
+  "search": {
+    "c_puct": 1.0,
+    "lambda": 1.0,
+    "bid_budget": {
+      "determinizations": 32,
+      "sims_per_determinization": 16
+    },
+    "play_budget": {
+      "determinizations": 32,
+      "sims_per_determinization": 16
+    },
+    "bid_temperature": 1.0,
+    "play_temperature": 0.0,
+    "dirichlet_epsilon": 0.0,
+    "dirichlet_alpha": 0.0,
+    "one_card_bids": "exact",
+    "bid_weighting": {
+      "candidates": 2,
+      "noise": 0.1
+    },
+    "prune_forced_visits": true,
+    "root_rule": "q",
+    "q_temperature": 0.05
+  },
+  "chunk_rounds": 50,
+  "chunk_secs": 60.0,
+  "value_actors": 0,
+  "value_chunk_secs": 30.0,
+  "rollout_actors": 28,
+  "rollout": {
+    "samples_per_round": 2,
+    "bid_temperature": 0.0,
+    "play_temperature": 0.0,
+    "deals": 1,
+    "bid_weighting": {
+      "candidates": 2,
+      "noise": 0.1
+    },
+    "rule_bot_2_share": 0.4
+  },
+  "rollout_chunk_secs": 30.0
+}

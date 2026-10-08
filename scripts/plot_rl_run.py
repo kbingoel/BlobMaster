@@ -15,6 +15,9 @@ published checkpoints in `<run>/models/`, and writes `<run>/plots/`:
 - `08_value_margin.png`    search's margin over P alone (vs rule bot 2 paired on the same deals and step, and
                            vs four copies of P, where P alone scores 0); V on the fixed
                            rounds of an earlier run; V on its own stream of P-alone rounds (runs from 2026-10-07)
+- `09_rollouts.png`        policy iteration by rollouts (runs from 2026-10-08): P vs four copies of the start P and vs
+                           rule bot 2; per-decision gain of P's (and V's) top move over the playing P on held-out deals;
+                           the loss, validation vs training sample; rollout throughput
 
 Every x-axis is running hours (pauses excluded); a bench sits at the hour
 its model was published. Weights need the venv's torch (`--no-weights`
@@ -369,6 +372,58 @@ def p_value_pace(ax, run: Run):
     legend(ax)
 
 
+def p_rollout_gain(ax, run: Run, key: str, ci_key: str, title: str, parts=("validation", "recent")):
+    """Held-out gain per decision (utility units) by phase: the first part with 95% bands, the second dashed."""
+    h = [r for r in run.of("held_out") if isinstance(r.get("rollout"), dict)]
+    xs = [num(r.get("active_hours")) for r in h]
+    names = {"validation": "validation", "recent": "newest"}
+    for ph, color in (("bids", BLUE), ("plays", ORANGE)):
+        main = parts[0]
+        series(ax, xs, [num(r["rollout"][main][ph].get(key)) for r in h], color, f"{ph} ({names[main]})",
+               ci=[num(r["rollout"][main][ph].get(ci_key)) for r in h], end="{:+.4f}")
+        for extra in parts[1:]:
+            series(ax, xs, [num(r["rollout"][extra][ph].get(key)) for r in h], color, f"{ph} ({names[extra]})", dashed=True, marker=False)
+    zero_line(ax)
+    style(ax, title, "utility per decision (1 pt of a 7-card round ≈ 0.06)", run=run)
+    legend(ax)
+
+
+def p_rollout_loss(ax, run: Run):
+    h = [r for r in run.of("held_out") if isinstance(r.get("rollout"), dict)]
+    xs = [num(r.get("active_hours")) for r in h]
+
+    def total(part):
+        n = sum(num(part[ph].get("samples")) for ph in ("bids", "plays"))
+        return sum(num(part[ph].get("loss")) * num(part[ph].get("samples")) for ph in ("bids", "plays")) / n if n else math.nan
+
+    series(ax, xs, [total(r["rollout"]["validation"]) for r in h], BLUE, "validation", end="{:.4f}")
+    series(ax, xs, [total(r["rollout"]["train_sample"]) for r in h], ORANGE, "training sample")
+    style(ax, "Policy-iteration loss, held out", "T·KL − Σπu (a growing gap = memorizing)", run=run)
+    legend(ax)
+
+
+def p_rollout_pace(ax, run: Run):
+    sp = [r for r in run.of("selfplay") if isinstance(r.get("rollout"), dict)]
+    xs = [num(r.get("active_hours")) for r in sp]
+    smooth_series(ax, xs, [num(r["rollout"].get("samples_per_hour")) / 1000 for r in sp], BLUE, None)
+    style(ax, "Rollouts: valued decisions per hour", "thousands per hour", run=run)
+    ax.set_ylim(bottom=0)
+
+
+def fig_rollouts(run: Run, out: Path):
+    if not any(isinstance(r.get("rollout"), dict) for r in run.of("held_out")):
+        return
+    fig, a = figure(2, 3)
+    p_bench(a[0][0], run, "net-vs0", "Network only vs four copies of the start P")
+    p_bench(a[0][1], run, "net-rb2", "Network only vs rule bot 2")
+    p_rollout_pace(a[0][2], run)
+    p_rollout_gain(a[1][0], run, "gain_vs_start", "gain_vs_start_ci", "P's top move vs the start P's (newest held-out deals)",
+                   parts=("recent",))
+    p_rollout_gain(a[1][1], run, "v_gain", "v_gain_ci", "V's pick (next state, true deal) vs the playing P's")
+    p_rollout_loss(a[1][2], run)
+    save(fig, out / "09_rollouts.png", f"{run.path.name}: policy iteration by rollouts")
+
+
 # ---- weights ------------------------------------------------------------------------------
 
 
@@ -570,7 +625,8 @@ def main() -> None:
     run = Run(args.run)
     out = args.out or args.run / "plots"
     out.mkdir(parents=True, exist_ok=True)
-    for f in (fig_overview, fig_strength, fig_bids, fig_learning, fig_generalization, fig_selfplay, fig_value_margin):
+    for f in (fig_overview, fig_strength, fig_bids, fig_learning, fig_generalization, fig_selfplay, fig_value_margin,
+              fig_rollouts):
         f(run, out)
     if not args.no_weights:
         fig_weights(run, out)

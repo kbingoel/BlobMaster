@@ -1,0 +1,51 @@
+# Second validation of policy iteration by rollouts (2026-10-08). Against the first's failure (no gain on held-out deals):
+# rounds played greedily (τ 0: the hidden cards then fall as they do behind greedy P's own play, not behind sampled play),
+# 4 batches per P step (2048 deals), each sample used twice. Otherwise as the first, from run 2b's final model
+# (the current best, P alone +12.3 vs rule bot 2), every actor thread on rollout rounds, no search in the loop.
+# Defaults of blob-train/train.sample.toml except these.
+[run]
+hours = 1.0
+init_checkpoint = "checkpoints/rl-2026-10-07b/models/step-003285/checkpoint"
+init_model = "checkpoints/rl-2026-10-07b/models/step-003285/model"
+actors = 0
+
+# Search settings of the final search benches (the night runs' self-play search).
+[selfplay.search]
+c_puct = 1.0
+root_rule = "q"
+q_temperature = 0.05
+dirichlet_epsilon = 0.0
+
+[selfplay.search.bid_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.play_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.bid_weighting]
+candidates = 2
+noise = 0.1
+
+[log]
+eval_every = 250
+publish_every = 125
+eval_examples = 40000
+
+[eval]
+threads = 8
+net_deals_rule_bot_2 = 512
+net_deals_vs_start = 256
+search_every_hours = 0.0
+search_baseline = "checkpoints/rl-2026-10-07b/bench/search-rb2-step-003285.csv"
+search_vs_p_deals = 0
+final_search = false
+final_rule_bot_deals = 0
+
+[rollout]
+actors = 28
+ratio = 2.0
+micro_batches = 4
+bid_temperature = 0.0
+play_temperature = 0.0

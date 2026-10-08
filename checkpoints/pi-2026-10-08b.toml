@@ -1,0 +1,53 @@
+# Night of 2026-10-08, run b: run a for 5.5 h with a third of the LR (3e-5) and 8 batches of 512 per P step (4,096
+# deals per update, ~540 updates/h). The question: is the plateau P reaches in its first 10 min the noise of one deal
+# per sample (Adam moves P by ~LR per step whatever the signal: a random walk around the optimum), or a fixed point
+# of one-step improvement? If noise, this run climbs above run a over hours; if a fixed point, both stay flat.
+# Defaults of blob-train/train.sample.toml except these.
+[run]
+hours = 5.5
+init_checkpoint = "checkpoints/rl-2026-10-07b/models/step-003285/checkpoint"
+init_model = "checkpoints/rl-2026-10-07b/models/step-003285/model"
+actors = 0
+
+# Only for the search benches, which are off here: the night runs' self-play search.
+[selfplay.search]
+c_puct = 1.0
+root_rule = "q"
+q_temperature = 0.05
+dirichlet_epsilon = 0.0
+
+[selfplay.search.bid_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.play_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.bid_weighting]
+candidates = 2
+noise = 0.1
+
+[learner]
+lr = 3e-5
+warmup_steps = 60
+
+[log]
+eval_every = 125
+publish_every = 60
+eval_examples = 40000
+
+[eval]
+threads = 8
+net_deals_rule_bot_2 = 512
+net_deals_vs_start = 512
+search_every_hours = 0.0
+search_baseline = ""
+search_vs_p_deals = 0
+final_search = false
+final_rule_bot_deals = 0
+
+[rollout]
+actors = 28
+ratio = 2.0
+micro_batches = 8

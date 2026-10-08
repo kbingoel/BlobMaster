@@ -1351,6 +1351,42 @@ fn greedy_move(s: &BlobState, p: &[f32]) -> u8 {
     }
 }
 
+/// Play every game of `games` to the round's end, P's top move at every
+/// seat (each from its own view), forced moves without a call. The games
+/// advance in lockstep, so P runs in batches.
+pub fn play_out_greedy<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState], policy: &P) {
+    play_out_greedy_with(games, policy, 0);
+}
+
+/// [`play_out_greedy`] with the seats in the `bots` bitmask played by rule
+/// bot 2 instead of P.
+pub fn play_out_greedy_with<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState], policy: &P, bots: u8) {
+    loop {
+        for g in games.iter_mut() {
+            loop {
+                if let Some(a) = forced_action(g) {
+                    apply_action(g, a);
+                } else if !is_terminal(g) && (bots >> g.current_player) & 1 == 1 {
+                    let a = crate::rule_bot_2::rule_bot_2_action(g);
+                    apply_action(g, a);
+                } else {
+                    break;
+                }
+            }
+        }
+        let open: Vec<usize> = (0..games.len()).filter(|&i| !is_terminal(&games[i])).collect();
+        if open.is_empty() {
+            return;
+        }
+        let states: Vec<BlobState> = open.iter().map(|&i| games[i]).collect();
+        let priors = crate::evaluator::policy_in_chunks(policy, &states);
+        for (&i, p) in open.iter().zip(&priors) {
+            let a = greedy_move(&games[i], p);
+            apply_action(&mut games[i], a);
+        }
+    }
+}
+
 /// [`RootRule::Rollouts`]: every legal move of `state` on every deal, the
 /// round then played out by P's top move at every seat, the playouts
 /// advanced in lockstep so P runs in batches.
@@ -1377,23 +1413,7 @@ fn rollout_root<P: PolicyEvaluator + ?Sized>(
             games.push(g);
         }
     }
-    loop {
-        for g in games.iter_mut() {
-            while let Some(a) = forced_action(g) {
-                apply_action(g, a);
-            }
-        }
-        let open: Vec<usize> = (0..games.len()).filter(|&i| !is_terminal(&games[i])).collect();
-        if open.is_empty() {
-            break;
-        }
-        let states: Vec<BlobState> = open.iter().map(|&i| games[i]).collect();
-        let priors = crate::evaluator::policy_in_chunks(policy, &states);
-        for (&i, p) in open.iter().zip(&priors) {
-            let a = greedy_move(&games[i], p);
-            apply_action(&mut games[i], a);
-        }
-    }
+    play_out_greedy(&mut games, policy);
     let mut q = vec![0.0f32; policy_len];
     let mut legal = Vec::with_capacity(moves.len());
     for (k, &m) in moves.iter().enumerate() {

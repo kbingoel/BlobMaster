@@ -11,7 +11,8 @@
 //!   `onnx::OnnxEvaluator` in production). `one_card` computes 1-card bids.
 //! - Training data: `replay`, with suit-permutation augmentation from
 //!   `augment`; `teacher` plays the warm start's rule-bot-2 rounds;
-//!   `selfplay` plays the Phase-5 actors' rounds.
+//!   `selfplay` plays the Phase-5 actors' rounds; `rollout` values every
+//!   move of P's own rounds by playing it out (policy iteration).
 //! - Yardsticks: `rule_bot`, `rule_bot_2` and `bench` (gen-2.md §5.7).
 //!
 //! Pure Rust plus `ort`; never depends on `tch` (that lives in `blob-nn`).
@@ -32,6 +33,7 @@ pub mod onnx;
 pub mod playing;
 pub mod profiling;
 pub mod replay;
+pub mod rollout;
 pub mod round;
 pub mod rule_bot;
 pub mod rule_bot_2;

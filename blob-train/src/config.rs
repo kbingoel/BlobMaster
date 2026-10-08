@@ -5,6 +5,7 @@
 //! config fails loudly. `pretrain.sample.toml` and `train.sample.toml` list
 //! them all.
 
+use blob_engine::rollout::RolloutConfig;
 use blob_engine::{RoundMix, SelfPlayConfig, TeacherConfig};
 use blob_nn::learner::LearnerConfig;
 use serde::{Deserialize, Serialize};
@@ -190,6 +191,95 @@ impl Default for ValueStreamConfig {
     }
 }
 
+/// `train`: policy iteration by rollouts (`blob_engine::rollout`, gen-2.md
+/// §6 Phase 5, day 3). The actor process plays rounds of P on `actors`
+/// threads and values `samples_per_round` decisions per round by playing
+/// out every legal move on the real deal; P then trains on them
+/// (`blob_nn::train::pi_loss`) instead of on search targets, one learner
+/// step per batch under its own replay ratio. The state after each move,
+/// with its outcome, trains V (`value_children`), in the steps and in
+/// V-only updates under `value_stream.ratio`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RolloutStreamConfig {
+    /// Threads playing rollout rounds; 0 = off (P trains on search targets).
+    pub actors: usize,
+    /// Decisions with a choice valued per round, drawn uniformly.
+    pub samples_per_round: usize,
+    /// τ of the bids and cards P plays in the rounds (1 = P's policy, 0 =
+    /// its top move: the hidden cards then fall as behind P's own play).
+    pub bid_temperature: f32,
+    pub play_temperature: f32,
+    /// Deals each valued bid is played out on: the real one and
+    /// `bid_deals − 1` drawn from the bidder's view (weighted by the bids
+    /// made); P's target averages them. Plays keep the real deal.
+    pub bid_deals: usize,
+    /// Candidate deals per drawn deal, weighted by the bids made.
+    pub bid_candidates: u32,
+    /// Chance that each seat of a round is played by rule bot 2 (in the
+    /// round and its play-outs): P then learns against a mixed table, not
+    /// only itself. Rule bot 2 is also the yardstick, so watch the rule bot
+    /// and the start P too.
+    pub rule_bot_2_share: f32,
+    /// T of the loss, in utility units: P moves toward
+    /// `π_ref · exp(E[u] / T)`.
+    pub temperature: f64,
+    /// Share of uniform in `π_ref` over the legal moves.
+    pub epsilon: f64,
+    /// Samples kept (FIFO); the validation buffer keeps the same window.
+    pub capacity: usize,
+    /// Training samples before the learner starts.
+    pub min_examples: usize,
+    /// Most P samples (learner steps × batch size × micro_batches) per
+    /// training sample produced.
+    pub ratio: f64,
+    /// Batches whose gradients add up into one P update (gradient
+    /// accumulation): one deal per sample is noisy, and a larger batch
+    /// averages more of them per step.
+    pub micro_batches: usize,
+    /// V also learns the state after each valued move.
+    pub value_children: bool,
+    /// A file of `replay-pi/` every this many seconds (the learner reads and
+    /// deletes it; a resume starts the buffers afresh).
+    pub chunk_secs: f64,
+}
+
+impl Default for RolloutStreamConfig {
+    fn default() -> Self {
+        Self {
+            actors: 0,
+            samples_per_round: 2,
+            bid_temperature: 0.0,
+            play_temperature: 0.0,
+            bid_deals: 1,
+            bid_candidates: 2,
+            rule_bot_2_share: 0.0,
+            temperature: 0.05,
+            epsilon: 0.03,
+            capacity: 1_000_000,
+            min_examples: 50_000,
+            ratio: 4.0,
+            micro_batches: 1,
+            value_children: true,
+            chunk_secs: 30.0,
+        }
+    }
+}
+
+impl RolloutStreamConfig {
+    /// The actors' round settings.
+    pub fn round(&self) -> RolloutConfig {
+        RolloutConfig {
+            samples_per_round: self.samples_per_round,
+            bid_temperature: self.bid_temperature,
+            play_temperature: self.play_temperature,
+            bid_deals: self.bid_deals,
+            bid_weighting: blob_engine::belief::BidWeighting { candidates: self.bid_candidates, noise: 0.1 },
+            rule_bot_2_share: self.rule_bot_2_share,
+        }
+    }
+}
+
 /// `train`: the learner. The LR is constant after the warm-up: the run has
 /// no fixed end (gen-2.md §5.6).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,6 +385,13 @@ pub struct EvalConfig {
     /// rule bot 2, search models the opponents as P, which stops fitting as
     /// P leaves rule bot 2 behind. 0 = skip.
     pub search_vs_p_deals: usize,
+    /// Network-only bench of every publish against four copies of the
+    /// run's starting P (default seed): progress in self-play's own
+    /// setting, where the start scores 0. 0 = skip.
+    pub net_deals_vs_start: usize,
+    /// The final search benches (against rule bot 2, and against P with
+    /// `search_vs_p_deals`); false skips them.
+    pub final_search: bool,
     /// At the end, also a search bench against the rule bot (default seed);
     /// 0 = skip.
     pub final_rule_bot_deals: usize,
@@ -320,6 +417,8 @@ impl Default for EvalConfig {
             search_seed: 7,
             search_baseline: "checkpoints/pretrain-2026-10-06/bench4b/search-rb2-128-seed7.csv".into(),
             search_vs_p_deals: 64,
+            net_deals_vs_start: 512,
+            final_search: true,
             final_rule_bot_deals: 64,
             final_rule_bot_baseline: "checkpoints/pretrain-2026-10-06/bench4b/search-rb-64.csv".into(),
             probe_rounds: 600,
@@ -340,6 +439,7 @@ pub struct TrainConfig {
     pub log: TrainLogConfig,
     pub eval: EvalConfig,
     pub value_stream: ValueStreamConfig,
+    pub rollout: RolloutStreamConfig,
 }
 
 impl TrainConfig {
@@ -354,8 +454,19 @@ impl TrainConfig {
         self.selfplay.search.validate()?;
         self.learner.learner().validate()?;
         let (r, run, log) = (&self.replay, &self.run, &self.log);
-        if !(run.hours > 0.0) || run.actors == 0 || run.init_checkpoint.is_empty() || run.init_model.is_empty() {
-            return Err("run: hours and actors must be > 0, init_checkpoint and init_model set".into());
+        if !(run.hours > 0.0) || run.init_checkpoint.is_empty() || run.init_model.is_empty() {
+            return Err("run: hours must be > 0, init_checkpoint and init_model set".into());
+        }
+        let ro = &self.rollout;
+        if run.actors == 0 && ro.actors == 0 {
+            return Err("run.actors must be > 0 unless rollout.actors is".into());
+        }
+        if ro.actors > 0 {
+            ro.round().validate()?;
+            let ok = ro.capacity > 0 && ro.min_examples <= ro.capacity && ro.ratio > 0.0 && ro.chunk_secs > 0.0 && ro.micro_batches > 0;
+            if !ok || !(ro.temperature > 0.0) || !(0.0..1.0).contains(&ro.epsilon) {
+                return Err("rollout: capacity > 0, min_examples <= capacity, ratio, chunk_secs and temperature > 0, epsilon in [0, 1)".into());
+            }
         }
         if r.capacity == 0 || r.min_examples == 0 || r.chunk_rounds == 0 || r.loader_threads == 0 {
             return Err("replay: capacity, min_examples, chunk_rounds and loader_threads must be > 0".into());
@@ -379,7 +490,7 @@ impl TrainConfig {
             return Err("log.checkpoint_minutes must be > 0".into());
         }
         let v = &self.value_stream;
-        if v.actors > 0 && (v.capacity == 0 || v.min_examples > v.capacity || !(v.ratio > 0.0) || !(v.chunk_secs > 0.0)) {
+        if (v.actors > 0 || (ro.actors > 0 && ro.value_children)) && (v.capacity == 0 || v.min_examples > v.capacity || !(v.ratio > 0.0) || !(v.chunk_secs > 0.0)) {
             return Err("value_stream: capacity > 0, min_examples <= capacity, ratio and chunk_secs > 0".into());
         }
         if self.eval.threads == 0 || self.eval.search_deals < 2 || !(self.eval.search_every_hours >= 0.0) {
@@ -427,6 +538,16 @@ sims_per_determinization = 10
         assert_eq!(c.selfplay.search.play_budget.determinizations, 2);
         let l = c.learner.learner();
         assert_eq!((l.peak_lr, l.min_lr), (2e-4, 2e-4));
+    }
+
+    #[test]
+    fn rollouts_may_replace_the_search_actors() {
+        let c = TrainConfig::parse("[run]\nactors = 0\n[rollout]\nactors = 30\n").unwrap();
+        assert_eq!((c.run.actors, c.rollout.actors, c.rollout.round().samples_per_round), (0, 30, 2));
+        assert!(TrainConfig::parse("[run]\nactors = 0\n").is_err(), "no actors at all");
+        assert!(TrainConfig::parse("[rollout]\nactors = 4\nepsilon = 1.0\n").is_err());
+        assert!(TrainConfig::parse("[rollout]\nactors = 4\nsamples_per_round = 0\n").is_err());
+        assert!(TrainConfig::parse("[rollout]\nactors = 4\ntemp = 0.1\n").is_err());
     }
 
     #[test]

@@ -15,3 +15,8 @@ pub mod learner;
 pub mod model;
 pub mod train;
 pub mod transformer;
+
+/// libtorch's RNG is global: tests that build networks from a seed take
+/// this lock, so another test's networks can't shift their init.
+#[cfg(test)]
+pub(crate) static TORCH_RNG: std::sync::Mutex<()> = std::sync::Mutex::new(());

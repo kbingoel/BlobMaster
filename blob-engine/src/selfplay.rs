@@ -28,6 +28,12 @@
 //! `value_actors` threads into `<run>/replay-v/`, which the learner reads
 //! and deletes.
 //!
+//! **Rollout rounds** (`crate::rollout::rollout_round`, policy iteration
+//! by rollouts): P alone plays every seat, and a few decisions per round
+//! are valued by playing out every legal move on the real deal. The actor
+//! process plays them on `rollout_actors` threads into `<run>/replay-pi/`,
+//! which the learner reads and deletes.
+//!
 //! **The actor process** ([`run_actors`], `blobmaster selfplay`): ONNX only,
 //! apart from the learner's libtorch process (an in-process mix crashed in
 //! ONNX Runtime). It reads its settings from `<run>/selfplay.json`
@@ -58,6 +64,7 @@ use crate::mcts::{
     DEFAULT_C_PUCT, DEFAULT_ONE_CARD_BIDS, DEFAULT_PLAY_BUDGET, DEFAULT_Q_TEMPERATURE,
 };
 use crate::replay::{Decision, SparsePolicy};
+use crate::rollout::{rollout_round, RolloutConfig, RolloutSample, RolloutStats};
 use crate::round::RoundMix;
 use crate::scoring::DEFAULT_LAMBDA;
 use crate::state::{BlobState, GamePhase};
@@ -231,13 +238,13 @@ fn entropy(p: &[f32]) -> f64 {
 
 /// Index of the largest entry, ties to the higher `tiebreak` entry, then
 /// the lowest index.
-fn top(p: &[f32], tiebreak: &[f32]) -> usize {
+pub(crate) fn top(p: &[f32], tiebreak: &[f32]) -> usize {
     let t = |i: usize| tiebreak.get(i).copied().unwrap_or(0.0);
     (1..p.len()).fold(0, |b, i| if p[i] > p[b] || (p[i] == p[b] && t(i) > t(b)) { i } else { b })
 }
 
 /// An index drawn in proportion to `p`; the top entry if `p` sums to 0.
-fn sample_index<R: Rng + ?Sized>(p: &[f32], rng: &mut R) -> usize {
+pub(crate) fn sample_index<R: Rng + ?Sized>(p: &[f32], rng: &mut R) -> usize {
     let z: f32 = p.iter().sum();
     if z <= 0.0 {
         return top(p, &[]);
@@ -268,7 +275,7 @@ fn prune(target: &[f32], total: u32, trees: u32) -> Vec<f32> {
 }
 
 /// `p` at temperature `tau`; one-hot on index `best` below 1e-3.
-fn at_temperature(p: &[f32], tau: f32, best: usize) -> Vec<f32> {
+pub(crate) fn at_temperature(p: &[f32], tau: f32, best: usize) -> Vec<f32> {
     if tau < 1e-3 {
         let mut out = vec![0.0; p.len()];
         out[best] = 1.0;
@@ -432,6 +439,15 @@ pub struct ActorsConfig {
     /// A file of `replay-v/` every this many seconds.
     #[serde(default = "default_value_chunk_secs")]
     pub value_chunk_secs: f64,
+    /// Threads playing rollout rounds (`crate::rollout::rollout_round`)
+    /// into `replay-pi/`; 0 = none.
+    #[serde(default)]
+    pub rollout_actors: usize,
+    #[serde(default)]
+    pub rollout: RolloutConfig,
+    /// A file of `replay-pi/` every this many seconds.
+    #[serde(default = "default_value_chunk_secs")]
+    pub rollout_chunk_secs: f64,
 }
 
 fn default_value_chunk_secs() -> f64 {
@@ -444,6 +460,9 @@ pub const REPLAY_DIR: &str = "replay";
 /// Rounds of P alone for V ([`policy_round`]); the learner deletes each
 /// file once read.
 pub const VALUE_REPLAY_DIR: &str = "replay-v";
+/// Rollout rounds ([`RolloutChunk`]); the learner deletes each file once
+/// read.
+pub const ROLLOUT_REPLAY_DIR: &str = "replay-pi";
 
 /// The model the actors play: `<run>/model.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -490,6 +509,39 @@ pub struct Chunk {
     pub rounds: Vec<ChunkRound>,
 }
 
+/// One rollout round's samples as stored in `replay-pi/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutChunkRound {
+    /// Round id; the learner's validation split hashes it.
+    pub id: u64,
+    /// The learner step of the model that played it.
+    pub model_step: u64,
+    pub samples: Vec<RolloutSample>,
+}
+
+/// A file of `replay-pi/`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RolloutChunk {
+    pub stats: RolloutStats,
+    pub rounds: Vec<RolloutChunkRound>,
+}
+
+/// `run/<dir>/chunk-<first id>.bin`, written beside and renamed in, so a
+/// reader never sees a partial file.
+fn write_bin_in<T: Serialize>(run: &Path, dir: &str, first: u64, value: &T) -> Result<PathBuf, String> {
+    let path = run.join(dir).join(format!("chunk-{first:09}.bin"));
+    let tmp = path.with_extension("tmp");
+    let f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    bincode::serialize_into(BufWriter::new(f), value).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn read_bin<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    bincode::deserialize_from(BufReader::new(f)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// `replay/chunk-<first id>.bin`, written beside and renamed in, so a
 /// reader never sees a partial file.
 pub fn write_chunk(run: &Path, chunk: &Chunk) -> Result<PathBuf, String> {
@@ -498,18 +550,20 @@ pub fn write_chunk(run: &Path, chunk: &Chunk) -> Result<PathBuf, String> {
 
 /// [`write_chunk`] into `run/<dir>/`.
 pub fn write_chunk_in(run: &Path, dir: &str, chunk: &Chunk) -> Result<PathBuf, String> {
-    let first = chunk.rounds.first().ok_or("empty chunk")?.id;
-    let path = run.join(dir).join(format!("chunk-{first:09}.bin"));
-    let tmp = path.with_extension("tmp");
-    let f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    bincode::serialize_into(BufWriter::new(f), chunk).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
+    write_bin_in(run, dir, chunk.rounds.first().ok_or("empty chunk")?.id, chunk)
 }
 
 pub fn read_chunk(path: &Path) -> Result<Chunk, String> {
-    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    bincode::deserialize_from(BufReader::new(f)).map_err(|e| format!("{}: {e}", path.display()))
+    read_bin(path)
+}
+
+/// A file of `replay-pi/`, written like [`write_chunk`].
+pub fn write_rollout_chunk(run: &Path, chunk: &RolloutChunk) -> Result<PathBuf, String> {
+    write_bin_in(run, ROLLOUT_REPLAY_DIR, chunk.rounds.first().ok_or("empty chunk")?.id, chunk)
+}
+
+pub fn read_rollout_chunk(path: &Path) -> Result<RolloutChunk, String> {
+    read_bin(path)
 }
 
 /// The chunk files of `run`, by first round id.
@@ -560,12 +614,53 @@ pub fn run_actors(run: &Path, cfg: &ActorsConfig, stop: &AtomicBool) -> Result<(
     let pointer_path = run.join(MODEL_POINTER_FILE);
     let (tx, rx) = channel::<(SelfPlayRound, u64)>();
     let (vtx, vrx) = channel::<(PolicyRound, u64)>();
+    let (rtx, rrx) = channel::<(Vec<RolloutSample>, RolloutStats, u64)>();
     let log = |msg: String| eprintln!("[selfplay] {msg}");
-    log(format!("{} actors, first round id {first_id}; {} actors for V", cfg.actors, cfg.value_actors));
+    log(format!(
+        "{} actors, first round id {first_id}; {} actors for V; {} rollout actors",
+        cfg.actors, cfg.value_actors, cfg.rollout_actors
+    ));
     if cfg.value_actors > 0 {
         std::fs::create_dir_all(run.join(VALUE_REPLAY_DIR)).map_err(|e| e.to_string())?;
     }
+    if cfg.rollout_actors > 0 {
+        std::fs::create_dir_all(run.join(ROLLOUT_REPLAY_DIR)).map_err(|e| e.to_string())?;
+    }
     std::thread::scope(|sc| {
+        // Writer of the rollout rounds: a chunk every `rollout_chunk_secs`,
+        // ids from the clock as for the rounds for V.
+        sc.spawn(move || {
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let mut next = secs << 24;
+            let mut chunk = RolloutChunk::default();
+            let mut last = Instant::now();
+            let flush = |chunk: &mut RolloutChunk, last: &mut Instant| {
+                if !chunk.rounds.is_empty() {
+                    if let Err(e) = write_rollout_chunk(run, chunk) {
+                        eprintln!("[selfplay] {e}");
+                    }
+                }
+                *chunk = RolloutChunk::default();
+                *last = Instant::now();
+            };
+            loop {
+                match rrx.recv_timeout(Duration::from_millis(500)) {
+                    Ok((samples, stats, model_step)) => {
+                        chunk.stats.merge(&stats);
+                        if !samples.is_empty() {
+                            chunk.rounds.push(RolloutChunkRound { id: next, model_step, samples });
+                            next += 1;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if last.elapsed().as_secs_f64() >= cfg.rollout_chunk_secs {
+                    flush(&mut chunk, &mut last);
+                }
+            }
+            flush(&mut chunk, &mut last);
+        });
         // Writer of the rounds for V: a chunk every `value_chunk_secs`. The
         // learner deletes what it read, so ids start from the clock, unique
         // across restarts of this process.
@@ -735,8 +830,53 @@ pub fn run_actors(run: &Path, cfg: &ActorsConfig, stop: &AtomicBool) -> Result<(
                 }
             });
         }
+        for i in 0..cfg.rollout_actors {
+            let (rtx, current) = (rtx.clone(), current.clone());
+            let seed = cfg.seed.wrapping_mul(0xA24B_AED4_963E_E407) ^ ((first_id << 8) + 0xC0 + i as u64);
+            sc.spawn(move || {
+                let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+                let mut version = 0u64;
+                let mut net: Option<(OnnxPolicy, u64)> = None;
+                while !stop.load(SeqCst) {
+                    let v = current.version.load(SeqCst);
+                    if v != version || net.is_none() {
+                        let Some(p) = current.pointer.lock().unwrap().clone() else {
+                            std::thread::sleep(Duration::from_millis(500));
+                            continue;
+                        };
+                        match OnnxPolicy::from_dir(&p.model) {
+                            Ok(pn) => net = Some((pn, p.step)),
+                            Err(e) => {
+                                if i == 0 {
+                                    eprintln!("[selfplay] rollout actors can't load {}: {e}", p.model.display());
+                                }
+                                if net.is_none() {
+                                    std::thread::sleep(Duration::from_secs(5));
+                                    continue;
+                                }
+                            }
+                        }
+                        version = v;
+                    }
+                    let (pn, step) = net.as_ref().expect("net loaded");
+                    let params = cfg.mix.sample(&mut rng);
+                    match catch_unwind(AssertUnwindSafe(|| rollout_round(params, pn, &cfg.rollout, &mut rng))) {
+                        Ok((samples, stats)) => {
+                            if rtx.send((samples, stats, *step)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("[selfplay] rollout actor {i}: a round panicked; reloading the network");
+                            net = None;
+                        }
+                    }
+                }
+            });
+        }
         drop(tx);
         drop(vtx);
+        drop(rtx);
     });
     log("stopped".into());
     Ok(())
@@ -840,6 +980,29 @@ mod tests {
             }
         }
         assert!(recorded > 1000, "{recorded} states recorded");
+    }
+
+    #[test]
+    fn rollout_chunks_round_trip() {
+        let dir = std::env::temp_dir().join(format!("blob-rollout-chunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(ROLLOUT_REPLAY_DIR)).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let params = RoundParams { num_players: 5, cards_dealt: 4, trump: 2, dealer: 1 };
+        let mut chunk = RolloutChunk::default();
+        for id in 40..42u64 {
+            let (samples, stats) = rollout_round(params, &DummyEvaluator, &RolloutConfig::default(), &mut rng);
+            chunk.stats.merge(&stats);
+            chunk.rounds.push(RolloutChunkRound { id, model_step: 3, samples });
+        }
+        let path = write_rollout_chunk(&dir, &chunk).unwrap();
+        assert!(path.ends_with("chunk-000000040.bin"));
+        let back = read_rollout_chunk(&path).unwrap();
+        assert_eq!(back.stats, chunk.stats);
+        assert_eq!(back.rounds[1].samples.len(), chunk.rounds[1].samples.len());
+        assert_eq!(back.rounds[1].samples[0].outcomes, chunk.rounds[1].samples[0].outcomes);
+        assert_eq!(chunk_files_in(&dir, ROLLOUT_REPLAY_DIR).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

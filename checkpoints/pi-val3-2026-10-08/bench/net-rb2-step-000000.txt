@@ -1,0 +1,17 @@
+focal     network /home/kbuntu/Documents/Github/BlobMaster/checkpoints/rl-2026-10-07b/models/step-003285/model
+opponents 4x rule bot 2
+table     5 players, 7 start cards; 512 deals x 5 seats = 2560 games in 80 s
+
+points/game  focal 131.2  opponents 119.3  diff +11.9 ± 0.6 (95% CI over deals)
+win share    0.361 ± 0.018 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card         12800   0.782    0.735      0.779       0.733
+2-4 cards      15360   0.736    0.632      0.684       0.556
+5-8 cards      15360   0.692    0.310      0.577       0.384
+all            43520   0.734    0.549      0.674       0.547
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.004  0.107  0.734  0.130  0.021  0.003
+opponents     0.000  0.000  0.107  0.674  0.167  0.043  0.009
+

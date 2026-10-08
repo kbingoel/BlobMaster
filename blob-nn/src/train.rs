@@ -87,6 +87,75 @@ impl ValueBatch {
     }
 }
 
+/// One phase's rollout samples for P (policy iteration by rollouts,
+/// [`pi_loss`]): `legal_mask`, `prior` (the policy of the P that played)
+/// and `utility` (the mover's utility of each legal move on the sample's
+/// deal, centred; 0 elsewhere) are `[B, 14]` or `[B, S]` like
+/// [`PolicyBatch`].
+pub struct PiTensors {
+    pub input: InputBatch,
+    pub phase: Phase,
+    pub legal_mask: Tensor,
+    pub prior: Tensor,
+    pub utility: Tensor,
+}
+
+impl PiTensors {
+    pub fn rows(&self) -> i64 {
+        self.prior.size()[0]
+    }
+
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            input: self.input.to_device(device),
+            phase: self.phase,
+            legal_mask: self.legal_mask.to_device(device),
+            prior: self.prior.to_device(device),
+            utility: self.utility.to_device(device),
+        }
+    }
+}
+
+/// P's policy on a rollout batch: `[B, 14]` or `[B, S]`.
+pub fn pi_probs(net: &PolicyNet, batch: &PiTensors, train: bool) -> Tensor {
+    match batch.phase {
+        Phase::Bidding => net.forward_bid(&batch.input, &batch.legal_mask, train),
+        Phase::Playing => net.forward_play(&batch.input, &batch.legal_mask, train),
+    }
+}
+
+/// Policy iteration's loss per row, `[B]`: `T · KL(π ‖ π_ref) − Σ π · u`,
+/// with `π_ref = (1 − ε) · prior + ε · uniform` over the legal moves.
+///
+/// Linear in `u`, so its expectation over the deals behind one view is the
+/// same loss with each move's expected utility, and its minimizer is
+/// `π ∝ π_ref · exp(E[u | view] / T)`: the Q rule's π' with the true
+/// information-set value. A cross-entropy against a per-deal target would
+/// instead average per-deal best moves, a vote. ε keeps every legal move
+/// reachable however sharp P is.
+pub fn pi_loss_rows(probs: &Tensor, batch: &PiTensors, temperature: f64, epsilon: f64) -> Tensor {
+    let legal = batch.legal_mask.to_kind(Kind::Float);
+    let k = legal.sum_dim_intlist(&[-1i64][..], true, Kind::Float).clamp_min(1.0);
+    let reference = &batch.prior * (1.0 - epsilon) + &legal * epsilon / &k;
+    let log_ratio = ((probs + LOG_EPS).log() - (reference + LOG_EPS).log()) * &legal;
+    let kl = (probs * log_ratio).sum_dim_intlist(&[-1i64][..], false, Kind::Float);
+    let ev = (probs * &batch.utility).sum_dim_intlist(&[-1i64][..], false, Kind::Float);
+    kl * temperature - ev
+}
+
+/// [`pi_loss_rows`] over a step's sub-batches, weighted by their example
+/// counts.
+pub fn pi_loss(net: &PolicyNet, batches: &[&PiTensors], temperature: f64, epsilon: f64, train: bool) -> Tensor {
+    let rows: i64 = batches.iter().map(|b| b.rows()).sum();
+    assert!(rows > 0, "policy step without examples");
+    batches
+        .iter()
+        .map(|b| pi_loss_rows(&pi_probs(net, b, train), b, temperature, epsilon).sum(Kind::Float))
+        .reduce(|a, b| a + b)
+        .expect("at least one batch")
+        / rows as f64
+}
+
 /// P's policy for a batch: `[B, 14]` or `[B, S]`.
 pub fn policy_probs(net: &PolicyNet, batch: &PolicyBatch, train: bool) -> Tensor {
     match batch.phase {
@@ -179,6 +248,29 @@ pub fn optimize(opt: &mut nn::Optimizer, vars: &[Tensor], lr: f64, loss: Tensor)
     clip_grad_norm(vars, GRAD_CLIP_MAX_NORM);
     opt.step();
     loss.detach()
+}
+
+/// [`optimize`] with gradient accumulation: each loss is backpropagated as
+/// it is produced (so only one sub-batch's graph is alive at a time), then
+/// one clipped step on the summed gradients. Returns the summed loss,
+/// detached, or `None` (and no step) if there was none.
+pub fn optimize_sum(opt: &mut nn::Optimizer, vars: &[Tensor], lr: f64, losses: impl IntoIterator<Item = Tensor>) -> Option<Tensor> {
+    opt.set_lr(lr);
+    opt.zero_grad();
+    let mut total: Option<Tensor> = None;
+    for loss in losses {
+        loss.backward();
+        let d = loss.detach();
+        total = Some(match total {
+            Some(t) => t + d,
+            None => d,
+        });
+    }
+    if total.is_some() {
+        clip_grad_norm(vars, GRAD_CLIP_MAX_NORM);
+        opt.step();
+    }
+    total
 }
 
 pub const POLICY_WEIGHTS: &str = "policy.ot";
@@ -372,6 +464,7 @@ mod tests {
 
     #[test]
     fn policy_and_value_steps_reduce_their_losses() {
+        let _rng = crate::TORCH_RNG.lock().unwrap_or_else(|e| e.into_inner());
         tch::manual_seed(42);
         let vs = VarStore::new(Device::Cpu);
         let p = PolicyNet::new(&vs.root());

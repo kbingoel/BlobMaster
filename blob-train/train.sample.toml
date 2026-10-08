@@ -7,7 +7,7 @@ seed = 1
 hours = 7.0  # running time (pauses excluded), then the final evaluation
 init_checkpoint = "checkpoints/pretrain-2026-10-06/checkpoint"  # learner checkpoint the networks start from
 init_model = "checkpoints/pretrain-2026-10-06/model"            # the same networks exported: the actors' first model
-actors = 28  # self-play threads, in the actor process (`blobmaster selfplay`)
+actors = 28  # self-play threads, in the actor process (`blobmaster selfplay`); may be 0 with [rollout] actors
 
 [selfplay.mix]
 players = [5]
@@ -75,6 +75,8 @@ search_deals = 128
 search_seed = 7
 search_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb2-128-seed7.csv"  # paired comparison; "" = none
 search_vs_p_deals = 64      # with every search bench: search vs four copies of the same P (network); P alone scores 0 there; 0 = skip
+net_deals_vs_start = 512    # network-only bench of every publish vs four copies of the run's starting P (it scores 0 there); 0 = skip
+final_search = true         # the final search benches vs rule bot 2 and vs P; false = skip
 final_rule_bot_deals = 64   # final search bench vs the rule bot (default seed); 0 = skip
 final_rule_bot_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb-64.csv"
 probe_rounds = 600          # teacher rounds: fixed states for P's change per publish and drift, V's error
@@ -89,3 +91,23 @@ capacity = 3000000        # states kept (FIFO)
 min_examples = 100000     # states before the V-only updates start
 ratio = 2.0               # most V-only samples (updates × batch) per state produced
 chunk_secs = 30.0         # a file of replay-v/ every this many seconds; the learner reads and deletes it
+
+# Policy iteration by rollouts (gen-2.md §6 Phase 5, day 3): rounds of P alone, and at a few decisions per round
+# every legal move played out on the real deal by P's top move at every seat. P trains on them with a loss
+# linear in each move's utility (π → π_ref·exp(E[u | view]/T)) instead of on search targets.
+[rollout]
+actors = 0                # threads of the actor process playing them; 0 = off (P trains on search targets)
+samples_per_round = 2     # decisions with a choice valued per round
+bid_temperature = 0.0     # τ of the bids P plays in these rounds (0 = P's top move: the hidden cards fall as behind P's own play)
+play_temperature = 0.0    # τ of the cards
+bid_deals = 1             # deals each valued bid is played out on: the real one + drawn ones (bid-weighted); P's target averages them
+bid_candidates = 2        # candidate deals per drawn deal, weighted by the bids made
+rule_bot_2_share = 0.0    # chance each seat of a round is rule bot 2 (round and play-outs); P then learns against a mixed table
+temperature = 0.05        # T of the loss, in utility units (a point of a 7-card round ≈ 0.06)
+epsilon = 0.03            # share of uniform in π_ref over the legal moves
+capacity = 1000000        # samples kept (FIFO)
+min_examples = 50000      # training samples before the learner starts
+ratio = 4.0               # most P samples (steps × batch × micro_batches) per training sample produced
+micro_batches = 1         # batches whose gradients add up into one P update (one deal per sample is noisy)
+value_children = true     # V also learns the state after each valued move (in steps and V-only updates)
+chunk_secs = 30.0         # a file of replay-pi/ every this many seconds; the learner reads and deletes it

@@ -1,0 +1,49 @@
+# Night of 2026-10-08, run a (gen-2.md §6 Phase 5, day 3): policy iteration by rollouts for 6 h from run 2b's final
+# model, validation 2's settings (greedy rounds, every move of 2 decisions per round played out on the real deal,
+# 4 batches of 512 per P step, each sample used twice). The question: does P keep improving over hours (the
+# rollouts' noise needs data to average out), or stay at the +0.8 vs its start that it reached in the first 10 min
+# (a fixed point of one-step improvement)? Defaults of blob-train/train.sample.toml except these.
+[run]
+hours = 6.0
+init_checkpoint = "checkpoints/rl-2026-10-07b/models/step-003285/checkpoint"
+init_model = "checkpoints/rl-2026-10-07b/models/step-003285/model"
+actors = 0
+
+# Only for the search benches, which are off here: the night runs' self-play search.
+[selfplay.search]
+c_puct = 1.0
+root_rule = "q"
+q_temperature = 0.05
+dirichlet_epsilon = 0.0
+
+[selfplay.search.bid_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.play_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.bid_weighting]
+candidates = 2
+noise = 0.1
+
+[log]
+eval_every = 250
+publish_every = 125
+eval_examples = 40000
+
+[eval]
+threads = 8
+net_deals_rule_bot_2 = 512
+net_deals_vs_start = 512
+search_every_hours = 0.0
+search_baseline = ""
+search_vs_p_deals = 0
+final_search = false
+final_rule_bot_deals = 0
+
+[rollout]
+actors = 28
+ratio = 2.0
+micro_batches = 4
