@@ -77,6 +77,50 @@ impl std::fmt::Display for OneCardBids {
 /// Default 1-card bids.
 pub const DEFAULT_ONE_CARD_BIDS: OneCardBids = OneCardBids::Exact;
 
+/// How the root's move and training target come out of the trees
+/// (`MctsConfig::root_rule`).
+///
+/// Each tree searches one sampled deal and piles its visits onto that
+/// deal's best move, so summed visits count in how many deals a move came
+/// out best: a vote, not its mean value over the deals. With few deals the
+/// vote is noisy, and a P distilled from many searches out-averages it
+/// (gen-2.md §6 Phase 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRule {
+    /// The root visits summed over the trees (AlphaZero's).
+    #[default]
+    Visits,
+    /// `π' ∝ P · exp(Q̄ / T)` over the legal moves. Q̄ is the move's mean
+    /// utility for the deciding seat in each tree, averaged over the trees
+    /// with equal weight; T is `MctsConfig::q_temperature`, and T = 0 picks
+    /// the best Q̄. Regularized policy improvement (Grill et al. 2020,
+    /// Gumbel MuZero): T, not c_puct, sets how far the values may move P.
+    Q,
+    /// π' as for `Q`, but Q̄ comes from play, not from V or a tree: on each
+    /// sampled deal, each legal move is played and the round played out
+    /// with P's top move at every seat, each from its own view (no seat
+    /// sees another's cards, so no strategy fusion); Q̄ is the mean
+    /// utility over the deals. Rule bot 2r with P in rule bot 2's place:
+    /// one step of policy iteration over P with an exact critic. Uses the
+    /// budget's deals only (no simulations, no V).
+    Rollouts,
+}
+
+impl std::fmt::Display for RootRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RootRule::Visits => "visits",
+            RootRule::Q => "q",
+            RootRule::Rollouts => "rollouts",
+        })
+    }
+}
+
+/// Default T of [`RootRule::Q`], in utility units (in a 7-card round one
+/// point is 1/17 ≈ 0.06).
+pub const DEFAULT_Q_TEMPERATURE: f32 = 0.05;
+
 /// Initial node capacity reserved per search. 10k nodes × ~80 B ≈ 800 KB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 10_000;
 
@@ -682,6 +726,10 @@ fn default_one_card_bids() -> OneCardBids {
     DEFAULT_ONE_CARD_BIDS
 }
 
+fn default_q_temperature() -> f32 {
+    DEFAULT_Q_TEMPERATURE
+}
+
 /// Sample a single `Gamma(alpha, 1)` variate via Marsaglia–Tsang for
 /// `alpha >= 1`, with the standard boost trick
 /// (`G(alpha) ≡ G(alpha+1) · U^(1/alpha)`) for `alpha < 1`. Used by
@@ -885,6 +933,13 @@ pub struct MctsConfig {
     /// Optional in config files.
     #[serde(default)]
     pub bid_weighting: BidWeighting,
+    /// How the root's move and training target are formed ([`RootRule`]).
+    /// Optional in config files.
+    #[serde(default)]
+    pub root_rule: RootRule,
+    /// T of [`RootRule::Q`]; 0 picks the best Q̄. Optional in config files.
+    #[serde(default = "default_q_temperature")]
+    pub q_temperature: f32,
 }
 
 impl MctsConfig {
@@ -921,6 +976,8 @@ impl Default for MctsConfig {
             root_dirichlet_epsilon: default_root_dirichlet_epsilon(),
             one_card_bids: DEFAULT_ONE_CARD_BIDS,
             bid_weighting: BidWeighting::default(),
+            root_rule: RootRule::default(),
+            q_temperature: DEFAULT_Q_TEMPERATURE,
         }
     }
 }
@@ -936,10 +993,10 @@ impl Default for MctsConfig {
 /// deliberately decoupled:
 ///
 /// - **`policy_target`** is always computed at τ = 1.0 from aggregated
-///   root visit counts (`v_i / Σ v`). This is the training label, and
-///   `visit_entropy` / `top1_visit_share` are computed from it. Keeping the
-///   target at τ=1 preserves entropy in the policy's training signal even
-///   when the sampler is sharp.
+///   root visit counts (`v_i / Σ v`), or is π' under [`RootRule::Q`]. This
+///   is the training label, and `visit_entropy` / `top1_visit_share` are
+///   computed from it. Keeping the target at τ=1 preserves entropy in the
+///   policy's training signal even when the sampler is sharp.
 /// - **`policy_sampling`** is computed at
 ///   `cfg.temperature_at(decision_index)`. Used only for action sampling in
 ///   self-play. At τ→0 this collapses to one-hot on the most-visited
@@ -953,8 +1010,9 @@ pub struct MctsResult {
     /// Root prior per action, averaged over the sampled deals (after root
     /// noise, when on). Breaks visit ties for greedy play.
     pub root_prior: Vec<f32>,
-    /// The deciding seat's mean utility per action, over every visit to it
-    /// in every tree; 0 for unvisited actions.
+    /// The deciding seat's mean utility per action: over every visit to it
+    /// in every tree (0 if unvisited), or Q̄ under [`RootRule::Q`] (each
+    /// tree's mean, the trees weighted equally).
     pub action_values: Vec<f32>,
     pub visit_entropy: f32,
     pub top1_visit_share: f32,
@@ -1143,10 +1201,20 @@ where
         let num_dets = budget.determinizations.max(1) as usize;
         let sims_per = budget.sims_per_determinization.max(1);
 
-        // One sampled deal and one arena per tree, driven in lockstep.
+        if cfg.root_rule == RootRule::Rollouts {
+            let deals = sample_deals(state, perspective, policy, num_dets, cfg.bid_weighting, rng);
+            return rollout_root(state, &deals, policy, cfg, &hand_card_indices, policy_len, decision_index);
+        }
+
+        // One sampled deal and one arena per tree, driven in lockstep. An
+        // expansion adds at most 14 children, so small trees reserve less.
         let det_states = sample_deals(state, perspective, policy, num_dets, cfg.bid_weighting, rng);
+        let capacity = cfg.arena_capacity.min(1 + 16 * sims_per as usize);
         let mut arenas: Vec<MctsArena> =
-            (0..num_dets).map(|_| MctsArena::with_capacity(perspective, cfg.arena_capacity)).collect();
+            (0..num_dets).map(|_| MctsArena::with_capacity(perspective, capacity)).collect();
+        // P's prior before root noise (the same in every tree: P sees only
+        // the deciding seat's view), for the Q rule.
+        let mut clean_prior: Option<Vec<f32>> = None;
 
         // Root Dirichlet noise: expand every root with one batched call
         // first, so the priors can be decorated with `(1−ε)·P + ε·Dir(α)`
@@ -1162,6 +1230,7 @@ where
             };
             let roots: Vec<&BlobState> = det_states.iter().collect();
             let priors = policy.policy_batch(&roots);
+            clean_prior = priors.first().cloned();
             let values = value.values_batch(&roots);
             for (det, (prior, v)) in priors.into_iter().zip(values).enumerate() {
                 let n = det_states[det].num_players;
@@ -1192,21 +1261,44 @@ where
             }
             value_sum += root.q(perspective).unwrap_or(0.0);
         }
-        let action_values: Vec<f32> = value_sums
-            .iter()
-            .zip(&agg_visits)
-            .map(|(&s, &n)| if n > 0 { s / n as f32 } else { 0.0 })
-            .collect();
-
-        // Two policy vectors over the summed visits: `policy_target` at
-        // τ=1 for the training label, `policy_sampling` at the configured τ
-        // for action selection (identical when that τ is 1).
         let tau_sampling = cfg.temperature_at(decision_index);
-        let policy_target = visits_to_policy(&agg_visits, &root_prior, 1.0);
-        let policy_sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
-            policy_target.clone()
-        } else {
-            visits_to_policy(&agg_visits, &root_prior, tau_sampling)
+        let (policy_target, policy_sampling, action_values) = match cfg.root_rule {
+            // Two policy vectors over the summed visits: `policy_target` at
+            // τ=1 for the training label, `policy_sampling` at the
+            // configured τ for action selection (identical when that τ is 1).
+            RootRule::Visits => {
+                let action_values: Vec<f32> = value_sums
+                    .iter()
+                    .zip(&agg_visits)
+                    .map(|(&s, &n)| if n > 0 { s / n as f32 } else { 0.0 })
+                    .collect();
+                let target = visits_to_policy(&agg_visits, &root_prior, 1.0);
+                let sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
+                    target.clone()
+                } else {
+                    visits_to_policy(&agg_visits, &root_prior, tau_sampling)
+                };
+                (target, sampling, action_values)
+            }
+            // π' is both the training label and, at the configured τ, the
+            // sampling distribution.
+            RootRule::Q | RootRule::Rollouts => {
+                let legal: Vec<usize> = arenas[0]
+                    .root()
+                    .children
+                    .iter()
+                    .filter_map(|&c| action_to_policy_index(phase, arenas[0].node(c).action, &hand_card_indices))
+                    .collect();
+                let q = per_tree_q(&arenas, phase, &hand_card_indices, policy_len, value_sum / num_dets as f32);
+                let prior = clean_prior.unwrap_or_else(|| root_prior.clone());
+                let target = improved_policy(&prior, &q, &legal, cfg.q_temperature);
+                let sampling = if (tau_sampling - 1.0).abs() < 1e-6 {
+                    target.clone()
+                } else {
+                    prior_at_temperature(&target, tau_sampling)
+                };
+                (target, sampling, q)
+            }
         };
 
         // Diagnostics read from the τ=1 target, the canonical "what does
@@ -1246,6 +1338,135 @@ fn prior_at_temperature(prior: &[f32], tau: f32) -> Vec<f32> {
         for (o, w) in out.iter_mut().zip(&weights) {
             *o = w / z;
         }
+    }
+    out
+}
+
+/// P's most likely legal move in `s`: the bid, or the card.
+fn greedy_move(s: &BlobState, p: &[f32]) -> u8 {
+    let best = (0..p.len()).fold(0, |b, i| if p[i] > p[b] { i } else { b });
+    match s.phase() {
+        GamePhase::Bidding => best as u8,
+        _ => hand_card_indices(s, s.current_player)[best],
+    }
+}
+
+/// [`RootRule::Rollouts`]: every legal move of `state` on every deal, the
+/// round then played out by P's top move at every seat, the playouts
+/// advanced in lockstep so P runs in batches.
+fn rollout_root<P: PolicyEvaluator + ?Sized>(
+    state: &BlobState,
+    deals: &[BlobState],
+    policy: &P,
+    cfg: &MctsConfig,
+    hand_card_indices: &[u8],
+    policy_len: usize,
+    decision_index: usize,
+) -> MctsResult {
+    let phase = state.phase();
+    let me = state.current_player as usize;
+    let moves: Vec<u8> = match phase {
+        GamePhase::Bidding => (0..NUM_BIDS as u8).filter(|&b| (legal_bids(state) >> b) & 1 == 1).collect(),
+        _ => hand_card_indices.iter().copied().filter(|&c| (legal_plays(state) >> c) & 1 == 1).collect(),
+    };
+    let mut games: Vec<BlobState> = Vec::with_capacity(deals.len() * moves.len());
+    for d in deals {
+        for &m in &moves {
+            let mut g = *d;
+            apply_action(&mut g, m);
+            games.push(g);
+        }
+    }
+    loop {
+        for g in games.iter_mut() {
+            while let Some(a) = forced_action(g) {
+                apply_action(g, a);
+            }
+        }
+        let open: Vec<usize> = (0..games.len()).filter(|&i| !is_terminal(&games[i])).collect();
+        if open.is_empty() {
+            break;
+        }
+        let states: Vec<BlobState> = open.iter().map(|&i| games[i]).collect();
+        let priors = crate::evaluator::policy_in_chunks(policy, &states);
+        for (&i, p) in open.iter().zip(&priors) {
+            let a = greedy_move(&games[i], p);
+            apply_action(&mut games[i], a);
+        }
+    }
+    let mut q = vec![0.0f32; policy_len];
+    let mut legal = Vec::with_capacity(moves.len());
+    for (k, &m) in moves.iter().enumerate() {
+        let i = action_to_policy_index(phase, m, hand_card_indices).expect("legal move in the policy layout");
+        let sum: f32 = (0..deals.len()).map(|d| terminal_utilities(&games[d * moves.len() + k], cfg.lambda)[me]).sum();
+        q[i] = sum / deals.len().max(1) as f32;
+        legal.push(i);
+    }
+    let prior = policy.policy(state);
+    let target = improved_policy(&prior, &q, &legal, cfg.q_temperature);
+    let tau = cfg.temperature_at(decision_index);
+    let sampling = if (tau - 1.0).abs() < 1e-6 { target.clone() } else { prior_at_temperature(&target, tau) };
+    let value_estimate = legal.iter().map(|&i| target[i] * q[i]).sum();
+    MctsResult {
+        visit_entropy: entropy(&target),
+        top1_visit_share: target.iter().cloned().fold(0.0f32, f32::max),
+        policy_target: target,
+        policy_sampling: sampling,
+        root_prior: prior,
+        action_values: q,
+        total_visits: games.len() as u32,
+        value_estimate,
+    }
+}
+
+/// Q̄ of [`RootRule::Q`], dense like the policy: per tree, each root move's
+/// mean utility for the deciding seat (the root's acting seat), averaged
+/// over the trees that visited it, each tree with equal weight. A move no
+/// tree visited gets `fallback` (the roots' mean value). Every legal move
+/// is visited in every tree once a tree has more simulations than legal
+/// moves (an unvisited child scores +∞), so the trees then compare the
+/// moves on the same deals.
+fn per_tree_q(arenas: &[MctsArena], phase: GamePhase, hand_card_indices: &[u8], len: usize, fallback: f32) -> Vec<f32> {
+    let mut sum = vec![0.0f32; len];
+    let mut trees = vec![0u32; len];
+    for arena in arenas {
+        let seat = arena.root_player;
+        for &c in &arena.root().children {
+            let child = arena.node(c);
+            if let (Some(q), Some(i)) = (child.q(seat), action_to_policy_index(phase, child.action, hand_card_indices)) {
+                sum[i] += q;
+                trees[i] += 1;
+            }
+        }
+    }
+    let mut out = vec![0.0f32; len];
+    if let Some(root) = arenas.first().map(|a| a.root()) {
+        for &c in &root.children {
+            if let Some(i) = action_to_policy_index(phase, arenas[0].node(c).action, hand_card_indices) {
+                out[i] = if trees[i] > 0 { sum[i] / trees[i] as f32 } else { fallback };
+            }
+        }
+    }
+    out
+}
+
+/// `π' ∝ prior · exp(q / t)` over the `legal` indices, 0 elsewhere; `t ≤
+/// 1e-6` is one-hot on the best `q`, ties to the higher prior. A prior is
+/// floored at 1e-8, so a move P rules out needs a margin of about 18·t.
+fn improved_policy(prior: &[f32], q: &[f32], legal: &[usize], t: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; q.len()];
+    let p = |i: usize| prior.get(i).copied().unwrap_or(0.0);
+    let Some(&first) = legal.first() else { return out };
+    if t <= 1e-6 {
+        let best = legal.iter().copied().fold(first, |b, i| if q[i] > q[b] || (q[i] == q[b] && p(i) > p(b)) { i } else { b });
+        out[best] = 1.0;
+        return out;
+    }
+    let logits: Vec<f32> = legal.iter().map(|&i| p(i).max(1e-8).ln() + q[i] / t).collect();
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = logits.iter().map(|&l| (l - m).exp()).sum();
+    for (&i, &l) in legal.iter().zip(&logits) {
+        out[i] = (l - m).exp() / z;
     }
     out
 }
@@ -2375,5 +2596,141 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-4, "policy_target sum {sum} ≠ 1");
         // The noise pre-step is each tree's first simulation.
         assert_eq!(result.total_visits, 3 * 24);
+    }
+
+    /// ŝ = 1 for `seat` once `card` has been played, else 0.
+    struct PlayedCard {
+        card: u8,
+        seat: u8,
+    }
+
+    impl ValueEvaluator for PlayedCard {
+        fn values(&self, s: &BlobState) -> [f32; MAX_PLAYERS] {
+            let mut v = [0.0; MAX_PLAYERS];
+            v[self.seat as usize] = ((s.played_this_round >> self.card) & 1) as f32;
+            v
+        }
+    }
+
+    /// 0.97 on `card` when the seat to move may play it, the rest spread
+    /// over the other legal moves; uniform otherwise.
+    struct Prefers(u8);
+
+    impl PolicyEvaluator for Prefers {
+        fn policy(&self, s: &BlobState) -> Vec<f32> {
+            let mut p = crate::evaluator::uniform_policy(s);
+            if s.phase() != GamePhase::Playing || (legal_plays(s) >> self.0) & 1 == 0 {
+                return p;
+            }
+            let hand = hand_card_indices(s, s.current_player);
+            let others = legal_plays(s).count_ones() as f32 - 1.0;
+            for (pos, &c) in hand.iter().enumerate() {
+                if p[pos] > 0.0 {
+                    p[pos] = if c == self.0 { 0.97 } else { 0.03 / others };
+                }
+            }
+            p
+        }
+    }
+
+    /// A playing state where the seat to move has at least two legal cards.
+    fn choice_state() -> BlobState {
+        (1..).map(playing_state).find(|s| legal_plays(s).count_ones() >= 2).unwrap()
+    }
+
+    /// The Q rule reads each move's mean value over the deals, whatever the
+    /// visits do: V pays only for the card P dislikes, P puts 0.97 on
+    /// another one. T = 0 takes the valued card, a large T stays with P's
+    /// prior (the noise-free one, with root noise on), and in between π' is
+    /// `P · exp(Q̄ / T)` normalized.
+    #[test]
+    fn q_rule_weights_the_prior_by_the_mean_value() {
+        let s = choice_state();
+        let me = s.current_player;
+        let hand = hand_card_indices(&s, me);
+        let legal: Vec<usize> = (0..hand.len()).filter(|&i| (legal_plays(&s) >> hand[i]) & 1 == 1).collect();
+        let (good, liked) = (legal[0], legal[1]);
+        let (v, p) = (PlayedCard { card: hand[good], seat: me }, Prefers(hand[liked]));
+        let sims = legal.len() as u32 + 3;
+        let base = MctsConfig { root_rule: RootRule::Q, ..cfg_with((1, 1), (8, sims)) };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(31);
+
+        let r = mcts_search(&s, &p, &v, &MctsConfig { q_temperature: 0.0, ..base }, &mut rng, 0);
+        assert_eq!(r.policy_target[good], 1.0, "{:?}", r.policy_target);
+        assert!((r.action_values[good] - 1.0).abs() < 1e-5 && r.action_values[liked].abs() < 1e-5, "{:?}", r.action_values);
+        let visits = MctsConfig { root_rule: RootRule::Visits, c_puct: 5.0, ..base };
+        let rv = mcts_search(&s, &p, &v, &visits, &mut rng, 0);
+        assert!(rv.policy_target[liked] > rv.policy_target[good], "visits follow P here: {:?}", rv.policy_target);
+
+        let prior = p.policy(&s);
+        let noisy = MctsConfig { q_temperature: 100.0, root_dirichlet_epsilon: 0.25, ..base };
+        let r = mcts_search(&s, &p, &v, &noisy, &mut rng, 0);
+        for &i in &legal {
+            assert!((r.policy_target[i] - prior[i]).abs() < 0.01, "move {i}: {} vs prior {}", r.policy_target[i], prior[i]);
+        }
+
+        let t = 0.5;
+        let r = mcts_search(&s, &p, &v, &MctsConfig { q_temperature: t, ..base }, &mut rng, 0);
+        let w: Vec<f32> = legal.iter().map(|&i| prior[i] * (r.action_values[i] / t).exp()).collect();
+        let z: f32 = w.iter().sum();
+        for (k, &i) in legal.iter().enumerate() {
+            assert!((r.policy_target[i] - w[k] / z).abs() < 1e-5, "move {i}");
+        }
+        let sum: f32 = r.policy_target.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5 && r.policy_target.iter().enumerate().all(|(i, &x)| x == 0.0 || legal.contains(&i)));
+        // Greedy sampling is the target's top move.
+        let greedy = mcts_search(&s, &p, &v, &MctsConfig { q_temperature: 0.0, temperature: 0.0, ..base }, &mut rng, 0);
+        assert_eq!(greedy.policy_sampling, greedy.policy_target);
+    }
+
+    #[test]
+    fn improved_policy_breaks_ties_by_the_prior_and_floors_it() {
+        let prior = [0.2f32, 0.8, 0.0];
+        assert_eq!(improved_policy(&prior, &[0.3, 0.3, 0.9], &[0, 1], 0.0), vec![0.0, 1.0, 0.0]);
+        let p = improved_policy(&[0.5, 0.5], &[0.1, 0.0], &[0, 1], 0.1);
+        let e = std::f32::consts::E;
+        assert!((p[0] - e / (e + 1.0)).abs() < 1e-6, "{p:?}");
+        // A zero prior counts as 1e-8: a margin of 20·t overcomes it.
+        let p = improved_policy(&[1.0, 0.0], &[0.0, 2.0], &[0, 1], 0.1);
+        assert!(p[1] > 0.8, "{p:?}");
+        assert!(improved_policy(&[1.0], &[0.0], &[], 0.1).iter().all(|&x| x == 0.0));
+    }
+
+    /// The rollout rule's values are the playouts' utilities: on the real
+    /// deal, each legal move then P's top move at every seat to the round's
+    /// end, one game at a time, equals the lockstep batches.
+    #[test]
+    fn rollout_values_match_one_playout_at_a_time() {
+        let s = choice_state();
+        let me = s.current_player;
+        let hand = hand_card_indices(&s, me);
+        let p = Prefers(hand[hand.len() - 1]);
+        let cfg = MctsConfig { root_rule: RootRule::Rollouts, q_temperature: 0.0, ..MctsConfig::default() };
+        let r = rollout_root(&s, &[s, s], &p, &cfg, &hand, hand.len(), 0);
+        let mut legal = 0;
+        for (pos, &c) in hand.iter().enumerate() {
+            if (legal_plays(&s) >> c) & 1 == 0 {
+                assert_eq!(r.action_values[pos], 0.0);
+                continue;
+            }
+            legal += 1;
+            let mut g = s;
+            apply_action(&mut g, c);
+            while !is_terminal(&g) {
+                let a = forced_action(&g).unwrap_or_else(|| greedy_move(&g, &p.policy(&g)));
+                apply_action(&mut g, a);
+            }
+            let u = terminal_utilities(&g, cfg.lambda)[me as usize];
+            assert!((r.action_values[pos] - u).abs() < 1e-6, "card {c}: {} vs {u}", r.action_values[pos]);
+        }
+        assert_eq!(r.total_visits, 2 * legal);
+        let best = (0..hand.len()).filter(|&i| r.policy_target[i] == 1.0).collect::<Vec<_>>();
+        assert_eq!(best.len(), 1);
+        assert!(hand.iter().enumerate().all(|(i, &c)| (legal_plays(&s) >> c) & 1 == 0 || r.action_values[i] <= r.action_values[best[0]]));
+        // Through mcts_search, on sampled deals.
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(8);
+        let r = mcts_search(&s, &p, &D, &MctsConfig { play_budget: SearchBudget::new(4, 1), ..cfg }, &mut rng, 0);
+        assert_eq!(r.total_visits, 4 * legal);
+        assert!((r.policy_target.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 }

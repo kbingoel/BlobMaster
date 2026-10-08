@@ -1,0 +1,17 @@
+focal     network checkpoints/vfit-2026-10-07/models/step-000000/model
+opponents 4x rule bot 2
+table     5 players, 7 start cards; 2 deals x 5 seats = 10 games in 2 s
+
+points/game  focal 135.2  opponents 122.2  diff +13.0 ± 5.5 (95% CI over deals)
+win share    0.300 ± 0.196 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card            50   0.820    0.820      0.795       0.795
+2-4 cards         60   0.767    0.600      0.750       0.600
+5-8 cards         60   0.700    0.317      0.554       0.404
+all              170   0.759    0.565      0.694       0.588
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.000  0.006  0.071  0.759  0.118  0.041  0.006
+opponents     0.000  0.000  0.076  0.694  0.153  0.056  0.021
+

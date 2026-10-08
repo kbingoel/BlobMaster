@@ -1,0 +1,11 @@
+{
+  "layout_id": "layout-4",
+  "learner_step": 0,
+  "checkpoint": "checkpoints/vfit-2026-10-07/models/step-000000/checkpoint",
+  "policy": {
+    "layers": 8
+  },
+  "value": {
+    "layers": 4
+  }
+}

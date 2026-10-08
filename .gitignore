@@ -57,3 +57,9 @@ flamegraph.svg
 
 # Claude Code local state
 .claude/scheduled_tasks.lock
+
+# Self-play RL runs: the replay buffer on disk (`blobmaster-train train`)
+**/replay/chunk-*.bin
+**/replay/chunk-*.tmp
+**/replay-v/chunk-*.bin
+**/replay-v/chunk-*.tmp

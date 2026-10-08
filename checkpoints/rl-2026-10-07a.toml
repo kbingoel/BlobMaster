@@ -1,0 +1,35 @@
+# Second Phase-5 run, part a (2026-10-07 night; gen-2.md §6 Phase 5, day 2). From run 1's plateau (step 7600):
+# search with the Q root rule over 32 small trees per decision, and V also learning from rounds of P alone
+# (the V stream). Defaults of blob-train/train.sample.toml except these.
+[run]
+hours = 3.5
+init_checkpoint = "checkpoints/rl-2026-10-06/models/step-007600/checkpoint"
+init_model = "checkpoints/rl-2026-10-06/models/step-007600/model"
+actors = 24
+
+[selfplay.search]
+c_puct = 1.0
+root_rule = "q"
+q_temperature = 0.05
+dirichlet_epsilon = 0.0   # every tree values every root move; bids explore by sampling π'
+
+[selfplay.search.bid_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.play_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.bid_weighting]
+candidates = 2
+noise = 0.1
+
+[eval]
+search_every_hours = 1.75
+search_baseline = "checkpoints/rl-2026-10-06/bench/search-rb2-step-007600.csv"  # run 1's search at step 7600 (visits, c_puct 0.2)
+final_rule_bot_deals = 0
+
+[value_stream]
+actors = 4
+ratio = 3.0

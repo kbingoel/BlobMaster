@@ -199,6 +199,29 @@ impl ReplayBuffer {
         self.batch_of(indices, rng, augment)
     }
 
+    /// [`ReplayBuffer::sample_batch`] over the examples whose state passes
+    /// `keep`, drawn with replacement by rejection: e.g. P's decisions with
+    /// a choice from a live buffer that also holds forced ones. Gives up
+    /// after `64 · n` draws and returns the examples found by then.
+    pub fn sample_batch_where<R, F>(&self, n: usize, rng: &mut R, augment: bool, keep: F) -> (BidBatch, PlayBatch)
+    where
+        R: Rng + ?Sized,
+        F: Fn(&BlobState) -> bool,
+    {
+        assert!(self.len > 0, "cannot sample from empty replay buffer");
+        let mut indices = Vec::with_capacity(n);
+        for _ in 0..64 * n {
+            if indices.len() == n {
+                break;
+            }
+            let i = rng.gen_range(0..self.len);
+            if keep(&self.states[i]) {
+                indices.push(i);
+            }
+        }
+        self.batch_of(indices, rng, augment)
+    }
+
     fn batch_of<R: Rng + ?Sized>(&self, indices: Vec<usize>, rng: &mut R, augment: bool) -> (BidBatch, PlayBatch) {
         let examples = indices
             .iter()
@@ -390,6 +413,20 @@ mod tests {
                 _ => return (out, s),
             }
         }
+    }
+
+    #[test]
+    fn sampling_where_draws_only_matching_states() {
+        let mut buf = ReplayBuffer::new(1000);
+        for seed in 0..10 {
+            let (decisions, end) = played_round(seed, 3);
+            buf.push_round(&decisions, &end);
+        }
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let (bid, play) = buf.sample_batch_where(64, &mut rng, true, |s| s.phase() == GamePhase::Bidding);
+        assert_eq!((bid.states.len(), play.states.len()), (64, 0));
+        let (bid, play) = buf.sample_batch_where(8, &mut rng, false, |_| false);
+        assert_eq!((bid.states.len(), play.states.len()), (0, 0));
     }
 
     #[test]

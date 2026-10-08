@@ -1,0 +1,91 @@
+# `blobmaster-train train` — Phase-5 self-play RL (gen-2.md §5.6, §6 Phase 5).
+# Every key is shown at its default; leave out any you don't change.
+# Unknown keys are an error.
+
+[run]
+seed = 1
+hours = 7.0  # running time (pauses excluded), then the final evaluation
+init_checkpoint = "checkpoints/pretrain-2026-10-06/checkpoint"  # learner checkpoint the networks start from
+init_model = "checkpoints/pretrain-2026-10-06/model"            # the same networks exported: the actors' first model
+actors = 28  # self-play threads, in the actor process (`blobmaster selfplay`)
+
+[selfplay.mix]
+players = [5]
+start_cards = 7
+large_round_exponent = 0.0  # 0 = real games' round mix
+
+# Every seat searches with the current P and V.
+[selfplay.search]
+c_puct = 0.2
+lambda = 1.0
+bid_temperature = 1.0    # τ of the bid played, over the visits; 0 = most visits
+play_temperature = 0.0   # τ of the card played
+dirichlet_epsilon = 0.25 # root noise weight; 0 = off
+dirichlet_alpha = 0.0    # 0 = 10 / legal moves
+one_card_bids = "exact"  # exact | policy | search
+prune_forced_visits = true  # target and move drawn without the one visit per tree every legal move gets (root_rule visits)
+root_rule = "visits"     # visits: summed root visits | q: π' ∝ P·exp(Q̄/T), Q̄ = each move's mean value over the sampled deals
+q_temperature = 0.05     # T of root_rule q, in utility units (a point of a 7-card round ≈ 0.06); 0 = the best Q̄
+
+[selfplay.search.bid_budget]
+determinizations = 20
+sims_per_determinization = 25
+
+[selfplay.search.play_budget]
+determinizations = 5
+sims_per_determinization = 100
+
+[selfplay.search.bid_weighting]
+candidates = 8  # candidate deals per kept deal; 0 = off
+noise = 0.1
+
+[replay]
+capacity = 600000           # training examples kept (FIFO); the validation buffer keeps the same window
+validation_fraction = 0.05  # rounds held out, split by round
+min_examples = 25000        # training examples before the learner starts
+replay_ratio = 6.0          # most V samples (steps × batch) per training example produced
+chunk_rounds = 50           # rounds per file of replay/: the actor process writes, the learner tails, a resume reloads
+chunk_secs = 60.0           # a partial file after this many seconds without one
+loader_threads = 2
+
+# Constant LR after the warm-up: the run has no fixed end.
+[learner]
+device = "cuda"
+batch_size = 512
+lr = 1e-4
+warmup_steps = 300
+resume_warmup_steps = 200  # AdamW restarts on resume; the LR ramps up again
+weight_decay = 1e-4
+augment = true
+
+[log]
+every = 50                # a training row, in learner steps
+eval_every = 200          # a held-out row: self-play validation vs an equal training sample, and the probe set
+eval_examples = 10000
+publish_every = 400       # export a model; the actors switch to it and the evaluator benches it
+status_secs = 60          # status.md and a self-play row
+checkpoint_minutes = 10.0 # the resume checkpoint (also saved at every publish)
+
+[eval]
+threads = 4                 # network-only benches at every publish, beside the actors
+net_deals_rule_bot_2 = 256  # 0 = skip
+net_deals_rule_bot = 128
+search_every_hours = 3.5    # search bench vs rule bot 2 (actors park); 0 = only at the end
+search_deals = 128
+search_seed = 7
+search_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb2-128-seed7.csv"  # paired comparison; "" = none
+search_vs_p_deals = 64      # with every search bench: search vs four copies of the same P (network); P alone scores 0 there; 0 = skip
+final_rule_bot_deals = 64   # final search bench vs the rule bot (default seed); 0 = skip
+final_rule_bot_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb-64.csv"
+probe_rounds = 600          # teacher rounds: fixed states for P's change per publish and drift, V's error
+value_rounds_from = "checkpoints/rl-2026-10-06"  # an earlier run: its last validation rounds are a fixed V check at every held-out row; "" = none
+value_rounds = 600
+
+# Rounds of P alone for V (AlphaGo's value-net recipe): one random move per round, P's top move after it,
+# the states after the random move recorded. V-only updates on them while P waits on the governor.
+[value_stream]
+actors = 0                # threads of the actor process playing them; 0 = off
+capacity = 3000000        # states kept (FIFO)
+min_examples = 100000     # states before the V-only updates start
+ratio = 2.0               # most V-only samples (updates × batch) per state produced
+chunk_secs = 30.0         # a file of replay-v/ every this many seconds; the learner reads and deletes it

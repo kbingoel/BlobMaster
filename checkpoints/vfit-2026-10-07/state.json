@@ -1,0 +1,7 @@
+{
+  "active_secs": 3929.3448304219974,
+  "model": "checkpoints/vfit-2026-10-07/models/step-000000/model",
+  "model_step": 0,
+  "next_search_secs": 1e+18,
+  "finished": true
+}

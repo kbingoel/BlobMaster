@@ -1,0 +1,10 @@
+bench: 128 deals x 5 seats = 640 games on 32 threads
+bench: 64/640 games, 6 s
+bench: 128/640 games, 9 s
+bench: 192/640 games, 13 s
+bench: 256/640 games, 16 s
+bench: 320/640 games, 19 s
+bench: 384/640 games, 23 s
+bench: 448/640 games, 26 s
+bench: 512/640 games, 29 s
+bench: 576/640 games, 32 s

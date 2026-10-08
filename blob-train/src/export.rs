@@ -24,7 +24,16 @@ fn python() -> PathBuf {
 /// random-init networks without one. `LD_PRELOAD` is removed: a preloaded
 /// tch libtorch crashes the venv's `import torch` (different C++ ABI).
 pub fn export(checkpoint: Option<&Path>, output: &Path, check: bool) -> Result<(), String> {
+    export_with_threads(checkpoint, output, check, None)
+}
+
+/// [`export`] with PyTorch limited to `threads` CPU threads, e.g. beside
+/// the self-play actors.
+pub fn export_with_threads(checkpoint: Option<&Path>, output: &Path, check: bool, threads: Option<usize>) -> Result<(), String> {
     let mut cmd = Command::new(python());
+    if let Some(n) = threads {
+        cmd.env("OMP_NUM_THREADS", n.to_string()).env("MKL_NUM_THREADS", n.to_string());
+    }
     cmd.env_remove("LD_PRELOAD")
         .arg(workspace_root().join("scripts/export_onnx.py"))
         .arg("--out-dir")

@@ -1,0 +1,18 @@
+focal     search bids 32x16, plays 32x16, c_puct 1, root q (T 0.05), 1-card bids exact, bid weighting 2x candidates, noise 0.1 checkpoints/rl-2026-10-06/bench/day2/hybrid-p7600-vfit
+opponents 4x rule bot 2
+table     5 players, 7 start cards; 128 deals x 5 seats = 640 games in 1748 s
+
+points/game  focal 130.3  opponents 119.4  diff +10.9 ± 1.4 (95% CI over deals)
+win share    0.344 ± 0.035 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          3200   0.787    0.742      0.781       0.739
+2-4 cards       3840   0.720    0.598      0.690       0.560
+5-8 cards       3840   0.682    0.293      0.570       0.388
+all            10880   0.727    0.533      0.675       0.552
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.004  0.121  0.727  0.123  0.020  0.004
+opponents     0.000  0.000  0.105  0.675  0.170  0.041  0.009
+
+paired vs checkpoints/rl-2026-10-06/bench/day2/qfull-rb2.csv: diff -0.2 ± 0.8 (95% CI over 128 deals)

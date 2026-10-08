@@ -1,0 +1,7 @@
+{
+  "active_secs": 15204.532538868027,
+  "model": "checkpoints/rl-2026-10-07b/models/step-003285/model",
+  "model_step": 3285,
+  "next_search_secs": 18982.03535841601,
+  "finished": true
+}

@@ -1,0 +1,39 @@
+{
+  "actors": 2,
+  "seed": 1,
+  "mix": {
+    "players": [
+      5
+    ],
+    "start_cards": 7,
+    "large_round_exponent": 0.0
+  },
+  "search": {
+    "c_puct": 1.0,
+    "lambda": 1.0,
+    "bid_budget": {
+      "determinizations": 20,
+      "sims_per_determinization": 25
+    },
+    "play_budget": {
+      "determinizations": 5,
+      "sims_per_determinization": 100
+    },
+    "bid_temperature": 1.0,
+    "play_temperature": 0.0,
+    "dirichlet_epsilon": 0.25,
+    "dirichlet_alpha": 0.0,
+    "one_card_bids": "exact",
+    "bid_weighting": {
+      "candidates": 8,
+      "noise": 0.1
+    },
+    "prune_forced_visits": true,
+    "root_rule": "visits",
+    "q_temperature": 0.05
+  },
+  "chunk_rounds": 50,
+  "chunk_secs": 60.0,
+  "value_actors": 6,
+  "value_chunk_secs": 30.0
+}

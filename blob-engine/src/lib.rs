@@ -10,7 +10,8 @@
 //!   made), guided by a policy and a value evaluator (`evaluator`;
 //!   `onnx::OnnxEvaluator` in production). `one_card` computes 1-card bids.
 //! - Training data: `replay`, with suit-permutation augmentation from
-//!   `augment`; `teacher` plays the warm start's rule-bot-2 rounds.
+//!   `augment`; `teacher` plays the warm start's rule-bot-2 rounds;
+//!   `selfplay` plays the Phase-5 actors' rounds.
 //! - Yardsticks: `rule_bot`, `rule_bot_2` and `bench` (gen-2.md §5.7).
 //!
 //! Pure Rust plus `ort`; never depends on `tch` (that lives in `blob-nn`).
@@ -35,6 +36,7 @@ pub mod round;
 pub mod rule_bot;
 pub mod rule_bot_2;
 pub mod scoring;
+pub mod selfplay;
 pub mod state;
 pub mod teacher;
 
@@ -52,7 +54,8 @@ pub use belief::{
 pub use mcts::{
     apply_action, backup, expand, is_terminal, mcts_search, root_action_probs, run_search,
     select_best_child, select_leaf, signal_ratio, ucb1_score, MctsArena, MctsConfig, MctsNode,
-    MctsResult, OneCardBids, SearchBudget, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
+    MctsResult, OneCardBids, RootRule, SearchBudget, DEFAULT_ARENA_CAPACITY, DEFAULT_C_PUCT,
+    DEFAULT_Q_TEMPERATURE,
 };
 pub use rule_bot::{rule_bot_action, rule_bot_bid, rule_bot_play};
 pub use rule_bot_2::{rule_bot_2_action, rule_bot_2_bid, rule_bot_2_play};
@@ -67,4 +70,5 @@ pub use round::{
     RoundMix, RoundParamsError, NO_TRUMP, TRUMP_CYCLE_LEN,
 };
 pub use state::{BlobState, GamePhase, TrickRecord, MAX_PLAYERS, MIN_PLAYERS};
+pub use selfplay::{run_actors, selfplay_round, ActorsConfig, ModelPointer, SelfPlayConfig, SelfPlayRound, SelfPlayStats};
 pub use teacher::{fill_buffer, teacher_policy, teacher_round, TeacherConfig};

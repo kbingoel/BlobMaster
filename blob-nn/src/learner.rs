@@ -325,6 +325,15 @@ pub struct Learner {
     pub trains_policy: bool,
     /// Learner steps taken.
     pub step: u64,
+    /// Multiplies the schedule's LR (1 by default), e.g. to warm up again
+    /// after a resume restarts AdamW.
+    pub lr_scale: f64,
+    /// V updates taken, those of learner steps and V-only ones
+    /// ([`Learner::train_value_on`]): V's LR follows the schedule at this
+    /// count. Equal to `step` when V updates only in learner steps.
+    pub value_updates: u64,
+    /// `lr_scale` for V.
+    pub value_lr_scale: f64,
     pub device: Device,
 }
 
@@ -357,6 +366,9 @@ impl Learner {
             schedule: cfg.schedule(),
             trains_policy: cfg.trains_policy(),
             step: 0,
+            lr_scale: 1.0,
+            value_updates: 0,
+            value_lr_scale: 1.0,
             device,
         })
     }
@@ -366,6 +378,7 @@ impl Learner {
         let meta = load_checkpoint(dir, &mut self.policy_vs, &mut self.value_vs)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         self.step = meta.learner_step;
+        self.value_updates = meta.learner_step;
         Ok(())
     }
 
@@ -374,9 +387,15 @@ impl Learner {
             .map_err(|e| format!("{}: {e}", dir.display()))
     }
 
-    /// The LR of the next step.
+    /// The LR of the next step: the schedule's, times `lr_scale`.
     pub fn lr(&self) -> f64 {
-        self.schedule.lr(self.step)
+        self.schedule.lr(self.step) * self.lr_scale
+    }
+
+    /// V's LR for its next update: the schedule's at `value_updates`, times
+    /// `value_lr_scale`.
+    pub fn value_lr(&self) -> f64 {
+        self.schedule.lr(self.value_updates) * self.value_lr_scale
     }
 
     /// One learner step: a P update on `p` and a V update on `v` (each a
@@ -397,12 +416,25 @@ impl Learner {
             let loss = policy_loss(&self.policy, &batches.policy.iter().collect::<Vec<_>>(), true);
             optimize(&mut self.policy_opt, &self.policy_vars, lr, loss)
         });
+        let v_lr = self.value_lr();
         let v_loss = batches.value.as_ref().map(|vb| {
             let loss = value_loss(&self.value, vb, true);
-            optimize(&mut self.value_opt, &self.value_vars, lr, loss)
+            optimize(&mut self.value_opt, &self.value_vars, v_lr, loss)
         });
+        self.value_updates += v_loss.is_some() as u64;
         self.step += 1;
         (p_loss, v_loss)
+    }
+
+    /// A V update alone, at [`Learner::value_lr`]. Doesn't count as a learner step
+    /// (steps pace publishing and the replay-ratio governor), e.g. for V's
+    /// own stream of rounds while P waits for search data. Returns the
+    /// training loss, detached, on the device.
+    pub fn train_value_on(&mut self, batch: &ValueBatch) -> Tensor {
+        let lr = self.value_lr();
+        let loss = value_loss(&self.value, batch, true);
+        self.value_updates += 1;
+        optimize(&mut self.value_opt, &self.value_vars, lr, loss)
     }
 
     /// P on `buf[indices]`, in chunks of `chunk` examples.

@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-06: gen 1 is concluded; Phases 0–4b are done. The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Phase 4b (bid-aware sampling: exact 1-card bids and bid-weighted deals) lifts search to +6.4 against rule bot 2, paired +1.7 over Phase 4 (§6 Phase 4b). Next: Phase 5, async self-play RL.
+Status, 2026-10-07: gen 1 is concluded; Phases 0–4b are done; Phase 5's driver is built and its first run done (§6 Phase 5: P alone +10.8 over the warm start vs rule bot 2, search +2.7, then a plateau with search no better than P alone). The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Phase 4b (bid-aware sampling: exact 1-card bids and bid-weighted deals) lifts search to +6.4 against rule bot 2, paired +1.7 over Phase 4 (§6 Phase 4b). Day 2 (§6 Phase 5): against rule bot 2 search models its opponents as P, which stopped fitting, so the improvement step is now judged against P: search beats P by ~1 point there, ~2 with an hour of V trained on rounds of P alone (the V stream). Next: the night runs from run 1's step 7600, Q rule with and without the V stream.
 
 ---
 
@@ -772,15 +772,124 @@ The sampled deals ignored the bids already made (§6 Phase 4, 1-card bids), and 
 - Self-play: the exact 1-card bids' targets are one-hot, so 1-card bids get no exploration from τ; and in self-play the opponents are P, the model the weighting assumes, the best case for it. Against humans the noise floor, then per-player models (§8.1), stand in.
 
 **Phase 5 — Async self-play RL**
-- [ ] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train`.
-- [ ] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run.
-- [ ] Self-play search settings: the warm start's priors are sharp; at c_puct 1.5 visit counts ≈ P's priors (Phase 4), hence the default of 0.2. Check it in self-play (the visit targets must depart from P's priors) before the short run. 1-card bids are exact (Phase 4b): their targets are one-hot on the computed bid.
-- [ ] Short run (a few hours, 5p7c) from the Phase-4 checkpoint.
+- [x] Actor–learner per §5.6: actors play single rounds with P + V search; publisher; replay-ratio governor; delta persistence; STOP / resume; an evaluator running `bench` at every publish; metrics. CLI: `blobmaster-train train` (2026-10-06, as built below).
+- [x] End-to-end smoke test on a tiny config (few actors, small buffer and budgets) before any real run: start, PAUSE, a killed actor process, a mid-run search bench, STOP, `--resume`, the final evaluation (2026-10-06).
+- [x] Self-play search settings: the warm start's priors are sharp; at c_puct 1.5 visit counts ≈ P's priors (Phase 4), hence the default of 0.2. Check it in self-play (the visit targets must depart from P's priors) before the short run. 1-card bids are exact (Phase 4b): their targets are one-hot on the computed bid. *Checked 2026-10-06:* at c_puct 0.2 search's top move differs from P's in ~12% of bids and ~15% of plays at the start; and every legal move gets one visit per tree, so the raw visits put ≥ 4% on every legal bid at 20 × 25 — targets and moves drawn now leave that visit out (below).
+- [x] Short run (a few hours, 5p7c) from the Phase-4 checkpoint: `checkpoints/rl-2026-10-06` (2026-10-06/07, 5.6 h of learning; results below). P alone gains +10.8, search +2.7 (G4's first half); then both plateau and search falls behind P alone, because c_puct 0.2 no longer fits a strong P and V barely learns.
+- [x] The improvement margin measured, at every search bench: vs rule bot 2 paired against P alone, and vs four copies of P (day 2, below). The planned c_puct-1.0 run was replaced: at step 7600 neither root rule beats P by more than ~1 point, and V turned out to be the lever.
+- [x] Root rule `q`, the V stream, the fixed V check (2026-10-07, day 2 below).
+- [ ] Night runs 2a / 2b from step 7600: Q rule with and without the V stream (day 2, below).
 - [ ] First human playtest (`blobmaster play`).
 - *Exit:*
   - G3 and G4 pass;
   - STOP / resume is clean, with no loss spike;
   - the validation–training gap stays flat.
+
+*As built (2026-10-06):*
+- **Two processes.** A search bench run inside the libtorch process crashed in ONNX Runtime while the learner trained (`BiasGelu … GetElementType is not implemented`); the same bench in `blobmaster` ran clean. So the actors are `blobmaster selfplay` (ONNX only, `blob-engine/src/selfplay.rs`), the benches `blobmaster bench` subprocesses, and the driver (`blob-train/src/rl.rs`) holds libtorch alone. They talk through files: `selfplay.json` (settings), `model.json` (the model to play), `replay/chunk-*.bin` (rounds, written beside and renamed in). The driver restarts a dead actor process, freezes it (SIGSTOP) for PAUSE and search benches, and stops it by closing its stdin. A chunk is also the delta persistence: a resume reloads `replay/`.
+- **Targets:** root visits at τ = 1 less one visit per tree per legal move (`prune_forced_visits`): an unvisited child scores +∞, so every legal move gets one visit in every tree, ≥ 4% of a 20 × 25 bid's visits each, however bad (KataGo's policy-target pruning). In the smoke test the unpruned bid targets had entropy 1.2 nats against P's 0.17, and 53% of the bids drawn at τ = 1 were not search's top. Moves are drawn from the pruned visits: bids at τ = 1, plays greedy; root Dirichlet noise ε = 0.25, α = 10 / legal moves.
+- **Learner:** constant LR 1e-4 after a 300-step warm-up (an open-ended run has no cosine end); replay-ratio governor at 6 V samples per training example produced; validation by round id (5%) in its own buffer over the same window; P samples decisions with a choice by rejection from the live buffer.
+- **Measurements:** a held-out row every 200 steps (self-play validation vs an equal training sample; fixed teacher "probe" states: P's agreement with rule bot 2, V's error); at every publish (400 steps) P's KL and V's mean change on the probe states vs the previous publish and the start — the signal an adaptive-LR controller would read, logged only; network-only benches vs rule bot 2 (256 deals) and the rule bot (128) paired vs the run's step 0; search benches vs rule bot 2 every 2.75 h and at the end, paired vs the Phase-4b per-deal file. `status.md` holds the run at a glance; `scripts/plot_rl_run.py` draws `<run>/plots/`.
+- **Throughput** (profiled before the run, 30 threads, warm start): 3.8k rounds/h, 92k decisions/h, 37% of them forced; P is 37% of thread time, V 20%, bid weighting 10%.
+
+*First run* (`checkpoints/rl-2026-10-06`, 2026-10-06 23:11 → 2026-10-07 05:11; the defaults above; stopped at step 7696 to test search settings, resumable). 31.1k rounds, 693k examples (39% forced), 19 publishes. The actor process played 5.9k rounds/h (130k examples/h) without a restart; the learner ran ~1,500 steps/h at the replay ratio, its GPU waiting 92% of the time; an export took 5 s. Charts: `checkpoints/rl-2026-10-06/plots/`.
+
+| Learner step (hours of learning) | 0 | 400 (0.3) | 2000 (1.4) | 4000 (2.7) | 5200 (3.9) | 7600 (5.6) |
+|---|---|---|---|---|---|---|
+| P alone vs rule bot 2 (256 deals) | +0.2 ± 0.4 | +5.9 ± 0.8 | +9.9 ± 0.9 | +10.1 ± 0.9 | +11.3 ± 0.9 | +11.0 ± 1.0 (paired +10.8 ± 1.0) |
+| P alone vs the rule bot (128 deals) | +15.5 ± 1.5 | +20.9 ± 1.6 | +22.9 ± 1.7 | +23.6 ± 1.7 | +23.8 ± 1.7 | +24.1 ± 1.6 (paired +8.6 ± 1.4) |
+| Search (c_puct 0.2) vs rule bot 2, `--seed 7` | +6.4 ± 1.1 (Phase 4b) | | | +9.2 ± 1.2 (paired +2.8 ± 1.3) | | +9.1 ± 1.5 (paired +2.7 ± 1.4) |
+
+- **P learned search's play in minutes, then plateaued.** After 400 steps (5 min of learning) P alone was +5.7 over the warm start (paired), about what search scored before; +10 by step 2000, ~+11 from step 5200 on. The gain is in the bids: made in 2–4-card rounds 0.694 → 0.731, in 5–8-card rounds 0.579 → 0.687 (search at the warm start: 0.636); 0-bids in 5–8-card rounds 0.379 → 0.314. P's change per publish (probe KL, bids / plays) fell from 0.18 / 0.08 to ~0.005 / 0.003 nats by step 2000; P left rule bot 2 behind (same top move on the probe states 0.99 / 0.97 → 0.80 / 0.78).
+- **G4, first half: search is clearly above the warm start** (+9.2 ± 1.2 against +6.4 ± 1.1, paired +2.8 ± 1.3). Second half not met: from step 4000 to 7600 search moved −0.1 ± 1.0 (paired).
+- **Search fell behind P alone.** On the same deals, P alone minus search: +0.7 ± 1.1 at step 4000, +1.8 ± 1.0 at step 7600 (at the warm start search was 6.3 ahead). Self-play then trains P on targets no better than itself, and the loop stalls.
+- **c_puct 0.2 is part of the cause.** Search settings on the step-7600 networks (`--seed 7`, 128 deals, vs rule bot 2; `rl-2026-10-06/bench/experiments/`, chart `plots/07_search_experiments.png`):
+
+  | Search | Points/game | Paired vs c_puct 0.2 | Paired vs P alone |
+  |---|---|---|---|
+  | P alone (network only) | +10.8 ± 1.3 | +1.8 ± 1.0 | |
+  | c_puct 0.2 | +9.1 ± 1.5 | | −1.8 ± 1.0 |
+  | c_puct 0.5 | +10.3 ± 1.5 | +1.2 ± 1.0 | −0.6 ± 0.9 |
+  | c_puct 1.0 | +11.2 ± 1.5 | +2.2 ± 1.1 | +0.4 ± 0.8 |
+  | c_puct 2.0 | +11.4 ± 1.4 | +2.3 ± 1.1 | +0.5 ± 0.7 |
+  | c_puct 1.0, plays 5 × 200 | +10.2 ± 1.5 | +1.2 ± 1.1 | −0.6 ± 0.9 |
+  | c_puct 0.2, warm-start V with step-7600 P | +8.9 ± 1.4 | −0.2 ± 1.1 | −1.9 ± 0.9 |
+
+  c_puct 0.2 was chosen when P was a copy of rule bot 2 and V the better judge (§6 Phase 4). Now P is the stronger, and a low c_puct lets V's noisy values overrule it. From 1.0 up, search is back level with P alone (c_puct 1.0 against the warm start's search: +4.8 ± 1.4), but not ahead of it: the improvement margin is ~0 either way.
+- **More simulations per tree hurt:** plays at 5 × 200 instead of 5 × 100 (c_puct 1.0) scored −1.0 ± 0.6 (paired), at 1.4× the time. Inside a sampled deal every card is known, and a deeper tree leans harder on that (strategy fusion) and on V's errors. If the budget is a lever, it is more deals with fewer simulations each, not deeper trees.
+- **V barely learned.** With the warm start's V in place of the trained one, search scored the same (−0.2 ± 1.1). On the same 600 recent validation rounds (`blob-engine/examples/rl_value_check.rs`), V's MSE was 0.0494 (warm start) → 0.0475 (step 5600), −4%, mostly at bids (0.0829 → 0.0768; plays 0.0399 → 0.0392). The warm start's V got worse as self-play moved away from it (0.0454 on the rounds of steps 0–1200, 0.0494 on those of steps 2800–5600); the trained V kept up but learned little more. Search can't outgrow P while V adds nothing P doesn't already know.
+- **P's play targets look noisy.** Search's top card differed from P's in ~16% of plays all run long, P's held-out agreement with search's top play went 0.857 → 0.832, and P's play entropy rose above the targets' (0.67 → 0.79 nats, targets ~0.70): P spreads over moves the 5 × 100 searches don't agree on. The bids converged: P picks search's top bid 95% of the time, KL(target ‖ P) 0.36 → 0.05.
+- **No memorization:** P's held-out losses equal the training sample's throughout (step 7600: bids 0.400 / 0.413, plays 0.803 / 0.803); V's gap stayed at 0.0015–0.003 MSE (0.045 / 0.043), not growing.
+- **Exploration:** 15% of the bids drawn at τ = 1 were not search's top; P's bid entropy rose 0.17 → 0.41 nats.
+
+*For the next run:*
+- Self-play c_puct 1.0, and re-measure it as P improves.
+- Re-measure the play budget the other way: more deals, fewer simulations (e.g. 10 × 50, 20 × 25) at c_puct 1.0, paired against 5 × 100.
+- Measure the improvement margin at every search bench: a network-only bench on the search bench's deals, paired (seconds). Training on while it is ≤ 0 teaches P nothing; change the search instead.
+- V is the bottleneck: it needs to learn more from self-play than its warm start knew. Candidates: lower-variance value targets (search's root value per seat, which needs ŝ backed up beside `u`), more self-play per V update, a larger V. Track V on recent validation rounds against the warm start's V at every publish (`rl_value_check`).
+- The run can continue from step 7696 with a new search setting: edit `config.toml`, `train --resume`.
+
+*Day 2 (2026-10-07): reading the first run, and what changed.*
+
+**Reading.** The loop works mechanically (P's gain is real, held-out gaps are flat, optimization is not the limit: P's KL per publish was ~0.005 nats from step 2000 and its held-out loss equals its training loss). What stalled is the improvement step, and the evidence points at how search turns its trees into a move, not only at V:
+- **Sampled deals are the lever of a one-step improvement.** Rule bot 2r (rollouts of rule bot 2 on sampled deals, `rule_bot_2.rs` header) gains +0.0 over rule bot 2 at 8 deals, +3.8 at 16, +6.7 at 32, +9.6 at 128: below ~16 deals the noise of comparing moves on few deals eats the gain. Search plays used 5 deals per decision, bids 20.
+- **Summed visits are a vote.** Each tree piles its visits onto its own deal's best move, so the sum counts in how many deals a move came out best, not its mean value over the deals. Deeper trees sharpen the vote (5 × 200 lost to 5 × 100), and a higher c_puct only pulls it back to P's prior (c_puct ≥ 1 ≈ P).
+- **Distillation averages out the vote's noise.** P trains on the searches of many similar positions, so it learns their mean vote, in effect far more than 5 deals; that is how P passed search. P's play entropy above its targets' (0.79 against 0.70) is the entropy of a mean of inconsistent targets, not a defect of P.
+- **V is short of data, not of capacity or optimization:** 31k self-play rounds against the warm start's 1M teacher rounds, the GPU idle 88–92% of the time, a small and flat held-out gap. The held-out V MSE rose (0.040 → 0.045) because the validation window moves with the policy; only fixed rounds compare V over time.
+- **Search's root value is not a valid V target.** V sees the real deal; the root value averages over deals sampled from the mover's view. Training V(real deal) toward it would teach V to ignore the hidden cards. The valid low-variance alternative is TD(λ) along the real trajectory.
+
+**Decomposition** (`checkpoints/rl-2026-10-06/bench/day2/`; step-7600 networks, `--seed 7`, 128 deals vs rule bot 2, paired against P alone on the same deals). `--dets 1 --sims 1` expands only the root, so visits tie and the move is P's top; with `--bid-dets 1 --bid-sims 1 --one-card-bids policy` too, the search path reproduces P alone exactly (paired 0.0 ± 0.0).
+
+| Search (c_puct 1.0, visits) | Paired vs P alone |
+|---|---|
+| bids only (20 × 25, exact 1-card bids), plays from P | +0.3 ± 0.5 |
+| plays only (5 × 100), bids from P | +0.0 ± 0.7 |
+| bids 20 × 25, plays 20 × 25 (4× the deals at the same budget) | +0.3 ± 0.7 |
+| both, default budgets (run 1's experiment) | +0.4 ± 0.8 |
+
+At c_puct 1.0 neither half of the search adds anything over P, and more deals don't help while the visit counts decide.
+
+**The Q rule** (same deals and pairing; built below). T in utility units (a point of a 7-card round ≈ 0.06); `--bid-candidates 2` with 32–64 deals:
+
+| Search | Paired vs P alone | Wall time (shared CPU) |
+|---|---|---|
+| plays only, 32 × 16, T 0.05 | +0.5 ± 0.8 | 28 min |
+| plays only, 64 × 8 (each move valued once per deal: depth 1), T 0.05 | −0.0 ± 0.8 | 44 min |
+| bids and plays 32 × 16, T 0.05, c_puct 1.0 | +0.3 ± 0.9 | 69 min |
+
+Neither averaging the values over the deals nor 6–13× the deals beats P against rule bot 2. At depth 1 the move is only as good as V's ranking of the children, so this points back at V, or at a P that one step of improvement can't beat.
+
+**Against rule bot 2, search models the opponents wrongly.** Search plays the other seats as P inside its trees, and reads their bids through P (bid-weighted deals, exact 1-card bids). That fit when P was rule bot 2's copy; in run 1, P left it behind (same top move 0.99 → 0.80), and search's margin over P against rule bot 2 fell from +6.3 to −1.8 meanwhile. The sharpest case: the round played out by P's top move at every seat from each move (root rule `rollouts`: an exact critic of P's own play, no V, no tree; rule bot 2r with P in its place, which gained +9.6 over rule bot 2 at 128 deals) scored **−4.0** against P alone on 16 deals against rule bot 2 (+10.1 against +14.1 on the same deals; 60 min on every core). So against rule bot 2 the improvement step is mostly measured against a wrong opponent model, while self-play, where the targets are made, has the right one. The step is judged in self-play's own setting from here: search against four copies of P, where P alone scores exactly 0 (checked: 0.0 ± 0.0). Rule bot 2 stays the yardstick for P alone, which models nobody.
+
+| Against four copies of step 7600's P (`--seed 7`, 128 deals) | Points/game |
+|---|---|
+| P alone | 0.0 ± 0.0 |
+| search, root rule `q`, bids and plays 32 × 16, T 0.05, c_puct 1.0 | **+1.0 ± 1.0** |
+| the same with the V-stream test's V (below) | **+1.9 ± 1.0**; paired vs step 7600's V **+0.9 ± 0.8** |
+| search, root rule `visits`, default budgets (bids 20 × 25, plays 5 × 100), c_puct 1.0 | +0.9 ± 0.8 (the `q` row minus this, paired: +0.1 ± 1.0) |
+
+| root rule `rollouts` (each move played out by P's top move at every seat), 32 deals, T 0 (32 deals of the list: 72 min on every core) | −1.5 ± 3.2 (5–8-card bids made 0.614 against the opponents' 0.656) |
+
+In self-play's setting both root rules improve on P by about a point, and equally: at step 7600 the root rule doesn't matter, V does. The Q rule stays for the next runs: it reads V's values directly rather than through a vote, so it should gain more as V improves; it costs ~20% more time per bench.
+
+The rollout critic is exact per deal but not over 32 deals: a round played out by greedy P is one deterministic outcome, so 32 deals put the chance of making a bid within about ±0.09, too coarse to beat a bid policy distilled from millions of positions (its large-round bids were made less often). V's expectations vary less across deals than single outcomes do, which is why V-based search does better here than the exact critic. More deals per decision cost P calls the self-play budget doesn't have (~1 ms per P state).
+
+**The V-stream test** (`checkpoints/vfit-2026-10-07`, 1 h): step 7600's networks, 6 threads playing rounds of P alone, 2 search actors (P took no step), so only V changed: ~14k V-only updates of 512 at LR 1e-4, ratio 3. V's MSE on the stream's held-out rounds 0.0225 → 0.0204 (validation = training sample); on run 1's fixed rounds 0.0450 → 0.0460 (bid states 0.0741 → 0.0790, play states 0.0365 → 0.0364): V moved from the value of run 1's search play toward that of P's play. With it, the Q-rule search gains +0.9 ± 0.8 against P (paired, same P): **one hour of V on P's own play nearly doubled the improvement margin.** The first change of the day that improves the improvement step, and the evidence that V, fed the right data, is the lever. Against rule bot 2 the same V changed nothing (paired −0.2 ± 0.8 against step 7600's V; +0.1 ± 1.0 against P alone): V learned P's play, which rule bot 2 doesn't play. Whether gains in self-play reach rule bot 2 is P alone's to show (run 1's did: +10.8).
+
+Run 1's P against its own earlier P's (network only, 256 deals): step 2000 vs 400 **+4.4 ± 0.7**; 7600 vs 2000 +1.0 ± 0.6; 4000 vs 2000 +0.3 ± 0.5; 7600 vs 5600 +0.4 ± 0.5. The self-play plateau is real too: the loop's gains shrank with its improvement margin.
+
+**Changes (as built, 2026-10-07):**
+- **Root rule `q`** (`MctsConfig::root_rule`, `q_temperature`; `bench --root q --q-temp T`; `[selfplay.search] root_rule, q_temperature`). Per tree, each root move's mean utility for the deciding seat; Q̄ = their mean over the trees, each tree weighted equally (a move no tree visited gets the roots' mean value); π' ∝ P · exp(Q̄ / T) over the legal moves, from the noise-free prior; T = 0 takes the best Q̄. π' is the target, the sampling distribution (bids τ = 1) and the greedy move; nothing is pruned. Regularized policy improvement (Grill et al. 2020; Gumbel MuZero): T, not c_puct, sets how far the values may move P, whatever P's sharpness. With more simulations per tree than legal moves, every tree values every move (an unvisited child scores +∞), so the trees compare the moves on the same deals. Arenas now reserve `1 + 16 · sims` nodes, not 4096, so 32–64 small trees are cheap.
+- **The V stream** (`[value_stream]`; `selfplay::policy_round`). AlphaGo trained its value net on games of its policy net, not of search; this does the same. `value_stream.actors` threads of the actor process play rounds of P alone: a decision U drawn uniformly, P sampled at τ = 1 before it, one uniformly random legal move at the first decision with a choice from U on, P's top move after it. The states after the random move are kept, so V learns the value of greedy P after one move off P's policy: what a depth-1 improvement over P needs from its critic, and what search asks at its root's children. They go to `replay-v/`, which the driver reads into its own pair of buffers (split by round id) and deletes. V-only updates (`Learner::train_value_on`, not a learner step; V's LR follows its own update count) run while P waits on the governor, up to `value_stream.ratio` samples per state. Throughput: ~60k rounds/h per thread under a full bench load (~110× a searched round per thread), ~11 states kept per round.
+- **The driver:** a training row at least every two minutes while anything trains; the starting held-out row comes before any update (V-only updates can start before P's first step); a final held-out row; a final publish whenever V changed since the last one.
+- **Measurements:** a network bench on the search bench's deals at every publish (`net-rb2-s7`), so every search bench is paired against P alone at the same step (the improvement margin); search benches run with the self-play search settings (they ran with `bench`'s defaults before); the fixed V check (`eval.value_rounds_from`: the last 600 validation rounds of run 1, by phase, the same states at every held-out row and in every run); the V stream's validation vs training sample; `scripts/plot_rl_run.py` draws `08_value_margin.png` (search's margin, the fixed V check, the V stream, the learner's pace). The fixed V check scores V against outcomes of run 1's search play: as V moves toward the value of P's play, its MSE there can rise while it becomes the better critic.
+- **Tests:** the Q rule follows the mean values against a P that prefers another move, T = 0 / large / closed form, the noise-free prior under root noise; self-play rounds under the Q rule; P-alone rounds record greedy play after the random move; STOP / `--resume` with the V stream; end-to-end smoke runs.
+- **Search vs P in the driver** (`eval.search_vs_p_deals`, default 64): with every search bench, search against four copies of the same model's P (`search-vsP`), the improvement margin where the targets are made.
+
+**The night of 2026-10-07: two runs from run 1's step 7600** (`checkpoints/night-2026-10-07.sh` runs them back to back; configs `checkpoints/rl-2026-10-07a.toml`, `…b.toml`). Both: root rule `q`, T 0.05, c_puct 1.0, bids and plays 32 × 16, 2 candidates per deal, no root noise (bids explore by sampling π'), 24 search actors, 3.5 h, search benches at 1.75 h and at the end (vs rule bot 2 paired against P alone, and vs P).
+- **2a:** with the V stream (4 threads, ratio 3).
+- **2b:** without it: the control for what the V stream adds in the loop (the Q rule alone adds ~+1 vs P).
+- *Pass marks, set before the runs:* P alone vs rule bot 2 (256 deals) paired vs step 0 (= run 1's step 7600) above 0 by the end; `search-vsP` above 0 at both benches and not falling; for 2a, V's MSE on the stream's held-out rounds falling and 2a's gains above 2b's. Guardrails as before (held-out gaps flat, 0-bids in 5–8-card rounds not drifting).
 
 **Phase 6 — Long run, 5 players / 7 cards**
 - *Exit:* G5. That means ≥ +20 points per game vs the rule bot, ahead of rule bot 2, bids made in 5–8-card rounds clearly above the rule bot's, and human playtests that feel strong.

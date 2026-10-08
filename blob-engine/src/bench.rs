@@ -36,7 +36,7 @@ use crate::evaluator::PolicyEvaluator;
 use crate::game::{advance_round, new_game};
 use crate::hand::Hand;
 use crate::mcts::{
-    mcts_search, MctsConfig, MctsResult, SearchBudget, DEFAULT_BID_BUDGET,
+    mcts_search, MctsConfig, MctsResult, RootRule, SearchBudget, DEFAULT_BID_BUDGET,
     DEFAULT_PLAY_BUDGET,
 };
 use crate::onnx::{OnnxPolicy, OnnxValue};
@@ -533,8 +533,13 @@ fn agent_label(a: &Agent, mcts: &MctsConfig) -> String {
         Agent::RuleBot2R(cfg) => format!("rule bot 2r ({cfg})"),
         Agent::Network(p) => format!("network {}", p.display()),
         Agent::Search(p) => {
+            let root = match mcts.root_rule {
+                RootRule::Visits => String::new(),
+                RootRule::Q => format!(", root q (T {})", mcts.q_temperature),
+                RootRule::Rollouts => format!(", root rollouts (T {})", mcts.q_temperature),
+            };
             format!(
-                "search bids {}, plays {}, c_puct {}, 1-card bids {}, bid weighting {} {}",
+                "search bids {}, plays {}, c_puct {}{root}, 1-card bids {}, bid weighting {} {}",
                 mcts.bid_budget,
                 mcts.play_budget,
                 mcts.c_puct,

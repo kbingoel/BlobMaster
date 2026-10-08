@@ -162,6 +162,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_xoshiro",
  "serde",
+ "serde_json",
  "smallvec",
  "toml",
  "tracing",
@@ -184,6 +185,7 @@ dependencies = [
 name = "blob-train"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "blob-engine",
  "blob-nn",
  "clap",

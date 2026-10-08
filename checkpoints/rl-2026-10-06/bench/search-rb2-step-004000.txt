@@ -1,0 +1,18 @@
+focal     search bids 20x25, plays 5x100, c_puct 0.2, 1-card bids exact, bid weighting 8x candidates, noise 0.1 checkpoints/rl-2026-10-06/models/step-004000/model
+opponents 4x rule bot 2
+table     5 players, 7 start cards; 128 deals x 5 seats = 640 games in 1338 s
+
+points/game  focal 128.4  opponents 119.2  diff +9.2 ± 1.2 (95% CI over deals)
+win share    0.313 ± 0.032 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          3200   0.787    0.741      0.781       0.739
+2-4 cards       3840   0.713    0.628      0.687       0.557
+5-8 cards       3840   0.669    0.320      0.571       0.385
+all            10880   0.719    0.553      0.674       0.550
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.000  0.004  0.109  0.719  0.139  0.024  0.005
+opponents     0.000  0.000  0.107  0.674  0.168  0.042  0.009
+
+paired vs warm start (checkpoints/pretrain-2026-10-06/bench4b/search-rb2-128-seed7.csv): diff +2.78 ± 1.26 (95% CI over 128 deals)

@@ -8,6 +8,9 @@
 //! - `bench`: absolute strength vs fixed opponents on duplicate deals
 //!   (gen-2.md §5.7, `blob_engine::bench`).
 //! - `play`: one human against bots in the terminal (`play.rs`).
+//! - `selfplay`: the actor process of `blobmaster-train train` (gen-2.md
+//!   §6 Phase 5; `blob_engine::selfplay::run_actors`). The learner's driver
+//!   starts it; it stops at end of input on stdin.
 //!
 //! A model is a directory (`policy.onnx`, `value.onnx`, `meta.json`;
 //! gen-2.md §5.3), written by `blobmaster-train export`.
@@ -23,7 +26,7 @@ use blob_engine::bench::{
     eval_mcts_config, paired_diff, run_bench, write_per_deal, Agent, BenchConfig, Nets, DEFAULT_SEED,
 };
 use blob_engine::belief::{BidWeighting, DEFAULT_BID_CANDIDATES, DEFAULT_BID_NOISE};
-use blob_engine::mcts::{MctsConfig, OneCardBids, SearchBudget, DEFAULT_C_PUCT};
+use blob_engine::mcts::{MctsConfig, OneCardBids, RootRule, SearchBudget, DEFAULT_C_PUCT, DEFAULT_Q_TEMPERATURE};
 use blob_engine::rule_bot_2::Rollouts;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -104,6 +107,14 @@ enum Command {
         #[arg(long)]
         compare: Option<PathBuf>,
     },
+    /// The actors of a `blobmaster-train train` run (started by it): play
+    /// rounds with `<run>/selfplay.json`'s settings and `<run>/model.json`'s
+    /// model into `<run>/replay/`, until stdin closes.
+    Selfplay {
+        /// The run directory.
+        #[arg(long)]
+        run: PathBuf,
+    },
     /// Play a game in the terminal against bots.
     Play {
         /// Model directory for the bots. Without it the bots are rule bots.
@@ -170,6 +181,24 @@ struct SearchArgs {
     /// exact 1-card bids (share of a uniform bid, 0..1).
     #[arg(long, default_value_t = DEFAULT_BID_NOISE, value_parser = parse_bid_noise)]
     bid_noise: f32,
+    /// Search: how the move comes out of the trees. `visits` is the most
+    /// visited move over all trees; `q` weights P's prior by each move's
+    /// mean value over the sampled deals (`--q-temp`); `rollouts` takes
+    /// those values from playing each move out with P's top move at every
+    /// seat on `--dets` / `--bid-dets` deals (no tree, no V).
+    #[arg(long, value_enum, default_value_t = RootArg::Visits)]
+    root: RootArg,
+    /// Search, root `q`: how far the values may move P's prior (utility
+    /// units; a point of a 7-card round is ~0.06). 0 = the best value.
+    #[arg(long, default_value_t = DEFAULT_Q_TEMPERATURE, value_parser = parse_c_puct)]
+    q_temp: f32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum RootArg {
+    Visits,
+    Q,
+    Rollouts,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -205,6 +234,12 @@ impl SearchArgs {
             c_puct: self.c_puct,
             one_card_bids,
             bid_weighting: BidWeighting { candidates: self.bid_candidates, noise: self.bid_noise },
+            root_rule: match self.root {
+                RootArg::Visits => RootRule::Visits,
+                RootArg::Q => RootRule::Q,
+                RootArg::Rollouts => RootRule::Rollouts,
+            },
+            q_temperature: self.q_temp,
             ..eval_mcts_config(budgets.0, budgets.1)
         }
     }
@@ -363,6 +398,29 @@ fn main() {
                 per_deal_out,
                 compare,
             )
+        }
+        Command::Selfplay { run } => {
+            let cfg: blob_engine::ActorsConfig =
+                match blob_engine::selfplay::read_json(&run.join(blob_engine::selfplay::ACTORS_CONFIG_FILE)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    }
+                };
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    // End of input (the driver closed the pipe, or exited) stops the actors.
+                    let mut sink = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+                    stop.store(true, Ordering::SeqCst);
+                });
+                if let Err(e) = blob_engine::run_actors(&run, &cfg, &stop) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            });
         }
         Command::Play { model, bot, players, cards, seat, seed, show, search, rollouts, no_color } => {
             let bot = match (bot, model) {

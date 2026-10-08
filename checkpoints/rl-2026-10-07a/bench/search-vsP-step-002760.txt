@@ -1,0 +1,18 @@
+focal     search bids 32x16, plays 32x16, c_puct 1, root q (T 0.05), 1-card bids exact, bid weighting 2x candidates, noise 0.1 checkpoints/rl-2026-10-07a/models/step-002760/model
+opponents 4x network checkpoints/rl-2026-10-07a/models/step-002760/model
+table     5 players, 7 start cards; 64 deals x 5 seats = 320 games in 849 s
+
+points/game  focal 126.6  opponents 126.2  diff +0.4 ± 1.1 (95% CI over deals)
+win share    0.216 ± 0.028 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          1600   0.764    0.724      0.767       0.726
+2-4 cards       1920   0.714    0.635      0.713       0.632
+5-8 cards       1920   0.656    0.336      0.650       0.335
+all             5440   0.708    0.556      0.706       0.555
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.004  0.115  0.708  0.139  0.028  0.006
+opponents     0.001  0.003  0.118  0.706  0.139  0.027  0.005
+
+paired vs previous (checkpoints/rl-2026-10-07a/bench/search-vsP-step-002000.csv): diff -0.23 ± 1.31 (95% CI over 64 deals)

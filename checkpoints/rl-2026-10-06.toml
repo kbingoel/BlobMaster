@@ -1,0 +1,6 @@
+# First Phase-5 run (2026-10-06 overnight): defaults of blob-train/train.sample.toml except these.
+[run]
+hours = 8.0
+
+[eval]
+search_every_hours = 2.75

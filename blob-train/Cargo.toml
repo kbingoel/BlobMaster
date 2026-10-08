@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 blob-engine = { path = "../blob-engine" }
 blob-nn = { path = "../blob-nn" }
+bincode = "1"
 clap = { version = "4", features = ["derive"] }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
