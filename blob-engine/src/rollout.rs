@@ -14,10 +14,12 @@
 //!
 //! - **Samples** ([`RolloutSample`]): the true state, P's policy there, and
 //!   each legal move with every seat's points after its play-out.
-//! - **Opponents** (`RolloutConfig::rule_bot_2_share`): seats of a round
-//!   can be played by rule bot 2 instead of P, in the round and in every
-//!   play-out, so P learns a best response to a mixed table rather than to
-//!   itself. Only P's decisions are valued.
+//! - **Opponents** (`RolloutConfig::rule_bot_2_share`, `rule_bot_share`,
+//!   `frozen_share`): seats of a round can be played by rule bot 2, the rule
+//!   bot or a frozen policy net ([`rollout_round_vs`]: earlier checkpoints,
+//!   their top move) instead of P, in the round and in every play-out, so P
+//!   learns a best response to a mixed table rather than to itself. Only
+//!   P's decisions are valued.
 //! - **More deals for bids** (`RolloutConfig::bid_deals`): a bid can also be
 //!   played out on deals drawn from the bidder's view (`belief::sample_deals`:
 //!   the bids made so far weight them, and at bid time they are all there is
@@ -42,7 +44,8 @@ use crate::bidding::legal_bids;
 use crate::dealing::{new_round, RoundParams};
 use crate::encoder::hand_card_indices;
 use crate::evaluator::{PolicyEvaluator, NUM_BIDS};
-use crate::mcts::{apply_action, forced_action, is_terminal, play_out_greedy_with};
+use crate::mcts::{apply_action, forced_action, greedy_move, is_terminal, play_out_greedy_at, Seat, Table};
+use crate::rule_bot::rule_bot_action;
 use crate::rule_bot_2::rule_bot_2_action;
 use crate::playing::legal_plays;
 use crate::replay::{SparsePolicy, MAX_BID_ACTIONS};
@@ -70,6 +73,11 @@ pub struct RolloutConfig {
     /// Chance that each seat of a round is played by rule bot 2 (in the
     /// round and its play-outs); at least one seat stays P's.
     pub rule_bot_2_share: f32,
+    /// The same for the rule bot.
+    pub rule_bot_share: f32,
+    /// The same for a frozen policy net, drawn uniformly from those passed
+    /// to [`rollout_round_vs`] (none passed: P's seat).
+    pub frozen_share: f32,
 }
 
 impl Default for RolloutConfig {
@@ -81,6 +89,8 @@ impl Default for RolloutConfig {
             bid_deals: 1,
             bid_weighting: BidWeighting { candidates: 2, noise: 0.1 },
             rule_bot_2_share: 0.0,
+            rule_bot_share: 0.0,
+            frozen_share: 0.0,
         }
     }
 }
@@ -91,8 +101,9 @@ impl RolloutConfig {
         if self.samples_per_round == 0 || self.bid_deals == 0 || !ok(self.bid_temperature) || !ok(self.play_temperature) {
             return Err("rollout: samples_per_round and bid_deals must be > 0, temperatures >= 0".into());
         }
-        if !(0.0..1.0).contains(&self.rule_bot_2_share) {
-            return Err("rollout: rule_bot_2_share must be in [0, 1)".into());
+        let shares = [self.rule_bot_2_share, self.rule_bot_share, self.frozen_share];
+        if !shares.iter().all(|x| (0.0..1.0).contains(x)) || !(shares.iter().sum::<f32>() < 1.0) {
+            return Err("rollout: rule_bot_2_share, rule_bot_share and frozen_share must be in [0, 1), their sum < 1".into());
         }
         Ok(())
     }
@@ -259,19 +270,45 @@ where
     P: PolicyEvaluator + ?Sized,
     R: Rng + ?Sized,
 {
-    // Rule bot 2's seats, at least one seat left to P.
-    let mut bots = 0u8;
-    if cfg.rule_bot_2_share > 0.0 {
-        for seat in 0..params.num_players {
-            if rng.gen::<f32>() < cfg.rule_bot_2_share {
-                bots |= 1 << seat;
-            }
+    rollout_round_vs(params, policy, &[], cfg, rng)
+}
+
+/// [`rollout_round`] with the `frozen` policy nets as opponents: each seat
+/// is drawn by [`draw_table`].
+pub fn rollout_round_vs<P, R>(params: RoundParams, policy: &P, frozen: &[&dyn PolicyEvaluator], cfg: &RolloutConfig, rng: &mut R) -> (Vec<RolloutSample>, RolloutStats)
+where
+    P: PolicyEvaluator + ?Sized,
+    R: Rng + ?Sized,
+{
+    let table = draw_table(params.num_players, cfg, frozen.len(), rng);
+    rollout_round_at(params, policy, frozen, cfg, &table, rng)
+}
+
+/// Who plays each seat of a round: rule bot 2, the rule bot or one of
+/// `frozen` nets (uniformly) with their shares, P otherwise; at least one
+/// seat stays P's. No draw at all when every share is 0.
+pub fn draw_table<R: Rng + ?Sized>(num_players: u8, cfg: &RolloutConfig, frozen: usize, rng: &mut R) -> Table {
+    let mut table = [Seat::P; MAX_PLAYERS];
+    let (rb2, rb) = (cfg.rule_bot_2_share, cfg.rule_bot_share);
+    let fz = if frozen > 0 { cfg.frozen_share } else { 0.0 };
+    if rb2 + rb + fz > 0.0 {
+        for t in table.iter_mut().take(num_players as usize) {
+            let u = rng.gen::<f32>();
+            *t = if u < rb2 {
+                Seat::RuleBot2
+            } else if u < rb2 + rb {
+                Seat::RuleBot
+            } else if u < rb2 + rb + fz {
+                Seat::Frozen(rng.gen_range(0..frozen) as u8)
+            } else {
+                Seat::P
+            };
         }
-        if bots.count_ones() == params.num_players as u32 {
-            bots &= !(1 << rng.gen_range(0..params.num_players));
+        if !table[..num_players as usize].contains(&Seat::P) {
+            table[rng.gen_range(0..num_players) as usize] = Seat::P;
         }
     }
-    rollout_round_with(params, policy, cfg, bots, rng)
+    table
 }
 
 /// [`rollout_round`] with rule bot 2 at the seats in the `bots` bitmask.
@@ -280,13 +317,38 @@ where
     P: PolicyEvaluator + ?Sized,
     R: Rng + ?Sized,
 {
+    let mut table = [Seat::P; MAX_PLAYERS];
+    for (seat, t) in table.iter_mut().enumerate() {
+        if (bots >> seat) & 1 == 1 {
+            *t = Seat::RuleBot2;
+        }
+    }
+    rollout_round_at(params, policy, &[], cfg, &table, rng)
+}
+
+/// [`rollout_round`] with each seat played as `table` says (frozen nets:
+/// indices into `frozen`).
+pub fn rollout_round_at<P, R>(
+    params: RoundParams,
+    policy: &P,
+    frozen: &[&dyn PolicyEvaluator],
+    cfg: &RolloutConfig,
+    table: &Table,
+    rng: &mut R,
+) -> (Vec<RolloutSample>, RolloutStats)
+where
+    P: PolicyEvaluator + ?Sized,
+    R: Rng + ?Sized,
+{
     let mut s = new_round(params, rng).expect("valid round parameters");
     let mut choices: Vec<(BlobState, Vec<f32>)> = Vec::with_capacity(params.num_players as usize * (1 + params.cards_dealt as usize));
     while matches!(s.phase(), GamePhase::Bidding | GamePhase::Playing) {
-        let action = match forced_action(&s) {
-            Some(a) => a,
-            None if (bots >> s.current_player) & 1 == 1 => rule_bot_2_action(&s),
-            None => {
+        let action = match (forced_action(&s), table[s.current_player as usize]) {
+            (Some(a), _) => a,
+            (None, Seat::RuleBot2) => rule_bot_2_action(&s),
+            (None, Seat::RuleBot) => rule_bot_action(&s),
+            (None, Seat::Frozen(k)) => greedy_move(&s, &frozen[k as usize].policy(&s)),
+            (None, Seat::P) => {
                 let p = policy.policy(&s);
                 let tau = if s.phase() == GamePhase::Bidding { cfg.bid_temperature } else { cfg.play_temperature };
                 let i = sample_index(&at_temperature(&p, tau, top(&p, &[])), rng);
@@ -325,7 +387,7 @@ where
             }
         }
     }
-    play_out_greedy_with(&mut games, policy, bots);
+    play_out_greedy_at(&mut games, policy, frozen, table);
     let mut ends = games.iter();
     let mut samples = Vec::with_capacity(picked.len());
     for ((&c, m), ds) in picked.iter().zip(&moves).zip(&deals) {
@@ -631,6 +693,95 @@ mod tests {
             assert!(movers.len() <= 4);
         }
         assert!(RolloutConfig { rule_bot_2_share: 1.0, ..Default::default() }.validate().is_err());
+    }
+
+    /// P counting its calls.
+    struct Counting<'a, P: PolicyEvaluator>(&'a P, &'a std::sync::atomic::AtomicUsize);
+
+    impl<P: PolicyEvaluator> PolicyEvaluator for Counting<'_, P> {
+        fn policy(&self, s: &BlobState) -> Vec<f32> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.0.policy(s)
+        }
+    }
+
+    /// A table of P, both rule bots and two frozen nets: every seat plays
+    /// its own moves in the round and in the play-outs, and only P's
+    /// decisions are valued.
+    #[test]
+    fn mixed_table_seats_play_their_own_moves() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(32);
+        let cfg = RolloutConfig { samples_per_round: 100, ..Default::default() };
+        let (c0, c1) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let (f0, f1) = (Counting(&DummyEvaluator, &c0), Counting(&Skewed, &c1));
+        let frozen: [&dyn PolicyEvaluator; 2] = [&f0, &f1];
+        let mut n = 0;
+        for k in 0..20u8 {
+            // Seats rotate through the kinds, so each kind bids at every position.
+            let kinds = [Seat::P, Seat::RuleBot, Seat::Frozen(0), Seat::RuleBot2, Seat::Frozen(1)];
+            let mut table = [Seat::P; MAX_PLAYERS];
+            for seat in 0..5 {
+                table[seat] = kinds[(seat + k as usize) % 5];
+            }
+            let params = RoundParams { num_players: 5, cards_dealt: 2 + k % 5, trump: k % 5, dealer: k % 5 };
+            for s in rollout_round_at(params, &Skewed, &frozen, &cfg, &table, &mut rng).0 {
+                n += 1;
+                assert_eq!(table[s.state.current_player as usize], Seat::P, "a non-P decision was valued");
+                for &(i, pts) in &s.outcomes {
+                    let mut g = s.child(i);
+                    while !is_terminal(&g) {
+                        let a = forced_action(&g).unwrap_or_else(|| match table[g.current_player as usize] {
+                            Seat::RuleBot => rule_bot_action(&g),
+                            Seat::RuleBot2 => rule_bot_2_action(&g),
+                            Seat::Frozen(0) => action_of(&g, top(&DummyEvaluator.policy(&g), &[]) as u8),
+                            _ => action_of(&g, top(&Skewed.policy(&g), &[]) as u8),
+                        });
+                        apply_action(&mut g, a);
+                    }
+                    assert_eq!(round_points(&g), pts, "move {i}");
+                }
+            }
+        }
+        assert!(n > 20, "{n} samples");
+        assert!(c0.load(Relaxed) > 0 && c1.load(Relaxed) > 0, "the frozen nets were not called");
+    }
+
+    #[test]
+    fn tables_are_drawn_by_the_shares() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(33);
+        // No shares: no draw, every seat P.
+        let mut before = rng.clone();
+        assert_eq!(draw_table(5, &RolloutConfig::default(), 3, &mut rng), [Seat::P; MAX_PLAYERS]);
+        assert_eq!(rng.gen::<u64>(), before.gen::<u64>(), "a draw without shares");
+        // A frozen share without frozen nets is P's.
+        let only_frozen = RolloutConfig { frozen_share: 0.5, ..Default::default() };
+        assert_eq!(draw_table(5, &only_frozen, 0, &mut rng), [Seat::P; MAX_PLAYERS]);
+        let cfg = RolloutConfig { rule_bot_2_share: 0.1, rule_bot_share: 0.1, frozen_share: 0.3, ..Default::default() };
+        let mut counts = [0usize; 5];
+        for _ in 0..4000 {
+            let t = draw_table(5, &cfg, 2, &mut rng);
+            assert!(t[..5].contains(&Seat::P), "no seat left to P");
+            assert!(t[5..].iter().all(|&x| x == Seat::P));
+            for &x in &t[..5] {
+                counts[match x {
+                    Seat::RuleBot2 => 0,
+                    Seat::RuleBot => 1,
+                    Seat::Frozen(0) => 2,
+                    Seat::Frozen(1) => 3,
+                    Seat::P => 4,
+                    Seat::Frozen(_) => panic!("frozen net out of range"),
+                }] += 1;
+            }
+        }
+        // A table without P (0.5^5 of them) gives one of its seats to P.
+        let keep = 1.0 - 0.5f64.powi(5) / (5.0 * 0.5);
+        let expected = [0.1 * keep, 0.1 * keep, 0.15 * keep, 0.15 * keep, 1.0 - 0.5 * keep];
+        for (i, e) in expected.iter().enumerate() {
+            assert!((counts[i] as f64 / 20_000.0 - e).abs() < 0.015, "{counts:?} vs {expected:?}");
+        }
+        assert!(RolloutConfig { rule_bot_share: 0.5, frozen_share: 0.5, ..Default::default() }.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -1261,10 +1261,11 @@ fn net_search_deals_name(sh: &Shared) -> String {
     format!("net-rb2-s{}", sh.cfg.eval.search_seed)
 }
 
-fn net_benches(sh: &Shared, step: u64, model: &Path) {
+/// The network benches of a publish, on `threads` (None: every core).
+fn net_benches(sh: &Shared, step: u64, model: &Path, threads: Option<usize>) {
     let e = &sh.cfg.eval;
     let start_model = std::fs::canonicalize(&sh.cfg.run.init_model).unwrap_or_else(|_| PathBuf::from(&sh.cfg.run.init_model));
-    let benches = [
+    let mut benches = vec![
         ("net-rb2".to_string(), "rulebot2".to_string(), e.net_deals_rule_bot_2, DEFAULT_SEED),
         ("net-rb".to_string(), "rulebot".to_string(), e.net_deals_rule_bot, DEFAULT_SEED),
         // The search bench's deals: search's margin over P alone, paired.
@@ -1273,6 +1274,11 @@ fn net_benches(sh: &Shared, step: u64, model: &Path) {
         // own setting (the start scores 0 there).
         ("net-vs0".to_string(), start_model.to_string_lossy().to_string(), if step > 0 { e.net_deals_vs_start } else { 0 }, DEFAULT_SEED),
     ];
+    // The panel of fixed opponents, step 0 included for the paired change.
+    for m in &e.panel {
+        let model = std::fs::canonicalize(&m.model).unwrap_or_else(|_| PathBuf::from(&m.model));
+        benches.push((format!("net-vs-{}", m.name), model.to_string_lossy().to_string(), e.net_deals_panel, DEFAULT_SEED));
+    }
     for (name, opponent, deals, seed) in benches {
         if deals == 0 {
             continue;
@@ -1287,7 +1293,7 @@ fn net_benches(sh: &Shared, step: u64, model: &Path) {
                 baselines.insert(0, ("start".to_string(), start));
             }
         }
-        bench(sh, step, &name, model, "network", &opponent, deals, seed, Some(e.threads), &[], &baselines);
+        bench(sh, step, &name, model, "network", &opponent, deals, seed, threads, &[], &baselines);
     }
 }
 
@@ -1335,7 +1341,10 @@ fn evaluator(sh: Arc<Shared>, rx: Receiver<(u64, PathBuf)>) {
         if sh.stop.load(SeqCst) && !sh.finish.load(SeqCst) {
             continue;
         }
-        net_benches(&sh, step, &model);
+        // Beside the actors on `eval.threads`; after they stopped (the final
+        // publish), on every core.
+        let threads = if sh.stop.load(SeqCst) { None } else { Some(e.threads) };
+        net_benches(&sh, step, &model, threads);
         let due = {
             let mut st = sh.state.lock().unwrap();
             let due = e.search_every_hours > 0.0 && step > 0 && st.active_secs >= st.next_search_secs;
@@ -1822,6 +1831,16 @@ pub fn train(cfg: TrainConfig, dir: &Path, resume: bool) -> Result<(), String> {
         value_chunk_secs: cfg.value_stream.chunk_secs,
         rollout_actors: cfg.rollout.actors,
         rollout: cfg.rollout.round(),
+        rollout_opponents: cfg
+            .rollout
+            .opponents
+            .iter()
+            .map(|m| match std::fs::canonicalize(m) {
+                Ok(p) if p.join("policy.onnx").is_file() => Ok(p),
+                Ok(p) => Err(format!("rollout opponent {}: no policy.onnx", p.display())),
+                Err(e) => Err(format!("rollout opponent {m}: {e}")),
+            })
+            .collect::<Result<_, _>>()?,
         rollout_chunk_secs: cfg.rollout.chunk_secs,
     };
     write_json(&dir.join(ACTORS_CONFIG_FILE), &actors).map_err(|e| format!("{ACTORS_CONFIG_FILE}: {e}"))?;

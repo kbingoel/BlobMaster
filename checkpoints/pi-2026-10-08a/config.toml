@@ -1,0 +1,102 @@
+[run]
+seed = 1
+hours = 6.0
+init_checkpoint = "checkpoints/rl-2026-10-07b/models/step-003285/checkpoint"
+init_model = "checkpoints/rl-2026-10-07b/models/step-003285/model"
+actors = 0
+
+[selfplay.mix]
+players = [5]
+start_cards = 7
+large_round_exponent = 0.0
+
+[selfplay.search]
+c_puct = 1.0
+lambda = 1.0
+bid_temperature = 1.0
+play_temperature = 0.0
+dirichlet_epsilon = 0.0
+dirichlet_alpha = 0.0
+one_card_bids = "exact"
+prune_forced_visits = true
+root_rule = "q"
+q_temperature = 0.05000000074505806
+
+[selfplay.search.bid_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.play_budget]
+determinizations = 32
+sims_per_determinization = 16
+
+[selfplay.search.bid_weighting]
+candidates = 2
+noise = 0.10000000149011612
+
+[replay]
+capacity = 600000
+validation_fraction = 0.05
+min_examples = 25000
+replay_ratio = 6.0
+chunk_rounds = 50
+chunk_secs = 60.0
+loader_threads = 2
+
+[learner]
+device = "cuda"
+batch_size = 512
+lr = 0.0001
+warmup_steps = 300
+resume_warmup_steps = 200
+weight_decay = 0.0001
+augment = true
+
+[log]
+every = 50
+eval_every = 250
+eval_examples = 40000
+publish_every = 125
+status_secs = 60
+checkpoint_minutes = 10.0
+
+[eval]
+threads = 8
+net_deals_rule_bot_2 = 512
+net_deals_rule_bot = 128
+search_every_hours = 0.0
+search_deals = 128
+search_seed = 7
+search_baseline = ""
+search_vs_p_deals = 0
+net_deals_vs_start = 512
+final_search = false
+final_rule_bot_deals = 0
+final_rule_bot_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb-64.csv"
+probe_rounds = 600
+value_rounds_from = "checkpoints/rl-2026-10-06"
+value_rounds = 600
+
+[value_stream]
+actors = 0
+capacity = 3000000
+min_examples = 100000
+ratio = 2.0
+chunk_secs = 30.0
+
+[rollout]
+actors = 28
+samples_per_round = 2
+bid_temperature = 0.0
+play_temperature = 0.0
+bid_deals = 1
+bid_candidates = 2
+rule_bot_2_share = 0.0
+temperature = 0.05
+epsilon = 0.03
+capacity = 1000000
+min_examples = 50000
+ratio = 2.0
+micro_batches = 4
+value_children = true
+chunk_secs = 30.0

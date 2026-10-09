@@ -1,0 +1,11 @@
+{
+  "layout_id": "layout-4",
+  "learner_step": 1250,
+  "checkpoint": "checkpoints/pi-2026-10-08a/models/step-001250/checkpoint",
+  "policy": {
+    "layers": 8
+  },
+  "value": {
+    "layers": 4
+  }
+}

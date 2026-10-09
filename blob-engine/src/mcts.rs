@@ -1343,13 +1343,28 @@ fn prior_at_temperature(prior: &[f32], tau: f32) -> Vec<f32> {
 }
 
 /// P's most likely legal move in `s`: the bid, or the card.
-fn greedy_move(s: &BlobState, p: &[f32]) -> u8 {
+pub(crate) fn greedy_move(s: &BlobState, p: &[f32]) -> u8 {
     let best = (0..p.len()).fold(0, |b, i| if p[i] > p[b] { i } else { b });
     match s.phase() {
         GamePhase::Bidding => best as u8,
         _ => hand_card_indices(s, s.current_player)[best],
     }
 }
+
+/// Who plays a seat in a play-out (and in a rollout round,
+/// `crate::rollout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seat {
+    /// P, the network being trained: its top move.
+    P,
+    RuleBot,
+    RuleBot2,
+    /// The `k`-th frozen policy net of the play-out: its top move.
+    Frozen(u8),
+}
+
+/// Who plays each seat (absolute), [`Seat::P`] beyond the table.
+pub type Table = [Seat; MAX_PLAYERS];
 
 /// Play every game of `games` to the round's end, P's top move at every
 /// seat (each from its own view), forced moves without a call. The games
@@ -1361,16 +1376,40 @@ pub fn play_out_greedy<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState], pol
 /// [`play_out_greedy`] with the seats in the `bots` bitmask played by rule
 /// bot 2 instead of P.
 pub fn play_out_greedy_with<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState], policy: &P, bots: u8) {
+    let mut table = [Seat::P; MAX_PLAYERS];
+    for (seat, t) in table.iter_mut().enumerate() {
+        if (bots >> seat) & 1 == 1 {
+            *t = Seat::RuleBot2;
+        }
+    }
+    play_out_greedy_at(games, policy, &[], &table);
+}
+
+/// [`play_out_greedy`] with each seat played as `table` says: the rule bots
+/// move inline, P and each frozen net run one batch per lockstep step over
+/// the games where one of their seats is to move.
+pub fn play_out_greedy_at<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState], policy: &P, frozen: &[&dyn PolicyEvaluator], table: &Table) {
+    let net_of = |seat: Seat| match seat {
+        Seat::Frozen(k) => {
+            assert!((k as usize) < frozen.len(), "seat played by frozen net {k} of {}", frozen.len());
+            Some(1 + k as usize)
+        }
+        Seat::P => Some(0),
+        Seat::RuleBot | Seat::RuleBot2 => None,
+    };
     loop {
         for g in games.iter_mut() {
             loop {
                 if let Some(a) = forced_action(g) {
                     apply_action(g, a);
-                } else if !is_terminal(g) && (bots >> g.current_player) & 1 == 1 {
-                    let a = crate::rule_bot_2::rule_bot_2_action(g);
-                    apply_action(g, a);
-                } else {
+                } else if is_terminal(g) {
                     break;
+                } else {
+                    match table[g.current_player as usize] {
+                        Seat::RuleBot2 => apply_action(g, crate::rule_bot_2::rule_bot_2_action(g)),
+                        Seat::RuleBot => apply_action(g, crate::rule_bot::rule_bot_action(g)),
+                        Seat::P | Seat::Frozen(_) => break,
+                    }
                 }
             }
         }
@@ -1378,11 +1417,20 @@ pub fn play_out_greedy_with<P: PolicyEvaluator + ?Sized>(games: &mut [BlobState]
         if open.is_empty() {
             return;
         }
-        let states: Vec<BlobState> = open.iter().map(|&i| games[i]).collect();
-        let priors = crate::evaluator::policy_in_chunks(policy, &states);
-        for (&i, p) in open.iter().zip(&priors) {
-            let a = greedy_move(&games[i], p);
-            apply_action(&mut games[i], a);
+        for net in 0..=frozen.len() {
+            let mine: Vec<usize> = open.iter().copied().filter(|&i| net_of(table[games[i].current_player as usize]) == Some(net)).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let states: Vec<BlobState> = mine.iter().map(|&i| games[i]).collect();
+            let priors = match net {
+                0 => crate::evaluator::policy_in_chunks(policy, &states),
+                k => crate::evaluator::policy_in_chunks(frozen[k - 1], &states),
+            };
+            for (&i, p) in mine.iter().zip(&priors) {
+                let a = greedy_move(&games[i], p);
+                apply_action(&mut games[i], a);
+            }
         }
     }
 }

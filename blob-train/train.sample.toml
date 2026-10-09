@@ -82,6 +82,8 @@ final_rule_bot_baseline = "checkpoints/pretrain-2026-10-06/bench4b/search-rb-64.
 probe_rounds = 600          # teacher rounds: fixed states for P's change per publish and drift, V's error
 value_rounds_from = "checkpoints/rl-2026-10-06"  # an earlier run: its last validation rounds are a fixed V check at every held-out row; "" = none
 value_rounds = 600
+net_deals_panel = 512       # network-only benches of every publish (step 0 too) vs four copies of each panel model; 0 = skip
+panel = []                  # fixed opponents: [{ name = "r1s7600", model = "checkpoints/rl-2026-10-06/models/step-007600/model" }, ...] → bench net-vs-<name>
 
 # Rounds of P alone for V (AlphaGo's value-net recipe): one random move per round, P's top move after it,
 # the states after the random move recorded. V-only updates on them while P waits on the governor.
@@ -103,6 +105,9 @@ play_temperature = 0.0    # τ of the cards
 bid_deals = 1             # deals each valued bid is played out on: the real one + drawn ones (bid-weighted); P's target averages them
 bid_candidates = 2        # candidate deals per drawn deal, weighted by the bids made
 rule_bot_2_share = 0.0    # chance each seat of a round is rule bot 2 (round and play-outs); P then learns against a mixed table
+rule_bot_share = 0.0      # the same for the rule bot
+frozen_share = 0.0        # the same for a frozen policy net from opponents (drawn uniformly; its top move); the shares sum < 1
+opponents = []            # model directories of the frozen opponents, e.g. earlier checkpoints
 temperature = 0.05        # T of the loss, in utility units (a point of a 7-card round ≈ 0.06)
 epsilon = 0.03            # share of uniform in π_ref over the legal moves
 capacity = 1000000        # samples kept (FIFO)

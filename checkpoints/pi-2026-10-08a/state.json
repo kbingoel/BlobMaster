@@ -1,0 +1,7 @@
+{
+  "active_secs": 21979.499624955002,
+  "model": "checkpoints/pi-2026-10-08a/models/step-006403/model",
+  "model_step": 6403,
+  "next_search_secs": 1e+18,
+  "finished": true
+}

@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! cargo run --release -p blob-engine --example rollout_profile -- \
-//!     <model dir> <threads> <secs> <samples per round>,... [<bid deals> [<rule bot 2 share>]]
+//!     <model dir> <threads> <secs> <samples per round>,... [<bid deals> [<rule bot 2 share> [<frozen share> <model dir>,...]]]
 //! ```
+//! The last two: a share of seats played by frozen policy nets (drawn
+//! uniformly from the model directories; `rollout::rollout_round_vs`).
 //! For each samples-per-round setting (0 = rounds of P alone, nothing
 //! valued) it plays rounds on every thread for `<secs>` and prints rounds
 //! and valued decisions per hour, per thread, the moves valued per
@@ -16,7 +18,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use blob_engine::evaluator::PolicyEvaluator;
-use blob_engine::rollout::{rollout_round, RolloutConfig, RolloutStats};
+use blob_engine::rollout::{rollout_round_vs, RolloutConfig, RolloutStats};
 use blob_engine::round::RoundMix;
 use blob_engine::{BlobState, OnnxPolicy};
 use rand::SeedableRng;
@@ -43,33 +45,37 @@ impl PolicyEvaluator for Counted<'_> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if !(5..=7).contains(&args.len()) {
-        eprintln!("usage: rollout_profile <model dir> <threads> <secs> <samples per round>,... [<bid deals> [<rule bot 2 share>]]");
+    if !(5..=9).contains(&args.len()) || args.len() == 8 {
+        eprintln!("usage: rollout_profile <model dir> <threads> <secs> <samples per round>,... [<bid deals> [<rule bot 2 share> [<frozen share> <model dir>,...]]]");
         std::process::exit(2);
     }
     let bid_deals: usize = args.get(5).map_or(1, |x| x.parse().expect("bid deals"));
     let share: f32 = args.get(6).map_or(0.0, |x| x.parse().expect("rule bot 2 share"));
+    let frozen_share: f32 = args.get(7).map_or(0.0, |x| x.parse().expect("frozen share"));
+    let frozen_dirs: Vec<&str> = args.get(8).map_or(vec![], |x| x.split(',').collect());
     let model = &args[1];
     let threads: usize = args[2].parse().expect("threads");
     let secs: f64 = args[3].parse().expect("secs");
     let settings: Vec<usize> = args[4].split(',').map(|x| x.parse().expect("samples per round")).collect();
     let mix = RoundMix::default();
     for &k in &settings {
-        let cfg = RolloutConfig { samples_per_round: k, bid_deals, rule_bot_2_share: share, ..Default::default() };
+        let cfg = RolloutConfig { samples_per_round: k, bid_deals, rule_bot_2_share: share, frozen_share, ..Default::default() };
         let (rounds, states, calls) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
         let stats = Mutex::new(RolloutStats::default());
         let deadline = Instant::now() + Duration::from_secs_f64(secs);
         std::thread::scope(|sc| {
             for t in 0..threads {
-                let (rounds, states, calls, stats, mix) = (&rounds, &states, &calls, &stats, &mix);
+                let (rounds, states, calls, stats, mix, frozen_dirs) = (&rounds, &states, &calls, &stats, &mix, &frozen_dirs);
                 sc.spawn(move || {
                     let p = OnnxPolicy::from_dir(model).expect("policy.onnx");
                     let counted = Counted { p: &p, states, calls };
+                    let frozen: Vec<OnnxPolicy> = frozen_dirs.iter().map(|d| OnnxPolicy::from_dir(d).expect("frozen policy.onnx")).collect();
+                    let frozen: Vec<&dyn PolicyEvaluator> = frozen.iter().map(|f| f as &dyn PolicyEvaluator).collect();
                     let mut rng = Xoshiro256PlusPlus::seed_from_u64(1000 + t as u64);
                     let mut local = RolloutStats::default();
                     while Instant::now() < deadline {
                         let params = mix.sample(&mut rng);
-                        let (_, st) = rollout_round(params, &counted, &cfg, &mut rng);
+                        let (_, st) = rollout_round_vs(params, &counted, &frozen, &cfg, &mut rng);
                         local.merge(&st);
                         rounds.fetch_add(1, Relaxed);
                     }
@@ -82,8 +88,9 @@ fn main() {
         let n = st.samples[0] + st.samples[1];
         let r = rounds.load(Relaxed) as f64;
         println!(
-            "samples/round {k}, bid deals {bid_deals}, rule bot 2 share {share}: {threads} threads, {:.0} rounds/h ({:.0}/thread); valued decisions {:.0}/h ({:.0}/thread; bids {:.0}%); \
+            "samples/round {k}, bid deals {bid_deals}, rule bot 2 share {share}, frozen share {frozen_share} of {}: {threads} threads, {:.0} rounds/h ({:.0}/thread); valued decisions {:.0}/h ({:.0}/thread; bids {:.0}%); \
              moves per decision {:.2}; P states per round {:.0} in {:.1} calls",
+            frozen_dirs.len(),
             r / h,
             r / h / threads as f64,
             n as f64 / h,

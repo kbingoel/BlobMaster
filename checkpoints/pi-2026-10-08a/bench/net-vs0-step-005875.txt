@@ -1,0 +1,18 @@
+focal     network checkpoints/pi-2026-10-08a/models/step-005875/model
+opponents 4x network /home/kbuntu/Documents/Github/BlobMaster/checkpoints/rl-2026-10-07b/models/step-003285/model
+table     5 players, 7 start cards; 512 deals x 5 seats = 2560 games in 422 s
+
+points/game  focal 128.5  opponents 126.6  diff +1.9 ± 0.5 (95% CI over deals)
+win share    0.218 ± 0.011 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card         12800   0.772    0.720      0.772       0.724
+2-4 cards      15360   0.712    0.610      0.709       0.624
+5-8 cards      15360   0.677    0.297      0.658       0.339
+all            43520   0.717    0.532      0.710       0.553
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.005  0.122  0.717  0.129  0.022  0.005
+opponents     0.001  0.004  0.113  0.710  0.141  0.026  0.006
+
+paired vs previous (checkpoints/pi-2026-10-08a/bench/net-vs0-step-005625.csv): diff +0.29 ± 0.34 (95% CI over 512 deals)

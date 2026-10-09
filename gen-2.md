@@ -4,7 +4,7 @@ The single source of truth for the remake. It replaces every gen-1 planning docu
 
 **Gen 2 is a clean break.** The code is rewritten for the gen-2 design only. Nothing is kept to run, train or compare against gen-1 models. Gen 1 survives as evidence (§2–§3) and as two git tags (§10).
 
-Status, 2026-10-08: gen 1 is concluded; Phases 0–4b are done; Phase 5's driver is built and three runs done (§6 Phase 5). The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Phase 4b (bid-aware sampling) lifts search to +6.4 against rule bot 2 (§6 Phase 4b). Run 1 took P alone from +0.2 to +11.0 against rule bot 2; the night runs of day 2 added ~+1.2 (P alone +12.3), in their first 25 minutes, then plateaued. Day 3 (§6 Phase 5): policy iteration by rollouts (P trains on every move of its own decisions played out on the real deal, no search) runs at ~20× search's labelled decisions but, like search, makes one quick step (+0.8 against its start P) and stops. Next: the night runs of 2026-10-08 tell a fixed point of one-step improvement from noise.
+Status, 2026-10-09: gen 1 is concluded; Phases 0–4b are done; Phase 5's driver is built and three runs done (§6 Phase 5). The supervised warm start (`checkpoints/pretrain-2026-10-06`): P alone matches rule bot 2 (+15.5 vs the rule bot); with V's trick features (layout 4), V passes G1 and search adds 4–5 points (G2), scoring +20.0 against the rule bot and +4.7 against rule bot 2 (§6 Phase 4). Phase 4b (bid-aware sampling) lifts search to +6.4 against rule bot 2 (§6 Phase 4b). Run 1 took P alone from +0.2 to +11.0 against rule bot 2; the night runs of day 2 added ~+1.2 (P alone +12.3), in their first 25 minutes, then plateaued. Day 3 (§6 Phase 5): policy iteration by rollouts (P trains on every move of its own decisions played out on the real deal, no search) runs at ~20× search's labelled decisions but, like search, makes one quick step (+0.8 against its start P) and stops. Day 4: the night's rollout runs reached +1.7 against their start P and stopped after ~3 h, a fixed point, not noise; the gain holds against every earlier self-play P, not against the rule bots. The best model (P alone +24.8 vs the rule bot, +11.6 vs rule bot 2, +5.8 vs the lookahead rule bot 2r) is past what our search can improve on (−0.0 ± 0.6 vs P). Next: the ~70-h chain of 2026-10-09 (league rollouts with frozen checkpoints and both rule bots at the table, between two exploiters), and the first human playtest.
 
 ---
 
@@ -780,7 +780,10 @@ The sampled deals ignored the bids already made (§6 Phase 4, 1-card bids), and 
 - [x] Root rule `q`, the V stream, the fixed V check (2026-10-07, day 2 below).
 - [x] Night runs 2a / 2b from step 7600: Q rule with and without the V stream (day 2, below; results under day 3).
 - [x] Policy iteration by rollouts: rollout actors, the policy-iteration loss, held-out gains on unseen deals, a bench against the start P (2026-10-08, day 3 below).
-- [ ] First human playtest (`blobmaster play`).
+- [x] Night runs of rollouts (2026-10-08): +1.7 against the start after ~3 h, then a fixed point, not noise; the gain holds against every self-play P, not against the rule bots (day 4 below).
+- [x] League tables (frozen checkpoints and both rule bots at the rollout rounds' seats), the panel benches, the actor thread count (2026-10-09, day 4 below).
+- [ ] The chain of 2026-10-09: exploiters of b's final and of the league's final around ten league legs (day 4 below).
+- [ ] First human playtest (`blobmaster play`, or the GUI).
 - *Exit:*
   - G3 and G4 pass;
   - STOP / resume is clean, with no loss spike;
@@ -943,6 +946,79 @@ Run 1's P against its own earlier P's (network only, 256 deals): step 2000 vs 40
 - **a** (`pi-2026-10-08a`, 6 h): validation 2's settings.
 - **b** (`pi-2026-10-08b`, 5.5 h): LR 3e-5 (a third) and 8 × 512 per step (~540 updates/h): less drift per update.
 - *Pass marks, set before the runs:* `net-vs0` (512 deals) above +1.5 and still rising in the last third (validation 2 sat at ~+0.8 from 10 min on), and P alone vs rule bot 2 (512 deals) paired vs start above +0.5. If b climbs above a, the plateau was noise; if both stay at ~+0.8, it is a fixed point, and the next step is to change what P can learn (opponent diversity beyond rule bot 2, a belief head, game-level objectives) rather than how it learns. Guardrails: the policy-iteration loss's validation–training gap, 0-bids in 5–8-card rounds.
+
+*Day 4 (2026-10-09): the night's rollouts, a panel of opponents, the thread count, and a league for 72 hours.*
+
+**The night of 2026-10-08** (both runs clean, back to back 21:01 → 08:43):
+
+| | a (LR 1e-4, 4 × 512 per step) | b (LR 3e-5, 8 × 512 per step) |
+|---|---|---|
+| Learning | 6 h, 6,403 steps, 6.6M rollout samples | 5.5 h, 2,931 steps, 6.0M |
+| P vs four copies of the start P (512 deals), end | **+1.72 ± 0.45** | **+1.72 ± 0.42** |
+| … mean of each third of the run | +1.19 / +1.60 / +1.65 | +1.15 / +1.54 / +1.66 |
+| … trend in the last third | +0.13/h (inside the noise) | +0.03/h |
+| P alone vs rule bot 2 (512), paired vs start, end | **−1.00 ± 0.52** (−2.0 … 0.0 along the run) | −0.33 ± 0.45 |
+| P alone vs the rule bot (128), paired vs start, end | −0.17 ± 0.93 | +0.13 ± 0.87 |
+| Bids made in 5–8-card rounds vs rule bot 2 (start 0.692) | 0.672 | 0.684 |
+| P's KL per publish on the probe states, bids | 0.03–0.21 | 0.01–0.04 |
+| Policy-iteration loss, validation / training | −0.208 / −0.213 | −0.213 / −0.215 |
+| Learner waiting for data | 64% | 60% |
+
+**A panel** (network only, 512 deals, four copies of each opponent, default seed; the change paired on the same deals):
+
+| Opponents | the start (2b's final) | a's final | b's final |
+|---|---|---|---|
+| run 1, step 2000 | +2.80 | +3.65 (+0.85 ± 0.51) | +3.87 (+1.08 ± 0.46) |
+| run 1, step 7600 | +1.15 | +2.52 (+1.37 ± 0.50) | +2.47 (+1.31 ± 0.44) |
+| 2a's final | −0.31 | +1.49 (+1.80 ± 0.47) | +1.28 (+1.59 ± 0.41) |
+
+Head to head: a vs four copies of b +0.09 ± 0.40, b vs four copies of a −0.23 ± 0.39.
+
+- **Against the pass marks:** above +1.5 against the start, yes; still rising in the last third, no; above +0.5 against rule bot 2, no.
+- **A fixed point, higher than the validations' +0.8:** both runs climbed for ~3 h and stopped at the same level, and b, with a third of the LR and twice the batch, ended level with a (head to head 0). So the plateau is not the noise of one deal per sample. The lower LR bought smoother learning (bid KL per publish 0.01–0.04 against up to 0.21) and a smaller loss against rule bot 2.
+- **The gain is real against every self-play P,** not only the start: +0.9 to +1.8 against three models of earlier runs. That is more than the search loop managed (2a / 2b: +1.2 to +1.6 against their own start), and on top of it.
+- **It doesn't carry over to the rule bots:** −0.3 to −1.0 against rule bot 2 (bids made in 5–8-card rounds fell), 0 against the rule bot. The rollouts value each move with every seat playing P's top move, so P learns the best reply to P. That carries over to other P's, which play alike, and not to bots that play differently: validation 3 the other way round.
+- **Best model: b's final** (`checkpoints/pi-2026-10-08b/models/step-002931/model`): level with a against the P's, −0.3 against rule bot 2 (inside the CI), **+24.8 ± 1.7** against the rule bot. No memorization (the loss is equal on validation and training samples).
+- **Next, per the pass marks: change what P learns.** Opponent diversity first (§8), since the evidence points at the opponents: a league (below).
+
+**How strong is it?** P alone (b's final), network only:
+- Against the rule bot: **+24.8 ± 1.7** points per game (135.6 to the rule bots' 110.8; it wins 54% of 5-player games, fair share 20%; bids made 0.76 against their 0.63). Against rule bot 2: **+11.6 ± 0.7** (wins 36%). G5's measured parts (≥ +20 against the rule bot, > 0 against four rule bot 2s) pass without search; only the human playtest is open.
+- That means far above our bots, not near optimal. Every yardstick is our own bot or model, P was trained from rule bot 2 and then against itself, and they can share blind spots. Each method tried so far still found gains against our models (search +0.5 to +1, rollouts +1.7), and each found less than the one before.
+- **Headroom, measured** (2026-10-09, b's final): P alone vs four copies of rule bot 2r (128 samples; a lookahead bot, +9.6 over rule bot 2; 256 deals) **+5.8 ± 0.9** (it wins 25%). P + V search with the night runs' self-play settings (32 × 16, c_puct 1, root `q`) vs four copies of P (64 deals): **−0.0 ± 0.6**, where day 2 found +0.4 to +1.0 for earlier models. Search no longer improves on P in its own setting, and rollout training sits at its fixed point: what headroom remains is invisible to our own tools. Rollout search (`--root rollouts`, 32 deals) did not finish 64 deals in 45 min.
+- What would tell: the human playtest (the GUI, separately), and the chain's exploiters (below), which measure how much our method can gain against a fixed P: a lower bound on its exploitability.
+
+**Thread count of the rollout actors** (asked on day 4: would fewer threads be faster?):
+- *Alone* (`rollout_profile`, b's final, 2 samples per round, 90 s per point; a hill-climb from 28 in steps of 2 that stops after the first step without a > 1% gain and tests one more, then 12–20 around the 16 cores):
+
+  | Threads | 12 | 14 | 16 | 18 | 20 | 24 | 26 | 28 | 30 | 32 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | Valued decisions/h (M) | 1.24 | 1.40 | 1.54 | 1.53 | 1.54 | 1.54 | 1.56 | 1.58, 1.55 | 1.54 | 1.53 |
+
+  Throughput grows with the physical cores up to 16 and is flat from 16 to 32 (the repeat at 28 differs by 2%, about the noise): the second thread of a core adds nothing, since ONNX inference already keeps the core busy.
+- *In the pipeline* (the driver with the league's config, learner on, benches off; 0.2 h per point, measured after the warm-up; a hill-climb from 28 in steps of 4, plus 16): 
+
+  | Actors | 16 | 20 | 24 | 28 | 32 |
+  |---|---|---|---|---|---|
+  | Valued decisions/h (M) | 1.39 | 1.42 | 1.44 | **1.47** | 1.46 |
+  | Learner steps/h (4,096 samples, replay ratio 2) | 699 | 691 | 679 | 749 | 679 |
+
+  28 stays: fewer actors lose a little (−5% at 16), more gain nothing. The learner keeps up at every count (ratio 2, waiting for data ~half the time) on 0.5–0.6 of a core. (Not like for like with the table above: these rounds have the league's mix, those P alone.)
+- **The night's lost throughput was the benches.** The night runs' actors made 1.15M decisions/h against 1.47M in the pipeline without benches: the evaluator benches the newest publish as soon as it is done with the last, so it ran 99% of the night on 8 threads, and `net-vs0` took 416 s beside the actors against ~150 s alone. The learner takes 0.5–0.6 cores. With the second thread of a core worth nothing, the actors' throughput follows their share of the running threads, whatever their number. So the chain runs its benches on 4 threads (the actors keep ~86% of the machine; a bench of every model in the panel takes ~1.5 h, so ~4 per leg) and a run's final benches, after the actors stopped, on every core (`rl::evaluator`; they were on `eval.threads`, ~25 idle minutes per run).
+
+
+*As built (2026-10-09):*
+- **League tables** (`blob-engine/src/rollout.rs`, `mcts.rs`): `mcts::Seat` (P, the rule bot, rule bot 2, frozen net k) and `Table`; `mcts::play_out_greedy_at` plays the rule bots inline and runs P and each frozen net in their own lockstep batches; `rollout::draw_table` draws each seat by `rule_bot_2_share`, `rule_bot_share` and `frozen_share` (one seat always stays P's, no draw when every share is 0, so earlier runs replay unchanged); `rollout_round_vs` takes the frozen nets, `rollout_round_at` a fixed table. Only P's decisions are valued; frozen nets play their top move, like P.
+- **Actors and driver:** `[rollout] rule_bot_share`, `frozen_share`, `opponents` (model directories; the driver checks each has `policy.onnx`, the actor threads load them once). `selfplay.json` carries them as `rollout_opponents`.
+- **The panel:** `[eval] panel = [{ name, model }, ...]`, `net_deals_panel`: network benches of every publish, step 0 included, against four copies of each model (`net-vs-<name>`), paired vs step 0; `plots/10_panel.png`.
+- `rollout_profile` takes a frozen share and the model directories. The league's mix (frozen 0.4 of 5 models, rule bot 2 0.1) ran at 1.31M valued decisions/h in a 60-s profile on 28 threads, and at 1.47M in the pipeline (above); P alone at 1.58M (90 s).
+- **Tests:** a table of P, both rule bots and two frozen nets (each seat plays its own moves in the round and the play-outs, only P's decisions are valued, both nets are called); the shares as drawn; the config keys (inline-table panel, validation, round trip). Engine 335, trainer 7.
+
+**The chain** (`checkpoints/chain-2026-10-09.sh`, launch pending (ready 2026-10-09 13:15), ~70 h back to back; configs from `checkpoints/chain-2026-10-09-{league,exploit}.toml.in`; 28 rollout threads; a publish every 120 steps, ~10 min, so the actors play a fresh P; network benches on 4 threads, each time of the newest publish):
+- **e1** (4 h): an exploiter of b's final. P starts as b's final and trains at one seat against four frozen copies of it (`frozen_share` 0.95). Its `net-vs0` is how much our method gains against a fixed b: a lower bound on b's exploitability, to set beside the +1.7 that self-play found against a moving P.
+- **l01–l10** (6 h each): league legs. Each seat is P (45%), a frozen model (40%, uniform over the pool), rule bot 2 (10%) or the rule bot (5%); LR 3e-5, 8 × 512 per step. The pool starts with b's and a's finals, 2b's final, run 1's step 7600 and the warm start (rule bot 2's style); every leg starts from the previous leg's final, which then joins the pool (fictitious play over the legs). A leg that leaves no model or loses more than 3 points against rule bot 2 ends the league.
+- **e2** (4 h): an exploiter of the league's final.
+- **The panel**, the same in every run: b's final and run 1's step 7600 (in the pool), run 1's step 2000 and 2a's final (never trained against), plus the rule bots and each run's start.
+- *Pass marks, set before the chain:* the league's final above b's final against the two held-out panel models (paired, CIs clear of 0), and against rule bot 2 not below b's final; e2's gain smaller than e1's (the league made P harder to exploit). If the league gains only against its pool, it learns best replies to its opponents, not general strength, and opponent diversity alone isn't the lever.
 
 
 **Phase 6 — Long run, 5 players / 7 cards**

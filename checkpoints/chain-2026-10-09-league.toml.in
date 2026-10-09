@@ -1,0 +1,48 @@
+# Chain of 2026-10-09 (gen-2.md §6 Phase 5, day 4), a league leg: policy iteration by rollouts at mixed tables.
+# Each seat of a round (and of its play-outs) is P (45%), a frozen earlier model (40%, drawn uniformly from
+# `opponents`: the night's and earlier runs' finals, the warm start, every earlier leg's final), rule bot 2 (10%) or
+# the rule bot (5%). Last night P learned the best reply to itself: +1.7 against every self-play P, nothing against
+# the rule bots. The question: does a varied table give gains that hold across the panel, including the two panel
+# models no leg trains against (r1s2000, 2a)? Written by checkpoints/chain-2026-10-09.sh from this template;
+# defaults of blob-train/train.sample.toml except these.
+[run]
+hours = @HOURS@
+init_checkpoint = "@INIT@/checkpoint"
+init_model = "@INIT@/model"
+actors = 0
+
+[learner]
+lr = 3e-5
+warmup_steps = 60
+
+[log]
+eval_every = 280
+publish_every = 120
+eval_examples = 40000
+
+[eval]
+threads = 4
+net_deals_rule_bot_2 = 512
+net_deals_vs_start = 512
+search_every_hours = 0.0
+search_baseline = ""
+search_vs_p_deals = 0
+final_search = false
+final_rule_bot_deals = 0
+net_deals_panel = 512
+panel = [
+  { name = "b", model = "checkpoints/pi-2026-10-08b/models/step-002931/model" },
+  { name = "r1s7600", model = "checkpoints/rl-2026-10-06/models/step-007600/model" },
+  { name = "r1s2000", model = "checkpoints/rl-2026-10-06/models/step-002000/model" },
+  { name = "2a", model = "checkpoints/rl-2026-10-07a/models/step-002760/model" },
+]
+
+[rollout]
+actors = @ACTORS@
+ratio = 2.0
+micro_batches = 8
+rule_bot_2_share = 0.1
+rule_bot_share = 0.05
+frozen_share = 0.4
+opponents = [
+@OPPONENTS@]

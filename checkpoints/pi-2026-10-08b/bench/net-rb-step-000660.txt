@@ -1,0 +1,19 @@
+focal     network checkpoints/pi-2026-10-08b/models/step-000660/model
+opponents 4x rule bot
+table     5 players, 7 start cards; 128 deals x 5 seats = 640 games in 22 s
+
+points/game  focal 135.7  opponents 110.9  diff +24.8 ± 1.6 (95% CI over deals)
+win share    0.545 ± 0.040 (fair 0.200)
+
+bids          rounds    made   0-bids   opp made  opp 0-bids
+1 card          3200   0.822    0.776      0.745       0.837
+2-4 cards       3840   0.749    0.654      0.619       0.571
+5-8 cards       3840   0.726    0.342      0.534       0.255
+all            10880   0.762    0.580      0.626       0.538
+
+tricks-bid     <=-3     -2     -1      0     +1     +2   >=+3
+focal         0.001  0.004  0.107  0.762  0.107  0.015  0.003
+opponents     0.000  0.008  0.152  0.626  0.173  0.034  0.007
+
+paired vs start (checkpoints/pi-2026-10-08b/bench/net-rb-step-000000.csv): diff +0.17 ± 0.75 (95% CI over 128 deals)
+paired vs previous (checkpoints/pi-2026-10-08b/bench/net-rb-step-000600.csv): diff +0.33 ± 0.50 (95% CI over 128 deals)

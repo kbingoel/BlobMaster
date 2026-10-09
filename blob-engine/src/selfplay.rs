@@ -64,7 +64,7 @@ use crate::mcts::{
     DEFAULT_C_PUCT, DEFAULT_ONE_CARD_BIDS, DEFAULT_PLAY_BUDGET, DEFAULT_Q_TEMPERATURE,
 };
 use crate::replay::{Decision, SparsePolicy};
-use crate::rollout::{rollout_round, RolloutConfig, RolloutSample, RolloutStats};
+use crate::rollout::{rollout_round_vs, RolloutConfig, RolloutSample, RolloutStats};
 use crate::round::RoundMix;
 use crate::scoring::DEFAULT_LAMBDA;
 use crate::state::{BlobState, GamePhase};
@@ -445,6 +445,10 @@ pub struct ActorsConfig {
     pub rollout_actors: usize,
     #[serde(default)]
     pub rollout: RolloutConfig,
+    /// Model directories of the frozen policy nets that play
+    /// `rollout.frozen_share` of the rollout rounds' seats.
+    #[serde(default)]
+    pub rollout_opponents: Vec<PathBuf>,
     /// A file of `replay-pi/` every this many seconds.
     #[serde(default = "default_value_chunk_secs")]
     pub rollout_chunk_secs: f64,
@@ -837,6 +841,15 @@ pub fn run_actors(run: &Path, cfg: &ActorsConfig, stop: &AtomicBool) -> Result<(
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
                 let mut version = 0u64;
                 let mut net: Option<(OnnxPolicy, u64)> = None;
+                // The frozen opponents, loaded once; without them no rounds.
+                let frozen: Vec<OnnxPolicy> = match cfg.rollout_opponents.iter().map(OnnxPolicy::from_dir).collect::<Result<_, _>>() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[selfplay] rollout actor {i} can't load its frozen opponents: {e}");
+                        return;
+                    }
+                };
+                let frozen: Vec<&dyn PolicyEvaluator> = frozen.iter().map(|f| f as &dyn PolicyEvaluator).collect();
                 while !stop.load(SeqCst) {
                     let v = current.version.load(SeqCst);
                     if v != version || net.is_none() {
@@ -860,7 +873,7 @@ pub fn run_actors(run: &Path, cfg: &ActorsConfig, stop: &AtomicBool) -> Result<(
                     }
                     let (pn, step) = net.as_ref().expect("net loaded");
                     let params = cfg.mix.sample(&mut rng);
-                    match catch_unwind(AssertUnwindSafe(|| rollout_round(params, pn, &cfg.rollout, &mut rng))) {
+                    match catch_unwind(AssertUnwindSafe(|| rollout_round_vs(params, pn, &frozen, &cfg.rollout, &mut rng))) {
                         Ok((samples, stats)) => {
                             if rtx.send((samples, stats, *step)).is_err() {
                                 return;
@@ -886,6 +899,7 @@ pub fn run_actors(run: &Path, cfg: &ActorsConfig, stop: &AtomicBool) -> Result<(
 mod tests {
     use super::*;
     use crate::evaluator::DummyEvaluator;
+    use crate::rollout::rollout_round;
     use crate::scoring::round_points;
     use rand::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;

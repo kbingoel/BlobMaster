@@ -221,6 +221,14 @@ pub struct RolloutStreamConfig {
     /// only itself. Rule bot 2 is also the yardstick, so watch the rule bot
     /// and the start P too.
     pub rule_bot_2_share: f32,
+    /// The same for the rule bot.
+    pub rule_bot_share: f32,
+    /// The same for a frozen policy net from `opponents` (drawn uniformly;
+    /// its top move): earlier checkpoints, so P learns against more than
+    /// its current self.
+    pub frozen_share: f32,
+    /// Model directories (`policy.onnx`) of the frozen opponents.
+    pub opponents: Vec<String>,
     /// T of the loss, in utility units: P moves toward
     /// `π_ref · exp(E[u] / T)`.
     pub temperature: f64,
@@ -254,6 +262,9 @@ impl Default for RolloutStreamConfig {
             bid_deals: 1,
             bid_candidates: 2,
             rule_bot_2_share: 0.0,
+            rule_bot_share: 0.0,
+            frozen_share: 0.0,
+            opponents: vec![],
             temperature: 0.05,
             epsilon: 0.03,
             capacity: 1_000_000,
@@ -276,6 +287,8 @@ impl RolloutStreamConfig {
             bid_deals: self.bid_deals,
             bid_weighting: blob_engine::belief::BidWeighting { candidates: self.bid_candidates, noise: 0.1 },
             rule_bot_2_share: self.rule_bot_2_share,
+            rule_bot_share: self.rule_bot_share,
+            frozen_share: self.frozen_share,
         }
     }
 }
@@ -404,6 +417,20 @@ pub struct EvalConfig {
     /// model trained in it); "" = none.
     pub value_rounds_from: String,
     pub value_rounds: usize,
+    /// Network-only benches of every publish (step 0 too) against four
+    /// copies of each `panel` model's P (default seed), paired vs step 0:
+    /// fixed opponents beyond the rule bots and the run's start. 0 = skip.
+    pub net_deals_panel: usize,
+    /// The panel: bench `net-vs-<name>` per model directory.
+    pub panel: Vec<PanelModel>,
+}
+
+/// A fixed opponent of the panel benches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PanelModel {
+    pub name: String,
+    pub model: String,
 }
 
 impl Default for EvalConfig {
@@ -424,6 +451,8 @@ impl Default for EvalConfig {
             probe_rounds: 600,
             value_rounds_from: "checkpoints/rl-2026-10-06".into(),
             value_rounds: 600,
+            net_deals_panel: 512,
+            panel: vec![],
         }
     }
 }
@@ -467,6 +496,9 @@ impl TrainConfig {
             if !ok || !(ro.temperature > 0.0) || !(0.0..1.0).contains(&ro.epsilon) {
                 return Err("rollout: capacity > 0, min_examples <= capacity, ratio, chunk_secs and temperature > 0, epsilon in [0, 1)".into());
             }
+            if ro.frozen_share > 0.0 && ro.opponents.is_empty() {
+                return Err("rollout: frozen_share > 0 needs opponents".into());
+            }
         }
         if r.capacity == 0 || r.min_examples == 0 || r.chunk_rounds == 0 || r.loader_threads == 0 {
             return Err("replay: capacity, min_examples, chunk_rounds and loader_threads must be > 0".into());
@@ -496,6 +528,10 @@ impl TrainConfig {
         if self.eval.threads == 0 || self.eval.search_deals < 2 || !(self.eval.search_every_hours >= 0.0) {
             return Err("eval: threads > 0, search_deals >= 2, search_every_hours >= 0".into());
         }
+        let names: std::collections::BTreeSet<&str> = self.eval.panel.iter().map(|m| m.name.as_str()).collect();
+        if names.len() != self.eval.panel.len() || self.eval.panel.iter().any(|m| m.name.is_empty() || m.model.is_empty() || m.name.contains(['/', ' '])) {
+            return Err("eval.panel: names unique, non-empty, without '/' or spaces; models set".into());
+        }
         Ok(())
     }
 
@@ -512,6 +548,23 @@ mod tests {
     fn train_sample_config_is_the_default() {
         let sample = TrainConfig::parse(include_str!("../train.sample.toml")).unwrap();
         assert_eq!(sample, TrainConfig::default());
+    }
+
+    #[test]
+    fn league_opponents_and_the_panel_parse_and_round_trip() {
+        let c = TrainConfig::parse(
+            "[run]\nactors = 0\n[rollout]\nactors = 4\nrule_bot_share = 0.05\nfrozen_share = 0.4\nopponents = [\"a/model\", \"b/model\"]\n\
+             [eval]\npanel = [{ name = \"r1\", model = \"x/model\" }, { name = \"r2\", model = \"y/model\" }]\n",
+        )
+        .unwrap();
+        assert_eq!((c.rollout.round().frozen_share, c.rollout.round().rule_bot_share), (0.4, 0.05));
+        assert_eq!(c.rollout.opponents, ["a/model", "b/model"]);
+        assert_eq!((c.eval.panel[1].name.as_str(), c.eval.panel[1].model.as_str()), ("r2", "y/model"));
+        assert_eq!(TrainConfig::parse(&c.to_toml()).unwrap(), c);
+        assert!(TrainConfig::parse("[run]\nactors = 0\n[rollout]\nactors = 4\nfrozen_share = 0.4\n").is_err(), "no opponents");
+        assert!(TrainConfig::parse("[run]\nactors = 0\n[rollout]\nactors = 4\nrule_bot_share = 0.6\nrule_bot_2_share = 0.5\n").is_err());
+        assert!(TrainConfig::parse("[eval]\npanel = [{ name = \"a\", model = \"x\" }, { name = \"a\", model = \"y\" }]\n").is_err());
+        assert!(TrainConfig::parse("[eval]\npanel = [{ name = \"a\", model = \"x\", deals = 4 }]\n").is_err());
     }
 
     #[test]

@@ -18,6 +18,8 @@ published checkpoints in `<run>/models/`, and writes `<run>/plots/`:
 - `09_rollouts.png`        policy iteration by rollouts (runs from 2026-10-08): P vs four copies of the start P and vs
                            rule bot 2; per-decision gain of P's (and V's) top move over the playing P on held-out deals;
                            the loss, validation vs training sample; rollout throughput
+- `10_panel.png`           P alone against the panel of fixed opponents (`eval.panel`, runs from 2026-10-09) and the
+                           rule bots: each one's change since step 0, paired on the same deals
 
 Every x-axis is running hours (pauses excluded); a bench sits at the hour
 its model was published. Weights need the venv's torch (`--no-weights`
@@ -424,6 +426,31 @@ def fig_rollouts(run: Run, out: Path):
     save(fig, out / "09_rollouts.png", f"{run.path.name}: policy iteration by rollouts")
 
 
+def p_paired_start(ax, run: Run, name: str, title: str):
+    """A bench's change since step 0, paired on the same deals, with its 95% band."""
+    b = run.of("bench", name=name)
+    m = [(run.hours(r["step"]), q) for r in b for q in r.get("paired", []) if q.get("vs") == "start"]
+    series(ax, [x for x, _ in m], [num(q["diff"]) for _, q in m], BLUE, None, ci=[num(q["ci"]) for _, q in m], end="{:+.2f}")
+    zero_line(ax)
+    style(ax, title, "change since step 0, paired (points/game)", run=run)
+
+
+def fig_panel(run: Run, out: Path):
+    """The panel benches (`eval.panel`, runs from 2026-10-09): one plot per fixed opponent, then the rule bots."""
+    names = sorted({r["name"] for r in run.of("bench") if str(r.get("name", "")).startswith("net-vs-")})
+    if not names:
+        return
+    plots = [(n, f"vs four copies of {n[len('net-vs-'):]}") for n in names]
+    plots += [("net-rb2", "vs rule bot 2"), ("net-rb", "vs the rule bot")]
+    cols = 3
+    fig, a = figure(math.ceil(len(plots) / cols), cols)
+    for k, (name, title) in enumerate(plots):
+        p_paired_start(a[k // cols][k % cols], run, name, title)
+    for k in range(len(plots), a.size):
+        a[k // cols][k % cols].set_visible(False)
+    save(fig, out / "10_panel.png", f"{run.path.name}: P alone against the panel of fixed opponents")
+
+
 # ---- weights ------------------------------------------------------------------------------
 
 
@@ -626,7 +653,7 @@ def main() -> None:
     out = args.out or args.run / "plots"
     out.mkdir(parents=True, exist_ok=True)
     for f in (fig_overview, fig_strength, fig_bids, fig_learning, fig_generalization, fig_selfplay, fig_value_margin,
-              fig_rollouts):
+              fig_rollouts, fig_panel):
         f(run, out)
     if not args.no_weights:
         fig_weights(run, out)
