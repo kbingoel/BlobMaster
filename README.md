@@ -37,6 +37,7 @@ An AI for the card game **Blob** (a trick-taking game with exact bidding, relate
 | `blob-nn/` | The policy and value transformers (tch / libtorch), losses and optimizer, the learner. |
 | `blob-train/` | `blobmaster-train` CLI: `pretrain` (supervised warm start from rule bot 2) and `export` (writes a model directory: policy and value nets as ONNX); `train` (self-play RL) comes in Phase 5. Run it through `scripts/blobmaster-train.sh`. |
 | `blob-bin/` | `blobmaster` inference CLI: `bench` (strength vs the rule bots) and `play` (you vs bots in the terminal). |
+| `models/` | Models committed for play, the GUI and playtests: `gen2-2026-10-09/` is the strongest so far ([models/README.md](models/README.md)). |
 | `scripts/` | ONNX export (Python) and plotting. |
 | `logs/` | Measurement outputs (rule bot 2 rollout sweeps). |
 | `legacy/` | Gen-0 Python reference code (read-only). |

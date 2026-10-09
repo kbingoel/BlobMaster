@@ -50,6 +50,8 @@ flamegraph.svg
 *.onnx
 *.safetensors
 *.ot
+# Except the models for play and the GUI, in models/ (models/README.md): committed on purpose.
+!models/**/*.onnx
 
 # Training replay buffers and decision logs (too large for GitHub)
 **/buffer.bin
